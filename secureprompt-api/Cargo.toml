@@ -1,0 +1,29 @@
+[package]
+name = "secureprompt-api"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "secureprompt_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "secureprompt-api"
+path = "src/main.rs"
+
+[dependencies]
+secureprompt-common = { path = "../secureprompt-common" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

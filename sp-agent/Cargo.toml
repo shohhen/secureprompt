@@ -1,0 +1,15 @@
+[package]
+name = "sp-agent"
+version = "0.1.0"
+edition = "2021"
+# Compile target: x86_64-unknown-linux-musl (static binary — D-25)
+# cargo build --release --target x86_64-unknown-linux-musl -p sp-agent
+
+[dependencies]
+secureprompt-common = { path = "../secureprompt-common" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

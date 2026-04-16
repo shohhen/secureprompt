@@ -1,0 +1,13 @@
+[package]
+name = "secureprompt-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+secureprompt-common = { path = "../secureprompt-common" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
