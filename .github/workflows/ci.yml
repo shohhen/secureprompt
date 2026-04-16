@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check --all-targets
+        run: cargo check --all-targets
+        env:
+          SQLX_OFFLINE: "true"
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets
+        env:
+          SQLX_OFFLINE: "true"
+
+  cross-tenant-tests:
+    name: Cross-tenant integration tests (AUTH-05 gate)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: secureprompt
+          POSTGRES_PASSWORD: secureprompt
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U secureprompt"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install postgres client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Create non-superuser test runner role
+        run: |
+          psql postgresql://secureprompt:secureprompt@localhost:5432/postgres <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'secureprompt_runner') THEN
+              CREATE ROLE secureprompt_runner
+                LOGIN
+                PASSWORD 'secureprompt'
+                NOSUPERUSER
+                CREATEDB
+                CREATEROLE
+                NOBYPASSRLS;
+            END IF;
+          END $$;
+          GRANT ALL PRIVILEGES ON DATABASE postgres TO secureprompt_runner;
+          SQL
+
+      - name: Run cross-tenant tests
+        # AUTH-05 gate: these tests fail if RLS or SET LOCAL regresses.
+        run: cargo test --test cross_tenant -- --nocapture
+        env:
+          DATABASE_URL: postgres://secureprompt_runner:secureprompt@localhost:5432/postgres
+          RUST_LOG: info

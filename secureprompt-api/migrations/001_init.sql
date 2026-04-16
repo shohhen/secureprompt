@@ -88,7 +88,7 @@ BEGIN
               AND policyname = 'workspace_isolation'
         ) THEN
             EXECUTE format(
-                'CREATE POLICY workspace_isolation ON %I USING (workspace_id = current_setting(''app.current_workspace_id'')::uuid)',
+                'CREATE POLICY workspace_isolation ON %I USING (workspace_id = current_setting(''app.current_workspace_id'', true)::uuid)',
                 t
             );
         END IF;
@@ -97,7 +97,7 @@ END $$;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'secureprompt_app') THEN
+    BEGIN
         CREATE ROLE secureprompt_app
             LOGIN
             PASSWORD 'change_in_production'
@@ -106,7 +106,10 @@ BEGIN
             NOCREATEROLE
             NOINHERIT
             NOREPLICATION;
-    END IF;
+    EXCEPTION
+        WHEN duplicate_object THEN
+            NULL;
+    END;
 END $$;
 
 GRANT USAGE ON SCHEMA public TO secureprompt_app;

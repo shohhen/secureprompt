@@ -38,7 +38,8 @@ impl PolicyRepository {
             .await
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
-        sqlx::query("SET LOCAL app.current_workspace_id = $1")
+        // Equivalent to `SET LOCAL app.current_workspace_id = $1`, but parameter-safe.
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
             .bind(workspace_id.to_string())
             .execute(&mut *tx)
             .await
