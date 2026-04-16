@@ -27,3 +27,6 @@ anyhow = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sqlx = { workspace = true }
