@@ -36,4 +36,16 @@ impl WorkspaceRepository {
             updated_at: record.get("updated_at"),
         }))
     }
+
+    pub async fn list_workspace_ids(&self) -> Result<Vec<WorkspaceId>, ApiError> {
+        let rows = sqlx::query("SELECT id FROM workspaces ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|record| WorkspaceId(record.get("id")))
+            .collect())
+    }
 }

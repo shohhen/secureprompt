@@ -1,2 +1,11 @@
+pub mod analytics;
 pub mod app_state;
 pub mod db;
+pub mod detection;
+pub mod http;
+pub mod observability;
+pub mod pipeline;
+pub mod policy;
+pub mod providers;
+pub mod token_usage;
+pub mod vault;

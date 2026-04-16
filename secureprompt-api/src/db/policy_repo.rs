@@ -76,4 +76,16 @@ impl PolicyRepository {
             })
             .collect())
     }
+
+    pub async fn list_enabled_rules(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<PolicyRuleRow>, ApiError> {
+        Ok(self
+            .list_rules(workspace_id)
+            .await?
+            .into_iter()
+            .filter(|rule| rule.enabled)
+            .collect())
+    }
 }

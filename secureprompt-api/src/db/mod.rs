@@ -6,9 +6,9 @@ pub mod workspace_repo;
 
 use secureprompt_common::errors::ApiError;
 
-pub use api_key_repo::ApiKeyRepository;
-pub use policy_repo::PolicyRepository;
-pub use provider_repo::ProviderRepository;
+pub use api_key_repo::{ApiKeyRepository, AuthenticatedApiKey};
+pub use policy_repo::{PolicyRepository, PolicyRuleRow};
+pub use provider_repo::{ProviderRepository, ResolvedModelTarget};
 pub use user_repo::UserRepository;
 pub use workspace_repo::WorkspaceRepository;
 

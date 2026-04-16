@@ -1,8 +1,9 @@
-use axum::Router;
+use secureprompt_api::{app_state::AppState, http::build_router};
 use secureprompt_common::{
     config::{AppConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig},
     telemetry::init_telemetry,
 };
+use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -34,7 +35,13 @@ async fn main() -> anyhow::Result<()> {
 
     init_telemetry(&config.telemetry);
 
-    let app = Router::new();
+    let db = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await?;
+
+    let state = AppState::new(db, config.clone());
+    let app = build_router(state);
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&address).await?;
 

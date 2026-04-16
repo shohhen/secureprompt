@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 macro_rules! uuid_newtype {
     ($name:ident) => {
@@ -49,14 +51,66 @@ pub struct TokenUsage {
     pub cache_write_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenVault;
+#[derive(Debug, Clone, Default)]
+pub struct TokenVault {
+    entries: HashMap<String, SecretValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SecretValue(String);
+
+impl SecretValue {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl TokenVault {
+    pub fn insert(&mut self, placeholder: String, original: String) {
+        self.entries.insert(placeholder, SecretValue::new(original));
+    }
+
+    #[must_use]
+    pub fn resolve(&self, placeholder: &str) -> Option<&str> {
+        self.entries.get(placeholder).map(SecretValue::as_str)
+    }
+
+    #[must_use]
+    pub fn restore(&self, content: &str) -> String {
+        let mut restored = content.to_owned();
+        for (placeholder, original) in &self.entries {
+            restored = restored.replace(placeholder, original.as_str());
+        }
+        restored
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detection {
     pub class: String,
     pub confidence: f32,
     pub span: Option<(usize, usize)>,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +130,8 @@ pub struct PolicyResult {
 pub struct ProviderResponse {
     pub content: String,
     pub model: String,
+    pub finish_reason: Option<String>,
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
