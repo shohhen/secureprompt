@@ -1,0 +1,32 @@
+# Air-gap override values — telemetry disabled, all images use internal registry.
+# Usage: helm install secureprompt ./helm/secureprompt -f helm/secureprompt/values-airgap.yaml
+
+otel:
+  enabled: false
+
+prometheus:
+  enabled: false
+
+api:
+  image:
+    repository: registry.internal/secureprompt/api
+    tag: "0.1.0"
+    pullPolicy: Never
+
+worker:
+  image:
+    repository: registry.internal/secureprompt/worker
+    tag: "0.1.0"
+    pullPolicy: Never
+
+postgres:
+  image:
+    repository: registry.internal/postgres
+    tag: "16-alpine"
+    pullPolicy: Never
+
+redis:
+  image:
+    repository: registry.internal/redis
+    tag: "7.4-alpine"
+    pullPolicy: Never

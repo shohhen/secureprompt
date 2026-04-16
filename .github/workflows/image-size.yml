@@ -1,0 +1,52 @@
+name: Image Policy Check
+
+on:
+  push:
+    paths:
+      - "docker-compose*.yml"
+      - "helm/**"
+      - "**/Dockerfile"
+  pull_request:
+    paths:
+      - "docker-compose*.yml"
+      - "helm/**"
+      - "**/Dockerfile"
+
+jobs:
+  no-bitnami-images:
+    name: Verify no Bitnami images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for bitnami image references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find . \( -name 'docker-compose*.yml' -o -path './helm/*' -o -name 'Dockerfile' \) -type f | sort)
+          found="$(grep -nH 'bitnami/' "${files[@]}" || true)"
+          if [[ -n "${found}" ]]; then
+            echo "ERROR: Bitnami images found:"
+            echo "${found}"
+            echo "Use upstream images instead."
+            exit 1
+          fi
+          echo "OK: no bitnami/ image references found."
+
+  document-image-budget:
+    name: Document image size budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report image budget targets
+        run: |
+          echo "=== SecurePrompt Image Size Budget ==="
+          echo "Target: Combined compressed size < 2 GB (OPS-01)"
+          echo "Rust gateway (distroless/cc-debian12): ~15-25 MB"
+          echo "Rust worker (distroless/cc-debian12): ~15-25 MB"
+          echo "Python sidecar (python-slim + torch-cpu): ~800 MB - 1.2 GB [Phase 3]"
+          echo "Next.js dashboard (node:alpine): ~200-400 MB [Phase 5]"
+          echo "postgres:16-alpine: ~80 MB"
+          echo "redis:7.4-alpine: ~10 MB"
+          echo "Budget enforcement: full build size check lands when later phase images are buildable."

@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-worker
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-worker
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: database-url
+                  optional: true
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: redis-url
+                  optional: true

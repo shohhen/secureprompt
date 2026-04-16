@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: secureprompt
+      POSTGRES_PASSWORD: secureprompt
+      POSTGRES_DB: secureprompt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: secureprompt-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: debug
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:

@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: secureprompt
+      POSTGRES_PASSWORD: secureprompt
+      POSTGRES_DB: secureprompt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secureprompt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: secureprompt-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: secureprompt-worker/Dockerfile
+    environment:
+      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

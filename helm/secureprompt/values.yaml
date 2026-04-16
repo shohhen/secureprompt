@@ -1,0 +1,32 @@
+nameOverride: ""
+fullnameOverride: ""
+
+api:
+  image:
+    repository: secureprompt/api
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+
+worker:
+  image:
+    repository: secureprompt/worker
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+
+redis:
+  image:
+    repository: redis
+    tag: "7.4-alpine"
+
+otel:
+  enabled: true
+
+prometheus:
+  enabled: true
