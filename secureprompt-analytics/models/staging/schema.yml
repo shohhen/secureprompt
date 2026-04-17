@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: stg_request_events
+    description: "Staging view over request_events with nullable tokens coalesced to 0"
+    columns:
+      - name: request_id
+        description: "UUID — not_null enforced at source"
+        tests:
+          - not_null
+      - name: workspace_id
+        tests:
+          - not_null
+      - name: cost_usd
+        tests:
+          - not_null
+
+  - name: stg_policy_events
+    description: "Staging view over policy_events"
+    columns:
+      - name: request_id
+        tests:
+          - not_null
+      - name: rule_id
+        tests:
+          - not_null
+      - name: action
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['allow', 'deny', 'redact', 'transform', 'flag']

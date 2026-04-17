@@ -1,0 +1,12 @@
+version: 2
+
+models:
+  - name: int_requests_enriched
+    description: "Request events with computed date/hour columns for downstream aggregation"
+    columns:
+      - name: request_id
+        tests:
+          - not_null
+      - name: usage_date
+        tests:
+          - not_null

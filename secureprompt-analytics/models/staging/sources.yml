@@ -1,0 +1,46 @@
+version: 2
+
+sources:
+  - name: secureprompt
+    database: secureprompt
+    schema: default
+    description: "Raw ClickHouse tables written by secureprompt-api analytics writer"
+    tables:
+      - name: request_events
+        description: "One row per LLM request; TTL 90 days"
+        columns:
+          - name: request_id
+            description: "UUID primary key"
+          - name: workspace_id
+          - name: provider
+          - name: model
+          - name: final_action
+          - name: cost_usd
+          - name: created_at
+      - name: policy_events
+        description: "One row per policy rule match per request; TTL 90 days"
+        columns:
+          - name: request_id
+          - name: workspace_id
+          - name: rule_id
+          - name: rule_name
+          - name: action
+          - name: dry_run
+          - name: created_at
+      - name: latency_samples
+        description: "Per-request latency samples; TTL 30 days"
+        columns:
+          - name: request_id
+          - name: workspace_id
+          - name: model
+          - name: latency_ms
+          - name: created_at
+      - name: token_usage
+        description: "Daily rollup SummingMergeTree; query with GROUP BY + sum()"
+        columns:
+          - name: workspace_id
+          - name: model
+          - name: date
+          - name: input_tokens
+          - name: output_tokens
+          - name: cost_usd

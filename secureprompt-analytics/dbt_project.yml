@@ -1,0 +1,30 @@
+name: 'secureprompt_analytics'
+version: '1.0.0'
+config-version: 2
+
+profile: 'secureprompt_analytics'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+analysis-paths: ["analyses"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  secureprompt_analytics:
+    staging:
+      +database: secureprompt_staging
+      +schema: default
+      +materialized: view
+    intermediate:
+      +database: secureprompt_intermediate
+      +schema: default
+      +materialized: table
+    marts:
+      +database: secureprompt_marts
+      +schema: default
+      +materialized: table

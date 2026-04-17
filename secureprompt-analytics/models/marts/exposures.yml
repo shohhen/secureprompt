@@ -1,0 +1,39 @@
+version: 2
+
+exposures:
+  - name: dashboard_usage_page
+    type: dashboard
+    maturity: high
+    owner:
+      name: SecurePrompt Engineering
+      email: eng@secureprompt.io
+    description: >
+      Phase 5 dashboard /usage page.
+      Reads mart_usage_daily for token/cost trends and mart_cost_by_model for model breakdown.
+    depends_on:
+      - ref('mart_usage_daily')
+      - ref('mart_cost_by_model')
+
+  - name: dashboard_policy_page
+    type: dashboard
+    maturity: medium
+    owner:
+      name: SecurePrompt Engineering
+      email: eng@secureprompt.io
+    description: >
+      Phase 5 dashboard /policy page.
+      Reads mart_policy_violations for rule match stream and violation counts.
+    depends_on:
+      - ref('mart_policy_violations')
+
+  - name: dashboard_requests_latency
+    type: dashboard
+    maturity: medium
+    owner:
+      name: SecurePrompt Engineering
+      email: eng@secureprompt.io
+    description: >
+      Phase 5 dashboard latency panels (used on /usage and /requests pages).
+      Reads mart_latency_pctiles for p50/p95/p99 by model.
+    depends_on:
+      - ref('mart_latency_pctiles')

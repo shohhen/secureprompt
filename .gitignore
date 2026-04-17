@@ -16,3 +16,6 @@
 
 # macOS
 .DS_Store
+
+# dbt profiles — contain credentials via env vars; never commit
+secureprompt-analytics/profiles.yml

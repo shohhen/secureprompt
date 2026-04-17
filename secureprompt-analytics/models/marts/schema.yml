@@ -1,0 +1,66 @@
+version: 2
+
+models:
+  - name: mart_usage_daily
+    description: "Daily token and cost breakdown by workspace and model — feeds /usage dashboard page"
+    tests:
+      - unique:
+          column_name: "concat(toString(workspace_id), '-', model, '-', toString(usage_date))"
+    columns:
+      - name: workspace_id
+        tests:
+          - not_null
+      - name: model
+        tests:
+          - not_null
+      - name: usage_date
+        tests:
+          - not_null
+      - name: total_cost_usd
+        tests:
+          - not_null
+
+  - name: mart_cost_by_model
+    description: "Cumulative cost per model with 7d and 30d rolling windows"
+    columns:
+      - name: model
+        tests:
+          - not_null
+      - name: usage_date
+        tests:
+          - not_null
+      - name: daily_cost_usd
+        tests:
+          - not_null
+
+  - name: mart_policy_violations
+    description: "Policy rule match counts grouped by rule and day — feeds /policy dashboard page"
+    columns:
+      - name: workspace_id
+        tests:
+          - not_null
+      - name: rule_id
+        tests:
+          - not_null
+      - name: violation_date
+        tests:
+          - not_null
+      - name: violation_count
+        tests:
+          - not_null
+
+  - name: mart_latency_pctiles
+    description: "p50/p95/p99 latency by model and workspace, daily"
+    columns:
+      - name: workspace_id
+        tests:
+          - not_null
+      - name: model
+        tests:
+          - not_null
+      - name: usage_date
+        tests:
+          - not_null
+      - name: p95_latency_ms
+        tests:
+          - not_null
