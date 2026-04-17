@@ -2,6 +2,8 @@ pub mod anthropic;
 pub mod ollama;
 pub mod openai;
 pub mod vllm;
+#[cfg(test)]
+mod tests;
 
 use crate::{http::model_router::ModelTarget, token_usage::dispatch::estimate_tokens};
 use async_trait::async_trait;
