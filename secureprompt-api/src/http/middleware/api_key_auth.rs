@@ -5,6 +5,7 @@ use crate::{
 };
 use axum::http::HeaderMap;
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ async fn cache_api_key(state: &AppState, token: &str, authenticated: &Authentica
                 api_key_id: authenticated.id,
                 workspace_id: authenticated.workspace_id,
                 name: authenticated.name.clone(),
+                cached_at: Instant::now(),
             },
         )
         .await;

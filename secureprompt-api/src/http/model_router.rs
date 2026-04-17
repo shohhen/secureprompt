@@ -6,15 +6,22 @@ use secureprompt_common::{
     errors::ApiError,
     types::{ProviderId, WorkspaceId},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, time::{Duration, Instant}};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// TTL for cached API key and model entries. After this duration a cache miss
+/// is returned so the caller re-validates against Postgres. This ensures that
+/// revoked keys and rotated credentials are reflected within 60 seconds.
+const CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct CachedApiKey {
     pub api_key_id: Uuid,
     pub workspace_id: WorkspaceId,
     pub name: String,
+    /// Instant at which this entry was inserted; used to enforce CACHE_TTL.
+    pub cached_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -34,27 +41,52 @@ pub struct ResolvedModel {
     pub targets: Vec<ModelTarget>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConfigCache {
     api_keys: RwLock<HashMap<String, CachedApiKey>>,
-    models: RwLock<HashMap<String, ResolvedModel>>,
+    /// Model entries are stored with the instant they were cached so TTL can be enforced.
+    models: RwLock<HashMap<String, (ResolvedModel, Instant)>>,
+}
+
+impl Default for ConfigCache {
+    fn default() -> Self {
+        Self {
+            api_keys: RwLock::new(HashMap::new()),
+            models: RwLock::new(HashMap::new()),
+        }
+    }
 }
 
 impl ConfigCache {
+    /// Returns a cached API key only if it was inserted within CACHE_TTL.
+    /// Returning `None` causes the caller to re-validate against the database,
+    /// ensuring that revoked keys stop authenticating within 60 seconds.
     pub async fn get_api_key(&self, token: &str) -> Option<CachedApiKey> {
-        self.api_keys.read().await.get(token).cloned()
+        let entry = self.api_keys.read().await.get(token).cloned()?;
+        if entry.cached_at.elapsed() > CACHE_TTL {
+            return None;
+        }
+        Some(entry)
     }
 
     pub async fn set_api_key(&self, token: &str, value: CachedApiKey) {
         self.api_keys.write().await.insert(token.to_owned(), value);
     }
 
+    /// Returns a cached model only if it was inserted within CACHE_TTL.
     pub async fn get_model(&self, key: &str) -> Option<ResolvedModel> {
-        self.models.read().await.get(key).cloned()
+        let (model, cached_at) = self.models.read().await.get(key).cloned()?;
+        if cached_at.elapsed() > CACHE_TTL {
+            return None;
+        }
+        Some(model)
     }
 
     pub async fn set_model(&self, key: &str, value: ResolvedModel) {
-        self.models.write().await.insert(key.to_owned(), value);
+        self.models
+            .write()
+            .await
+            .insert(key.to_owned(), (value, Instant::now()));
     }
 }
 
@@ -124,6 +156,7 @@ mod tests {
                     api_key_id: key_id,
                     workspace_id,
                     name: "test".to_owned(),
+                    cached_at: Instant::now(),
                 },
             )
             .await;
