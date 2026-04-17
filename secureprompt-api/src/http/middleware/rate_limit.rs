@@ -51,3 +51,38 @@ pub async fn enforce_rate_limit(state: &AppState, auth: &AuthContext) -> Result<
         .check(&format!("workspace:{}", auth.workspace_id))
         .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rate_limiter_allows_requests_within_window() {
+        let limiter = RateLimiter::new(5, 60);
+        for _ in 0..5 {
+            assert!(limiter.check("test_key").await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_blocks_after_exceeding_limit() {
+        let limiter = RateLimiter::new(2, 60);
+        assert!(limiter.check("test_key").await.is_ok());
+        assert!(limiter.check("test_key").await.is_ok());
+        let result = limiter.check("test_key").await;
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::Forbidden(msg)) => assert!(msg.contains("rate limit exceeded")),
+            _ => panic!("expected Forbidden error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_tracks_different_keys_independently() {
+        let limiter = RateLimiter::new(1, 60);
+        assert!(limiter.check("key_a").await.is_ok());
+        assert!(limiter.check("key_b").await.is_ok());
+        assert!(limiter.check("key_a").await.is_err());
+        assert!(limiter.check("key_b").await.is_err());
+    }
+}

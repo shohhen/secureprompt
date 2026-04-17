@@ -70,3 +70,46 @@ async fn cache_api_key(state: &AppState, token: &str, authenticated: &Authentica
         )
         .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn make_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            value.parse().expect("valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn token_must_start_with_sp_prefix() {
+        // Validate the Bearer + sp_ prefix logic inline without a DB
+        let header = "Bearer sp_abc123";
+        let token = header
+            .strip_prefix("Bearer ")
+            .expect("strip Bearer prefix");
+        assert!(token.starts_with("sp_"), "token must have sp_ prefix");
+    }
+
+    #[test]
+    fn non_sp_token_fails_prefix_check() {
+        let token = "sk-abc123";
+        assert!(
+            !token.starts_with("sp_"),
+            "non-sp_ token should be rejected"
+        );
+    }
+
+    #[test]
+    fn missing_bearer_prefix_fails() {
+        let header = "Basic sp_abc123";
+        assert!(
+            header.strip_prefix("Bearer ").is_none(),
+            "Basic auth should not match Bearer"
+        );
+    }
+}

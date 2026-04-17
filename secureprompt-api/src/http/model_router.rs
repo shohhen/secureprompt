@@ -106,3 +106,69 @@ impl From<ResolvedModelTarget> for ModelTarget {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn config_cache_stores_and_retrieves_api_key() {
+        let cache = ConfigCache::default();
+        let key_id = uuid::Uuid::new_v4();
+        let workspace_id = secureprompt_common::types::WorkspaceId(uuid::Uuid::new_v4());
+
+        cache
+            .set_api_key(
+                "sp_testkey",
+                CachedApiKey {
+                    api_key_id: key_id,
+                    workspace_id,
+                    name: "test".to_owned(),
+                },
+            )
+            .await;
+
+        let retrieved = cache.get_api_key("sp_testkey").await;
+        assert!(retrieved.is_some());
+        let cached = retrieved.unwrap();
+        assert_eq!(cached.api_key_id, key_id);
+        assert_eq!(cached.workspace_id, workspace_id);
+    }
+
+    #[tokio::test]
+    async fn config_cache_returns_none_for_missing_key() {
+        let cache = ConfigCache::default();
+        assert!(cache.get_api_key("sp_nonexistent").await.is_none());
+        assert!(cache.get_model("workspace:model").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_cache_stores_and_retrieves_model() {
+        let cache = ConfigCache::default();
+        let workspace_id = secureprompt_common::types::WorkspaceId(uuid::Uuid::new_v4());
+        let provider_id = secureprompt_common::types::ProviderId(uuid::Uuid::new_v4());
+
+        let resolved = ResolvedModel {
+            public_model: "gpt-4o-mini".to_owned(),
+            targets: vec![ModelTarget {
+                model_id: uuid::Uuid::new_v4(),
+                workspace_id,
+                provider_id,
+                provider_name: "openai-primary".to_owned(),
+                provider_type: "openai".to_owned(),
+                model_name: "gpt-4o-mini".to_owned(),
+                encrypted_credential: None,
+            }],
+        };
+
+        let cache_key = format!("{workspace_id}:gpt-4o-mini");
+        cache.set_model(&cache_key, resolved.clone()).await;
+
+        let retrieved = cache.get_model(&cache_key).await;
+        assert!(retrieved.is_some());
+        let cached = retrieved.unwrap();
+        assert_eq!(cached.public_model, "gpt-4o-mini");
+        assert_eq!(cached.targets.len(), 1);
+        assert_eq!(cached.targets[0].provider_type, "openai");
+    }
+}
