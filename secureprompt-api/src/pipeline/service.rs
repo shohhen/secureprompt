@@ -1,7 +1,7 @@
 use crate::{
     analytics::events::RequestEvent,
     app_state::AppState,
-    detection::detect_content,
+    detection::{detect_content, merge::merge_detections},
     http::{
         middleware::api_key_auth::AuthContext,
         model_router::{ModelTarget, ResolvedModel},
@@ -69,7 +69,9 @@ impl PipelineService {
         let request_id = RequestId::new();
         let prompt = prompt_from_messages(&request.messages);
         let mut pipeline_state = PipelineState::default();
-        pipeline_state.detections = detect_content(&prompt);
+        let regex_detections = detect_content(&prompt);
+        let ml_detections = self.state.ml_sidecar.detect_if_available(&prompt).await;
+        pipeline_state.detections = merge_detections(regex_detections, ml_detections);
 
         log_request_start(request_id, auth.workspace_id, &request.public_model);
 
