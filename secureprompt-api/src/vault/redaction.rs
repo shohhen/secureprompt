@@ -32,6 +32,13 @@ pub fn apply_redaction(
             continue;
         }
 
+        // Reject spans that do not align to UTF-8 character boundaries.
+        // Byte-indexed slicing panics on non-boundary offsets; skipping the
+        // detection is safer than corrupting the output or crashing.
+        if !content.is_char_boundary(start) || !content.is_char_boundary(end) {
+            continue;
+        }
+
         redacted.push_str(&content[cursor..start]);
         let placeholder = placeholder_for(&detection.class, &detection.value);
         vault.insert(placeholder.clone(), detection.value.clone());
@@ -58,6 +65,10 @@ pub fn apply_transform(content: &str, detections: &[Detection], template: &str) 
         };
 
         if start < cursor || end > content.len() {
+            continue;
+        }
+
+        if !content.is_char_boundary(start) || !content.is_char_boundary(end) {
             continue;
         }
 
