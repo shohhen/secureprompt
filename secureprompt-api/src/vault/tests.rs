@@ -38,12 +38,12 @@ mod placeholder_tests {
     }
 
     #[test]
-    fn placeholder_contains_hash8() {
+    fn placeholder_contains_hash16() {
         let ph = placeholder_for("email", "user@example.com");
-        // Format: [REDACTED:EMAIL:xxxxxxxx] where xxxxxxxx is 8 hex chars
+        // Format: [REDACTED:EMAIL:xxxxxxxxxxxxxxxx] where the suffix is 16 hex chars (64-bit)
         let parts: Vec<&str> = ph.trim_matches(|c| c == '[' || c == ']').split(':').collect();
         assert_eq!(parts.len(), 3, "Placeholder must have 3 colon-separated parts: {ph}");
-        assert_eq!(parts[2].len(), 8, "Hash suffix must be 8 chars, got: {}", parts[2]);
+        assert_eq!(parts[2].len(), 16, "Hash suffix must be 16 chars, got: {}", parts[2]);
     }
 
     #[test]
@@ -138,7 +138,7 @@ mod redaction_tests {
     fn unresolved_placeholder_stays_redacted() {
         // If vault doesn't have the placeholder, restore returns it as-is (redacted)
         let vault = TokenVault::default();
-        let redacted_content = "Contact [REDACTED:EMAIL:abcd1234]";
+        let redacted_content = "Contact [REDACTED:EMAIL:abcd1234abcd1234]";
         let restored = restore_content(redacted_content, &vault);
         // Since the placeholder is not in vault, it stays as-is (fail-safe)
         assert!(

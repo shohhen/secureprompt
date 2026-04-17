@@ -5,7 +5,9 @@ use std::collections::HashMap;
 #[must_use]
 pub fn placeholder_for(class: &str, value: &str) -> String {
     let digest = hex::encode(Sha256::digest(value.as_bytes()));
-    format!("[REDACTED:{}:{}]", class.to_uppercase(), &digest[..8])
+    // Use 16 hex characters (64 bits) to reduce birthday-collision probability
+    // from ~2^16 to ~2^32 distinct secrets before a collision is expected.
+    format!("[REDACTED:{}:{}]", class.to_uppercase(), &digest[..16])
 }
 
 #[must_use]
