@@ -103,12 +103,11 @@ impl ApiKeyRepository {
                 "SELECT id, workspace_id, name
                  FROM api_keys
                  WHERE revoked_at IS NULL
-                   AND (key_hash = $1 OR key_hash = $2)
+                   AND key_hash = $1
                  ORDER BY created_at DESC
                  LIMIT 1",
             )
             .bind(&presented_hash)
-            .bind(presented_key)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|error| ApiError::Database(error.to_string()))?;
