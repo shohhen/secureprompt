@@ -45,6 +45,7 @@ async fn streaming_route_restores_redacted_values_and_includes_usage(
         json!({
             "model": "gpt-4o-mini",
             "stream": true,
+            "stream_options": { "include_usage": true },
             "messages": [{
                 "role": "user",
                 "content": "email alice@example.com should round trip"
