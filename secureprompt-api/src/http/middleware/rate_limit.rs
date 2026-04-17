@@ -27,9 +27,26 @@ impl RateLimiter {
     pub async fn check(&self, key: &str) -> Result<(), ApiError> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().await;
-        let entry = buckets.entry(key.to_owned()).or_default();
 
-        entry.retain(|instant| now.duration_since(*instant) <= self.window);
+        // Trim expired timestamps.
+        if let Some(entry) = buckets.get_mut(key) {
+            entry.retain(|instant| now.duration_since(*instant) <= self.window);
+        }
+
+        // Evict the bucket when all timestamps have expired to prevent unbounded growth.
+        if buckets.get(key).map_or(false, |e| e.is_empty()) {
+            buckets.remove(key);
+            return Ok(());
+        }
+
+        // Cap total tracked keys to avoid memory exhaustion from unique-key DoS.
+        if buckets.len() > 100_000 {
+            return Err(ApiError::Forbidden(
+                "rate limiter capacity exceeded".into(),
+            ));
+        }
+
+        let entry = buckets.entry(key.to_owned()).or_default();
 
         if entry.len() >= self.max_requests {
             return Err(ApiError::Forbidden(format!(
