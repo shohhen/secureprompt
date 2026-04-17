@@ -157,7 +157,8 @@ impl ProviderRepository {
                     providers.encrypted_credential
              FROM models
              INNER JOIN providers ON providers.id = models.provider_id
-             WHERE models.name = $2
+             WHERE models.workspace_id = $1::uuid
+               AND models.name = $2
              ORDER BY models.created_at ASC, providers.created_at ASC",
         )
         .bind(workspace_id.to_string())
