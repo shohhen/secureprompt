@@ -13,6 +13,7 @@ use crate::{
     token_usage::dispatch::{derive_usage, UsageComputation},
     vault::restore_content,
 };
+use std::time::Instant;
 use secureprompt_common::{
     errors::ApiError,
     pipeline::{PipelineInput, PipelineOutput, PipelineState},
@@ -143,9 +144,11 @@ impl PipelineService {
             extra_params: request.extra_params.clone(),
         };
 
+        let t0 = Instant::now();
         let (chosen_target, provider_output) = self
             .invoke_provider_chain(&resolved.targets, &request, &pipeline_input)
             .await?;
+        let latency_ms = t0.elapsed().as_millis() as u32;
 
         let restored_content =
             if provider_output.embedding.is_some() && provider_output.content.is_empty() {
@@ -196,7 +199,7 @@ impl PipelineService {
             policy_result: policy_outcome.result.clone(),
         };
 
-        let event = RequestEvent::new(
+        let mut event = RequestEvent::new(
             request_id,
             auth.workspace_id,
             chosen_target.provider_name.clone(),
@@ -207,6 +210,7 @@ impl PipelineService {
             cost_usd,
             policy_outcome.result.events.clone(),
         );
+        event.latency_ms = Some(latency_ms);
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
