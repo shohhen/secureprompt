@@ -1,9 +1,10 @@
-use secureprompt_api::{app_state::AppState, http::build_router};
+use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::{
-    config::{AppConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig},
+    config::{AppConfig, ClickhouseConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig},
     telemetry::init_telemetry,
 };
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -31,6 +32,12 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(8080),
         },
+        clickhouse: ClickhouseConfig {
+            url: std::env::var("CLICKHOUSE_URL")
+                .unwrap_or_else(|_| "http://localhost:8123".into()),
+            database: std::env::var("CLICKHOUSE_DATABASE")
+                .unwrap_or_else(|_| "default".into()),
+        },
     };
 
     init_telemetry(&config.telemetry);
@@ -40,7 +47,10 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database.url)
         .await?;
 
-    let state = AppState::new(db, config.clone());
+    let ml_sidecar_url = std::env::var("ML_SIDECAR_URL").unwrap_or_default();
+    let ml_sidecar = Arc::new(MlSidecarClient::new(ml_sidecar_url, 200));
+
+    let state = AppState::new(db, config.clone(), ml_sidecar);
     let app = build_router(state);
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&address).await?;

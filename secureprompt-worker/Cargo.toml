@@ -7,7 +7,11 @@ edition = "2021"
 secureprompt-common = { path = "../secureprompt-common" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+clickhouse = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true

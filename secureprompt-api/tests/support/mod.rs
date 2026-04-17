@@ -5,10 +5,11 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use secureprompt_api::{app_state::AppState, db::api_key_repo::hash_api_key, http::build_router};
+use secureprompt_api::{app_state::AppState, db::api_key_repo::hash_api_key, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::config::{
-    AppConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig,
 };
+use std::sync::Arc;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -32,11 +33,16 @@ pub fn test_config() -> AppConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
         },
+        clickhouse: ClickhouseConfig {
+            url: "http://localhost:8123".to_owned(),
+            database: "default".to_owned(),
+        },
     }
 }
 
 pub fn router(pool: PgPool) -> Router {
-    build_router(AppState::new(pool, test_config()))
+    let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 200));
+    build_router(AppState::new(pool, test_config(), ml_sidecar))
 }
 
 pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) -> sqlx::Result<()> {

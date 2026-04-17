@@ -158,11 +158,13 @@ mod analytics_tests {
         let policy_events = vec![
             PolicyEvent {
                 rule_id: Uuid::new_v4(),
+                rule_name: "redact-rule".to_owned(),
                 action: "redact".to_owned(),
                 dry_run: false,
             },
             PolicyEvent {
                 rule_id: Uuid::new_v4(),
+                rule_name: "flag-rule".to_owned(),
                 action: "flag".to_owned(),
                 dry_run: true,
             },

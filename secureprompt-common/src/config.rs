@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub redis: RedisConfig,
     pub telemetry: TelemetryConfig,
     pub server: ServerConfig,
+    pub clickhouse: ClickhouseConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,4 +32,17 @@ pub struct TelemetryConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MlSidecarConfig {
+    pub url: String,
+    /// Per-call timeout in milliseconds (D-04: 200ms).
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClickhouseConfig {
+    pub url: String,
+    pub database: String,
 }

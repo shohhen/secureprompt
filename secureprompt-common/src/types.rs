@@ -116,6 +116,7 @@ pub struct Detection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyEvent {
     pub rule_id: Uuid,
+    pub rule_name: String,
     pub action: String,
     pub dry_run: bool,
 }
