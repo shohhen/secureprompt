@@ -9,7 +9,7 @@ use crate::{
     },
     observability::tracing::{log_request_finish, log_request_start},
     policy::engine::{evaluate, PolicyEvaluationInput},
-    providers::{InvocationKind, ProviderInvocation},
+    providers::{sanitize_extra_params, InvocationKind, ProviderInvocation},
     token_usage::dispatch::{derive_usage, UsageComputation},
     vault::restore_content,
 };
@@ -249,7 +249,7 @@ impl PipelineService {
             model: pipeline_input.model.clone(),
             prompt: prompt_from_messages(&pipeline_input.messages),
             messages: pipeline_input.messages.clone(),
-            extra_params: pipeline_input.extra_params.clone(),
+            extra_params: sanitize_extra_params(pipeline_input.extra_params.clone()),
             stream: pipeline_input.stream,
             kind,
         };

@@ -97,6 +97,24 @@ impl ProviderCatalog {
     }
 }
 
+/// Strip test-only control parameters from `extra_params` so that production
+/// traffic cannot suppress usage reporting or force provider failures via the
+/// request body. This function is a no-op in test builds.
+#[cfg(not(test))]
+pub(crate) fn sanitize_extra_params(mut params: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut map) = params {
+        map.remove("omit_usage");
+        map.remove("force_provider_failure");
+    }
+    params
+}
+
+#[cfg(test)]
+pub(crate) fn sanitize_extra_params(params: serde_json::Value) -> serde_json::Value {
+    // In test builds, allow test-only params to pass through unchanged.
+    params
+}
+
 pub(crate) fn maybe_fail(
     provider_type: &str,
     target: &ModelTarget,
