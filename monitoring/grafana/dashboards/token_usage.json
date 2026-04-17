@@ -1,0 +1,52 @@
+{
+  "id": null,
+  "uid": "secureprompt-token-usage",
+  "title": "SecurePrompt — Token & Cost",
+  "description": "Daily token consumption and cost by workspace and model.",
+  "tags": ["secureprompt", "tokens", "cost"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5m",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Daily Cost by Model (USD)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "ClickHouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT usage_date, model, sum(total_cost_usd) AS cost_usd FROM secureprompt_marts.default.mart_usage_daily GROUP BY usage_date, model ORDER BY usage_date ASC",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Daily Tokens by Model",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "ClickHouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT usage_date, model, sum(total_input_tokens) AS input_tokens, sum(total_output_tokens) AS output_tokens FROM secureprompt_marts.default.mart_usage_daily GROUP BY usage_date, model ORDER BY usage_date ASC",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Rolling 7d Cost by Model",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "ClickHouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT model, usage_date, daily_cost_usd, rolling_7d_cost_usd, rolling_30d_cost_usd FROM secureprompt_marts.default.mart_cost_by_model ORDER BY usage_date DESC LIMIT 100",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}
