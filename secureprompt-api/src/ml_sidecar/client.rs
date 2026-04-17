@@ -44,11 +44,14 @@ impl AtomicCircuit {
         self.open_since.store(0, Ordering::Relaxed);
     }
 
-    fn record_failure(&self) {
+    /// Returns `true` if this failure caused the circuit to transition to OPEN.
+    fn record_failure(&self) -> bool {
         let prev = self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-        if prev + 1 >= FAILURE_THRESHOLD {
+        if prev + 1 == FAILURE_THRESHOLD {
             self.open_since.store(now_secs(), Ordering::Relaxed);
+            return true; // just transitioned to OPEN
         }
+        false
     }
 }
 
@@ -65,31 +68,44 @@ pub struct MlSidecarClient {
     pub enabled: bool,
     http: Option<Client>,
     circuit: Option<Arc<AtomicCircuit>>,
+    // Observable counters — always allocated, zero when disabled.
+    calls_total: Arc<AtomicU64>,
+    failures_total: Arc<AtomicU64>,
+    circuit_open_count: Arc<AtomicU64>,
 }
 
 impl MlSidecarClient {
     #[must_use]
     pub fn new(base_url: String, timeout_ms: u64) -> Self {
-        let enabled = !base_url.is_empty();
-        if !enabled {
-            return Self {
-                base_url,
-                enabled: false,
-                http: None,
-                circuit: None,
-            };
+        // T-03-05b: Reject non-empty URLs with invalid scheme to prevent SSRF via misconfiguration.
+        let enabled = !base_url.is_empty()
+            && (base_url.starts_with("http://") || base_url.starts_with("https://"));
+        if !base_url.is_empty() && !enabled {
+            tracing::warn!(
+                url = %base_url,
+                "ML_SIDECAR_URL has invalid scheme (expected http:// or https://); sidecar disabled"
+            );
         }
-        let http = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .use_rustls_tls()
-            .build()
-            .expect("reqwest client build failed");
+
+        let (http, circuit) = if enabled {
+            let h = Client::builder()
+                .timeout(Duration::from_millis(timeout_ms))
+                .use_rustls_tls()
+                .build()
+                .expect("reqwest client build failed");
+            (Some(h), Some(Arc::new(AtomicCircuit::new())))
+        } else {
+            (None, None)
+        };
 
         Self {
             base_url,
-            enabled: true,
-            http: Some(http),
-            circuit: Some(Arc::new(AtomicCircuit::new())),
+            enabled,
+            http,
+            circuit,
+            calls_total: Arc::new(AtomicU64::new(0)),
+            failures_total: Arc::new(AtomicU64::new(0)),
+            circuit_open_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -113,6 +129,7 @@ impl MlSidecarClient {
             Ok(resp) => match resp.json::<NerResponse>().await {
                 Ok(ner) => {
                     circuit.record_success();
+                    self.calls_total.fetch_add(1, Ordering::Relaxed);
                     ner.entities
                         .into_iter()
                         .map(|e| MlDetection {
@@ -125,15 +142,40 @@ impl MlSidecarClient {
                         .collect()
                 }
                 Err(_) => {
-                    circuit.record_failure();
+                    if circuit.record_failure() {
+                        self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.failures_total.fetch_add(1, Ordering::Relaxed);
                     Vec::new()
                 }
             },
             Err(_) => {
-                circuit.record_failure();
+                if circuit.record_failure() {
+                    self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.failures_total.fetch_add(1, Ordering::Relaxed);
                 Vec::new()
             }
         }
+    }
+
+    /// Prometheus metrics for the ML sidecar client.
+    /// Append to the main metrics output in the /metrics HTTP handler.
+    #[must_use]
+    pub fn render_prometheus(&self) -> String {
+        format!(
+            concat!(
+                "# TYPE secureprompt_ml_sidecar_calls_total counter\n",
+                "secureprompt_ml_sidecar_calls_total {}\n",
+                "# TYPE secureprompt_ml_sidecar_failures_total counter\n",
+                "secureprompt_ml_sidecar_failures_total {}\n",
+                "# TYPE secureprompt_ml_sidecar_circuit_open_total counter\n",
+                "secureprompt_ml_sidecar_circuit_open_total {}\n",
+            ),
+            self.calls_total.load(Ordering::Relaxed),
+            self.failures_total.load(Ordering::Relaxed),
+            self.circuit_open_count.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -165,5 +207,29 @@ mod tests {
             circuit.record_failure();
         }
         assert!(circuit.is_open(), "circuit must be OPEN after threshold failures");
+    }
+
+    /// T-03-05b: Invalid URL scheme disables the client (SSRF protection).
+    #[test]
+    fn test_invalid_scheme_disables_client() {
+        let client = MlSidecarClient::new("ftp://evil.example.com/ner".to_owned(), 200);
+        assert!(!client.enabled, "invalid scheme must disable client");
+    }
+
+    /// T-03-06b: circuit_open_count increments exactly on the 5th consecutive failure.
+    #[tokio::test]
+    async fn test_circuit_open_count_increments_on_threshold() {
+        let circuit = Arc::new(AtomicCircuit::new());
+        let open_count = Arc::new(AtomicU64::new(0));
+        for _ in 0..(FAILURE_THRESHOLD - 1) {
+            let just_opened = circuit.record_failure();
+            assert!(!just_opened);
+        }
+        let just_opened = circuit.record_failure();
+        assert!(just_opened, "5th failure must signal circuit just opened");
+        if just_opened {
+            open_count.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(open_count.load(Ordering::Relaxed), 1);
     }
 }

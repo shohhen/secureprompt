@@ -25,6 +25,26 @@ services:
       timeout: 5s
       retries: 10
 
+  secureprompt-ml:
+    build:
+      context: .
+      dockerfile: secureprompt-ml/Dockerfile
+    restart: on-failure
+    environment:
+      ML_LANGUAGE: en
+      ML_USE_ONNX: "false"
+    # No ports: mapping — api already binds host 8080; gateway calls via Docker DNS only.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')\" || exit 1",
+        ]
+      start_period: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   api:
     build:
       context: .
@@ -33,12 +53,15 @@ services:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
+      ML_SIDECAR_URL: http://secureprompt-ml:8080
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      secureprompt-ml:
         condition: service_healthy
 
   worker:

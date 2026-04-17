@@ -255,7 +255,8 @@ pub async fn embeddings(
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Response {
-    (StatusCode::OK, state.metrics.render_prometheus()).into_response()
+    let output = state.metrics.render_prometheus() + &state.ml_sidecar.render_prometheus();
+    (StatusCode::OK, output).into_response()
 }
 
 fn stream_chat_response(execution: PipelineExecution) -> Response {
