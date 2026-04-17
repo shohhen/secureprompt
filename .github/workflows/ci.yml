@@ -157,8 +157,23 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install postgres client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Create non-superuser test runner role
+        run: |
+          psql postgresql://secureprompt:secureprompt@localhost:5432/postgres <<'SQL'
+          DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'secureprompt_runner') THEN
+              CREATE ROLE secureprompt_runner LOGIN PASSWORD 'secureprompt'
+                NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+            END IF;
+          END $$;
+          GRANT ALL PRIVILEGES ON DATABASE postgres TO secureprompt_runner;
+          SQL
+
       - name: Run Phase 2 gateway tests
         run: cargo test --test openai_compat --test streaming_redaction --test token_usage_fallback --test provider_fallback --test fuzz_placeholder_boundaries -- --nocapture
         env:
-          DATABASE_URL: postgres://secureprompt:secureprompt@localhost:5432/postgres
+          DATABASE_URL: postgres://secureprompt_runner:secureprompt@localhost:5432/postgres
           RUST_LOG: info
