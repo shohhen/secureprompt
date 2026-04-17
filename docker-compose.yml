@@ -45,6 +45,23 @@ services:
       timeout: 5s
       retries: 3
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: secureprompt
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build:
       context: .
@@ -54,6 +71,8 @@ services:
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       ML_SIDECAR_URL: http://secureprompt-ml:8080
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: secureprompt
     ports:
       - "8080:8080"
     depends_on:
@@ -62,6 +81,8 @@ services:
       redis:
         condition: service_healthy
       secureprompt-ml:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
 
   worker:
@@ -72,11 +93,17 @@ services:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: secureprompt
+      CLICKHOUSE_MIGRATIONS_DIR: /app/clickhouse/migrations
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
 
 volumes:
   postgres_data:
+  clickhouse_data:
