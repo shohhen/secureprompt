@@ -50,6 +50,16 @@ dashmap = "6"
 # NOT set_auth_url/set_token_url — those are the v4 names (Pitfall 3).
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 
+# rmcp 1.5.0 — official Rust MCP SDK (modelcontextprotocol/rust-sdk).
+# CRITICAL: version is 1.5, NOT 0.2.x. The 0.2.x API is completely different.
+# Features: server (ServerHandler trait), macros (#[tool_router] etc.),
+#           transport-io (stdio() function), schemars (JsonSchema derive re-export).
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io", "schemars"] }
+
+# schemars 1.0 required separately — rmcp re-exports the crate but parameter structs
+# need the derive macro from the crate itself. MUST be 1.0, NOT 0.8 (Pitfall 6).
+schemars = "1.0"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
