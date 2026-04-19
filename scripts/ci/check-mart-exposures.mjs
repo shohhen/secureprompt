@@ -102,9 +102,11 @@ console.log(`Found ${pageFiles.length} dashboard page(s): ${pageFiles.map(f => f
 // ── 3. Extract MART_EXPOSURES from each page ──────────────────────────────────
 
 // Matches: export const MART_EXPOSURES = ["mart_foo", "mart_bar"] as const ...
+// Also matches with a TypeScript type annotation:
+//   export const MART_EXPOSURES: MartName[] = ["mart_usage_daily"]
 // Handles multi-line arrays via a loose match on the constant block.
 const martExposuresPattern =
-  /export\s+const\s+MART_EXPOSURES\s*=\s*\[([^\]]*)\]/;
+  /export\s+const\s+MART_EXPOSURES(?:\s*:\s*[^=]+)?\s*=\s*\[([^\]]*)\]/;
 
 let errors = 0;
 

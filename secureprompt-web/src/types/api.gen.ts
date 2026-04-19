@@ -55,6 +55,95 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/analytics/usage-daily": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Daily token and cost usage by workspace and model */
+        get: operations["getUsageDaily"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/cost-by-model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Daily cost with 7-day and 30-day rolling windows per model */
+        get: operations["getCostByModel"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/policy-violations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Policy rule violation counts by workspace, rule, and day */
+        get: operations["getPolicyViolations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/latency-pctiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** p50/p95/p99 latency percentiles by model and workspace, daily */
+        get: operations["getLatencyPctiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workspaces/{id}/budgets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the current workspace budget limits and live usage
+         * @description Any authenticated workspace member may read budgets. Missing rows return defaults (null limits, behavior="warn", 0 usage). Current usage is read live from Redis INCRBY counters that the enforcement middleware writes to, so the dashboard always mirrors what the pipeline sees.
+         */
+        get: operations["getWorkspaceBudget"];
+        /** Upsert workspace budget limits (admin only) */
+        put: operations["putWorkspaceBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -105,6 +194,106 @@ export interface components {
             details?: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * @description Enforcement behavior when a workspace crosses its limit. `block` → HTTP 402 ApiError{code:"budget_exceeded"}. `warn`  → 200 + response header `X-SecurePrompt-Budget-Warning: daily|monthly`. `flag`  → 200 (silent; analytics-only signal).
+         * @enum {string}
+         */
+        BudgetBehavior: "block" | "warn" | "flag";
+        BudgetResponse: {
+            /**
+             * Format: int64
+             * @description Daily token ceiling; null = unlimited.
+             */
+            daily_token_limit?: number | null;
+            /**
+             * Format: int64
+             * @description Monthly token ceiling; null = unlimited.
+             */
+            monthly_token_limit?: number | null;
+            behavior: components["schemas"]["BudgetBehavior"];
+            /** Format: date-time */
+            updated_at: string;
+            /**
+             * Format: int64
+             * @description Current UTC-day Redis counter.
+             */
+            daily_used: number;
+            /**
+             * Format: int64
+             * @description Current UTC-month Redis counter.
+             */
+            monthly_used: number;
+        };
+        PutBudgetRequest: {
+            /** Format: int64 */
+            daily_token_limit?: number | null;
+            /** Format: int64 */
+            monthly_token_limit?: number | null;
+            behavior: components["schemas"]["BudgetBehavior"];
+        };
+        UsageDailyRow: {
+            /** Format: uuid */
+            workspace_id: string;
+            model: string;
+            /** Format: date */
+            usage_date: string;
+            /** Format: int64 */
+            total_input_tokens: number;
+            /** Format: int64 */
+            total_output_tokens: number;
+            /** Format: int64 */
+            total_reasoning_tokens: number;
+            /** Format: double */
+            total_cost_usd: number;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: int64 */
+            estimated_request_count: number;
+        };
+        CostByModelRow: {
+            model: string;
+            /** Format: date */
+            usage_date: string;
+            /** Format: double */
+            daily_cost_usd: number;
+            /** Format: int64 */
+            daily_request_count: number;
+            /** Format: double */
+            rolling_7d_cost_usd: number;
+            /** Format: double */
+            rolling_30d_cost_usd: number;
+        };
+        PolicyViolationsRow: {
+            /** Format: uuid */
+            workspace_id: string;
+            /** Format: uuid */
+            rule_id: string;
+            rule_name: string;
+            action: string;
+            /** Format: date */
+            violation_date: string;
+            /** Format: int64 */
+            violation_count: number;
+            /** Format: int64 */
+            dry_run_count: number;
+            /** Format: int64 */
+            enforced_count: number;
+        };
+        LatencyPctilesRow: {
+            /** Format: uuid */
+            workspace_id: string;
+            model: string;
+            /** Format: date */
+            usage_date: string;
+            /** Format: double */
+            p50_latency_ms: number;
+            /** Format: double */
+            p95_latency_ms: number;
+            /** Format: double */
+            p99_latency_ms: number;
+            /** Format: int64 */
+            sample_count: number;
         };
     };
     responses: never;
@@ -196,6 +385,287 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    getUsageDaily: {
+        parameters: {
+            query: {
+                from: string;
+                to: string;
+                workspace_id?: string;
+                model?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage daily rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageDailyRow"][];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description workspace_id mismatch (IDOR guard) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Mart not populated — run dbt build */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    getCostByModel: {
+        parameters: {
+            query: {
+                from: string;
+                to: string;
+                workspace_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cost by model rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CostByModelRow"][];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description workspace_id mismatch (IDOR guard) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Mart not populated — run dbt build */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    getPolicyViolations: {
+        parameters: {
+            query: {
+                from: string;
+                to: string;
+                workspace_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Policy violations rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyViolationsRow"][];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description workspace_id mismatch (IDOR guard) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Mart not populated — run dbt build */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    getLatencyPctiles: {
+        parameters: {
+            query: {
+                from: string;
+                to: string;
+                workspace_id?: string;
+                model?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latency percentile rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LatencyPctilesRow"][];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description workspace_id mismatch (IDOR guard) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Mart not populated — run dbt build */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    getWorkspaceBudget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Budget snapshot */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetResponse"];
+                };
+            };
+            /** @description IDOR guard — requester is not in the target workspace */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    putWorkspaceBudget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutBudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description Budget updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetResponse"];
+                };
+            };
+            /** @description Workspace budget exceeded (enforcement path). */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description IDOR guard or non-admin role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
             };
         };
     };

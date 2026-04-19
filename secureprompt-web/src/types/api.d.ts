@@ -13,3 +13,9 @@ export type TokenRequest = components["schemas"]["TokenRequest"];
 export type TokenResponse = components["schemas"]["TokenResponse"];
 export type RefreshRequest = components["schemas"]["RefreshRequest"];
 export type ApiErrorEnvelope = components["schemas"]["ApiError"];
+
+// Phase 5 / Plan 05-03 — analytics mart row types
+export type UsageDailyRow = components["schemas"]["UsageDailyRow"];
+export type CostByModelRow = components["schemas"]["CostByModelRow"];
+export type PolicyViolationsRow = components["schemas"]["PolicyViolationsRow"];
+export type LatencyPctilesRow = components["schemas"]["LatencyPctilesRow"];
