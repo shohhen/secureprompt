@@ -25,6 +25,23 @@ redis:
     repository: redis
     tag: "7.4-alpine"
 
+web:
+  image:
+    repository: secureprompt/web
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+  env:
+    apiUrl: "http://secureprompt-api:8080"
+    nextauthUrl: "http://localhost:3000"
+
 otel:
   enabled: true
 

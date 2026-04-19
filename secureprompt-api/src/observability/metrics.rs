@@ -76,6 +76,9 @@ pub struct MetricsRegistry {
     dashboard_errors: Mutex<Vec<(String, String, u64)>>,
     /// Histogram surrogate for `secureprompt_dashboard_mart_query_duration_seconds{mart}`.
     dashboard_mart_duration: Mutex<Vec<(String, u64, u64)>>,
+    /// Counter `secureprompt_dashboard_client_errors_total{component}`.
+    /// Incremented by POST /v1/telemetry/client-error (Plan 05-06).
+    dashboard_client_errors: Mutex<Vec<(String, u64)>>,
 }
 
 impl MetricsRegistry {
@@ -188,6 +191,42 @@ impl MetricsRegistry {
         } else {
             guard.push((mart.to_owned(), 1, micros));
         }
+    }
+
+    /// Increment the client-error counter for a given component.
+    ///
+    /// Called by `POST /v1/telemetry/client-error` (Plan 05-06).
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn inc_client_error(&self, component: &str) {
+        let mut guard = self
+            .dashboard_client_errors
+            .lock()
+            .expect("dashboard_client_errors mutex");
+        if let Some(row) = guard.iter_mut().find(|(c, _)| c == component) {
+            row.1 += 1;
+        } else {
+            guard.push((component.to_owned(), 1));
+        }
+    }
+
+    /// Return the client-error count for a given component.
+    ///
+    /// Used by integration tests.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn client_error_count(&self, component: &str) -> u64 {
+        let guard = self
+            .dashboard_client_errors
+            .lock()
+            .expect("dashboard_client_errors mutex");
+        guard
+            .iter()
+            .find(|(c, _)| c == component)
+            .map_or(0, |(_, count)| *count)
     }
 
     /// Return the query count for the named mart.
@@ -340,6 +379,25 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_dashboard_mart_query_duration_seconds_sum{{mart=\"{mart}\"}} {sum_secs}"
+                    );
+                }
+            }
+        }
+
+        // Plan 05-06 — client-error counter.
+        {
+            let guard = self
+                .dashboard_client_errors
+                .lock()
+                .expect("dashboard_client_errors mutex");
+            if !guard.is_empty() {
+                out.push_str(
+                    "# TYPE secureprompt_dashboard_client_errors_total counter\n",
+                );
+                for (component, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_dashboard_client_errors_total{{component=\"{component}\"}} {value}"
                     );
                 }
             }

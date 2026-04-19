@@ -2,6 +2,12 @@
 .env
 .env.local
 .env.production
+**/.env.local
+
+# Next.js build output and test artefacts
+secureprompt-web/.next/
+secureprompt-web/playwright-report/
+secureprompt-web/test-results/
 
 # Rust build artifacts
 /target/
