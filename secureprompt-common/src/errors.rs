@@ -16,6 +16,10 @@ pub enum ApiError {
     Internal(String),
     #[error("database error: {0}")]
     Database(String),
+    /// HTTP 402 Payment Required — workspace exceeded its token budget.
+    /// Emitted by Plan 05's budget_check when `workspace_budgets.behavior = 'block'`.
+    #[error("budget exceeded: {0}")]
+    BudgetExceeded(String),
 }
 
 #[derive(Error, Debug)]

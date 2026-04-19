@@ -32,17 +32,29 @@ pub fn api_error_response(error: ApiError) -> Response {
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApiError::NotFound(_) => StatusCode::NOT_FOUND,
         ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+        // Phase 5 / Plan 05-01: workspace budget exhausted (LIM-02 / LIM-03).
+        ApiError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
         ApiError::Database(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    (
-        status,
-        Json(json!({
+    // `BudgetExceeded` gets a structured error code for client-side branching
+    // (dashboard shows the budget-exhausted banner). Other variants keep the
+    // existing OpenAI-compatible envelope.
+    let body = match &error {
+        ApiError::BudgetExceeded(msg) => json!({
+            "error": {
+                "code": "budget_exceeded",
+                "message": msg,
+                "type": "secureprompt_error"
+            }
+        }),
+        _ => json!({
             "error": {
                 "message": error.to_string(),
                 "type": "secureprompt_error"
             }
-        })),
-    )
-        .into_response()
+        }),
+    };
+
+    (status, Json(body)).into_response()
 }

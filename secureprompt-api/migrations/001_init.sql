@@ -109,6 +109,12 @@ BEGIN
     EXCEPTION
         WHEN duplicate_object THEN
             NULL;
+        WHEN unique_violation THEN
+            -- Role exists cluster-wide (shared Postgres instance across #[sqlx::test]
+            -- per-test databases). pg_authid is cluster-scoped; a concurrent or prior
+            -- test may have created the role, which surfaces as SQLSTATE 23505 on the
+            -- pg_authid_rolname_index rather than SQLSTATE 42710.
+            NULL;
     END;
 END $$;
 

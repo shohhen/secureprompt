@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub telemetry: TelemetryConfig,
     pub server: ServerConfig,
     pub clickhouse: ClickhouseConfig,
+    /// Phase 5 / Plan 05-01 — dashboard JWT signing + rotation parameters.
+    pub jwt: JwtConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,4 +47,97 @@ pub struct MlSidecarConfig {
 pub struct ClickhouseConfig {
     pub url: String,
     pub database: String,
+}
+
+/// Phase 5 / Plan 05-01 — dashboard JWT configuration.
+///
+/// Loaded from three env vars (see `JwtConfig::from_env`):
+///   - `SECUREPROMPT_JWT_SECRET` — required, must be distinct from
+///     `SECUREPROMPT_PROVIDER_KEY` (AES-GCM key for provider credentials).
+///   - `SECUREPROMPT_JWT_ACCESS_TTL_SECS` — default 900 (15 min).
+///   - `SECUREPROMPT_JWT_REFRESH_TTL_SECS` — default 2_592_000 (30 days).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JwtConfig {
+    pub secret: String,
+    pub access_ttl_secs: u64,
+    pub refresh_ttl_secs: u64,
+}
+
+impl JwtConfig {
+    pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
+    pub const DEFAULT_REFRESH_TTL_SECS: u64 = 2_592_000;
+
+    /// Load from environment. Returns `Err` if `SECUREPROMPT_JWT_SECRET` is
+    /// missing or equals `SECUREPROMPT_PROVIDER_KEY` (both-env-must-differ
+    /// guardrail per 05-PATTERNS.md §providers.rs).
+    ///
+    /// # Errors
+    /// Returns a human-readable error string when the secret is missing,
+    /// empty, or aliased to the provider key.
+    pub fn from_env() -> Result<Self, String> {
+        let secret = std::env::var("SECUREPROMPT_JWT_SECRET")
+            .map_err(|_| "SECUREPROMPT_JWT_SECRET is required".to_string())?;
+        if secret.trim().is_empty() {
+            return Err("SECUREPROMPT_JWT_SECRET must not be empty".into());
+        }
+        if let Ok(provider_key) = std::env::var("SECUREPROMPT_PROVIDER_KEY") {
+            if !provider_key.is_empty() && provider_key == secret {
+                return Err(
+                    "SECUREPROMPT_JWT_SECRET must differ from SECUREPROMPT_PROVIDER_KEY".into(),
+                );
+            }
+        }
+        let access_ttl_secs = std::env::var("SECUREPROMPT_JWT_ACCESS_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(Self::DEFAULT_ACCESS_TTL_SECS);
+        let refresh_ttl_secs = std::env::var("SECUREPROMPT_JWT_REFRESH_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(Self::DEFAULT_REFRESH_TTL_SECS);
+        Ok(Self {
+            secret,
+            access_ttl_secs,
+            refresh_ttl_secs,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JwtConfig;
+
+    fn clear_jwt_env() {
+        std::env::remove_var("SECUREPROMPT_JWT_SECRET");
+        std::env::remove_var("SECUREPROMPT_JWT_ACCESS_TTL_SECS");
+        std::env::remove_var("SECUREPROMPT_JWT_REFRESH_TTL_SECS");
+        std::env::remove_var("SECUREPROMPT_PROVIDER_KEY");
+    }
+
+    #[test]
+    fn rejects_missing_secret() {
+        clear_jwt_env();
+        let result = JwtConfig::from_env();
+        assert!(result.is_err(), "missing secret must error");
+    }
+
+    #[test]
+    fn rejects_secret_equal_to_provider_key() {
+        clear_jwt_env();
+        std::env::set_var("SECUREPROMPT_JWT_SECRET", "same-string");
+        std::env::set_var("SECUREPROMPT_PROVIDER_KEY", "same-string");
+        let result = JwtConfig::from_env();
+        clear_jwt_env();
+        assert!(result.is_err(), "aliased keys must error");
+    }
+
+    #[test]
+    fn loads_defaults_when_ttl_unset() {
+        clear_jwt_env();
+        std::env::set_var("SECUREPROMPT_JWT_SECRET", "distinct-secret-value");
+        let cfg = JwtConfig::from_env().expect("valid secret");
+        clear_jwt_env();
+        assert_eq!(cfg.access_ttl_secs, JwtConfig::DEFAULT_ACCESS_TTL_SECS);
+        assert_eq!(cfg.refresh_ttl_secs, JwtConfig::DEFAULT_REFRESH_TTL_SECS);
+    }
 }

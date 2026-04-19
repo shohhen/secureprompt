@@ -36,6 +36,10 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 failsafe = { workspace = true }
 clickhouse = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+deadpool-redis = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,6 +1,9 @@
 use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::{
-    config::{AppConfig, ClickhouseConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig},
+    config::{
+        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
+        TelemetryConfig,
+    },
     telemetry::init_telemetry,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -38,6 +41,8 @@ async fn main() -> anyhow::Result<()> {
             database: std::env::var("CLICKHOUSE_DATABASE")
                 .unwrap_or_else(|_| "default".into()),
         },
+        jwt: JwtConfig::from_env()
+            .map_err(|msg| anyhow::anyhow!("invalid JWT configuration: {msg}"))?,
     };
 
     init_telemetry(&config.telemetry);
