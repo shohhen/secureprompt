@@ -43,6 +43,7 @@ deadpool-redis = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
+oauth2 = { workspace = true }
 
 [lints]
 workspace = true

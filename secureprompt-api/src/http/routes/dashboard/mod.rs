@@ -9,6 +9,8 @@ pub mod auth;
 pub mod budgets;
 // Plan 05-04 namespaces.
 pub mod keys;
+// Plan 06-02: OIDC PKCE flow (AUTH-03).
+pub mod oidc;
 pub mod policy_rules;
 pub mod providers;
 pub mod requests;

@@ -279,7 +279,7 @@ pub async fn logout(
 
 // ---------- Helpers ----------
 
-async fn issue_token_pair(
+pub(crate) async fn issue_token_pair(
     state: &AppState,
     user_id: Uuid,
     workspace_id: Uuid,
