@@ -46,6 +46,9 @@ tokio-cron-scheduler = { version = "0.15" }
 aes-gcm = "0.10"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 dashmap = "6"
+# oauth2 v5.0.0 (2025-01-21 stable). CRITICAL: use set_auth_uri/set_token_uri,
+# NOT set_auth_url/set_token_url — those are the v4 names (Pitfall 3).
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

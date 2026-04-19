@@ -136,6 +136,85 @@ pub async fn get_counter(pool: &Pool, key: &str) -> Result<i64, ApiError> {
     Ok(raw.unwrap_or(0))
 }
 
+// ── OIDC PKCE state storage (Phase 6 / Plan 06-02, D-12, AUTH-03) ────────
+
+/// Store PKCE verifier secret in Redis for `ttl_secs` (600 = 10 min).
+/// Key: `oidc_state:{state_id}`.
+///
+/// # Errors
+/// `ApiError::Internal` on Redis checkout or command failure.
+pub async fn store_oidc_state(
+    pool: &Pool,
+    state_id: &str,
+    pkce_verifier_secret: &str,
+    ttl_secs: u64,
+) -> Result<(), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("redis checkout failed: {e}")))?;
+    cmd("SET")
+        .arg(oidc_state_key(state_id))
+        .arg(pkce_verifier_secret)
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async::<()>(&mut conn)
+        .await
+        .map_err(|e| redis_error(&e))?;
+    Ok(())
+}
+
+/// Atomically get-and-delete the PKCE verifier secret (GETDEL).
+/// Returns `None` if the key does not exist (expired or invalid state).
+/// GETDEL prevents replay — the state can only be consumed once (D-12).
+///
+/// # Errors
+/// `ApiError::Internal` on Redis failure.
+pub async fn consume_oidc_state(
+    pool: &Pool,
+    state_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("redis checkout failed: {e}")))?;
+    // GETDEL: atomic get + delete. Returns nil if key absent.
+    let value: Option<String> = cmd("GETDEL")
+        .arg(oidc_state_key(state_id))
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| redis_error(&e))?;
+    Ok(value)
+}
+
+/// Push a serialized task envelope onto a Redis list (RPUSH).
+/// Used by `secureprompt-api` to enqueue work for `secureprompt-worker`.
+///
+/// # Errors
+/// `ApiError::Internal` on Redis failure.
+pub async fn enqueue_task(
+    pool: &Pool,
+    queue: &str,
+    payload: &str,
+) -> Result<(), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("redis checkout failed: {e}")))?;
+    cmd("RPUSH")
+        .arg(queue)
+        .arg(payload)
+        .query_async::<i64>(&mut conn)
+        .await
+        .map_err(|e| redis_error(&e))?;
+    Ok(())
+}
+
+// Private key derivation helper.
+fn oidc_state_key(state_id: &str) -> String {
+    format!("oidc_state:{state_id}")
+}
+
 fn jti_key(jti: &str) -> String {
     format!("jti_blacklist:{jti}")
 }
@@ -167,5 +246,13 @@ mod tests {
             result.is_err(),
             "invalid URL must return ApiError::Internal, got {result:?}"
         );
+    }
+
+    /// Ensure `oidc_state_key` produces the expected prefix shape. The OIDC
+    /// callback and any integration tests depend on the `oidc_state:{id}` key
+    /// pattern matching exactly.
+    #[test]
+    fn oidc_state_key_has_stable_shape() {
+        assert_eq!(oidc_state_key("abc123"), "oidc_state:abc123");
     }
 }
