@@ -5,9 +5,15 @@ edition = "2021"
 
 [dependencies]
 secureprompt-common = { path = "../secureprompt-common" }
+rmcp = { workspace = true }
+schemars = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
