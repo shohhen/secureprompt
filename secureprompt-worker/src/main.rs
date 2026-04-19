@@ -1,11 +1,14 @@
 use anyhow::Context;
+use deadpool_redis::redis::cmd;
 use secureprompt_common::{
     config::{
         AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
         TelemetryConfig,
     },
+    tasks::{TaskEnvelope, ALL_QUEUES},
     telemetry::init_telemetry,
 };
+use std::time::Duration;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 #[tokio::main]
@@ -116,11 +119,96 @@ async fn main() -> anyhow::Result<()> {
 
     sched.start().await?;
 
+    // Phase 6 / Plan 06-04 — Redis task queue drain loop (RDS-03, D-20).
+    // Runs concurrently with the cron scheduler via tokio::spawn.
+    let redis_pool_drain = {
+        let cfg = &config.redis;
+        deadpool_redis::Config::from_url(&cfg.url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .context("Worker: failed to create Redis pool for drain loop")?
+    };
+
+    tokio::spawn(async move {
+        run_queue_drain(redis_pool_drain).await;
+    });
+
+    tracing::info!("Task queue drain loop started");
+
     tracing::info!("secureprompt-worker running; OPTIMIZE FINAL at 02:00 + rotation cleanup at 03:00 daily");
     tokio::signal::ctrl_c().await?;
     tracing::info!("secureprompt-worker shutting down");
 
     Ok(())
+}
+
+/// Blocking poll loop over all task queues.
+/// Uses BLPOP with a 5-second timeout to multiplex 3 queues without busy-waiting.
+/// Runs forever in its own tokio task until the process exits.
+async fn run_queue_drain(redis_pool: deadpool_redis::Pool) {
+    loop {
+        let mut conn = match redis_pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "redis checkout failed in drain loop");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        // BLPOP blocks up to 5s on any of the queues.
+        // Returns (queue_name, json_payload) or None on timeout.
+        let result: Option<(String, String)> = cmd("BLPOP")
+            .arg(ALL_QUEUES.as_slice())
+            .arg(5u64) // timeout in seconds
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(None);
+
+        if let Some((_queue_name, json)) = result {
+            match serde_json::from_str::<TaskEnvelope>(&json) {
+                Ok(task) => dispatch_task(task).await,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        body_preview = %&json[..json.len().min(200)],
+                        "invalid task envelope — dropping"
+                    );
+                }
+            }
+        }
+        // On timeout (None): loop again immediately — no sleep needed.
+    }
+}
+
+/// Dispatch a deserialized TaskEnvelope to the appropriate handler.
+/// Each handler is a no-op stub in Phase 6 — real implementations land in Phase 7.
+async fn dispatch_task(task: TaskEnvelope) {
+    use secureprompt_common::tasks::task_types;
+
+    tracing::info!(
+        task_type = %task.task_type,
+        workspace_id = %task.workspace_id,
+        retry_count = task.retry_count,
+        "dispatching task"
+    );
+
+    match task.task_type.as_str() {
+        task_types::ANALYTICS_FLUSH => {
+            tracing::debug!("analytics.flush — no-op stub (Phase 7 implementation)");
+        }
+        task_types::AUDIT_EXPORT => {
+            tracing::debug!("audit.export — no-op stub (Phase 7 implementation)");
+        }
+        task_types::RETENTION_PURGE => {
+            tracing::debug!("retention.purge — no-op stub (Phase 7 implementation)");
+        }
+        task_types::API_KEY_ROTATION_CLEANUP => {
+            tracing::debug!("api_key.rotation_cleanup — handled by cron in Plan 06-01");
+        }
+        unknown => {
+            tracing::warn!(task_type = %unknown, "unknown task type — dropping");
+        }
+    }
 }
 
 /// Apply pending ClickHouse DDL migrations from the migrations directory.
