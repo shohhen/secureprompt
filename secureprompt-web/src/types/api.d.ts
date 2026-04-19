@@ -19,3 +19,20 @@ export type UsageDailyRow = components["schemas"]["UsageDailyRow"];
 export type CostByModelRow = components["schemas"]["CostByModelRow"];
 export type PolicyViolationsRow = components["schemas"]["PolicyViolationsRow"];
 export type LatencyPctilesRow = components["schemas"]["LatencyPctilesRow"];
+
+// Phase 5 / Plan 05-05 — workspace budget types
+export type BudgetBehavior = "block" | "warn" | "flag";
+
+export interface BudgetResponse {
+  daily_token_limit: number | null;
+  monthly_token_limit: number | null;
+  behavior: BudgetBehavior;
+  daily_used: number;
+  monthly_used: number;
+}
+
+export interface PutBudgetRequest {
+  daily_token_limit?: number | null;
+  monthly_token_limit?: number | null;
+  behavior: BudgetBehavior;
+}

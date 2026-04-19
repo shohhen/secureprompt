@@ -121,6 +121,10 @@ export async function apiFetch<T = unknown>(
 
   if (res.status === 402) {
     const err = await parseError(res);
+    // Notify the BudgetBanner component so it can render a toast/banner.
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("sp:budget-exceeded", { detail: err }));
+    }
     throw new ApiError(err.message, {
       status: 402,
       code: err.code || "budget_exceeded",
