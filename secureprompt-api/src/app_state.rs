@@ -1,6 +1,8 @@
 use crate::{
-    analytics::AnalyticsHandle,
-    db::refresh_token_repo::RefreshTokenRepository,
+    analytics::{
+        clickhouse_writer::build_clickhouse_client, AnalyticsHandle, DashboardReader,
+    },
+    db::{budget_repo::BudgetRepository, refresh_token_repo::RefreshTokenRepository},
     http::{middleware::jwt_auth::JwtKeys, middleware::rate_limit::RateLimiter, model_router::ConfigCache},
     ml_sidecar::MlSidecarClient,
     observability::metrics::MetricsRegistry,
@@ -31,6 +33,13 @@ pub struct AppState {
     /// Phase 5 / Plan 05-01 — refresh-token repository (populated by Task
     /// 5-01-C). Wrapped in `Arc` so handlers can clone cheaply.
     pub refresh_tokens: Arc<RefreshTokenRepository>,
+    /// Phase 5 / Plan 05-05 — workspace budgets repository. Consumed by the
+    /// `/v1/workspaces/:id/budgets` handlers and by
+    /// `rate_limit::budget_check` before dispatch.
+    pub budgets: Arc<BudgetRepository>,
+    /// Phase 5 / Plan 05-03 — read-only `ClickHouse` facade over the four dbt mart tables.
+    /// Backed by a DISTINCT `clickhouse::Client` (not the writer's async-insert client).
+    pub dashboard_reader: Arc<DashboardReader>,
 }
 
 impl AppState {
@@ -50,6 +59,10 @@ impl AppState {
         let jwt = JwtKeys::from_config(&config.jwt);
         let redis_pool = crate::redis::build_pool(&config.redis.url)?;
         let refresh_tokens = Arc::new(RefreshTokenRepository::new(db.clone()));
+        let budgets = Arc::new(BudgetRepository::new(db.clone()));
+        // Distinct read-only client — no async_insert settings (RESEARCH A5).
+        let ch_reader_client = build_clickhouse_client(&ch_url, &ch_database);
+        let dashboard_reader = Arc::new(DashboardReader::new(ch_reader_client));
 
         Ok(Self {
             db,
@@ -64,6 +77,8 @@ impl AppState {
             jwt,
             redis_pool,
             refresh_tokens,
+            budgets,
+            dashboard_reader,
         })
     }
 

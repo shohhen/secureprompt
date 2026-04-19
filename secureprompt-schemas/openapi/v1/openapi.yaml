@@ -66,6 +66,293 @@ paths:
       responses:
         "204":
           description: Revoked
+  /v1/analytics/usage-daily:
+    get:
+      summary: Daily token and cost usage by workspace and model
+      operationId: getUsageDaily
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: workspace_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: model
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Usage daily rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UsageDailyRow"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: workspace_id mismatch (IDOR guard)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Mart not populated — run dbt build
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/analytics/cost-by-model:
+    get:
+      summary: Daily cost with 7-day and 30-day rolling windows per model
+      operationId: getCostByModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: workspace_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Cost by model rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CostByModelRow"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: workspace_id mismatch (IDOR guard)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Mart not populated — run dbt build
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/analytics/policy-violations:
+    get:
+      summary: Policy rule violation counts by workspace, rule, and day
+      operationId: getPolicyViolations
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: workspace_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Policy violations rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PolicyViolationsRow"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: workspace_id mismatch (IDOR guard)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Mart not populated — run dbt build
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/analytics/latency-pctiles:
+    get:
+      summary: p50/p95/p99 latency percentiles by model and workspace, daily
+      operationId: getLatencyPctiles
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: workspace_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: model
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Latency percentile rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LatencyPctilesRow"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: workspace_id mismatch (IDOR guard)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Mart not populated — run dbt build
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/workspaces/{id}/budgets:
+    get:
+      summary: Read the current workspace budget limits and live usage
+      description: >
+        Any authenticated workspace member may read budgets. Missing rows
+        return defaults (null limits, behavior="warn", 0 usage). Current
+        usage is read live from Redis INCRBY counters that the enforcement
+        middleware writes to, so the dashboard always mirrors what the
+        pipeline sees.
+      operationId: getWorkspaceBudget
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Budget snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BudgetResponse"
+        "403":
+          description: IDOR guard — requester is not in the target workspace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+    put:
+      summary: Upsert workspace budget limits (admin only)
+      operationId: putWorkspaceBudget
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutBudgetRequest"
+      responses:
+        "200":
+          description: Budget updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BudgetResponse"
+        "402":
+          description: Workspace budget exceeded (enforcement path).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: IDOR guard or non-admin role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 components:
   securitySchemes:
     bearerAuth:
@@ -142,3 +429,198 @@ components:
         details:
           type: object
           additionalProperties: true
+    BudgetBehavior:
+      type: string
+      description: >
+        Enforcement behavior when a workspace crosses its limit.
+        `block` → HTTP 402 ApiError{code:"budget_exceeded"}.
+        `warn`  → 200 + response header `X-SecurePrompt-Budget-Warning:
+        daily|monthly`.
+        `flag`  → 200 (silent; analytics-only signal).
+      enum: [block, warn, flag]
+    BudgetResponse:
+      type: object
+      required: [behavior, updated_at, daily_used, monthly_used]
+      properties:
+        daily_token_limit:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Daily token ceiling; null = unlimited.
+        monthly_token_limit:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Monthly token ceiling; null = unlimited.
+        behavior:
+          $ref: "#/components/schemas/BudgetBehavior"
+        updated_at:
+          type: string
+          format: date-time
+        daily_used:
+          type: integer
+          format: int64
+          description: Current UTC-day Redis counter.
+        monthly_used:
+          type: integer
+          format: int64
+          description: Current UTC-month Redis counter.
+    PutBudgetRequest:
+      type: object
+      required: [behavior]
+      properties:
+        daily_token_limit:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+        monthly_token_limit:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+        behavior:
+          $ref: "#/components/schemas/BudgetBehavior"
+    UsageDailyRow:
+      type: object
+      required:
+        - workspace_id
+        - model
+        - usage_date
+        - total_input_tokens
+        - total_output_tokens
+        - total_reasoning_tokens
+        - total_cost_usd
+        - request_count
+        - estimated_request_count
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        model:
+          type: string
+        usage_date:
+          type: string
+          format: date
+        total_input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        total_output_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        total_reasoning_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        total_cost_usd:
+          type: number
+          format: double
+        request_count:
+          type: integer
+          format: int64
+          minimum: 0
+        estimated_request_count:
+          type: integer
+          format: int64
+          minimum: 0
+    CostByModelRow:
+      type: object
+      required:
+        - model
+        - usage_date
+        - daily_cost_usd
+        - daily_request_count
+        - rolling_7d_cost_usd
+        - rolling_30d_cost_usd
+      properties:
+        model:
+          type: string
+        usage_date:
+          type: string
+          format: date
+        daily_cost_usd:
+          type: number
+          format: double
+        daily_request_count:
+          type: integer
+          format: int64
+          minimum: 0
+        rolling_7d_cost_usd:
+          type: number
+          format: double
+        rolling_30d_cost_usd:
+          type: number
+          format: double
+    PolicyViolationsRow:
+      type: object
+      required:
+        - workspace_id
+        - rule_id
+        - rule_name
+        - action
+        - violation_date
+        - violation_count
+        - dry_run_count
+        - enforced_count
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        rule_id:
+          type: string
+          format: uuid
+        rule_name:
+          type: string
+        action:
+          type: string
+        violation_date:
+          type: string
+          format: date
+        violation_count:
+          type: integer
+          format: int64
+          minimum: 0
+        dry_run_count:
+          type: integer
+          format: int64
+          minimum: 0
+        enforced_count:
+          type: integer
+          format: int64
+          minimum: 0
+    LatencyPctilesRow:
+      type: object
+      required:
+        - workspace_id
+        - model
+        - usage_date
+        - p50_latency_ms
+        - p95_latency_ms
+        - p99_latency_ms
+        - sample_count
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        model:
+          type: string
+        usage_date:
+          type: string
+          format: date
+        p50_latency_ms:
+          type: number
+          format: double
+        p95_latency_ms:
+          type: number
+          format: double
+        p99_latency_ms:
+          type: number
+          format: double
+        sample_count:
+          type: integer
+          format: int64
+          minimum: 0

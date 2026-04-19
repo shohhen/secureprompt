@@ -16,3 +16,6 @@ pub mod auth;
 
 #[path = "budgets_tests.rs"]
 pub mod budgets;
+
+#[path = "analytics_tests.rs"]
+pub mod analytics;

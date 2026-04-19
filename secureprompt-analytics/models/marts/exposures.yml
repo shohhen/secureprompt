@@ -37,3 +37,15 @@ exposures:
       Reads mart_latency_pctiles for p50/p95/p99 by model.
     depends_on:
       - ref('mart_latency_pctiles')
+
+  - name: dashboard_cost_page
+    type: dashboard
+    maturity: medium
+    owner:
+      name: SecurePrompt Engineering
+      email: eng@secureprompt.io
+    description: >
+      Phase 5 dashboard /cost page.
+      Reads mart_cost_by_model for daily cost + 7-day/30-day rolling windows.
+    depends_on:
+      - ref('mart_cost_by_model')
