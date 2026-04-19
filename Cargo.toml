@@ -45,6 +45,7 @@ clickhouse = { version = "0.15", features = ["inserter", "uuid", "chrono", "rust
 tokio-cron-scheduler = { version = "0.15" }
 aes-gcm = "0.10"
 rand = { version = "0.8", features = ["std", "std_rng"] }
+dashmap = "6"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

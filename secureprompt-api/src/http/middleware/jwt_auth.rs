@@ -10,12 +10,19 @@
 //!      leeway of 60 s stays unchanged.
 //!   3. Checks `state.redis_pool` for `jti_blacklist:{jti}` — logged-out
 //!      access tokens are rejected until natural expiry.
+//!      On Redis failure, falls back to `state.auth_cache` (D-15, PG-04).
 //!   4. Inserts `JwtAuthContext` into the request extensions so handlers can
 //!      extract it via `axum::Extension<JwtAuthContext>`.
 //!
 //! All failure paths return `ApiError::Unauthorized(_)` with a generic copy
 //! so an attacker cannot distinguish signature-fail from expiry-fail
 //! (threat T-05-07 on the auth surface, T-05-02 on the JWT surface).
+//!
+//! Phase 6 / Plan 06-01 additions:
+//!   * `UserRole` extended from 3 → 4 variants (Owner/Admin/Developer/Viewer)
+//!   * `CachedAuthEntry` struct + 5-minute TTL in-memory auth cache (D-14, PG-04)
+//!   * Write-through cache population on every successful auth (D-15)
+//!   * Postgres/Redis failure fallback reads from `auth_cache` (D-15, PG-04)
 
 use axum::{
     body::Body,
@@ -57,14 +64,15 @@ impl JwtKeys {
     }
 }
 
-/// Role values permitted in `users.role` (enforced by the CHECK constraint
-/// in migration 004). `serde(rename_all = "snake_case")` matches the DB
-/// string values and JWT claim payload exactly.
+/// Role values permitted in `users.role`. Extended from 3→4 levels in Phase 6 (D-08, D-09).
+/// `member` DB string is renamed `developer`; `owner` is added above `admin`.
+/// Hierarchy: Owner > Admin > Developer > Viewer (highest to lowest privilege).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
+    Owner,
     Admin,
-    Member,
+    Developer, // renamed from Member (D-09)
     Viewer,
 }
 
@@ -72,8 +80,9 @@ impl UserRole {
     #[must_use]
     pub const fn as_db_str(self) -> &'static str {
         match self {
+            Self::Owner => "owner",
             Self::Admin => "admin",
-            Self::Member => "member",
+            Self::Developer => "developer",
             Self::Viewer => "viewer",
         }
     }
@@ -81,13 +90,14 @@ impl UserRole {
     /// Parse from the `users.role` column value.
     ///
     /// # Errors
-    /// Returns `ApiError::Internal` for unknown strings — the CHECK
-    /// constraint on `users.role` makes this unreachable in practice, but a
-    /// runtime assertion is preferable to a panic.
+    /// Returns `ApiError::Internal` for unknown strings.
     pub fn from_db_str(value: &str) -> Result<Self, ApiError> {
         match value {
+            "owner" => Ok(Self::Owner),
             "admin" => Ok(Self::Admin),
-            "member" => Ok(Self::Member),
+            "developer" => Ok(Self::Developer),
+            // Backward compat: 'member' rows updated in migration 005, but accept during rollout.
+            "member" => Ok(Self::Developer),
             "viewer" => Ok(Self::Viewer),
             other => Err(ApiError::Internal(format!("unknown role: {other}"))),
         }
@@ -106,6 +116,27 @@ pub struct JwtAuthContext {
     /// `/v1/auth/logout` to size the Redis blacklist TTL (no point in
     /// blacklisting a jti past its own `exp`).
     pub exp: i64,
+}
+
+/// Phase 6 / Plan 06-01 — Per-pod in-memory auth cache entry (D-14, PG-04).
+///
+/// Stored in `AppState.auth_cache: Arc<DashMap<Uuid, CachedAuthEntry>>`.
+/// TTL = 5 minutes, checked on every read (no background eviction).
+/// Key: `user_id` (Uuid).
+#[derive(Debug, Clone)]
+pub struct CachedAuthEntry {
+    pub user_id: uuid::Uuid,
+    pub workspace_id: secureprompt_common::types::WorkspaceId,
+    pub role: UserRole,
+    pub cached_at: std::time::Instant,
+}
+
+impl CachedAuthEntry {
+    /// Returns `true` if the entry is still within the 5-minute TTL.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.cached_at.elapsed().as_secs() < 300
+    }
 }
 
 /// JWT payload. Short field names (`sub`, `ws`) keep the encoded token
@@ -151,9 +182,35 @@ pub async fn require(
     let claims = decoded.claims;
 
     // jti blacklist gate — `POST /v1/auth/logout` plants these entries.
-    let blacklisted = crate::redis::jti_is_blacklisted(&state.redis_pool, &claims.jti)
-        .await
-        .map_err(api_error_response)?;
+    // On Redis failure, fall back to in-memory cache (D-15, PG-04).
+    // PITFALL 4: clone out of the DashMap Ref before any await point.
+    let blacklisted = match crate::redis::jti_is_blacklisted(&state.redis_pool, &claims.jti).await {
+        Ok(b) => b,
+        Err(_redis_err) => {
+            // Redis/Postgres unavailable — fall back to in-memory cache (D-15, PG-04).
+            // Pitfall 4: clone out of the Ref before doing anything else.
+            if let Some(entry) = state.auth_cache.get(&claims.sub) {
+                if entry.is_valid() {
+                    // Cache hit — rebuild context from cache and short-circuit.
+                    let cached_role = entry.role;
+                    let cached_workspace = entry.workspace_id.clone();
+                    drop(entry); // release DashMap shard lock before next operation
+                    req.extensions_mut().insert(JwtAuthContext {
+                        user_id: claims.sub,
+                        workspace_id: cached_workspace,
+                        role: cached_role,
+                        jti: claims.jti,
+                        exp: claims.exp,
+                    });
+                    return Ok(next.run(req).await);
+                }
+            }
+            return Err(api_error_response(ApiError::ServiceUnavailable(
+                "auth service temporarily unavailable".into(),
+            )));
+        }
+    };
+
     if blacklisted {
         return Err(api_error_response(ApiError::Unauthorized(
             "Invalid credentials".into(),
@@ -163,6 +220,15 @@ pub async fn require(
     let role = UserRole::from_db_str(&claims.role).map_err(|_| {
         api_error_response(ApiError::Unauthorized("Invalid credentials".into()))
     })?;
+
+    // Write-through: populate cache on every successful auth (D-15, PG-04).
+    // NOTE: do NOT hold the DashMap Ref across an await — clone out immediately (Pitfall 4).
+    state.auth_cache.insert(claims.sub, CachedAuthEntry {
+        user_id: claims.sub,
+        workspace_id: WorkspaceId(claims.ws),
+        role,
+        cached_at: std::time::Instant::now(),
+    });
 
     req.extensions_mut().insert(JwtAuthContext {
         user_id: claims.sub,
@@ -247,10 +313,12 @@ mod tests {
 
     #[test]
     fn user_role_roundtrips_through_db_strings() {
-        for value in ["admin", "member", "viewer"] {
+        for value in ["owner", "admin", "developer", "viewer"] {
             let role = UserRole::from_db_str(value).expect("valid role");
             assert_eq!(role.as_db_str(), value);
         }
+        // Legacy 'member' still accepted but maps to Developer.
+        assert!(matches!(UserRole::from_db_str("member"), Ok(UserRole::Developer)));
         assert!(UserRole::from_db_str("root").is_err());
     }
 

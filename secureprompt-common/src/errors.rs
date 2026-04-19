@@ -20,6 +20,11 @@ pub enum ApiError {
     /// Emitted by Plan 05's budget_check when `workspace_budgets.behavior = 'block'`.
     #[error("budget exceeded: {0}")]
     BudgetExceeded(String),
+    /// HTTP 503 Service Unavailable — a backing service (Redis, Postgres) is
+    /// temporarily unreachable and no cache fallback is available.
+    /// Added Phase 6 / Plan 06-01 for auth-cache fallback exhaustion (D-15, PG-04).
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 #[derive(Error, Debug)]

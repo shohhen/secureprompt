@@ -99,6 +99,8 @@ pub fn api_error_response(error: ApiError) -> Response {
         ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
         // Phase 5 / Plan 05-01: workspace budget exhausted (LIM-02 / LIM-03).
         ApiError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
+        // Phase 6 / Plan 06-01: auth-cache fallback exhausted (D-15, PG-04).
+        ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ApiError::Database(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 

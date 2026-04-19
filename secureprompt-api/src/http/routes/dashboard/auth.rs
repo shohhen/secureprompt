@@ -268,6 +268,9 @@ pub async fn logout(
         return api_error_to_response(err);
     }
 
+    // Phase 6 / Plan 06-01 — evict from in-process auth cache on logout (D-16).
+    state.auth_cache.remove(&ctx.user_id);
+
     // Revoke-all refresh rows for this user — no-op if none are active.
     let _ = state.refresh_tokens.revoke_all_for_user(ctx.user_id).await;
 

@@ -3,16 +3,22 @@ use crate::{
         clickhouse_writer::build_clickhouse_client, AnalyticsHandle, DashboardReader,
     },
     db::{budget_repo::BudgetRepository, refresh_token_repo::RefreshTokenRepository},
-    http::{middleware::jwt_auth::JwtKeys, middleware::rate_limit::RateLimiter, model_router::ConfigCache},
+    http::{
+        middleware::jwt_auth::{CachedAuthEntry, JwtKeys},
+        middleware::rate_limit::RateLimiter,
+        model_router::ConfigCache,
+    },
     ml_sidecar::MlSidecarClient,
     observability::metrics::MetricsRegistry,
     providers::ProviderCatalog,
     token_usage::pricing::PricingTable,
 };
+use dashmap::DashMap;
 use deadpool_redis::Pool as RedisPool;
 use secureprompt_common::{config::AppConfig, errors::ApiError};
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -40,6 +46,9 @@ pub struct AppState {
     /// Phase 5 / Plan 05-03 — read-only `ClickHouse` facade over the four dbt mart tables.
     /// Backed by a DISTINCT `clickhouse::Client` (not the writer's async-insert client).
     pub dashboard_reader: Arc<DashboardReader>,
+    /// Phase 6 / Plan 06-01 — per-pod in-memory auth cache (D-14, PG-04).
+    /// Key: user_id. TTL = 5 min (checked on read). Not Redis-backed by design.
+    pub auth_cache: Arc<DashMap<Uuid, CachedAuthEntry>>,
 }
 
 impl AppState {
@@ -79,6 +88,7 @@ impl AppState {
             refresh_tokens,
             budgets,
             dashboard_reader,
+            auth_cache: Arc::new(DashMap::new()),
         })
     }
 

@@ -42,6 +42,7 @@ password-hash = { workspace = true }
 deadpool-redis = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
+dashmap = { workspace = true }
 
 [lints]
 workspace = true
