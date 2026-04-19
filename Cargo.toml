@@ -31,7 +31,11 @@ tower = "0.5.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 deadpool-redis = "0.23"
-jsonwebtoken = "10"
+# jsonwebtoken 10.x requires an explicit crypto provider feature at workspace
+# level. `rust_crypto` is pure-Rust and matches rustls defaults elsewhere in
+# the stack (reqwest + clickhouse use `rustls-tls`). See
+# <https://docs.rs/jsonwebtoken/10.3.0/jsonwebtoken/#feature-flags>.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 argon2 = "0.5"
 password-hash = "0.5"
 zeroize = "1.8.2"

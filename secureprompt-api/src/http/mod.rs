@@ -14,6 +14,9 @@ use secureprompt_common::errors::ApiError;
 use serde_json::json;
 
 pub fn build_router(state: AppState) -> Router {
+    // Phase 5 / Plan 05-01 — dashboard auth routes nest under `/v1/auth`.
+    // `/token` and `/refresh` are public; `/logout` gets the JWT middleware
+    // applied per-route inside `dashboard::auth::routes` (Task 5-01-C).
     Router::new()
         .route(
             "/v1/chat/completions",
@@ -22,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/completions", post(routes::openai::completions))
         .route("/v1/embeddings", post(routes::openai::embeddings))
         .route("/metrics", get(routes::openai::metrics))
+        .nest("/v1/auth", routes::dashboard::auth::routes())
         .with_state(state)
 }
 
