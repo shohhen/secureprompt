@@ -1,4 +1,4 @@
-FROM rust:1.88-slim AS builder
+FROM rust:1.89-slim-bookworm AS builder
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,4 +26,6 @@ RUN touch secureprompt-common/src/lib.rs secureprompt-worker/src/main.rs \
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /workspace/target/release/secureprompt-worker /usr/local/bin/secureprompt-worker
+COPY --from=builder /workspace/secureprompt-api/clickhouse/migrations /clickhouse/migrations
+ENV CLICKHOUSE_MIGRATIONS_DIR=/clickhouse/migrations
 ENTRYPOINT ["/usr/local/bin/secureprompt-worker"]

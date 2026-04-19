@@ -73,6 +73,8 @@ services:
       ML_SIDECAR_URL: http://secureprompt-ml:8080
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
+      SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}
+      SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:-dev-provider-key-changeme-in-prod}
     ports:
       - "8080:8080"
     depends_on:
@@ -95,7 +97,7 @@ services:
       LOG_LEVEL: info
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
-      CLICKHOUSE_MIGRATIONS_DIR: /app/clickhouse/migrations
+      CLICKHOUSE_MIGRATIONS_DIR: /clickhouse/migrations
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,7 +121,7 @@ services:
       api:
         condition: service_started
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3000/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3

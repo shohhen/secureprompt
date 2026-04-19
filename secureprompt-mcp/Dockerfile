@@ -4,7 +4,7 @@
 # Docker is used only for deployment packaging; the MCP host (Claude Desktop, Cursor, etc.)
 # launches the binary directly.
 
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1.89-slim-bookworm AS builder
 
 WORKDIR /workspace
 COPY . .

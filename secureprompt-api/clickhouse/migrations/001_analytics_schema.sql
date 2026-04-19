@@ -1,7 +1,7 @@
 -- Phase 4: Analytics schema migration
 -- Applied by secureprompt-worker at startup via _schema_migrations table.
 
--- 1. Migration tracking (must come first; worker checks this before applying)
+-- 1. Migration tracking (must come first — worker checks this before applying)
 CREATE TABLE IF NOT EXISTS _schema_migrations (
     version     String,
     applied_at  DateTime DEFAULT now()
@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS _schema_migrations (
 ORDER BY version;
 
 -- 2. dbt single-run lock (D-10)
--- ReplacingMergeTree deduplicates on lock_key; INSERT-then-check pattern.
+-- ReplacingMergeTree deduplicates on lock_key — INSERT-then-check pattern.
 CREATE TABLE IF NOT EXISTS _dbt_lock (
     lock_key   String,
     locked_at  DateTime DEFAULT now(),

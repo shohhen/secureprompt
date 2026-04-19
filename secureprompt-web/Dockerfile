@@ -10,7 +10,8 @@ COPY secureprompt-web/package.json secureprompt-web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 # Copy schemas for codegen, then app source
-COPY secureprompt-schemas /schemas
+# Path must match codegen script: ../secureprompt-schemas/... resolves to /secureprompt-schemas from WORKDIR /app
+COPY secureprompt-schemas /secureprompt-schemas
 COPY secureprompt-web/. ./
 
 # Run codegen (openapi-typescript) + build (produces .next/standalone)
