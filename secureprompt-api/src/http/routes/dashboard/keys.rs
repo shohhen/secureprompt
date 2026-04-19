@@ -68,7 +68,7 @@ pub struct CreateKeyRequest {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_keys).post(create_key))
-        .route("/:id", delete(revoke_key))
+        .route("/{id}", delete(revoke_key))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

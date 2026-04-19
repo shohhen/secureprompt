@@ -172,7 +172,7 @@ pub struct RequestDetail {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_requests))
-        .route("/:id", get(get_request_detail))
+        .route("/{id}", get(get_request_detail))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

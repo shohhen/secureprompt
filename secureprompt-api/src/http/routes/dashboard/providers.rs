@@ -74,7 +74,7 @@ pub struct UpdateProviderRequest {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_providers).post(create_provider))
-        .route("/:id", put(update_provider).delete(delete_provider))
+        .route("/{id}", put(update_provider).delete(delete_provider))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

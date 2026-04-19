@@ -100,9 +100,9 @@ pub struct ToggleRequest {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_rules).post(create_rule))
-        .route("/:id", get(get_rule).put(update_rule).delete(delete_rule))
-        .route("/:id/enabled", patch(toggle_enabled))
-        .route("/:id/dry-run", patch(toggle_dry_run))
+        .route("/{id}", get(get_rule).put(update_rule).delete(delete_rule))
+        .route("/{id}/enabled", patch(toggle_enabled))
+        .route("/{id}/dry-run", patch(toggle_dry_run))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

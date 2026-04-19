@@ -67,6 +67,75 @@ pub async fn blacklist_jti(pool: &Pool, jti: &str, ttl_secs: u64) -> Result<(), 
     Ok(())
 }
 
+/// Atomically increment a counter by `delta` and return the new value.
+///
+/// If the key is newly created by this operation, sets its TTL to
+/// `ttl_secs_on_new` seconds (using `EXPIRE key ttl NX` so an existing TTL
+/// is never overwritten).
+///
+/// This is the building block for budget counters:
+/// - Daily key: `budget:{workspace_id}:tokens:{YYYYMMDD}` — TTL = 2 days
+/// - Monthly key: `budget:{workspace_id}:tokens:{YYYYMM}` — TTL = 32 days
+///
+/// The `INCRBY` is unconditional; a tiny overshoot is acceptable per the
+/// "conservative reservation" semantics documented in Plan 05-05.
+///
+/// # Errors
+/// Returns `ApiError::Internal` on Redis connection or command failure.
+pub async fn incr_and_get(
+    pool: &Pool,
+    key: &str,
+    delta: i64,
+    ttl_secs_on_new: u64,
+) -> Result<i64, ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
+
+    // Execute INCRBY first — always atomic and returns the post-increment value.
+    let new_value: i64 = cmd("INCRBY")
+        .arg(key)
+        .arg(delta)
+        .query_async(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+
+    // Set the TTL only if the key has no expiry yet (NX flag).
+    // This is a best-effort call; if it fails we still have the counter value.
+    let _: i64 = cmd("EXPIRE")
+        .arg(key)
+        .arg(ttl_secs_on_new)
+        .arg("NX")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(0);
+
+    Ok(new_value)
+}
+
+/// Read the current value of a budget counter without incrementing it.
+///
+/// Returns `0` when the key does not exist (i.e. no usage in the current window).
+///
+/// # Errors
+/// Returns `ApiError::Internal` on Redis connection or command failure.
+pub async fn get_counter(pool: &Pool, key: &str) -> Result<i64, ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
+
+    // GET returns nil for missing keys; map nil → 0.
+    let raw: Option<i64> = cmd("GET")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+
+    Ok(raw.unwrap_or(0))
+}
+
 fn jti_key(jti: &str) -> String {
     format!("jti_blacklist:{jti}")
 }
