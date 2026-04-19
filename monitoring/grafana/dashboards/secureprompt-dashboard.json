@@ -1,0 +1,129 @@
+{
+  "uid": "secureprompt-dashboard",
+  "title": "SecurePrompt Dashboard",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "tags": ["secureprompt", "dashboard"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Dashboard Request Duration (P50 / P95 / P99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Request latency percentiles across all dashboard API endpoints. Source: secureprompt_dashboard_request_duration_seconds.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, endpoint) (rate(secureprompt_dashboard_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{endpoint}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(secureprompt_dashboard_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{endpoint}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(secureprompt_dashboard_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 {{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 2,
+      "title": "Dashboard Error Rate by Endpoint",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Rate of dashboard API errors per endpoint and HTTP status code. Source: secureprompt_dashboard_errors_total.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (endpoint, code) (rate(secureprompt_dashboard_errors_total[5m]))",
+          "legendFormat": "{{endpoint}} / {{code}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 3,
+      "title": "Mart Query Duration P95 by Mart",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "P95 query latency broken down by mart (mart_usage_daily, mart_cost_by_model, etc.). Source: secureprompt_dashboard_mart_query_duration_seconds.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, mart) (rate(secureprompt_dashboard_mart_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{mart}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "title": "Budget Events by Behavior (block / warn / flag)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Stacked rate of budget enforcement events. block=402 returned, warn=header set, flag=silent log. Source: secureprompt_dashboard_budget_events_total.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (behavior) (rate(secureprompt_dashboard_budget_events_total[5m]))",
+          "legendFormat": "{{behavior}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "stacking": { "mode": "normal" }
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "label": "Prometheus",
+        "hide": 0,
+        "current": {}
+      }
+    ]
+  }
+}

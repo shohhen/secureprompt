@@ -74,6 +74,18 @@ pub fn build_router(state: AppState) -> Router {
                     middleware::jwt_auth::require,
                 )),
         )
+        .nest(
+            "/v1/telemetry",
+            Router::new()
+                .route(
+                    "/client-error",
+                    post(routes::telemetry::client_error),
+                )
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
         .with_state(state)
 }

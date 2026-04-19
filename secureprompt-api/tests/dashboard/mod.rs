@@ -25,3 +25,6 @@ pub mod requests;
 
 #[path = "settings_tests.rs"]
 pub mod settings;
+
+#[path = "rls_matrix.rs"]
+pub mod rls;

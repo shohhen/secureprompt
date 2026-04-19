@@ -1,0 +1,26 @@
+# On-prem overlay — air-gap overrides for docker-compose.yml.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.onprem.yml up
+#
+# This overlay:
+#   - Pins image tags so no external registry pull happens at runtime.
+#   - Sets pull_policy: never (images must be pre-loaded via `docker load`).
+#   - Points API_URL at the internal Docker DNS name.
+#   - Disables any external hostname references.
+
+services:
+  web:
+    image: secureprompt/web:${SP_VERSION:-0.1.0}
+    pull_policy: never
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8080
+      API_URL: http://api:8080
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+
+  api:
+    image: secureprompt/api:${SP_VERSION:-0.1.0}
+    pull_policy: never
+
+  worker:
+    image: secureprompt/worker:${SP_VERSION:-0.1.0}
+    pull_policy: never
