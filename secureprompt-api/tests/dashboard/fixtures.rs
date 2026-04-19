@@ -44,6 +44,70 @@ pub struct SeededWorkspaces {
     pub viewer_b: Uuid,
 }
 
+/// Unique workspace fixture used by Plan 05-05 budget tests. Every test
+/// gets a fresh `(workspace_id, admin_user_id, viewer_user_id)` triple plus
+/// login credentials so concurrent runs never collide on Redis budget
+/// counter keys (which are keyed by workspace UUID).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct UniqueWorkspace {
+    pub workspace_id: Uuid,
+    pub admin_id: Uuid,
+    pub viewer_id: Uuid,
+    pub admin_email: String,
+    pub viewer_email: String,
+    pub password: String,
+}
+
+/// Seed a workspace with a fresh UUID + unique admin/viewer emails. Each
+/// test should call this so its Redis budget keys are uniquely namespaced.
+#[allow(dead_code)]
+pub async fn seed_unique_workspace(pool: &PgPool) -> sqlx::Result<UniqueWorkspace> {
+    let workspace_id = Uuid::new_v4();
+    let admin_id = Uuid::new_v4();
+    let viewer_id = Uuid::new_v4();
+    let suffix = format!("{}", Uuid::new_v4().simple()); // 32 hex chars
+    let admin_email = format!("admin-{suffix}@example.com");
+    let viewer_email = format!("viewer-{suffix}@example.com");
+    let password = SHARED_PASSWORD.to_owned();
+    let password_hash = hash_password(&password);
+
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(workspace_id)
+    .bind(format!("Workspace {suffix}"))
+    .execute(pool)
+    .await?;
+
+    for (user_id, email, role) in [
+        (admin_id, &admin_email, "admin"),
+        (viewer_id, &viewer_email, "viewer"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
+        )
+        .bind(user_id)
+        .bind(workspace_id)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(role)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(UniqueWorkspace {
+        workspace_id,
+        admin_id,
+        viewer_id,
+        admin_email,
+        viewer_email,
+        password,
+    })
+}
+
 /// Hash a plaintext password with Argon2id using a fresh random salt.
 /// Used both by the fixture seeder and by the refresh-token tests.
 #[allow(dead_code)]

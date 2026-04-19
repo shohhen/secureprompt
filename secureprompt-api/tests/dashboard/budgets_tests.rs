@@ -201,6 +201,7 @@ fn daily_key(workspace_id: Uuid) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn monthly_key(workspace_id: Uuid) -> String {
     format!(
         "budget:{}:tokens:{}",
@@ -228,17 +229,17 @@ async fn set_counter(pool: &Pool, key: &str, value: i64) {
 /// than 404, so the UI always has a valid shape to render.
 #[sqlx::test]
 async fn get_empty(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
 
     let response = send_json(
         &router,
         "GET",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         None,
         &bearer(&token),
     )
@@ -257,12 +258,12 @@ async fn get_empty(pool: PgPool) -> sqlx::Result<()> {
 /// PUT succeeds as admin; follow-up GET echoes the new values.
 #[sqlx::test]
 async fn put_happy(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
 
     let put_body = json!({
         "daily_token_limit": 100_000,
@@ -273,7 +274,7 @@ async fn put_happy(pool: PgPool) -> sqlx::Result<()> {
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(put_body),
         &bearer(&token),
     )
@@ -288,7 +289,7 @@ async fn put_happy(pool: PgPool) -> sqlx::Result<()> {
     let response = send_json(
         &router,
         "GET",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         None,
         &bearer(&token),
     )
@@ -304,17 +305,17 @@ async fn put_happy(pool: PgPool) -> sqlx::Result<()> {
 /// Viewer is not allowed to PUT — 403.
 #[sqlx::test]
 async fn put_viewer_forbidden(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::VIEWER_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.viewer_email, &ws.password).await;
 
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({"behavior": "block"})),
         &bearer(&token),
     )
@@ -328,19 +329,20 @@ async fn put_viewer_forbidden(pool: PgPool) -> sqlx::Result<()> {
 /// (T-05-05). Guard fires before the role check so this is 403, not 200.
 #[sqlx::test]
 async fn idor_guard(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
-    flush_budget_keys(&redis_pool, seeded.workspace_b).await;
+    flush_budget_keys(&redis_pool, ws_a.workspace_id).await;
+    flush_budget_keys(&redis_pool, ws_b.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws_a.admin_email, &ws_a.password).await;
 
     // IDOR via PUT — target workspace B while signed in as admin A.
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_b),
+        &format!("/v1/workspaces/{}/budgets", ws_b.workspace_id),
         Some(json!({"behavior": "block"})),
         &bearer(&token),
     )
@@ -351,7 +353,7 @@ async fn idor_guard(pool: PgPool) -> sqlx::Result<()> {
     let response = send_json(
         &router,
         "GET",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_b),
+        &format!("/v1/workspaces/{}/budgets", ws_b.workspace_id),
         None,
         &bearer(&token),
     )
@@ -365,18 +367,19 @@ async fn idor_guard(pool: PgPool) -> sqlx::Result<()> {
 /// B still has no row.
 #[sqlx::test]
 async fn rls_isolation(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
-    flush_budget_keys(&redis_pool, seeded.workspace_b).await;
+    flush_budget_keys(&redis_pool, ws_a.workspace_id).await;
+    flush_budget_keys(&redis_pool, ws_b.workspace_id).await;
 
     let (_state, router) = build_app(pool.clone());
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws_a.admin_email, &ws_a.password).await;
 
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws_a.workspace_id),
         Some(json!({
             "daily_token_limit": 500,
             "monthly_token_limit": 10_000,
@@ -391,13 +394,13 @@ async fn rls_isolation(pool: PgPool) -> sqlx::Result<()> {
     let rows = sqlx::query(
         "SELECT workspace_id FROM workspace_budgets WHERE workspace_id = $1 OR workspace_id = $2",
     )
-    .bind(seeded.workspace_a)
-    .bind(seeded.workspace_b)
+    .bind(ws_a.workspace_id)
+    .bind(ws_b.workspace_id)
     .fetch_all(&pool)
     .await?;
     assert_eq!(rows.len(), 1, "only workspace A's row must exist");
-    let ws: Uuid = rows[0].get("workspace_id");
-    assert_eq!(ws, seeded.workspace_a);
+    let ws_stored: Uuid = rows[0].get("workspace_id");
+    assert_eq!(ws_stored, ws_a.workspace_id);
     Ok(())
 }
 
@@ -405,20 +408,20 @@ async fn rls_isolation(pool: PgPool) -> sqlx::Result<()> {
 /// GET to echo it in `daily_used`.
 #[sqlx::test]
 async fn current_usage_from_redis(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
-    let daily = daily_key(seeded.workspace_a);
+    let daily = daily_key(ws.workspace_id);
     set_counter(&redis_pool, &daily, 500).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
 
     let response = send_json(
         &router,
         "GET",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         None,
         &bearer(&token),
     )
@@ -427,7 +430,7 @@ async fn current_usage_from_redis(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["daily_used"], 500);
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
@@ -440,19 +443,19 @@ async fn current_usage_from_redis(pool: PgPool) -> sqlx::Result<()> {
 async fn daily_counter(pool: PgPool) -> sqlx::Result<()> {
     use secureprompt_api::http::middleware::rate_limit::{budget_check, BudgetOutcome};
 
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     // Seed a budget row: daily=1000, monthly unlimited, behavior=block.
     // Use the repo indirectly via a PUT through the router so this test
     // stays hermetic (no private-module access).
     let (state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({
             "daily_token_limit": 1000,
             "monthly_token_limit": null,
@@ -464,13 +467,13 @@ async fn daily_counter(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     for _ in 0..10 {
-        let outcome = budget_check(&state, seeded.workspace_a, 100)
+        let outcome = budget_check(&state, ws.workspace_id, 100)
             .await
             .expect("budget_check ok");
         assert!(matches!(outcome, BudgetOutcome::Allow), "outcome={outcome:?}");
     }
 
-    let outcome = budget_check(&state, seeded.workspace_a, 100)
+    let outcome = budget_check(&state, ws.workspace_id, 100)
         .await
         .expect("budget_check ok");
     assert!(
@@ -478,7 +481,7 @@ async fn daily_counter(pool: PgPool) -> sqlx::Result<()> {
         "11th call must be Exceeded, got {outcome:?}"
     );
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
@@ -489,16 +492,16 @@ async fn daily_counter(pool: PgPool) -> sqlx::Result<()> {
 /// probe runs the budget check as if a real chat completion had arrived.
 #[sqlx::test]
 async fn block_402(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({
             "daily_token_limit": 1,
             "monthly_token_limit": null,
@@ -510,7 +513,7 @@ async fn block_402(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Pre-seed the counter to 2 so the next probe is over the limit.
-    set_counter(&redis_pool, &daily_key(seeded.workspace_a), 2).await;
+    set_counter(&redis_pool, &daily_key(ws.workspace_id), 2).await;
 
     let response = post_json(
         &router,
@@ -523,7 +526,7 @@ async fn block_402(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "body={body}");
     assert_eq!(body["error"]["code"], "budget_exceeded");
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
@@ -531,16 +534,16 @@ async fn block_402(pool: PgPool) -> sqlx::Result<()> {
 /// `x-secureprompt-budget-warning: daily`.
 #[sqlx::test]
 async fn warn_header(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({
             "daily_token_limit": 1,
             "monthly_token_limit": null,
@@ -551,7 +554,7 @@ async fn warn_header(pool: PgPool) -> sqlx::Result<()> {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    set_counter(&redis_pool, &daily_key(seeded.workspace_a), 2).await;
+    set_counter(&redis_pool, &daily_key(ws.workspace_id), 2).await;
 
     let response = post_json(
         &router,
@@ -570,7 +573,7 @@ async fn warn_header(pool: PgPool) -> sqlx::Result<()> {
         .to_owned();
     assert_eq!(header, "daily");
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
@@ -580,16 +583,16 @@ async fn warn_header(pool: PgPool) -> sqlx::Result<()> {
 /// assertion).
 #[sqlx::test]
 async fn flag_silent(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({
             "daily_token_limit": 1,
             "monthly_token_limit": null,
@@ -600,7 +603,7 @@ async fn flag_silent(pool: PgPool) -> sqlx::Result<()> {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    set_counter(&redis_pool, &daily_key(seeded.workspace_a), 2).await;
+    set_counter(&redis_pool, &daily_key(ws.workspace_id), 2).await;
 
     let response = post_json(
         &router,
@@ -618,7 +621,7 @@ async fn flag_silent(pool: PgPool) -> sqlx::Result<()> {
         "flag behavior must not emit the budget header"
     );
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
@@ -631,16 +634,16 @@ async fn flag_silent(pool: PgPool) -> sqlx::Result<()> {
 ///   - no second-wave 200 after exhaustion
 #[sqlx::test]
 async fn parallel_no_bypass(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
     let response = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({
             "daily_token_limit": 10,
             "monthly_token_limit": null,
@@ -652,7 +655,7 @@ async fn parallel_no_bypass(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Reset the counter to 0 explicitly (the PUT doesn't touch it).
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..20 {
@@ -693,7 +696,7 @@ async fn parallel_no_bypass(pool: PgPool) -> sqlx::Result<()> {
     // the concurrency delta.
     let mut conn = redis_pool.get().await.expect("redis checkout");
     let counter: i64 = cmd("GET")
-        .arg(daily_key(seeded.workspace_a))
+        .arg(daily_key(ws.workspace_id))
         .query_async(&mut conn)
         .await
         .unwrap_or(0);
@@ -702,30 +705,30 @@ async fn parallel_no_bypass(pool: PgPool) -> sqlx::Result<()> {
         "counter overshoot must be bounded by concurrency (got {counter})"
     );
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }
 
 /// VALIDATION 5-07-06 — Prometheus counters increment per behavior/outcome.
 #[sqlx::test]
 async fn prometheus_events(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let ws = fixtures::seed_unique_workspace(&pool).await?;
     let redis_pool = connect_redis().await;
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, fixtures::ADMIN_A_EMAIL, fixtures::SHARED_PASSWORD).await;
+    let token = login(&router, &ws.admin_email, &ws.password).await;
 
     // Behavior=block, Redis=2, limit=1 → one "block/exceeded" event.
     let _ = send_json(
         &router,
         "PUT",
-        &format!("/v1/workspaces/{}/budgets", seeded.workspace_a),
+        &format!("/v1/workspaces/{}/budgets", ws.workspace_id),
         Some(json!({"daily_token_limit": 1, "behavior": "block"})),
         &bearer(&token),
     )
     .await;
-    set_counter(&redis_pool, &daily_key(seeded.workspace_a), 2).await;
+    set_counter(&redis_pool, &daily_key(ws.workspace_id), 2).await;
     let _ = post_json(
         &router,
         "/v1/internal/budget-probe",
@@ -752,6 +755,6 @@ async fn prometheus_events(pool: PgPool) -> sqlx::Result<()> {
         "metrics must include outcome label; got:\n{text}"
     );
 
-    flush_budget_keys(&redis_pool, seeded.workspace_a).await;
+    flush_budget_keys(&redis_pool, ws.workspace_id).await;
     Ok(())
 }

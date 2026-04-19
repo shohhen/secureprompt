@@ -1,4 +1,4 @@
-FROM rust:1.82-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,7 +13,8 @@ COPY secureprompt-mcp/Cargo.toml secureprompt-mcp/
 COPY sp-agent/Cargo.toml sp-agent/
 
 RUN mkdir -p secureprompt-common/src && echo "pub fn _stub() {}" > secureprompt-common/src/lib.rs \
- && mkdir -p secureprompt-api/src && echo "fn main() {}" > secureprompt-api/src/main.rs \
+ && mkdir -p secureprompt-api/src && echo "pub fn _stub() {}" > secureprompt-api/src/lib.rs \
+ && echo "fn main() {}" > secureprompt-api/src/main.rs \
  && mkdir -p secureprompt-worker/src && echo "fn main() {}" > secureprompt-worker/src/main.rs \
  && mkdir -p secureprompt-mcp/src && echo "fn main() {}" > secureprompt-mcp/src/main.rs \
  && mkdir -p sp-agent/src && echo "fn main() {}" > sp-agent/src/main.rs
@@ -21,7 +22,8 @@ RUN mkdir -p secureprompt-common/src && echo "pub fn _stub() {}" > secureprompt-
 RUN cargo build --release -p secureprompt-api
 
 COPY . .
-RUN touch secureprompt-api/src/main.rs && cargo build --release -p secureprompt-api
+RUN touch secureprompt-common/src/lib.rs secureprompt-api/src/lib.rs secureprompt-api/src/main.rs \
+ && cargo build --release -p secureprompt-api
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /workspace/target/release/secureprompt-api /usr/local/bin/secureprompt-api

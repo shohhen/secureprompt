@@ -1,6 +1,9 @@
 use anyhow::Context;
 use secureprompt_common::{
-    config::{AppConfig, ClickhouseConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig},
+    config::{
+        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
+        TelemetryConfig,
+    },
     telemetry::init_telemetry,
 };
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -32,6 +35,14 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "http://localhost:8123".into()),
             database: std::env::var("CLICKHOUSE_DATABASE")
                 .unwrap_or_else(|_| "secureprompt".into()),
+        },
+        // The worker doesn't issue or verify JWTs, but AppConfig is a shared
+        // struct. Default placeholder TTLs + empty secret are acceptable here
+        // because no JWT code path runs in the worker binary.
+        jwt: JwtConfig {
+            secret: std::env::var("SECUREPROMPT_JWT_SECRET").unwrap_or_default(),
+            access_ttl_secs: JwtConfig::DEFAULT_ACCESS_TTL_SECS,
+            refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
     };
 

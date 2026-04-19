@@ -1,4 +1,4 @@
-FROM rust:1.82-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,7 +21,8 @@ RUN mkdir -p secureprompt-common/src && echo "pub fn _stub() {}" > secureprompt-
 RUN cargo build --release -p secureprompt-worker
 
 COPY . .
-RUN touch secureprompt-worker/src/main.rs && cargo build --release -p secureprompt-worker
+RUN touch secureprompt-common/src/lib.rs secureprompt-worker/src/main.rs \
+ && cargo build --release -p secureprompt-worker
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /workspace/target/release/secureprompt-worker /usr/local/bin/secureprompt-worker
