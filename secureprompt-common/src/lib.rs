@@ -2,6 +2,7 @@ pub mod config;
 pub mod crypto;
 pub mod errors;
 pub mod pipeline;
+pub mod tasks;    // Phase 6 / Plan 06-04
 pub mod telemetry;
 pub mod types;
 
