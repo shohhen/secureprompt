@@ -10,7 +10,7 @@ import {
   refreshAccessTokenIfNeeded,
   REFRESH_WINDOW_SECONDS,
   type AppJWT,
-} from "@/lib/auth";
+} from "@/lib/auth-refresh";
 
 const NOW = Math.floor(Date.now() / 1000);
 
