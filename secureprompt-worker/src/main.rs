@@ -85,9 +85,38 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("Failed to schedule OPTIMIZE FINAL job")?;
 
+    // Phase 6 / Plan 06-01 — API key rotation cleanup cron (D-17, AUTH-08).
+    // Runs daily at 03:00 to move expired-grace-window rotating keys to 'revoked'.
+    let pg_pool_cleanup = sqlx::PgPool::connect(&config.database.url)
+        .await
+        .context("Worker: failed to connect to Postgres for rotation cleanup")?;
+
+    sched.add(
+        Job::new_async("0 0 3 * * *", move |_uuid, _l| {
+            let pool = pg_pool_cleanup.clone();
+            Box::pin(async move {
+                let result = sqlx::query(
+                    "UPDATE api_keys
+                     SET status = 'revoked', revoked_at = NOW()
+                     WHERE status = 'rotating'
+                       AND rotated_at + (rotation_grace_secs || ' seconds')::INTERVAL <= NOW()"
+                )
+                .execute(&pool)
+                .await;
+                match result {
+                    Ok(r) => tracing::info!(rows_affected = r.rows_affected(), "rotation cleanup complete"),
+                    Err(e) => tracing::error!(error = %e, "rotation cleanup failed"),
+                }
+            })
+        })
+        .context("Failed to create rotation cleanup job")?,
+    )
+    .await
+    .context("Failed to schedule rotation cleanup job")?;
+
     sched.start().await?;
 
-    tracing::info!("secureprompt-worker running; OPTIMIZE FINAL scheduled at 02:00 daily");
+    tracing::info!("secureprompt-worker running; OPTIMIZE FINAL at 02:00 + rotation cleanup at 03:00 daily");
     tokio::signal::ctrl_c().await?;
     tracing::info!("secureprompt-worker shutting down");
 

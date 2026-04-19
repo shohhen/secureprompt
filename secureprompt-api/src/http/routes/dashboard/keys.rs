@@ -1,9 +1,10 @@
 //! Phase 5 / Plan 05-04 — `/v1/keys` API key management handlers.
 //!
 //! Routes:
-//!   GET  /v1/keys        — list keys (any role)
-//!   POST /v1/keys        — create key (admin only); returns plaintext ONCE
-//!   DELETE /v1/keys/:id  — revoke key (admin only)
+//!   GET    /v1/keys        — list keys (any role)
+//!   POST   /v1/keys        — create key (admin only); returns plaintext ONCE
+//!   DELETE /v1/keys/:id    — revoke key (admin only)
+//!   POST   /v1/keys/:id/rotate — rotate key (admin only); idempotent (D-18)
 //!
 //! Security:
 //!   * `CreateKeyResponse` and `KeyResponse` are DISTINCT structs — POST
@@ -14,7 +15,7 @@
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -58,6 +59,14 @@ pub struct CreateKeyResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Response for POST /v1/keys/{id}/rotate (D-17).
+/// `new_key` is the plaintext of the replacement key — shown once.
+#[derive(Debug, Serialize)]
+pub struct RotateKeyResponse {
+    pub new_key: String,
+    pub grace_expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyRequest {
     pub name: String,
@@ -69,6 +78,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_keys).post(create_key))
         .route("/{id}", delete(revoke_key))
+        .route("/{id}/rotate", post(rotate_key))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -150,4 +160,30 @@ async fn revoke_key(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/keys/{id}/rotate` — rotate an API key (Admin+ only).
+///
+/// Idempotent within the grace window: a second call on a `'rotating'` key
+/// returns the same new key + updated grace_expires_at (D-18).
+async fn rotate_key(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<JwtAuthContext>,
+    Path(key_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<RotateKeyResponse>), axum::response::Response> {
+    require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
+
+    let repo = ApiKeyRepository::new(state.db.clone());
+    let (new_plaintext, grace_expires_at) = repo
+        .rotate(ctx.workspace_id, key_id)
+        .await
+        .map_err(api_error_response)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RotateKeyResponse {
+            new_key: new_plaintext,
+            grace_expires_at,
+        }),
+    ))
 }
