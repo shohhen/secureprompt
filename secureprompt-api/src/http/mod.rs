@@ -25,7 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/completions", post(routes::openai::completions))
         .route("/v1/embeddings", post(routes::openai::embeddings))
         .route("/metrics", get(routes::openai::metrics))
-        .nest("/v1/auth", routes::dashboard::auth::routes())
+        .nest("/v1/auth", routes::dashboard::auth::build_router(state.clone()))
         .with_state(state)
 }
 

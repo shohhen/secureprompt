@@ -7,7 +7,8 @@ use axum::{
 use http_body_util::BodyExt;
 use secureprompt_api::{app_state::AppState, db::api_key_repo::hash_api_key, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, RedisConfig, ServerConfig, TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
+    TelemetryConfig,
 };
 use std::sync::Arc;
 use serde_json::Value;
@@ -36,6 +37,11 @@ pub fn test_config() -> AppConfig {
         clickhouse: ClickhouseConfig {
             url: "http://localhost:8123".to_owned(),
             database: "default".to_owned(),
+        },
+        jwt: JwtConfig {
+            secret: "test-jwt-secret-distinct-from-provider-key".to_owned(),
+            access_ttl_secs: JwtConfig::DEFAULT_ACCESS_TTL_SECS,
+            refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
     }
 }
