@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secureprompt-py"
+version = "0.1.0"
+description = "Python client for the SecurePrompt LLM security gateway"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    # httpx >= 0.27 required for streaming support with iter_lines() / aiter_lines().
+    # No other runtime dependencies (SDK-04).
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    # respx: mock transport for httpx — avoids real HTTP calls in tests.
+    "respx>=0.21",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/secureprompt"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
