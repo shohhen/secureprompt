@@ -1,0 +1,144 @@
+openapi: 3.0.3
+info:
+  title: SecurePrompt Gateway API
+  version: "0.1.0-stub"
+  description: >
+    MINIMAL STUB consumed by Plan 05-02 codegen. Full spec ships with Plan
+    05-01 (auth-foundation) in the same wave. This stub pins the types
+    05-02 needs to compile; Plan 01's completion will replace this file and
+    `pnpm codegen:check` will detect the diff on CI.
+servers:
+  - url: http://localhost:8080
+    description: Local dev Rust gateway
+paths:
+  /v1/auth/token:
+    post:
+      summary: Issue access + refresh tokens for email/password
+      operationId: issueToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+      responses:
+        "200":
+          description: Tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/auth/refresh:
+    post:
+      summary: Refresh an access token using a refresh token
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: New tokens issued (refresh-token rotation)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          description: Refresh token invalid / replayed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /v1/auth/logout:
+    post:
+      summary: Revoke the current refresh token
+      operationId: logout
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Revoked
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    TokenRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 1
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    TokenResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+        - access_expires_at
+        - refresh_expires_at
+      properties:
+        access_token:
+          type: string
+          description: Opaque JWT bearer token
+        refresh_token:
+          type: string
+          description: Opaque refresh token (rotated on refresh)
+        access_expires_at:
+          type: integer
+          format: int64
+          description: Unix seconds when access_token expires
+        refresh_expires_at:
+          type: integer
+          format: int64
+          description: Unix seconds when refresh_token expires
+        user:
+          type: object
+          required: [id, email]
+          properties:
+            id:
+              type: string
+              format: uuid
+            email:
+              type: string
+              format: email
+        workspace_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [admin, member, viewer]
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable error code for machine handling
+          example: invalid_credentials
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          additionalProperties: true
