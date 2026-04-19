@@ -13,3 +13,6 @@ pub mod jwt;
 
 #[path = "auth_tests.rs"]
 pub mod auth;
+
+#[path = "budgets_tests.rs"]
+pub mod budgets;
