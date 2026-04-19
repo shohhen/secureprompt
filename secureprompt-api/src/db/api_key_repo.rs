@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use rand::{distributions::Alphanumeric, Rng};
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -72,6 +73,110 @@ impl ApiKeyRepository {
                 revoked_at: record.get("revoked_at"),
             })
             .collect())
+    }
+
+    /// Create a new API key for the workspace.
+    ///
+    /// Returns `(ApiKeyRow, plaintext)` — the plaintext is shown to the user
+    /// exactly once (POST response) and never stored. The caller must put it
+    /// in `CreateKeyResponse` and never log it.
+    ///
+    /// # Errors
+    /// Returns `ApiError::Database` on any SQL failure.
+    pub async fn create(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+    ) -> Result<(ApiKeyRow, String), ApiError> {
+        // Generate: "sp_" + 48 random alphanumeric chars = 51 chars total.
+        let suffix: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(48)
+            .map(char::from)
+            .collect();
+        let plaintext = format!("sp_{suffix}");
+        let key_hash = hash_api_key(&plaintext);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let row = sqlx::query(
+            "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             RETURNING id, workspace_id, name, key_hash, created_at, revoked_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id.0)
+        .bind(name)
+        .bind(&key_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let record = ApiKeyRow {
+            id: row.get("id"),
+            workspace_id: row.get("workspace_id"),
+            name: row.get("name"),
+            key_hash: row.get("key_hash"),
+            created_at: row.get("created_at"),
+            revoked_at: row.get("revoked_at"),
+        };
+        Ok((record, plaintext))
+    }
+
+    /// Revoke an API key by setting `revoked_at = NOW()`.
+    ///
+    /// # Errors
+    /// Returns `ApiError::NotFound` when the key does not exist in this
+    /// workspace. Returns `ApiError::Database` on any SQL failure.
+    pub async fn revoke(
+        &self,
+        workspace_id: WorkspaceId,
+        key_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "UPDATE api_keys SET revoked_at = NOW()
+             WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .bind(workspace_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound(format!("api key {key_id} not found")));
+        }
+        Ok(())
     }
 
     pub async fn authenticate_api_key(

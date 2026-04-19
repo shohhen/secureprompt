@@ -1,4 +1,5 @@
 pub mod api_key_repo;
+pub mod budget_repo;
 pub mod policy_repo;
 pub mod provider_repo;
 pub mod refresh_token_repo;
@@ -8,6 +9,7 @@ pub mod workspace_repo;
 use secureprompt_common::errors::ApiError;
 
 pub use api_key_repo::{ApiKeyRepository, AuthenticatedApiKey};
+pub use budget_repo::{BudgetBehavior, BudgetRepository, WorkspaceBudgetRow};
 pub use policy_repo::{PolicyRepository, PolicyRuleRow};
 pub use provider_repo::{ProviderRepository, ResolvedModelTarget};
 pub use refresh_token_repo::RefreshTokenRepository;

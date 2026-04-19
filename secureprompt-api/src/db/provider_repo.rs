@@ -91,6 +91,195 @@ impl ProviderRepository {
             .collect())
     }
 
+    /// Create a new provider with an encrypted credential.
+    ///
+    /// `encrypted_credential` is `Some(base64url(nonce||ct))` when the caller
+    /// supplied a plaintext credential, `None` otherwise.
+    ///
+    /// # Errors
+    /// Returns `ApiError::Database` on SQL failure.
+    pub async fn create_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+        provider_type: &str,
+        encrypted_credential: Option<String>,
+    ) -> Result<ProviderRow, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let row = sqlx::query(
+            "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id.0)
+        .bind(name)
+        .bind(provider_type)
+        .bind(encrypted_credential.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        Ok(ProviderRow {
+            id: row.get("id"),
+            workspace_id: row.get("workspace_id"),
+            name: row.get("name"),
+            provider_type: row.get("provider_type"),
+            encrypted_credential: row.get("encrypted_credential"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
+    /// Update a provider's name/type/credential. Passing `None` for
+    /// `encrypted_credential` leaves the stored credential unchanged; passing
+    /// `Some(None)` clears it.
+    ///
+    /// # Errors
+    /// Returns `ApiError::NotFound` when the provider does not exist in this
+    /// workspace. Returns `ApiError::Database` on SQL failure.
+    pub async fn update_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+        name: Option<&str>,
+        provider_type: Option<&str>,
+        encrypted_credential: Option<Option<String>>,
+    ) -> Result<ProviderRow, ApiError> {
+        // Build the SET clause dynamically based on which fields were provided.
+        let mut sets: Vec<String> = vec!["updated_at = NOW()".to_owned()];
+        if name.is_some() {
+            sets.push("name = $3".to_owned());
+        }
+        if provider_type.is_some() {
+            sets.push(format!("provider_type = ${}", sets.len() + 2));
+        }
+        if encrypted_credential.is_some() {
+            sets.push(format!("encrypted_credential = ${}", sets.len() + 2));
+        }
+
+        // Simpler approach: full-replace with explicit params.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // Fetch current to fill unset fields.
+        let current = sqlx::query(
+            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at
+             FROM providers WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(provider_id)
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("provider {provider_id} not found")))?;
+
+        let new_name: String = name.map(String::from).unwrap_or_else(|| current.get("name"));
+        let new_type: String = provider_type.map(String::from).unwrap_or_else(|| current.get("provider_type"));
+        let new_cred: Option<String> = match encrypted_credential {
+            Some(v) => v,
+            None => current.get("encrypted_credential"),
+        };
+
+        let _ = sets; // suppress the unused warning from the dynamic builder above
+
+        let row = sqlx::query(
+            "UPDATE providers
+             SET name = $3, provider_type = $4, encrypted_credential = $5, updated_at = NOW()
+             WHERE id = $1 AND workspace_id = $2
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+        )
+        .bind(provider_id)
+        .bind(workspace_id.0)
+        .bind(&new_name)
+        .bind(&new_type)
+        .bind(new_cred.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        Ok(ProviderRow {
+            id: row.get("id"),
+            workspace_id: row.get("workspace_id"),
+            name: row.get("name"),
+            provider_type: row.get("provider_type"),
+            encrypted_credential: row.get("encrypted_credential"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
+    /// Delete a provider by ID within the workspace.
+    ///
+    /// # Errors
+    /// Returns `ApiError::NotFound` when the provider does not exist.
+    /// Returns `ApiError::Database` on SQL failure.
+    pub async fn delete_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "DELETE FROM providers WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(provider_id)
+        .bind(workspace_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound(format!(
+                "provider {provider_id} not found"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
         let mut tx = self
             .pool

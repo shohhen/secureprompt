@@ -49,6 +49,40 @@ pub struct ClickhouseConfig {
     pub database: String,
 }
 
+/// Phase 5 / Plan 05-04 — AES-256-GCM key for provider credential encryption.
+///
+/// Loaded from `SECUREPROMPT_PROVIDER_KEY` (64 hex chars = 32 bytes).
+/// Must be DISTINCT from `SECUREPROMPT_JWT_SECRET` (enforced by `JwtConfig::from_env`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderKeyConfig {
+    /// 32-byte AES key as hex string (64 chars).
+    pub hex_key: String,
+}
+
+impl ProviderKeyConfig {
+    /// Load from `SECUREPROMPT_PROVIDER_KEY`.  Returns a zeroed-key config
+    /// (for tests / missing env) rather than failing, because the API can
+    /// start without provider encryption when no credentials have been stored.
+    ///
+    /// Production deployments MUST set this env var; the config validator
+    /// should warn loudly when it is missing.
+    #[must_use]
+    pub fn from_env_or_zero() -> Self {
+        let hex_key = std::env::var("SECUREPROMPT_PROVIDER_KEY")
+            .unwrap_or_else(|_| "0".repeat(64));
+        Self { hex_key }
+    }
+
+    /// Parse the stored hex string into raw key bytes.
+    ///
+    /// # Errors
+    /// Returns `Err` when the value is not exactly 64 valid hex characters.
+    pub fn to_key_bytes(&self) -> Result<[u8; 32], String> {
+        crate::crypto::parse_provider_key(&self.hex_key)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Phase 5 / Plan 05-01 — dashboard JWT configuration.
 ///
 /// Loaded from three env vars (see `JwtConfig::from_env`):

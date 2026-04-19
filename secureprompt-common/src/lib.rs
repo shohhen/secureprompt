@@ -1,4 +1,5 @@
 pub mod config;
+pub mod crypto;
 pub mod errors;
 pub mod pipeline;
 pub mod telemetry;
