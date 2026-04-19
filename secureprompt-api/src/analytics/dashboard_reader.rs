@@ -99,6 +99,15 @@ impl DashboardReader {
         Self { client }
     }
 
+    /// Expose the raw `clickhouse::Client` for handlers that need to run
+    /// ad-hoc queries against raw tables (e.g. `requests.rs` in Plan 05-04).
+    /// The mart-only CI gate applies only to `analytics.rs`, not to callers
+    /// of this accessor.
+    #[must_use]
+    pub const fn client(&self) -> &clickhouse::Client {
+        &self.client
+    }
+
     /// Query `mart_usage_daily` for a workspace in the given date window.
     ///
     /// `model` is an optional filter; when `None` all models are returned.

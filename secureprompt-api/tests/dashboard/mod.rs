@@ -19,3 +19,9 @@ pub mod budgets;
 
 #[path = "analytics_tests.rs"]
 pub mod analytics;
+
+#[path = "requests_tests.rs"]
+pub mod requests;
+
+#[path = "settings_tests.rs"]
+pub mod settings;

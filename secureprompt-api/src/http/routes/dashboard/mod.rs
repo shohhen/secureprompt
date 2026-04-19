@@ -7,8 +7,14 @@
 pub mod analytics;
 pub mod auth;
 pub mod budgets;
+// Plan 05-04 namespaces.
+pub mod keys;
+pub mod policy_rules;
+pub mod providers;
+pub mod requests;
+pub mod role;
 
 // Task 5-01-C wires `auth` into `Router::nest("/v1/auth", ...)`.
 // Task 5-03-A wires `analytics` into `Router::nest("/v1/analytics", ...)`.
 // Task 5-05-A wires `budgets` into `Router::nest("/v1/workspaces", ...)`.
-// The remaining namespaces (requests, keys, providers, policy_rules) land in Plan 05-04.
+// Task 5-04-B/C wires `keys`, `providers`, `policy_rules`, `requests`.

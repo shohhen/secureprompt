@@ -42,6 +42,38 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/workspaces",
             routes::dashboard::budgets::build_router(state.clone()),
         )
+        .nest(
+            "/v1/requests",
+            routes::dashboard::requests::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
+            "/v1/keys",
+            routes::dashboard::keys::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
+            "/v1/providers",
+            routes::dashboard::providers::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
+            "/v1/policy-rules",
+            routes::dashboard::policy_rules::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
         .with_state(state)
 }
