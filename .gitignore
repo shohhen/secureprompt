@@ -25,3 +25,4 @@ secureprompt-web/test-results/
 
 # dbt profiles — contain credentials via env vars; never commit
 secureprompt-analytics/profiles.yml
+.worktrees/
