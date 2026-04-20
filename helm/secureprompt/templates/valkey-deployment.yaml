@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-valkey
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-valkey
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-valkey
+      {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
+      annotations:
+        linkerd.io/inject: enabled
+      {{- end }}
+    spec:
+      containers:
+        - name: valkey
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.valkey.image.repository }}:{{ .Values.valkey.image.tag }}"
+          imagePullPolicy: {{ .Values.valkey.image.pullPolicy }}
+          ports:
+            - containerPort: 6379
+              protocol: TCP
+              name: redis
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5

@@ -1,3 +1,6 @@
+global:
+  imageRegistry: ""  # Air-gap: set to "registry.internal/" (trailing slash required)
+
 nameOverride: ""
 fullnameOverride: ""
 
@@ -20,10 +23,27 @@ postgres:
     repository: postgres
     tag: "16-alpine"
 
-redis:
+valkey:
   image:
-    repository: redis
-    tag: "7.4-alpine"
+    repository: valkey/valkey
+    tag: "8.1.6-alpine"
+    pullPolicy: IfNotPresent
+
+qdrant:
+  image:
+    repository: qdrant/qdrant
+    tag: "v1.17.1"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: 5Gi
+
+kms:
+  backend: "file"
+
+serviceMesh:
+  enabled: false
+  provider: "linkerd"
 
 web:
   image:

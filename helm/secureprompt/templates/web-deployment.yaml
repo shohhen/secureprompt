@@ -13,10 +13,14 @@ spec:
     metadata:
       labels:
         app: {{ include "secureprompt.fullname" . }}-web
+      {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
+      annotations:
+        linkerd.io/inject: enabled
+      {{- end }}
     spec:
       containers:
         - name: web
-          image: "{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
           imagePullPolicy: {{ .Values.web.image.pullPolicy }}
           ports:
             - containerPort: 3000

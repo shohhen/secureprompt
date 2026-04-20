@@ -1,0 +1,16 @@
+# SECURITY: ClusterIP only — Qdrant must never be externally reachable.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-qdrant
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6333
+      targetPort: 6333
+      protocol: TCP
+      name: http
+  selector:
+    app: {{ include "secureprompt.fullname" . }}-qdrant

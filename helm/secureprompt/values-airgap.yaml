@@ -1,5 +1,8 @@
-# Air-gap override values — telemetry disabled, all images use internal registry.
-# Usage: helm install secureprompt ./helm/secureprompt -f helm/secureprompt/values-airgap.yaml
+# Air-gap override values — all images use internal registry, telemetry disabled.
+# IMPORTANT: global.imageRegistry must include a trailing slash.
+
+global:
+  imageRegistry: "registry.internal/"  # trailing slash required
 
 otel:
   enabled: false
@@ -9,24 +12,42 @@ prometheus:
 
 api:
   image:
-    repository: registry.internal/secureprompt/api
+    repository: secureprompt/api
     tag: "0.1.0"
     pullPolicy: Never
 
 worker:
   image:
-    repository: registry.internal/secureprompt/worker
+    repository: secureprompt/worker
     tag: "0.1.0"
     pullPolicy: Never
 
 postgres:
   image:
-    repository: registry.internal/postgres
+    repository: postgres
     tag: "16-alpine"
     pullPolicy: Never
 
-redis:
+valkey:
   image:
-    repository: registry.internal/redis
-    tag: "7.4-alpine"
+    repository: valkey/valkey
+    tag: "8.1.6-alpine"
+    pullPolicy: Never
+
+qdrant:
+  image:
+    repository: qdrant/qdrant
+    tag: "v1.17.1"
+    pullPolicy: Never
+
+web:
+  image:
+    repository: secureprompt/web
+    tag: "0.1.0"
+    pullPolicy: Never
+
+ml:
+  image:
+    repository: secureprompt/ml
+    tag: "0.1.0"
     pullPolicy: Never

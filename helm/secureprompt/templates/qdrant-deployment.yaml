@@ -1,0 +1,46 @@
+# SECURITY: Qdrant is cluster-internal only. Never change Service type from ClusterIP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-qdrant
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-qdrant
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-qdrant
+      {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
+      annotations:
+        linkerd.io/inject: enabled
+      {{- end }}
+    spec:
+      containers:
+        - name: qdrant
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
+          imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          ports:
+            - containerPort: 6333
+              protocol: TCP
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 6333
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          {{- if .Values.qdrant.persistence.enabled }}
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+          {{- end }}
+      {{- if .Values.qdrant.persistence.enabled }}
+      volumes:
+        - name: qdrant-storage
+          persistentVolumeClaim:
+            claimName: {{ include "secureprompt.fullname" . }}-qdrant-pvc
+      {{- end }}

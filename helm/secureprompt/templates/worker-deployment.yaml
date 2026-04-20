@@ -13,10 +13,14 @@ spec:
     metadata:
       labels:
         app: {{ include "secureprompt.fullname" . }}-worker
+      {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
+      annotations:
+        linkerd.io/inject: enabled
+      {{- end }}
     spec:
       containers:
         - name: worker
-          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
           imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
           env:
             - name: DATABASE_URL
