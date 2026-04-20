@@ -1,3 +1,5 @@
+mod tasks;
+
 use anyhow::Context;
 use deadpool_redis::redis::cmd;
 use secureprompt_common::{
@@ -128,8 +130,21 @@ async fn main() -> anyhow::Result<()> {
             .context("Worker: failed to create Redis pool for drain loop")?
     };
 
+    // Phase 7 / Plan 07-04 — Qdrant client for RAG indexing (QD-01..03).
+    let qdrant_url = std::env::var("QDRANT_URL")
+        .unwrap_or_else(|_| "http://qdrant:6334".into());
+    let qdrant = std::sync::Arc::new(
+        qdrant_client::Qdrant::from_url(&qdrant_url)
+            .build()
+            .context("Failed to create Qdrant client")?,
+    );
+
+    let ml_sidecar_url = std::env::var("ML_SIDECAR_URL")
+        .unwrap_or_else(|_| "http://secureprompt-ml:8080".into());
+    let ml_http = reqwest::Client::new();
+
     tokio::spawn(async move {
-        run_queue_drain(redis_pool_drain).await;
+        run_queue_drain(redis_pool_drain, qdrant, ml_http, ml_sidecar_url).await;
     });
 
     tracing::info!("Task queue drain loop started");
@@ -142,9 +157,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Blocking poll loop over all task queues.
-/// Uses BLPOP with a 5-second timeout to multiplex 3 queues without busy-waiting.
+/// Uses BLPOP with a 5-second timeout to multiplex queues without busy-waiting.
 /// Runs forever in its own tokio task until the process exits.
-async fn run_queue_drain(redis_pool: deadpool_redis::Pool) {
+async fn run_queue_drain(
+    redis_pool: deadpool_redis::Pool,
+    qdrant: std::sync::Arc<qdrant_client::Qdrant>,
+    ml_client: reqwest::Client,
+    ml_sidecar_url: String,
+) {
     loop {
         let mut conn = match redis_pool.get().await {
             Ok(c) => c,
@@ -166,7 +186,9 @@ async fn run_queue_drain(redis_pool: deadpool_redis::Pool) {
 
         if let Some((_queue_name, json)) = result {
             match serde_json::from_str::<TaskEnvelope>(&json) {
-                Ok(task) => dispatch_task(task).await,
+                Ok(task) => {
+                    dispatch_task(task, &qdrant, &ml_client, &ml_sidecar_url).await;
+                }
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -181,8 +203,12 @@ async fn run_queue_drain(redis_pool: deadpool_redis::Pool) {
 }
 
 /// Dispatch a deserialized TaskEnvelope to the appropriate handler.
-/// Each handler is a no-op stub in Phase 6 — real implementations land in Phase 7.
-async fn dispatch_task(task: TaskEnvelope) {
+async fn dispatch_task(
+    task: TaskEnvelope,
+    qdrant: &qdrant_client::Qdrant,
+    ml_client: &reqwest::Client,
+    ml_sidecar_url: &str,
+) {
     use secureprompt_common::tasks::task_types;
 
     tracing::info!(
@@ -204,6 +230,15 @@ async fn dispatch_task(task: TaskEnvelope) {
         }
         task_types::API_KEY_ROTATION_CLEANUP => {
             tracing::debug!("api_key.rotation_cleanup — handled by cron in Plan 06-01");
+        }
+        task_types::INDEX_POLICY_RULE => {
+            tasks::index_policy_rule::handle_index_policy_rule(
+                &task,
+                ml_client,
+                qdrant,
+                ml_sidecar_url,
+            )
+            .await;
         }
         unknown => {
             tracing::warn!(task_type = %unknown, "unknown task type — dropping");
