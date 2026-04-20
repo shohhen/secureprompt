@@ -15,7 +15,7 @@ use crate::{
 };
 use dashmap::DashMap;
 use deadpool_redis::Pool as RedisPool;
-use secureprompt_common::{config::AppConfig, errors::ApiError};
+use secureprompt_common::{config::AppConfig, errors::ApiError, kms::KmsBackend};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -49,6 +49,10 @@ pub struct AppState {
     /// Phase 6 / Plan 06-01 — per-pod in-memory auth cache (D-14, PG-04).
     /// Key: user_id. TTL = 5 min (checked on read). Not Redis-backed by design.
     pub auth_cache: Arc<DashMap<Uuid, CachedAuthEntry>>,
+    /// Phase 7 / Plan 07-01 — KMS backend for envelope encryption.
+    /// Defaults to `FileKms` (AES-256-GCM). Switch to `VaultKms` via
+    /// `KMS_BACKEND=vault` for regulated on-prem deployments.
+    pub kms: Arc<dyn KmsBackend>,
 }
 
 impl AppState {
@@ -73,6 +77,9 @@ impl AppState {
         let ch_reader_client = build_clickhouse_client(&ch_url, &ch_database);
         let dashboard_reader = Arc::new(DashboardReader::new(ch_reader_client));
 
+        let kms = secureprompt_common::kms::kms_backend_from_env()
+            .map_err(|e| ApiError::Internal(format!("KMS init failed: {e}")))?;
+
         Ok(Self {
             db,
             config,
@@ -89,6 +96,7 @@ impl AppState {
             budgets,
             dashboard_reader,
             auth_cache: Arc::new(DashMap::new()),
+            kms,
         })
     }
 
