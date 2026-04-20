@@ -29,8 +29,16 @@ pub const QUEUE_AUDIT_EXPORT: &str = "queue:audit_export";
 /// Redis list key for data retention purge tasks.
 pub const QUEUE_RETENTION: &str = "queue:retention";
 
+/// Redis list key for policy rule RAG indexing tasks.
+pub const QUEUE_POLICY_INDEX: &str = "queue:policy_index";
+
 /// All queue names as a slice — used by worker BLPOP call.
-pub const ALL_QUEUES: [&str; 3] = [QUEUE_ANALYTICS, QUEUE_AUDIT_EXPORT, QUEUE_RETENTION];
+pub const ALL_QUEUES: [&str; 4] = [
+    QUEUE_ANALYTICS,
+    QUEUE_AUDIT_EXPORT,
+    QUEUE_RETENTION,
+    QUEUE_POLICY_INDEX,
+];
 
 // ── Task envelope (D-21) ───────────────────────────────────────────────────────
 
@@ -92,6 +100,9 @@ pub mod task_types {
     /// (Worker can also handle this inline, but the task type is defined
     /// here for symmetry with the cron approach in Plan 06-01 Task 3.)
     pub const API_KEY_ROTATION_CLEANUP: &str = "api_key.rotation_cleanup";
+
+    /// Index a policy rule into the policy_rag Qdrant collection (QD-01..03).
+    pub const INDEX_POLICY_RULE: &str = "policy.index_rule";
 }
 
 #[cfg(test)]
@@ -124,10 +135,21 @@ mod tests {
     }
 
     #[test]
-    fn all_queues_covers_three_queues() {
-        assert_eq!(ALL_QUEUES.len(), 3);
+    fn all_queues_covers_four_queues() {
+        assert_eq!(ALL_QUEUES.len(), 4);
         assert!(ALL_QUEUES.contains(&QUEUE_ANALYTICS));
         assert!(ALL_QUEUES.contains(&QUEUE_AUDIT_EXPORT));
         assert!(ALL_QUEUES.contains(&QUEUE_RETENTION));
+        assert!(ALL_QUEUES.contains(&QUEUE_POLICY_INDEX));
+    }
+
+    #[test]
+    fn policy_index_queue_constant() {
+        assert_eq!(QUEUE_POLICY_INDEX, "queue:policy_index");
+    }
+
+    #[test]
+    fn index_policy_rule_task_type() {
+        assert_eq!(task_types::INDEX_POLICY_RULE, "policy.index_rule");
     }
 }
