@@ -224,3 +224,40 @@ jobs:
             exit 1
           fi
           echo "OK: No hardcoded passwords in Grafana dashboard JSON files"
+
+  frontend:
+    name: Frontend (Next.js, TypeScript)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: secureprompt-web/pnpm-lock.yaml
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: cd secureprompt-web && pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: cd secureprompt-web && pnpm exec eslint .
+
+      - name: Build
+        run: cd secureprompt-web && pnpm build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8080
+          NEXTAUTH_SECRET: ci-placeholder-secret
+          NEXTAUTH_URL: http://localhost:3000
+
+      - name: Type check
+        run: cd secureprompt-web && pnpm exec tsc --noEmit
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8080
+          NEXTAUTH_SECRET: ci-placeholder-secret
+          NEXTAUTH_URL: http://localhost:3000
