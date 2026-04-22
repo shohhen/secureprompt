@@ -46,13 +46,13 @@ async fn main() -> anyhow::Result<()> {
         public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
     };
 
+    init_telemetry(&config.telemetry);
+
     if config.public_signup_enabled {
         tracing::warn!(
             "public signup is enabled (SECUREPROMPT_PUBLIC_SIGNUP_ENABLED) — this should only be on for cloud/demo deployments"
         );
     }
-
-    init_telemetry(&config.telemetry);
 
     let db = PgPoolOptions::new()
         .max_connections(config.database.max_connections)

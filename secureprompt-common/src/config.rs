@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn public_signup_enabled_parses_truthy_values() {
         let _g = env_lock();
-        for v in ["1", "true", "TRUE", "yes", "YES"] {
+        for v in ["1", "true", "TRUE", "yes", "YES", "  true  "] {
             std::env::set_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED", v);
             assert!(
                 super::AppConfig::public_signup_enabled_from_env(),
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn public_signup_enabled_rejects_non_truthy() {
         let _g = env_lock();
-        for v in ["0", "false", "no", "", "maybe"] {
+        for v in ["0", "false", "no", "", "maybe", "  "] {
             std::env::set_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED", v);
             assert!(
                 !super::AppConfig::public_signup_enabled_from_env(),
