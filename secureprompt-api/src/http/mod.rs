@@ -172,7 +172,6 @@ pub fn api_error_response(error: ApiError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
 
     #[test]
     fn too_many_requests_maps_to_429() {
