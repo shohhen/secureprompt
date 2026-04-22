@@ -89,6 +89,7 @@ fn build_state(pool: PgPool) -> AppState {
             access_ttl_secs: 900,
             refresh_ttl_secs: 2_592_000,
         },
+        public_signup_enabled: false,
     };
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));
     AppState::new(pool, config, ml_sidecar)

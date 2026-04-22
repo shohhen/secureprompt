@@ -43,6 +43,7 @@ pub fn test_config() -> AppConfig {
             access_ttl_secs: JwtConfig::DEFAULT_ACCESS_TTL_SECS,
             refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
+        public_signup_enabled: false,
     }
 }
 

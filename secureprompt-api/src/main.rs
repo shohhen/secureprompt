@@ -43,7 +43,14 @@ async fn main() -> anyhow::Result<()> {
         },
         jwt: JwtConfig::from_env()
             .map_err(|msg| anyhow::anyhow!("invalid JWT configuration: {msg}"))?,
+        public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
     };
+
+    if config.public_signup_enabled {
+        tracing::warn!(
+            "public signup is enabled (SECUREPROMPT_PUBLIC_SIGNUP_ENABLED) — this should only be on for cloud/demo deployments"
+        );
+    }
 
     init_telemetry(&config.telemetry);
 

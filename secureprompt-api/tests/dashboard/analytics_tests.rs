@@ -73,6 +73,7 @@ fn test_config() -> AppConfig {
             access_ttl_secs: 900,
             refresh_ttl_secs: 3600,
         },
+        public_signup_enabled: false,
     }
 }
 

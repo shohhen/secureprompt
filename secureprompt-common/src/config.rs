@@ -9,6 +9,24 @@ pub struct AppConfig {
     pub clickhouse: ClickhouseConfig,
     /// Phase 5 / Plan 05-01 — dashboard JWT signing + rotation parameters.
     pub jwt: JwtConfig,
+    /// Public `POST /v1/auth/register` endpoint. `false` in on-prem
+    /// deployments (default); enabled explicitly for cloud/demo.
+    /// Populated from `SECUREPROMPT_PUBLIC_SIGNUP_ENABLED`.
+    #[serde(default)]
+    pub public_signup_enabled: bool,
+}
+
+impl AppConfig {
+    /// Parse `SECUREPROMPT_PUBLIC_SIGNUP_ENABLED` from the environment.
+    /// Truthy values: `1`, `true`, `yes` (case-insensitive). Everything else
+    /// (including unset) → `false`.
+    #[must_use]
+    pub fn public_signup_enabled_from_env() -> bool {
+        std::env::var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,5 +201,38 @@ mod tests {
         clear_jwt_env();
         assert_eq!(cfg.access_ttl_secs, JwtConfig::DEFAULT_ACCESS_TTL_SECS);
         assert_eq!(cfg.refresh_ttl_secs, JwtConfig::DEFAULT_REFRESH_TTL_SECS);
+    }
+
+    #[test]
+    fn public_signup_enabled_defaults_to_false_when_unset() {
+        let _g = env_lock();
+        std::env::remove_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED");
+        assert!(!super::AppConfig::public_signup_enabled_from_env());
+    }
+
+    #[test]
+    fn public_signup_enabled_parses_truthy_values() {
+        let _g = env_lock();
+        for v in ["1", "true", "TRUE", "yes", "YES"] {
+            std::env::set_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED", v);
+            assert!(
+                super::AppConfig::public_signup_enabled_from_env(),
+                "{v} should parse as true"
+            );
+        }
+        std::env::remove_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED");
+    }
+
+    #[test]
+    fn public_signup_enabled_rejects_non_truthy() {
+        let _g = env_lock();
+        for v in ["0", "false", "no", "", "maybe"] {
+            std::env::set_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED", v);
+            assert!(
+                !super::AppConfig::public_signup_enabled_from_env(),
+                "{v} should parse as false"
+            );
+        }
+        std::env::remove_var("SECUREPROMPT_PUBLIC_SIGNUP_ENABLED");
     }
 }

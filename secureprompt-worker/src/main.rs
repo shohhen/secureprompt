@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             access_ttl_secs: JwtConfig::DEFAULT_ACCESS_TTL_SECS,
             refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
+        public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
     };
 
     init_telemetry(&config.telemetry);
