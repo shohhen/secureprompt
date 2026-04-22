@@ -25,6 +25,9 @@ pub struct AppState {
     pub db: PgPool,
     pub config: AppConfig,
     pub redis_rate_limiter: Arc<RateLimiter>,
+    /// Per-IP limiter for `POST /v1/auth/register` (10 requests / 1 hour).
+    /// In-memory, process-local — sharing across replicas is a follow-up.
+    pub signup_rate_limiter: Arc<RateLimiter>,
     pub redis_config_cache: Arc<ConfigCache>,
     pub providers: ProviderCatalog,
     pub analytics: AnalyticsHandle,
@@ -84,6 +87,7 @@ impl AppState {
             db,
             config,
             redis_rate_limiter: Arc::new(RateLimiter::new(60, 60)),
+            signup_rate_limiter: Arc::new(RateLimiter::new(10, 3600)),
             redis_config_cache: Arc::new(ConfigCache::default()),
             providers: ProviderCatalog::with_defaults(),
             analytics: AnalyticsHandle::new(metrics.clone(), &ch_url, &ch_database),

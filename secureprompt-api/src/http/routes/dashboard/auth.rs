@@ -341,7 +341,7 @@ fn random_refresh_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn client_ip_key(headers: &HeaderMap) -> String {
+pub(crate) fn client_ip_key(headers: &HeaderMap) -> String {
     // Prefer `X-Forwarded-For` when nginx terminates TLS. The router does
     // not currently attach `ConnectInfo` (no `into_make_service_with_connect_info`
     // call), so header-only extraction is the supported path for on-prem
