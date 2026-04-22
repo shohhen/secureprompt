@@ -14,6 +14,9 @@ pub mod jwt;
 #[path = "auth_tests.rs"]
 pub mod auth;
 
+#[path = "auth_register_tests.rs"]
+pub mod auth_register;
+
 #[path = "budgets_tests.rs"]
 pub mod budgets;
 

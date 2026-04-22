@@ -72,6 +72,13 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub workspace_name: String,
+}
+
 // ---------- Router ----------
 
 /// Dashboard auth routes. `/logout` is wrapped in the JWT middleware so
@@ -109,6 +116,7 @@ pub fn build_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/token", post(token))
         .route("/refresh", post(refresh))
+        .route("/register", post(register))
         .route("/logout", post(logout).route_layer(jwt_layer))
 }
 
@@ -275,6 +283,45 @@ pub async fn logout(
     let _ = state.refresh_tokens.revoke_all_for_user(ctx.user_id).await;
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /v1/auth/register` — create a workspace + owner user in one call.
+///
+/// Gated by `AppConfig.public_signup_enabled`. Public route (no JWT layer).
+pub async fn register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RegisterRequest>,
+) -> Response {
+    if !state.config.public_signup_enabled {
+        return api_error_to_response(ApiError::Forbidden(
+            "public signup is disabled on this deployment".into(),
+        ));
+    }
+
+    let _ip_key = client_ip_key(&headers); // wired up in Task 9
+
+    let email = body.email.trim().to_ascii_lowercase();
+    let workspace_name = body.workspace_name.trim().to_owned();
+
+    let hash = match user_repo::hash_password(&body.password) {
+        Ok(h) => h,
+        Err(err) => return api_error_to_response(err),
+    };
+
+    let ws_repo = crate::db::workspace_repo::WorkspaceRepository::new(state.db.clone());
+    let (ws, user) = match ws_repo
+        .create_with_owner(&workspace_name, &email, &hash)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(err) => return api_error_to_response(err),
+    };
+
+    match build_token_pair_body(&state, user.id, ws.id, "owner", &user.email).await {
+        Ok(body) => (StatusCode::CREATED, JsonResponse(body)).into_response(),
+        Err(err) => api_error_to_response(err),
+    }
 }
 
 // ---------- Helpers ----------
