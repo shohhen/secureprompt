@@ -118,11 +118,7 @@ impl UserRepository {
         plaintext_password: &str,
         role: &str,
     ) -> Result<UserRow, ApiError> {
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
-            .hash_password(plaintext_password.as_bytes(), &salt)
-            .map_err(|e| ApiError::Internal(format!("password hash failed: {e}")))?
-            .to_string();
+        let hash = hash_password(plaintext_password)?;
 
         let row = sqlx::query(
             "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
@@ -180,6 +176,21 @@ impl UserRepository {
             role: record.get("role"),
         }))
     }
+}
+
+/// Hash a plaintext password with Argon2id using OS randomness for the salt.
+/// Centralised so every caller (`create_user`, the workspace + owner flow)
+/// uses the same parameters.
+///
+/// # Errors
+/// Returns `ApiError::Internal` if the argon2 crate fails (extremely rare —
+/// typically an OOM condition).
+pub fn hash_password(plaintext: &str) -> Result<String, ApiError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| ApiError::Internal(format!("password hash failed: {e}")))
 }
 
 /// Verify a plaintext password against an Argon2id PHC hash string. Returns
