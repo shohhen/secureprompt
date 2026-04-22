@@ -298,7 +298,7 @@ fn validate_register_input(
             "password must be 8–128 characters".into(),
         ));
     }
-    if workspace_name.is_empty() || workspace_name.len() > 100 {
+    if workspace_name.is_empty() || workspace_name.chars().count() > 100 {
         return Err(ApiError::BadRequest(
             "workspace_name must be 1–100 characters".into(),
         ));
@@ -320,6 +320,10 @@ pub async fn register(
         ));
     }
 
+    // Rate limit BEFORE validation so malformed-request bursts (e.g. a
+    // brute-force probe spraying garbage payloads) still count against the
+    // per-IP quota. The spec §5 originally specified the opposite ordering,
+    // but security review (Task 9) overrode it.
     let ip_key = client_ip_key(&headers);
     if state
         .signup_rate_limiter
@@ -353,6 +357,11 @@ pub async fn register(
         Err(err) => return api_error_to_response(err),
     };
 
+    // KNOWN BEHAVIOUR: if `build_token_pair_body` fails after `create_with_owner`
+    // has already committed, the workspace + user rows exist but the client
+    // gets a 500 with no token. They can recover by calling `POST /v1/auth/token`
+    // with their email/password. This is rare (only fires on Redis or DB
+    // failure during refresh-token persistence) and acceptable for MVP.
     match build_token_pair_body(&state, user.id, ws.id, "owner", &user.email).await {
         Ok(body) => (StatusCode::CREATED, JsonResponse(body)).into_response(),
         Err(err) => api_error_to_response(err),
