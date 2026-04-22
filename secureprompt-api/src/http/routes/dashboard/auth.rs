@@ -285,6 +285,27 @@ pub async fn logout(
     StatusCode::NO_CONTENT.into_response()
 }
 
+fn validate_register_input(
+    email: &str,
+    password: &str,
+    workspace_name: &str,
+) -> Result<(), ApiError> {
+    if email.is_empty() || email.len() > 255 || !email.contains('@') {
+        return Err(ApiError::BadRequest("email invalid".into()));
+    }
+    if password.len() < 8 || password.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "password must be 8–128 characters".into(),
+        ));
+    }
+    if workspace_name.is_empty() || workspace_name.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "workspace_name must be 1–100 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /v1/auth/register` — create a workspace + owner user in one call.
 ///
 /// Gated by `AppConfig.public_signup_enabled`. Public route (no JWT layer).
@@ -303,6 +324,10 @@ pub async fn register(
 
     let email = body.email.trim().to_ascii_lowercase();
     let workspace_name = body.workspace_name.trim().to_owned();
+
+    if let Err(err) = validate_register_input(&email, &body.password, &workspace_name) {
+        return api_error_to_response(err);
+    }
 
     let hash = match user_repo::hash_password(&body.password) {
         Ok(h) => h,

@@ -188,3 +188,63 @@ async fn register_returns_token_pair_that_authenticates_subsequent_request(pool:
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── 4 ──────────────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn register_rejects_short_password_with_400(pool: PgPool) {
+    let app = build_app(pool.clone(), true);
+    let resp = app
+        .oneshot(post_register(register_body(
+            "a@b.com",
+            "short",
+            "Acme",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let ws_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ws_count, 0);
+}
+
+// ── 5 ──────────────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn register_rejects_invalid_email_with_400(pool: PgPool) {
+    let app = build_app(pool.clone(), true);
+    let resp = app
+        .oneshot(post_register(register_body(
+            "notanemail",
+            "correct-horse-staple",
+            "Acme",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let ws_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ws_count, 0);
+}
+
+// ── 6 ──────────────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn register_rejects_blank_workspace_name_with_400(pool: PgPool) {
+    let app = build_app(pool.clone(), true);
+    let resp = app
+        .oneshot(post_register(register_body(
+            "a@b.com",
+            "correct-horse-staple",
+            "   ",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
