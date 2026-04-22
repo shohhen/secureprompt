@@ -279,13 +279,16 @@ pub async fn logout(
 
 // ---------- Helpers ----------
 
-pub(crate) async fn issue_token_pair(
+/// Build a `TokenResponse` (access + refresh, with persistence side-effects)
+/// without wrapping in an HTTP response. Both `/auth/token` (200) and
+/// `/auth/register` (201) use this, then differ only in the status code.
+pub(crate) async fn build_token_pair_body(
     state: &AppState,
     user_id: Uuid,
     workspace_id: Uuid,
     role: &str,
     email: &str,
-) -> Response {
+) -> Result<TokenResponse, ApiError> {
     let now = Utc::now();
     let access_exp = now + Duration::seconds(state.jwt.access_ttl_secs as i64);
     let refresh_exp = now + Duration::seconds(state.jwt.refresh_ttl_secs as i64);
@@ -298,21 +301,15 @@ pub(crate) async fn issue_token_pair(
         exp: access_exp.timestamp(),
         jti,
     };
-    let access_token = match encode_access(state, &access_claims) {
-        Ok(token) => token,
-        Err(err) => return api_error_to_response(err),
-    };
+    let access_token = encode_access(state, &access_claims)?;
 
     let refresh_raw = random_refresh_token();
-    if let Err(err) = state
+    state
         .refresh_tokens
         .insert(user_id, workspace_id, &refresh_raw, refresh_exp)
-        .await
-    {
-        return api_error_to_response(err);
-    }
+        .await?;
 
-    let body = TokenResponse {
+    Ok(TokenResponse {
         access_token,
         refresh_token: refresh_raw,
         user: UserDto {
@@ -323,8 +320,20 @@ pub(crate) async fn issue_token_pair(
         role: role.to_owned(),
         access_expires_at: access_exp.timestamp(),
         refresh_expires_at: refresh_exp.timestamp(),
-    };
-    (StatusCode::OK, JsonResponse(body)).into_response()
+    })
+}
+
+pub(crate) async fn issue_token_pair(
+    state: &AppState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    role: &str,
+    email: &str,
+) -> Response {
+    match build_token_pair_body(state, user_id, workspace_id, role, email).await {
+        Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
+        Err(err) => api_error_to_response(err),
+    }
 }
 
 fn encode_access(state: &AppState, claims: &Claims) -> Result<String, ApiError> {
