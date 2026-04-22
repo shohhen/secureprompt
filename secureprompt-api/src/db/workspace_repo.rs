@@ -61,6 +61,7 @@ impl WorkspaceRepository {
     ///
     /// * `password_hash` must already be Argon2id-encoded
     ///   (see `crate::db::user_repo::hash_password`).
+    /// * `workspace_name` must be pre-trimmed (no leading/trailing whitespace).
     /// * On unique-email collision, returns `ApiError::Conflict` and the
     ///   transaction rolls back — no workspace row is left behind.
     ///
@@ -96,6 +97,10 @@ impl WorkspaceRepository {
             updated_at: ws_row.get("updated_at"),
         };
 
+        // Role is hardcoded to 'owner' here and is NOT included in the RETURNING
+        // clause — the caller already knows the role. `UserRow` has no `role`
+        // field; if a caller ever needs it, they must re-fetch (see
+        // `UserRepository::find_by_email_with_role`).
         let user_row = sqlx::query(
             "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
              VALUES (gen_random_uuid(), $1, $2, $3, 'owner', NOW(), NOW())
@@ -185,6 +190,15 @@ mod tests {
             ApiError::Conflict(_) => {}
             other => panic!("expected Conflict, got {other:?}"),
         }
+
+        let user_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            user_count_after, 1,
+            "failed register must not orphan a partial user row"
+        );
 
         // Workspace count must be unchanged — no orphan from the failed tx.
         let ws_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
