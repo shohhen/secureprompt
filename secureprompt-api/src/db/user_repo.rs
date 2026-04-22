@@ -1,5 +1,5 @@
 use argon2::{
-    password_hash::{PasswordHash, PasswordVerifier},
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use chrono::{DateTime, Utc};
@@ -107,6 +107,51 @@ impl UserRepository {
                 updated_at: record.get("updated_at"),
             })
             .collect())
+    }
+
+    /// Create a new user in the workspace with an Argon2id-hashed password.
+    /// Returns `ApiError::Conflict` if the email is already taken.
+    pub async fn create_user(
+        &self,
+        workspace_id: WorkspaceId,
+        email: &str,
+        plaintext_password: &str,
+        role: &str,
+    ) -> Result<UserRow, ApiError> {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(plaintext_password.as_bytes(), &salt)
+            .map_err(|e| ApiError::Internal(format!("password hash failed: {e}")))?
+            .to_string();
+
+        let row = sqlx::query(
+            "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW(), NOW())
+             RETURNING id, workspace_id, email, password_hash, created_at, updated_at",
+        )
+        .bind(workspace_id.0)
+        .bind(email)
+        .bind(&hash)
+        .bind(role)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            let msg = error.to_string();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                ApiError::Conflict("email already in use".into())
+            } else {
+                ApiError::Database(msg)
+            }
+        })?;
+
+        Ok(UserRow {
+            id: row.get("id"),
+            workspace_id: row.get("workspace_id"),
+            email: row.get("email"),
+            password_hash: row.get("password_hash"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
     }
 
     /// Look up a user by email including the `role` column. Used by

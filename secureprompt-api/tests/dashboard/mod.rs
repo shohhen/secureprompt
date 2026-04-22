@@ -28,3 +28,9 @@ pub mod settings;
 
 #[path = "rls_matrix.rs"]
 pub mod rls;
+
+#[path = "users_tests.rs"]
+pub mod users;
+
+#[path = "secure_mode_tests.rs"]
+pub mod secure_mode;

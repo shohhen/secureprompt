@@ -1,32 +1,47 @@
 /**
- * Next.js 16 proxy (renamed from middleware.ts — 05-PATTERNS Pitfall #6).
+ * Next.js 16 proxy — auth guard + security headers (merged from middleware.ts).
  *
- * Gates dashboard routes: any unauthenticated request to a non-/login path
- * is redirected to /login with the original path preserved as callbackUrl.
- * Authenticated users visiting /login are redirected to callbackUrl or "/".
+ * Next.js 16 only allows one file: src/proxy.ts.  This replaces both the
+ * old middleware.ts (CSP / security headers) and the initial auth-only proxy.
  *
- * IMPORTANT: file path MUST be `src/proxy.ts`, NOT `src/middleware.ts`.
- * Next.js 16 emits a deprecation warning for the legacy name.
+ * Behaviour per request:
+ *   1. Unauthenticated → /login with callbackUrl preserved.
+ *   2. Authenticated on /login → redirect to callbackUrl or "/".
+ *   3. All responses get nonce-based CSP + X-Frame-Options + Referrer-Policy
+ *      + X-Content-Type-Options headers.
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { buildCsp } from "@/lib/csp";
 
 export default auth((req) => {
+  const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+  const csp = buildCsp(nonce);
+
   const { nextUrl } = req;
   const isLogin = nextUrl.pathname === "/login";
+
+  let response: Response;
 
   if (!req.auth && !isLogin) {
     const url = new URL("/login", nextUrl);
     url.searchParams.set("callbackUrl", nextUrl.pathname + nextUrl.search);
-    return NextResponse.redirect(url);
-  }
-
-  if (req.auth && isLogin) {
+    response = NextResponse.redirect(url);
+  } else if (req.auth && isLogin) {
     const cb = nextUrl.searchParams.get("callbackUrl") ?? "/";
-    return NextResponse.redirect(new URL(cb, nextUrl));
+    response = NextResponse.redirect(new URL(cb, nextUrl));
+  } else {
+    const requestHeaders = new Headers(req.headers);
+    requestHeaders.set("x-nonce", nonce);
+    response = NextResponse.next({ request: { headers: requestHeaders } });
   }
 
-  return NextResponse.next();
+  response.headers.set("Content-Security-Policy", csp);
+  response.headers.set("X-Frame-Options", "DENY");
+  response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  response.headers.set("X-Content-Type-Options", "nosniff");
+
+  return response;
 });
 
 export const config = {

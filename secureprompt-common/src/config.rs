@@ -140,6 +140,13 @@ impl JwtConfig {
 #[cfg(test)]
 mod tests {
     use super::JwtConfig;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn clear_jwt_env() {
         std::env::remove_var("SECUREPROMPT_JWT_SECRET");
@@ -150,6 +157,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_secret() {
+        let _g = env_lock();
         clear_jwt_env();
         let result = JwtConfig::from_env();
         assert!(result.is_err(), "missing secret must error");
@@ -157,6 +165,7 @@ mod tests {
 
     #[test]
     fn rejects_secret_equal_to_provider_key() {
+        let _g = env_lock();
         clear_jwt_env();
         std::env::set_var("SECUREPROMPT_JWT_SECRET", "same-string");
         std::env::set_var("SECUREPROMPT_PROVIDER_KEY", "same-string");
@@ -167,6 +176,7 @@ mod tests {
 
     #[test]
     fn loads_defaults_when_ttl_unset() {
+        let _g = env_lock();
         clear_jwt_env();
         std::env::set_var("SECUREPROMPT_JWT_SECRET", "distinct-secret-value");
         let cfg = JwtConfig::from_env().expect("valid secret");

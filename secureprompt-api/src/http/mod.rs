@@ -15,6 +15,7 @@ use secureprompt_common::errors::ApiError;
 use serde_json::json;
 
 pub fn build_router(state: AppState) -> Router {
+    // MCP utility routes — registered below the OpenAI compat routes.
     // Phase 5 / Plan 05-01 — dashboard auth routes nest under `/v1/auth`.
     // `/token` and `/refresh` are public; `/logout` gets the JWT middleware
     // applied per-route inside `dashboard::auth::routes` (Task 5-01-C).
@@ -29,6 +30,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/completions", post(routes::openai::completions))
         .route("/v1/embeddings", post(routes::openai::embeddings))
         .route("/metrics", get(routes::openai::metrics))
+        .route("/openapi.json", get(openapi_json))
+        .route("/v1/redact", post(routes::mcp_routes::redact))
+        .route(
+            "/v1/tokens/estimate",
+            post(routes::mcp_routes::tokens_estimate),
+        )
+        .route("/v1/policy/check", post(routes::mcp_routes::policy_check))
         .nest(
             "/v1/auth",
             routes::dashboard::auth::build_router(state.clone())
@@ -90,8 +98,37 @@ pub fn build_router(state: AppState) -> Router {
                     middleware::jwt_auth::require,
                 )),
         )
+        .nest(
+            "/v1/users",
+            routes::dashboard::users::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
+            "/v1/secure-mode",
+            routes::dashboard::secure_mode::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
         .with_state(state)
+}
+
+async fn openapi_json() -> impl IntoResponse {
+    const SPEC: &str = include_str!(
+        "../../../secureprompt-schemas/openapi/v1/openapi.json"
+    );
+    (
+        [
+            ("content-type", "application/json"),
+            ("access-control-allow-origin", "*"),
+        ],
+        SPEC,
+    )
 }
 
 pub fn api_error_response(error: ApiError) -> Response {
@@ -105,6 +142,7 @@ pub fn api_error_response(error: ApiError) -> Response {
         ApiError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
         // Phase 6 / Plan 06-01: auth-cache fallback exhausted (D-15, PG-04).
         ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ApiError::Conflict(_) => StatusCode::CONFLICT,
         ApiError::Database(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 

@@ -172,3 +172,8 @@ pub async fn response_text(response: Response) -> String {
         .to_bytes();
     String::from_utf8(bytes.to_vec()).expect("body must be utf-8")
 }
+
+pub async fn response_json(response: Response) -> Value {
+    let text = response_text(response).await;
+    serde_json::from_str(&text).expect("response must be valid JSON")
+}

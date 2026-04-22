@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 
-use crate::ml_sidecar::types::{MlDetection, NerRequest, NerResponse};
+use crate::ml_sidecar::types::{MlDetection, NerRequest, NerResponse, RagCheckRequest, RagCheckResponse};
 
 const FAILURE_THRESHOLD: u32 = 5;
 const OPEN_DURATION_SECS: u64 = 30;
@@ -159,6 +159,53 @@ impl MlSidecarClient {
         }
     }
 
+    /// Call `/v1/rag-check` on the ML sidecar. Returns empty response (no matches)
+    /// when the circuit is OPEN or the sidecar is disabled (fail-open, D-13).
+    pub async fn rag_check_if_available(&self, text: &str, workspace_id: uuid::Uuid) -> RagCheckResponse {
+        let empty = RagCheckResponse {
+            matches: vec![],
+            is_match: false,
+        };
+
+        let (http, circuit) = match (&self.http, &self.circuit) {
+            (Some(h), Some(c)) if self.enabled => (h, c),
+            _ => return empty,
+        };
+
+        if circuit.is_open() {
+            return empty;
+        }
+
+        let url = format!("{}/v1/rag-check", self.base_url);
+        let body = RagCheckRequest {
+            text: text.to_owned(),
+            workspace_id: workspace_id.to_string(),
+        };
+
+        match http.post(&url).json(&body).send().await {
+            Ok(resp) => match resp.json::<RagCheckResponse>().await {
+                Ok(r) => {
+                    circuit.record_success();
+                    r
+                }
+                Err(_) => {
+                    if circuit.record_failure() {
+                        self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.failures_total.fetch_add(1, Ordering::Relaxed);
+                    empty
+                }
+            },
+            Err(_) => {
+                if circuit.record_failure() {
+                    self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.failures_total.fetch_add(1, Ordering::Relaxed);
+                empty
+            }
+        }
+    }
+
     /// Prometheus metrics for the ML sidecar client.
     /// Append to the main metrics output in the /metrics HTTP handler.
     #[must_use]
@@ -214,6 +261,28 @@ mod tests {
     fn test_invalid_scheme_disables_client() {
         let client = MlSidecarClient::new("ftp://evil.example.com/ner".to_owned(), 200);
         assert!(!client.enabled, "invalid scheme must disable client");
+    }
+
+    /// rag_check_if_available returns empty when disabled.
+    #[tokio::test]
+    async fn test_rag_check_disabled_returns_empty() {
+        let client = MlSidecarClient::new(String::new(), 200);
+        let result = client
+            .rag_check_if_available("some prompt", uuid::Uuid::new_v4())
+            .await;
+        assert!(!result.is_match, "disabled client must return is_match=false");
+        assert!(result.matches.is_empty(), "disabled client must return empty matches");
+    }
+
+    /// rag_check_if_available returns empty when sidecar is unreachable.
+    #[tokio::test]
+    async fn test_rag_check_unreachable_returns_empty() {
+        let client = MlSidecarClient::new("http://127.0.0.1:19999".to_owned(), 50);
+        let result = client
+            .rag_check_if_available("some prompt", uuid::Uuid::new_v4())
+            .await;
+        assert!(!result.is_match);
+        assert!(result.matches.is_empty());
     }
 
     /// T-03-06b: circuit_open_count increments exactly on the 5th consecutive failure.

@@ -29,7 +29,13 @@ function BudgetExceededListener() {
   return null;
 }
 
-export function Providers({ children }: { children: ReactNode }) {
+export function Providers({
+  children,
+  nonce,
+}: {
+  children: ReactNode;
+  nonce?: string;
+}) {
   const queryClient = getQueryClient();
   return (
     <SessionProvider>

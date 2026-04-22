@@ -74,6 +74,20 @@ impl PipelineService {
         let ml_detections = self.state.ml_sidecar.detect_if_available(&prompt).await;
         pipeline_state.detections = merge_detections(regex_detections, ml_detections);
 
+        let rag_result = self
+            .state
+            .ml_sidecar
+            .rag_check_if_available(&prompt, auth.workspace_id.0)
+            .await;
+        if rag_result.is_match {
+            tracing::info!(
+                %request_id,
+                workspace_id = %auth.workspace_id,
+                match_count = rag_result.matches.len(),
+                "rag_check: policy rule semantic matches found"
+            );
+        }
+
         log_request_start(request_id, auth.workspace_id, &request.public_model);
 
         let policy_repo = crate::db::PolicyRepository::new(self.state.db.clone());

@@ -20,11 +20,9 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
-use secureprompt_common::{
-    crypto::{decode_encrypted, encode_encrypted, encrypt_aes_gcm},
-    errors::ApiError,
-};
+use secureprompt_common::errors::ApiError;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -114,6 +112,7 @@ async fn create_provider(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let encrypted = encrypt_credential(body.credential.as_deref(), &state)
+        .await
         .map_err(api_error_response)?;
 
     let repo = ProviderRepository::new(state.db.clone());
@@ -148,6 +147,7 @@ async fn update_provider(
     let encrypted_update: Option<Option<String>> = if body.credential.is_some() {
         Some(
             encrypt_credential(body.credential.as_deref(), &state)
+                .await
                 .map_err(api_error_response)?,
         )
     } else {
@@ -194,51 +194,40 @@ async fn delete_provider(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Encrypt a plaintext credential with AES-256-GCM using the provider key
-/// from `AppState`. Returns `None` when `plaintext` is `None`.
-///
-/// The key is loaded from `SECUREPROMPT_PROVIDER_KEY` (32-byte hex) which is
-/// validated to be distinct from `SECUREPROMPT_JWT_SECRET` at startup.
-///
-/// # Errors
-/// Returns `ApiError::Internal` when the provider key is missing or invalid,
-/// or when AES-GCM encryption fails.
-fn encrypt_credential(
+/// Encrypt a plaintext credential via `state.kms`. Returns `None` when `plaintext` is `None`.
+/// Output is URL-safe base64 of the raw ciphertext bytes returned by the KMS backend.
+async fn encrypt_credential(
     plaintext: Option<&str>,
     state: &AppState,
 ) -> Result<Option<String>, ApiError> {
     let Some(text) = plaintext else {
         return Ok(None);
     };
-
-    let key = load_provider_key(state)?;
-    let (nonce, ciphertext) = encrypt_aes_gcm(text.as_bytes(), &key)
+    let ciphertext = state
+        .kms
+        .encrypt(text.as_bytes())
+        .await
         .map_err(|e| ApiError::Internal(format!("credential encryption failed: {e}")))?;
-
-    Ok(Some(encode_encrypted(&nonce, &ciphertext)))
+    Ok(Some(URL_SAFE_NO_PAD.encode(&ciphertext)))
 }
 
-/// Load the 32-byte AES key from the environment (SECUREPROMPT_PROVIDER_KEY).
-fn load_provider_key(_state: &AppState) -> Result<[u8; 32], ApiError> {
-    let hex_key = std::env::var("SECUREPROMPT_PROVIDER_KEY").unwrap_or_else(|_| "0".repeat(64));
-    secureprompt_common::crypto::parse_provider_key(&hex_key)
-        .map_err(|e| ApiError::Internal(format!("provider key invalid: {e}")))
-}
-
-/// Decrypt a stored credential string. Used by the resolve_model_target path
-/// (not in this handler — the provider catalog calls it separately).
+/// Decrypt a stored credential string via `state.kms`.
+/// Input is URL-safe base64 of the raw ciphertext bytes stored in the database.
 ///
 /// # Errors
-/// Returns `ApiError::Internal` when the key or ciphertext is invalid.
+/// Returns `ApiError::Internal` when the ciphertext is invalid base64 or decryption fails.
 #[allow(dead_code)]
-pub fn decrypt_stored_credential(
+pub async fn decrypt_stored_credential(
     stored: &str,
     state: &AppState,
 ) -> Result<String, ApiError> {
-    let key = load_provider_key(state)?;
-    let (nonce, ct) = decode_encrypted(stored)
+    let raw = URL_SAFE_NO_PAD
+        .decode(stored)
         .map_err(|e| ApiError::Internal(format!("credential decode failed: {e}")))?;
-    let plaintext = secureprompt_common::crypto::decrypt_aes_gcm(&nonce, &ct, &key)
+    let plaintext = state
+        .kms
+        .decrypt(&raw)
+        .await
         .map_err(|e| ApiError::Internal(format!("credential decryption failed: {e}")))?;
     String::from_utf8(plaintext)
         .map_err(|e| ApiError::Internal(format!("credential not valid UTF-8: {e}")))

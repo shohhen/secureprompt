@@ -1,18 +1,54 @@
 openapi: 3.0.3
 info:
   title: SecurePrompt Gateway API
-  version: "0.1.0-stub"
+  version: "1.0.0"
   description: >
-    MINIMAL STUB consumed by Plan 05-02 codegen. Full spec ships with Plan
-    05-01 (auth-foundation) in the same wave. This stub pins the types
-    05-02 needs to compile; Plan 01's completion will replace this file and
-    `pnpm codegen:check` will detect the diff on CI.
+    SecurePrompt is an LLM security gateway that sits between enterprise
+    applications and AI providers. It redacts PII/secrets, enforces policy,
+    tracks token costs, and provides governance analytics.
+
+    Two auth schemes are used:
+    - **JWT** (`Authorization: Bearer eyJ...`) — dashboard routes
+    - **API Key** (`Authorization: Bearer sp-...`) — gateway + MCP utility routes
 servers:
   - url: http://localhost:8080
     description: Local dev Rust gateway
+  - url: https://api.secureprompt.tech
+    description: Cloud
+
+tags:
+  - name: Auth
+    description: JWT login / refresh / logout
+  - name: Gateway
+    description: OpenAI-compatible proxy endpoints (API key auth)
+  - name: MCP
+    description: MCP utility endpoints — redact, token estimate, policy check (API key auth)
+  - name: Analytics
+    description: ClickHouse dbt-mart analytics (JWT auth)
+  - name: Requests
+    description: Raw request event log with cursor pagination (JWT auth)
+  - name: Keys
+    description: API key management (JWT auth)
+  - name: Providers
+    description: LLM provider credential management (JWT auth)
+  - name: PolicyRules
+    description: Policy rule CRUD (JWT auth)
+  - name: Workspaces
+    description: Workspace budget management (JWT auth)
+  - name: Telemetry
+    description: Frontend error reporting (JWT auth)
+  - name: Billing
+    description: Billing usage and limits (JWT auth)
+  - name: Settings
+    description: Secure mode and webhook configuration (JWT auth)
+  - name: Observability
+    description: Prometheus metrics endpoint
+
 paths:
+  # ── Auth ─────────────────────────────────────────────────────────────────────
   /v1/auth/token:
     post:
+      tags: [Auth]
       summary: Issue access + refresh tokens for email/password
       operationId: issueToken
       requestBody:
@@ -29,13 +65,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/TokenResponse"
         "401":
-          description: Invalid credentials
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/auth/refresh:
     post:
+      tags: [Auth]
       summary: Refresh an access token using a refresh token
       operationId: refreshToken
       requestBody:
@@ -52,13 +86,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/TokenResponse"
         "401":
-          description: Refresh token invalid / replayed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/auth/logout:
     post:
+      tags: [Auth]
       summary: Revoke the current refresh token
       operationId: logout
       security:
@@ -66,31 +98,190 @@ paths:
       responses:
         "204":
           description: Revoked
+
+  # ── Gateway (OpenAI-compatible) ───────────────────────────────────────────────
+  /v1/chat/completions:
+    post:
+      tags: [Gateway]
+      summary: Chat completions (OpenAI-compatible)
+      description: >
+        Proxies to the configured LLM provider after PII redaction and policy
+        enforcement. Supports streaming via `stream: true`. Use an API key
+        (`sp-...`) in the Authorization header.
+      operationId: chatCompletions
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionsRequest"
+      responses:
+        "200":
+          description: >
+            OpenAI-compatible chat completion response, or a server-sent event
+            stream when `stream: true`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionsResponse"
+            text/event-stream:
+              schema:
+                type: string
+                description: "SSE stream of data: {...} chunks"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/BudgetExceeded"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/completions:
+    post:
+      tags: [Gateway]
+      summary: Text completions — legacy OpenAI endpoint
+      operationId: completions
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionRequest"
+      responses:
+        "200":
+          description: OpenAI-compatible completion response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/BudgetExceeded"
+
+  /v1/embeddings:
+    post:
+      tags: [Gateway]
+      summary: Embeddings (OpenAI-compatible)
+      operationId: embeddings
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbeddingsRequest"
+      responses:
+        "200":
+          description: OpenAI-compatible embeddings response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/BudgetExceeded"
+
+  # ── MCP Utilities ─────────────────────────────────────────────────────────────
+  /v1/redact:
+    post:
+      tags: [MCP]
+      summary: Redact PII and secrets from text
+      description: >
+        Runs regex + ML NER detection on the input text, replaces detected
+        values with opaque tokens, and returns the redacted text along with
+        the detection list. Respects workspace policy rules (may deny or
+        further redact). Requires an API key.
+      operationId: redact
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedactRequest"
+      responses:
+        "200":
+          description: Redacted text with detection list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedactResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/tokens/estimate:
+    post:
+      tags: [MCP]
+      summary: Estimate token count for a text + model pair
+      description: >
+        Approximates token count (1 token ≈ 4 characters, GPT-family
+        heuristic). No auth required for this endpoint.
+      operationId: estimateTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EstimateRequest"
+      responses:
+        "200":
+          description: Token estimate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EstimateResponse"
+
+  /v1/policy/check:
+    post:
+      tags: [MCP]
+      summary: Dry-run policy evaluation (no provider call)
+      description: >
+        Evaluates workspace policy rules against the given text without
+        making a downstream provider call. Returns whether the request would
+        be allowed and which policy events fired. Requires an API key.
+      operationId: checkPolicy
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyCheckRequest"
+      responses:
+        "200":
+          description: Policy check result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyCheckResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Analytics ─────────────────────────────────────────────────────────────────
   /v1/analytics/usage-daily:
     get:
+      tags: [Analytics]
       summary: Daily token and cost usage by workspace and model
       operationId: getUsageDaily
       security:
         - bearerAuth: []
       parameters:
-        - in: query
-          name: from
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: to
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: workspace_id
-          required: false
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/WorkspaceIdQuery"
         - in: query
           name: model
           required: false
@@ -106,48 +297,23 @@ paths:
                 items:
                   $ref: "#/components/schemas/UsageDailyRow"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: workspace_id mismatch (IDOR guard)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Forbidden"
         "404":
-          description: Mart not populated — run dbt build
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/NotFound"
+
   /v1/analytics/cost-by-model:
     get:
+      tags: [Analytics]
       summary: Daily cost with 7-day and 30-day rolling windows per model
       operationId: getCostByModel
       security:
         - bearerAuth: []
       parameters:
-        - in: query
-          name: from
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: to
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: workspace_id
-          required: false
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/WorkspaceIdQuery"
       responses:
         "200":
           description: Cost by model rows
@@ -158,100 +324,23 @@ paths:
                 items:
                   $ref: "#/components/schemas/CostByModelRow"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: workspace_id mismatch (IDOR guard)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Forbidden"
         "404":
-          description: Mart not populated — run dbt build
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
-  /v1/analytics/policy-violations:
-    get:
-      summary: Policy rule violation counts by workspace, rule, and day
-      operationId: getPolicyViolations
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: query
-          name: from
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: to
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: workspace_id
-          required: false
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Policy violations rows
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/PolicyViolationsRow"
-        "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
-        "403":
-          description: workspace_id mismatch (IDOR guard)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
-        "404":
-          description: Mart not populated — run dbt build
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/NotFound"
+
   /v1/analytics/latency-pctiles:
     get:
+      tags: [Analytics]
       summary: p50/p95/p99 latency percentiles by model and workspace, daily
       operationId: getLatencyPctiles
       security:
         - bearerAuth: []
       parameters:
-        - in: query
-          name: from
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: to
-          required: true
-          schema:
-            type: string
-            format: date
-        - in: query
-          name: workspace_id
-          required: false
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/WorkspaceIdQuery"
         - in: query
           name: model
           required: false
@@ -267,33 +356,111 @@ paths:
                 items:
                   $ref: "#/components/schemas/LatencyPctilesRow"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: workspace_id mismatch (IDOR guard)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Forbidden"
         "404":
-          description: Mart not populated — run dbt build
+          $ref: "#/components/responses/NotFound"
+
+  /v1/analytics/policy-violations:
+    get:
+      tags: [Analytics]
+      summary: Policy rule violation counts by workspace, rule, and day
+      operationId: getPolicyViolations
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/WorkspaceIdQuery"
+      responses:
+        "200":
+          description: Policy violations rows
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiError"
-  /v1/workspaces/{id}/budgets:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PolicyViolationsRow"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Requests ──────────────────────────────────────────────────────────────────
+  /v1/requests:
     get:
-      summary: Read the current workspace budget limits and live usage
+      tags: [Requests]
+      summary: List gateway requests (cursor-paginated)
       description: >
-        Any authenticated workspace member may read budgets. Missing rows
-        return defaults (null limits, behavior="warn", 0 usage). Current
-        usage is read live from Redis INCRBY counters that the enforcement
-        middleware writes to, so the dashboard always mirrors what the
-        pipeline sees.
-      operationId: getWorkspaceBudget
+        Reads raw `request_events` + `policy_events` from ClickHouse.
+        Maximum window: 90 days. Maximum page size: 200.
+        Pagination: pass `next_cursor` from the previous response as `cursor`.
+      operationId: listRequests
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: from
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Start of time window (default now - 7 days; max 90 days ago)
+        - in: query
+          name: to
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: End of time window (default now)
+        - in: query
+          name: model
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: has_violation
+          required: false
+          schema:
+            type: boolean
+          description: Filter to only requests that triggered at least one policy event
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: string
+          description: Opaque cursor from previous response's `next_cursor`
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - $ref: "#/components/parameters/WorkspaceIdQuery"
+      responses:
+        "200":
+          description: Paginated request list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListRequestsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/requests/{id}:
+    get:
+      tags: [Requests]
+      summary: Get a single request with policy events
+      operationId: getRequest
       security:
         - bearerAuth: []
       parameters:
@@ -305,29 +472,415 @@ paths:
             format: uuid
       responses:
         "200":
+          description: Request detail with policy events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── API Keys ──────────────────────────────────────────────────────────────────
+  /v1/keys:
+    get:
+      tags: [Keys]
+      summary: List API keys for the workspace
+      operationId: listKeys
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of API keys (plaintext never included)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KeyResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Keys]
+      summary: Create a new API key (admin only)
+      description: >
+        Returns the full plaintext key exactly once in `api_key`.
+        Store it immediately — it cannot be retrieved again.
+      operationId: createKey
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateKeyRequest"
+      responses:
+        "201":
+          description: Key created — plaintext returned once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateKeyResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/keys/{id}:
+    delete:
+      tags: [Keys]
+      summary: Revoke an API key (admin only)
+      operationId: revokeKey
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "204":
+          description: Key revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/keys/{id}/rotate:
+    post:
+      tags: [Keys]
+      summary: Rotate an API key (admin only)
+      description: >
+        Issues a new key and starts a grace period during which both keys
+        are valid. Idempotent within the grace window.
+      operationId: rotateKey
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: New key issued — plaintext returned once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateKeyResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Providers ─────────────────────────────────────────────────────────────────
+  /v1/providers:
+    get:
+      tags: [Providers]
+      summary: List LLM providers
+      operationId: listProviders
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of providers (credential never included)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProviderResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Providers]
+      summary: Create a provider (admin only)
+      operationId: createProvider
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProviderRequest"
+      responses:
+        "201":
+          description: Provider created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/providers/{id}:
+    put:
+      tags: [Providers]
+      summary: Update / rotate provider credential (admin only)
+      operationId: updateProvider
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProviderRequest"
+      responses:
+        "200":
+          description: Provider updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Providers]
+      summary: Delete a provider (admin only)
+      operationId: deleteProvider
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "204":
+          description: Provider deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Policy Rules ──────────────────────────────────────────────────────────────
+  /v1/policy-rules:
+    get:
+      tags: [PolicyRules]
+      summary: List policy rules
+      operationId: listPolicyRules
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of policy rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PolicyRuleResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [PolicyRules]
+      summary: Create a policy rule (admin only)
+      description: >
+        Action must be one of: `deny`, `allow`, `redact`, `transform`, `flag`.
+        Priority must be unique within the workspace (409 on conflict).
+        The rule is immediately indexed in Qdrant for semantic policy lookup.
+      operationId: createPolicyRule
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRuleRequest"
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRuleResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Priority already in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PriorityConflict"
+
+  /v1/policy-rules/{id}:
+    get:
+      tags: [PolicyRules]
+      summary: Get a single policy rule
+      operationId: getPolicyRule
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Policy rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRuleResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [PolicyRules]
+      summary: Update a policy rule (admin only)
+      operationId: updatePolicyRule
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRuleRequest"
+      responses:
+        "200":
+          description: Rule updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRuleResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Priority already in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PriorityConflict"
+    delete:
+      tags: [PolicyRules]
+      summary: Delete a policy rule (admin only)
+      operationId: deletePolicyRule
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "204":
+          description: Rule deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/policy-rules/{id}/enabled:
+    patch:
+      tags: [PolicyRules]
+      summary: Toggle enabled flag on a policy rule (admin only)
+      operationId: togglePolicyRuleEnabled
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ToggleRequest"
+      responses:
+        "200":
+          description: Rule updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRuleResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/policy-rules/{id}/dry-run:
+    patch:
+      tags: [PolicyRules]
+      summary: Toggle dry-run flag on a policy rule (admin only)
+      operationId: togglePolicyRuleDryRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ToggleRequest"
+      responses:
+        "200":
+          description: Rule updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRuleResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Workspace Budgets ─────────────────────────────────────────────────────────
+  /v1/workspaces/{id}/budgets:
+    get:
+      tags: [Workspaces]
+      summary: Read workspace budget limits and live usage
+      description: >
+        Any authenticated workspace member may read budgets. Missing rows
+        return defaults (null limits, behavior="warn", 0 usage). Usage is
+        read live from Redis counters.
+      operationId: getWorkspaceBudget
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
           description: Budget snapshot
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/BudgetResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: IDOR guard — requester is not in the target workspace
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Forbidden"
     put:
+      tags: [Workspaces]
       summary: Upsert workspace budget limits (admin only)
       operationId: putWorkspaceBudget
       security:
         - bearerAuth: []
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/IdPath"
       requestBody:
         required: true
         content:
@@ -341,23 +894,45 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BudgetResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "402":
-          description: Workspace budget exceeded (enforcement path).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/BudgetExceeded"
         "403":
-          description: IDOR guard or non-admin role
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Forbidden"
+
+  # ── Telemetry ─────────────────────────────────────────────────────────────────
+  /v1/telemetry/client-error:
+    post:
+      tags: [Telemetry]
+      summary: Report a frontend error event
+      description: >
+        Accepts bounded frontend error events. Logs via structured tracing
+        and increments the Prometheus counter
+        `secureprompt_dashboard_client_errors_total{component}`.
+        Does NOT persist to Postgres or ClickHouse.
+      operationId: reportClientError
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientErrorEvent"
+      responses:
+        "204":
+          description: Event accepted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Billing ───────────────────────────────────────────────────────────────────
   /v1/billing/usage:
     get:
+      tags: [Billing]
       summary: Get current billing period usage
-      tags:
-        - Billing
       operationId: getBillingUsage
       security:
         - bearerAuth: []
@@ -369,16 +944,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingUsage"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/billing/limits:
     get:
+      tags: [Billing]
       summary: Get billing limits and remaining allowance
-      tags:
-        - Billing
       operationId: getBillingLimits
       security:
         - bearerAuth: []
@@ -390,16 +961,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingLimits"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/billing/breakdown:
     get:
+      tags: [Billing]
       summary: Get billing breakdown by provider and model
-      tags:
-        - Billing
       operationId: getBillingBreakdown
       security:
         - bearerAuth: []
@@ -411,16 +978,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingBreakdown"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/billing/trends:
     get:
+      tags: [Billing]
       summary: Get billing trends over time
-      tags:
-        - Billing
       operationId: getBillingTrends
       security:
         - bearerAuth: []
@@ -432,16 +995,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingTrends"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Settings ──────────────────────────────────────────────────────────────────
   /v1/secure-mode:
     get:
+      tags: [Settings]
       summary: Get secure mode configuration
-      tags:
-        - Settings
       operationId: getSecureMode
       security:
         - bearerAuth: []
@@ -453,15 +1013,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SecureMode"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
     put:
+      tags: [Settings]
       summary: Update secure mode configuration
-      tags:
-        - Settings
       operationId: putSecureMode
       security:
         - bearerAuth: []
@@ -479,16 +1034,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/SecureMode"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/webhooks:
     get:
+      tags: [Settings]
       summary: List all webhooks
-      tags:
-        - Settings
       operationId: listWebhooks
       security:
         - bearerAuth: []
@@ -500,15 +1051,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookList"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
     post:
+      tags: [Settings]
       summary: Create a new webhook
-      tags:
-        - Settings
       operationId: createWebhook
       security:
         - bearerAuth: []
@@ -526,48 +1072,133 @@ paths:
               schema:
                 $ref: "#/components/schemas/Webhook"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/webhooks/{id}:
     delete:
+      tags: [Settings]
       summary: Delete a webhook
-      tags:
-        - Settings
       operationId: deleteWebhook
       security:
         - bearerAuth: []
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/IdPath"
       responses:
         "204":
           description: Webhook deleted
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiError"
+          $ref: "#/components/responses/Unauthorized"
         "404":
-          description: Webhook not found
+          $ref: "#/components/responses/NotFound"
+
+  # ── Observability ─────────────────────────────────────────────────────────────
+  /metrics:
+    get:
+      tags: [Observability]
+      summary: Prometheus metrics
+      description: >
+        Prometheus text exposition format. No authentication required.
+        Scrape this endpoint with your Prometheus instance.
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus metrics text
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /openapi.json:
+    get:
+      tags: [Observability]
+      summary: OpenAPI spec (JSON)
+      description: This spec, served as JSON with CORS headers.
+      operationId: getOpenApiSpec
+      responses:
+        "200":
+          description: OpenAPI 3.0 spec
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiError"
+                type: object
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: "Dashboard JWT — Authorization: Bearer eyJ..."
+    apiKeyAuth:
+      type: http
+      scheme: bearer
+      description: "API key — Authorization: Bearer sp-..."
+
+  parameters:
+    IdPath:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    FromDate:
+      in: query
+      name: from
+      required: true
+      schema:
+        type: string
+        format: date
+    ToDate:
+      in: query
+      name: to
+      required: true
+      schema:
+        type: string
+        format: date
+    WorkspaceIdQuery:
+      in: query
+      name: workspace_id
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: IDOR guard — must equal the JWT workspace_id when provided
+
+  responses:
+    BadRequest:
+      description: Bad request — validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Forbidden:
+      description: Insufficient role or workspace mismatch
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    BudgetExceeded:
+      description: Workspace budget exhausted
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BudgetExceededError"
+
   schemas:
+    # ── Auth ────────────────────────────────────────────────────────────────────
     TokenRequest:
       type: object
       required: [email, password]
@@ -579,12 +1210,14 @@ components:
           type: string
           format: password
           minLength: 1
+
     RefreshRequest:
       type: object
       required: [refresh_token]
       properties:
         refresh_token:
           type: string
+
     TokenResponse:
       type: object
       required:
@@ -595,18 +1228,16 @@ components:
       properties:
         access_token:
           type: string
-          description: Opaque JWT bearer token
         refresh_token:
           type: string
-          description: Opaque refresh token (rotated on refresh)
         access_expires_at:
           type: integer
           format: int64
-          description: Unix seconds when access_token expires
+          description: Unix seconds
         refresh_expires_at:
           type: integer
           format: int64
-          description: Unix seconds when refresh_token expires
+          description: Unix seconds
         user:
           type: object
           required: [id, email]
@@ -623,29 +1254,551 @@ components:
         role:
           type: string
           enum: [admin, member, viewer]
-    ApiError:
+
+    # ── Gateway ─────────────────────────────────────────────────────────────────
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+
+    ChatCompletionsRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          example: gpt-4o
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          type: object
+          nullable: true
+          properties:
+            include_usage:
+              type: boolean
+
+    ChatCompletionsResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: chat.completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: "#/components/schemas/ChatMessage"
+              finish_reason:
+                type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    CompletionRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model:
+          type: string
+        prompt:
+          description: String or array of strings
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        stream:
+          type: boolean
+          default: false
+
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          example: text-embedding-3-small
+        input:
+          description: String or array of strings
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+
+    # ── MCP ─────────────────────────────────────────────────────────────────────
+    RedactRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+
+    DetectionItem:
+      type: object
+      required: [class, value]
+      properties:
+        class:
+          type: string
+          example: EMAIL
+        value:
+          type: string
+          example: john@example.com
+
+    RedactResponse:
+      type: object
+      required: [redacted_text, detections, vault_size]
+      properties:
+        redacted_text:
+          type: string
+        detections:
+          type: array
+          items:
+            $ref: "#/components/schemas/DetectionItem"
+        vault_size:
+          type: integer
+          minimum: 0
+
+    EstimateRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+        model:
+          type: string
+          nullable: true
+
+    EstimateResponse:
+      type: object
+      required: [estimated_tokens, model]
+      properties:
+        estimated_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        model:
+          type: string
+
+    PolicyCheckRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+        model:
+          type: string
+          nullable: true
+
+    PolicyCheckResponse:
+      type: object
+      required: [allowed, action, events]
+      properties:
+        allowed:
+          type: boolean
+        action:
+          type: string
+          example: deny
+        events:
+          type: array
+          items:
+            type: string
+
+    # ── Requests ────────────────────────────────────────────────────────────────
+    RequestListItem:
+      type: object
+      required:
+        - request_id
+        - workspace_id
+        - provider
+        - model
+        - final_action
+        - cost_usd
+        - has_violation
+        - created_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        model:
+          type: string
+        final_action:
+          type: string
+        input_tokens:
+          type: integer
+          nullable: true
+        output_tokens:
+          type: integer
+          nullable: true
+        cost_usd:
+          type: number
+          format: double
+        has_violation:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    ListRequestsResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/RequestListItem"
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page; null when no more pages
+
+    PolicyEventSummary:
+      type: object
+      required: [rule_id, rule_name, action, dry_run]
+      properties:
+        rule_id:
+          type: string
+          format: uuid
+        rule_name:
+          type: string
+        action:
+          type: string
+        dry_run:
+          type: boolean
+
+    RequestDetail:
+      type: object
+      required:
+        - request_id
+        - workspace_id
+        - provider
+        - model
+        - final_action
+        - cost_usd
+        - created_at
+        - policy_events
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        model:
+          type: string
+        final_action:
+          type: string
+        input_tokens:
+          type: integer
+          nullable: true
+        output_tokens:
+          type: integer
+          nullable: true
+        reasoning_tokens:
+          type: integer
+          nullable: true
+        cache_read_tokens:
+          type: integer
+          nullable: true
+        cache_write_tokens:
+          type: integer
+          nullable: true
+        cost_usd:
+          type: number
+          format: double
+        created_at:
+          type: string
+          format: date-time
+        policy_events:
+          type: array
+          items:
+            $ref: "#/components/schemas/PolicyEventSummary"
+
+    # ── Keys ────────────────────────────────────────────────────────────────────
+    CreateKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    KeyResponse:
+      type: object
+      required: [id, name, prefix, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        prefix:
+          type: string
+          description: First 8 characters of the key (safe to display)
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    CreateKeyResponse:
+      type: object
+      required: [id, name, api_key, prefix, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        api_key:
+          type: string
+          description: Full plaintext key — shown once, never stored
+        prefix:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    RotateKeyResponse:
+      type: object
+      required: [new_key, grace_expires_at]
+      properties:
+        new_key:
+          type: string
+          description: Plaintext replacement key — shown once
+        grace_expires_at:
+          type: string
+          format: date-time
+          description: When the old key expires
+
+    # ── Providers ───────────────────────────────────────────────────────────────
+    ProviderResponse:
+      type: object
+      required: [id, name, provider_type, has_credential, last_rotated_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        provider_type:
+          type: string
+          example: openai
+        has_credential:
+          type: boolean
+          description: True when an encrypted credential is stored
+        last_rotated_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    CreateProviderRequest:
+      type: object
+      required: [name, provider_type]
+      properties:
+        name:
+          type: string
+        provider_type:
+          type: string
+          example: openai
+        credential:
+          type: string
+          nullable: true
+          description: Plaintext API key — encrypted before storage
+
+    UpdateProviderRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+        provider_type:
+          type: string
+          nullable: true
+        credential:
+          type: string
+          nullable: true
+          description: New plaintext key; omit to leave existing unchanged
+
+    # ── Policy Rules ─────────────────────────────────────────────────────────────
+    PolicyAction:
+      type: string
+      enum: [deny, allow, redact, transform, flag]
+
+    PolicyRuleResponse:
+      type: object
+      required:
+        - id
+        - workspace_id
+        - name
+        - priority
+        - conditions
+        - action
+        - action_params
+        - enabled
+        - dry_run
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        priority:
+          type: integer
+          description: Lower = higher precedence; must be unique per workspace
+        conditions:
+          type: object
+          description: Rule conditions (arbitrary JSON)
+        action:
+          $ref: "#/components/schemas/PolicyAction"
+        action_params:
+          type: object
+          description: Action parameters (arbitrary JSON)
+        enabled:
+          type: boolean
+        dry_run:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateRuleRequest:
+      type: object
+      required: [name, priority, action]
+      properties:
+        name:
+          type: string
+        priority:
+          type: integer
+        conditions:
+          type: object
+          nullable: true
+        action:
+          $ref: "#/components/schemas/PolicyAction"
+        action_params:
+          type: object
+          nullable: true
+        enabled:
+          type: boolean
+          default: true
+        dry_run:
+          type: boolean
+          default: false
+
+    UpdateRuleRequest:
+      type: object
+      required: [name, priority, action]
+      properties:
+        name:
+          type: string
+        priority:
+          type: integer
+        conditions:
+          type: object
+          nullable: true
+        action:
+          $ref: "#/components/schemas/PolicyAction"
+        action_params:
+          type: object
+          nullable: true
+        enabled:
+          type: boolean
+          default: true
+        dry_run:
+          type: boolean
+          default: false
+
+    ToggleRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: boolean
+
+    PriorityConflict:
       type: object
       required: [code, message]
       properties:
         code:
           type: string
-          description: Stable error code for machine handling
-          example: invalid_credentials
+          example: priority_conflict
         message:
           type: string
-          description: Human-readable error message
-        details:
+
+    # ── Telemetry ───────────────────────────────────────────────────────────────
+    ClientErrorEvent:
+      type: object
+      required: [component, message, url]
+      properties:
+        component:
+          type: string
+          maxLength: 128
+        message:
+          type: string
+          maxLength: 1024
+        url:
+          type: string
+          maxLength: 512
+        user_agent:
+          type: string
+          nullable: true
+        context:
           type: object
-          additionalProperties: true
+          nullable: true
+          description: Arbitrary structured context; max 2 KB serialized
+
+    # ── Workspaces / Budgets ────────────────────────────────────────────────────
     BudgetBehavior:
       type: string
-      description: >
-        Enforcement behavior when a workspace crosses its limit.
-        `block` → HTTP 402 ApiError{code:"budget_exceeded"}.
-        `warn`  → 200 + response header `X-SecurePrompt-Budget-Warning:
-        daily|monthly`.
-        `flag`  → 200 (silent; analytics-only signal).
       enum: [block, warn, flag]
+      description: >
+        `block` → HTTP 402. `warn` → 200 + `X-SecurePrompt-Budget-Warning` header.
+        `flag` → 200, analytics-only.
+
     BudgetResponse:
       type: object
       required: [behavior, updated_at, daily_used, monthly_used]
@@ -655,13 +1808,11 @@ components:
           format: int64
           nullable: true
           minimum: 0
-          description: Daily token ceiling; null = unlimited.
         monthly_token_limit:
           type: integer
           format: int64
           nullable: true
           minimum: 0
-          description: Monthly token ceiling; null = unlimited.
         behavior:
           $ref: "#/components/schemas/BudgetBehavior"
         updated_at:
@@ -670,11 +1821,10 @@ components:
         daily_used:
           type: integer
           format: int64
-          description: Current UTC-day Redis counter.
         monthly_used:
           type: integer
           format: int64
-          description: Current UTC-month Redis counter.
+
     PutBudgetRequest:
       type: object
       required: [behavior]
@@ -691,6 +1841,8 @@ components:
           minimum: 0
         behavior:
           $ref: "#/components/schemas/BudgetBehavior"
+
+    # ── Analytics rows ─────────────────────────────────────────────────────────
     UsageDailyRow:
       type: object
       required:
@@ -735,6 +1887,7 @@ components:
           type: integer
           format: int64
           minimum: 0
+
     CostByModelRow:
       type: object
       required:
@@ -763,6 +1916,7 @@ components:
         rolling_30d_cost_usd:
           type: number
           format: double
+
     PolicyViolationsRow:
       type: object
       required:
@@ -800,6 +1954,7 @@ components:
           type: integer
           format: int64
           minimum: 0
+
     LatencyPctilesRow:
       type: object
       required:
@@ -832,14 +1987,11 @@ components:
           type: integer
           format: int64
           minimum: 0
+
+    # ── Billing ─────────────────────────────────────────────────────────────────
     BillingUsage:
       type: object
-      required:
-        - period_start
-        - period_end
-        - total_tokens
-        - total_cost_usd
-        - requests_count
+      required: [period_start, period_end, total_tokens, total_cost_usd, requests_count]
       properties:
         period_start:
           type: string
@@ -859,6 +2011,7 @@ components:
           type: integer
           format: int64
           minimum: 0
+
     BillingLimits:
       type: object
       required: [limit_enforcement]
@@ -884,6 +2037,7 @@ components:
         limit_enforcement:
           type: string
           enum: [soft, hard]
+
     BillingBreakdownItem:
       type: object
       required: [provider, model, tokens, cost_usd, requests]
@@ -904,6 +2058,7 @@ components:
           type: integer
           format: int64
           minimum: 0
+
     BillingBreakdown:
       type: object
       required: [by_provider]
@@ -912,6 +2067,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BillingBreakdownItem"
+
     BillingTrendItem:
       type: object
       required: [date, tokens, cost_usd, requests]
@@ -931,6 +2087,7 @@ components:
           type: integer
           format: int64
           minimum: 0
+
     BillingTrends:
       type: object
       required: [days]
@@ -939,6 +2096,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BillingTrendItem"
+
+    # ── Settings ────────────────────────────────────────────────────────────────
     SecureMode:
       type: object
       required:
@@ -963,6 +2122,7 @@ components:
         updated_at:
           type: string
           format: date-time
+
     SecureModeRequest:
       type: object
       properties:
@@ -977,6 +2137,7 @@ components:
           type: boolean
         redact_pii_in_responses:
           type: boolean
+
     Webhook:
       type: object
       required: [id, url, events, enabled, created_at]
@@ -996,6 +2157,7 @@ components:
         created_at:
           type: string
           format: date-time
+
     WebhookRequest:
       type: object
       required: [url, events]
@@ -1009,7 +2171,9 @@ components:
             type: string
         secret:
           type: string
+          nullable: true
           description: Optional HMAC secret
+
     WebhookList:
       type: object
       required: [webhooks]
@@ -1018,3 +2182,38 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Webhook"
+
+    # ── Errors ──────────────────────────────────────────────────────────────────
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+              example: secureprompt_error
+            code:
+              type: string
+              description: Stable machine-readable code (e.g. budget_exceeded)
+
+    BudgetExceededError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, type]
+          properties:
+            code:
+              type: string
+              example: budget_exceeded
+            message:
+              type: string
+            type:
+              type: string
+              example: secureprompt_error

@@ -3,6 +3,7 @@ pub mod budget_repo;
 pub mod policy_repo;
 pub mod provider_repo;
 pub mod refresh_token_repo;
+pub mod secure_mode_repo;
 pub mod user_repo;
 pub mod workspace_repo;
 

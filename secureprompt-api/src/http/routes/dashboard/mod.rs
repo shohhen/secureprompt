@@ -15,6 +15,8 @@ pub mod policy_rules;
 pub mod providers;
 pub mod requests;
 pub mod role;
+pub mod secure_mode;
+pub mod users;
 
 // Task 5-01-C wires `auth` into `Router::nest("/v1/auth", ...)`.
 // Task 5-03-A wires `analytics` into `Router::nest("/v1/analytics", ...)`.

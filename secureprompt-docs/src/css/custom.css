@@ -1,0 +1,87 @@
+/**
+ * SecurePrompt Documentation Theme
+ * Matches promptforge-docs design: dark gray primary, grayscale palette.
+ */
+
+:root {
+  --ifm-color-primary: #111827;
+  --ifm-color-primary-dark: #0d1420;
+  --ifm-color-primary-darker: #0a101a;
+  --ifm-color-primary-darkest: #050810;
+  --ifm-color-primary-light: #1f2937;
+  --ifm-color-primary-lighter: #374151;
+  --ifm-color-primary-lightest: #4b5563;
+  --ifm-code-font-size: 95%;
+  --ifm-font-family-base: 'Inter', 'Avenir Next', 'Segoe UI', 'Helvetica Neue', system-ui, sans-serif;
+  --ifm-font-family-monospace: 'JetBrains Mono', 'SF Mono', Menlo, Monaco, Consolas, monospace;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #f3f4f6;
+  --ifm-color-primary-dark: #d1d5db;
+  --ifm-color-primary-darker: #9ca3af;
+  --ifm-color-primary-darkest: #6b7280;
+  --ifm-color-primary-light: #f9fafb;
+  --ifm-color-primary-lighter: #ffffff;
+  --ifm-color-primary-lightest: #ffffff;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* Navbar */
+.navbar {
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+/* Sidebar */
+.menu__link {
+  font-size: 0.9rem;
+}
+
+/* Code blocks */
+.prism-code {
+  font-size: 0.875rem;
+}
+
+/* Table of contents */
+.table-of-contents {
+  font-size: 0.85rem;
+}
+
+/* Doc cards */
+.card {
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 1rem;
+  transition: border-color 0.2s;
+}
+
+.card:hover {
+  border-color: var(--ifm-color-primary);
+}
+
+/* API method badges */
+.api-method {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-right: 0.5rem;
+  font-family: var(--ifm-font-family-monospace);
+}
+
+.api-method-get    { background-color: #22c55e; color: white; }
+.api-method-post   { background-color: #3b82f6; color: white; }
+.api-method-put    { background-color: #f59e0b; color: white; }
+.api-method-delete { background-color: #ef4444; color: white; }
+.api-method-patch  { background-color: #8b5cf6; color: white; }
+
+/* Admonitions */
+.alert { border-radius: 8px; }
+
+/* Footer */
+.footer { background-color: #111827; }
+[data-theme='dark'] .footer { background-color: #030712; }

@@ -25,6 +25,9 @@ pub enum ApiError {
     /// Added Phase 6 / Plan 06-01 for auth-cache fallback exhaustion (D-15, PG-04).
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// HTTP 409 Conflict — e.g. duplicate email on user creation.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 #[derive(Error, Debug)]

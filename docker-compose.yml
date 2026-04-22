@@ -32,7 +32,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/healthz || exit 1"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -91,6 +91,7 @@ services:
       CLICKHOUSE_DATABASE: secureprompt
       SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}
       SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:-dev-provider-key-changeme-in-prod}
+      KMS_FILE_KEY: ${KMS_FILE_KEY:-c2VjdXJlcHJvbXB0LWRldi1rbXMta2V5LTMyYnl0ZXM=}
     ports:
       - "8080:8080"
     depends_on:
@@ -136,7 +137,7 @@ services:
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme-dev-only}
       API_URL: http://api:8080
     ports:
-      - "3001:3000"
+      - "3000:3000"
     depends_on:
       api:
         condition: service_started
@@ -161,7 +162,7 @@ services:
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
       - grafana_data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on:
       clickhouse:
         condition: service_healthy

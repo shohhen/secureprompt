@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use secureprompt_common::tasks::{task_types, TaskEnvelope, QUEUE_POLICY_INDEX};
+
 use crate::{
     app_state::AppState,
     db::policy_repo::PolicyRepository,
@@ -34,6 +36,7 @@ use crate::{
         middleware::jwt_auth::{JwtAuthContext, UserRole},
         routes::dashboard::role::require_role,
     },
+    redis::enqueue_task,
 };
 
 // ── Valid actions ─────────────────────────────────────────────────────────────
@@ -170,7 +173,9 @@ async fn create_rule(
         .await
         .map_err(api_error_response)?;
 
-    Ok((StatusCode::CREATED, Json(into_response(row))))
+    let response = into_response(row);
+    enqueue_index_task(&state, response.id, &response.name, ctx.workspace_id.0).await;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// `PUT /v1/policy-rules/:id` — update a rule (admin only).
@@ -209,7 +214,9 @@ async fn update_rule(
         .await
         .map_err(api_error_response)?;
 
-    Ok(Json(into_response(row)))
+    let response = into_response(row);
+    enqueue_index_task(&state, response.id, &response.name, ctx.workspace_id.0).await;
+    Ok(Json(response))
 }
 
 /// `DELETE /v1/policy-rules/:id` — delete a rule (admin only).
@@ -265,6 +272,29 @@ async fn toggle_dry_run(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Enqueue a background task to embed and index this rule in Qdrant.
+/// Errors are logged but not propagated — rule creation succeeds even if indexing fails.
+async fn enqueue_index_task(state: &AppState, rule_id: Uuid, rule_name: &str, workspace_id: Uuid) {
+    let envelope = TaskEnvelope::new(
+        task_types::INDEX_POLICY_RULE,
+        serde_json::json!({
+            "rule_id": rule_id.to_string(),
+            "condition_text": rule_name,
+        }),
+        workspace_id,
+    );
+    let json = match serde_json::to_string(&envelope) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize IndexPolicyRule envelope");
+            return;
+        }
+    };
+    if let Err(e) = enqueue_task(&state.redis_pool, QUEUE_POLICY_INDEX, &json).await {
+        tracing::warn!(error = %e, %rule_id, "failed to enqueue IndexPolicyRule task");
+    }
+}
 
 fn into_response(row: crate::db::policy_repo::PolicyRuleRow) -> PolicyRuleResponse {
     PolicyRuleResponse {

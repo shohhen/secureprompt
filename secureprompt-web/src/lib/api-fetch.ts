@@ -42,6 +42,16 @@ export class ApiError extends Error {
   }
 }
 
+/** Thrown when the request never reached the server (network down, DNS failure, timeout). */
+export class NetworkError extends Error {
+  readonly isNetworkError = true as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "NetworkError";
+  }
+}
+
 function apiBaseUrl(): string {
   const url = process.env.NEXT_PUBLIC_API_URL ?? DEFAULT_API_URL;
   return url.replace(/\/+$/, "");
@@ -77,9 +87,8 @@ async function parseError(
   try {
     const parsed = JSON.parse(text) as Partial<ApiErrorEnvelope>;
     return {
-      code: parsed.code ?? fallback.code,
-      message: parsed.message ?? fallback.message,
-      details: parsed.details,
+      code: parsed.error?.code ?? fallback.code,
+      message: parsed.error?.message ?? fallback.message,
     };
   } catch {
     return { ...fallback, details: text };
@@ -113,7 +122,18 @@ export async function apiFetch<T = unknown>(
   };
 
   const url = path.startsWith("http") ? path : `${apiBaseUrl()}${path}`;
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new NetworkError("Request timed out or was aborted");
+    }
+    if (e instanceof TypeError) {
+      throw new NetworkError(e.message || "Network request failed");
+    }
+    throw e;
+  }
 
   if (res.status === 401 && signOutOn401) {
     await signOutOn401IfClient();
