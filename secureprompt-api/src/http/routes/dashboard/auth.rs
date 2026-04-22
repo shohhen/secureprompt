@@ -320,7 +320,17 @@ pub async fn register(
         ));
     }
 
-    let _ip_key = client_ip_key(&headers); // wired up in Task 9
+    let ip_key = client_ip_key(&headers);
+    if state
+        .signup_rate_limiter
+        .check(&format!("signup:{ip_key}"))
+        .await
+        .is_err()
+    {
+        return api_error_to_response(ApiError::TooManyRequests(
+            "rate limit exceeded for signup".into(),
+        ));
+    }
 
     let email = body.email.trim().to_ascii_lowercase();
     let workspace_name = body.workspace_name.trim().to_owned();

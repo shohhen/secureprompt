@@ -248,3 +248,95 @@ async fn register_rejects_blank_workspace_name_with_400(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── 7 ──────────────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn register_rejects_duplicate_email_with_409_and_rolls_back_workspace(pool: PgPool) {
+    let app = build_app(pool.clone(), true);
+
+    // First registration succeeds.
+    let resp = app
+        .clone()
+        .oneshot(post_register(register_body(
+            "dup@example.com",
+            "correct-horse-staple",
+            "First Workspace",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let ws_count_after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ws_count_after_first, 1);
+
+    // Second registration with same email — must 409 AND not leave an orphan workspace.
+    let resp = app
+        .oneshot(post_register(register_body(
+            "dup@example.com",
+            "correct-horse-staple",
+            "Second Workspace",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let ws_count_after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_count_after_second, 1,
+        "failed register must not leave orphan workspace"
+    );
+}
+
+// ── 8 ──────────────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn register_rate_limits_after_10_attempts_per_ip(pool: PgPool) {
+    let app = build_app(pool.clone(), true);
+
+    // 10 registrations with the same X-Forwarded-For must be allowed.
+    // We use invalid-email payloads so each one returns 400 (not 201) —
+    // this avoids the unique-email collision on attempt 2 while still
+    // counting toward the limiter.
+    for i in 0..10 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "10.0.0.99")
+                    .body(register_body("notanemail", "correct-horse-staple", "W"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i} should not be rate-limited yet"
+        );
+    }
+
+    // 11th request from the same IP must be rate-limited.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/register")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.99")
+                .body(register_body("notanemail", "correct-horse-staple", "W"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
