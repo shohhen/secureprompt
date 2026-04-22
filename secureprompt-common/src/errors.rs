@@ -28,6 +28,11 @@ pub enum ApiError {
     /// HTTP 409 Conflict — e.g. duplicate email on user creation.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// HTTP 429 Too Many Requests — per-IP rate limit exceeded.
+    /// Currently emitted by the public signup endpoint; other rate-limited
+    /// surfaces keep their existing 403 mapping until a follow-up unifies them.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 #[derive(Error, Debug)]

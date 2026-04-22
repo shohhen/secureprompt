@@ -143,6 +143,7 @@ pub fn api_error_response(error: ApiError) -> Response {
         // Phase 6 / Plan 06-01: auth-cache fallback exhausted (D-15, PG-04).
         ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ApiError::Conflict(_) => StatusCode::CONFLICT,
+        ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         ApiError::Database(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -166,4 +167,17 @@ pub fn api_error_response(error: ApiError) -> Response {
     };
 
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn too_many_requests_maps_to_429() {
+        let err = ApiError::TooManyRequests("slow down".into());
+        let resp = api_error_response(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }
