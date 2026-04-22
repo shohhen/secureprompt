@@ -157,6 +157,37 @@
         }
       }
     },
+    "/v1/auth/register": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Register a new workspace and owner user (feature-flagged).",
+        "description": "Creates a workspace and its first owner user in a single call. Returns an access/refresh token pair. Returns 403 when public signup is disabled on the deployment. Availability is controlled by the SECUREPROMPT_PUBLIC_SIGNUP_ENABLED server env var.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegisterRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Workspace + owner user created. Returns the same token pair shape as POST /v1/auth/token.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": { "description": "Validation error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "403": { "description": "Public signup disabled on this deployment.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "409": { "description": "Email already in use.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "429": { "description": "Per-IP rate limit exceeded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "500": { "description": "Internal error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+        }
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "tags": [
@@ -1957,6 +1988,31 @@
         "properties": {
           "refresh_token": {
             "type": "string"
+          }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "required": ["email", "password", "workspace_name"],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 255,
+            "description": "Primary email for the new owner user. Must be globally unique across all workspaces."
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128,
+            "writeOnly": true,
+            "description": "Plaintext password. Argon2id-hashed server-side; never persisted in the clear."
+          },
+          "workspace_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Display name for the new workspace."
           }
         }
       },
