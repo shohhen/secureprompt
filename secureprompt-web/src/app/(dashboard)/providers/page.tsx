@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getServerSession } from "@/lib/session";
-import { ProvidersTable } from "./providers-table";
+import { ProvidersPanel } from "../settings/providers/providers-panel";
 
 export default async function ProvidersPage() {
   const session = await getServerSession();
@@ -11,10 +11,11 @@ export default async function ProvidersPage() {
       <div>
         <h1 className="text-2xl font-semibold">Providers</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Configure LLM provider credentials. Credentials are encrypted at rest.
+          LLM provider credentials used by the gateway. Credentials are
+          encrypted at rest; only the prefix is ever returned.
         </p>
       </div>
-      <ProvidersTable workspaceId={session.workspaceId} />
+      <ProvidersPanel />
     </div>
   );
 }

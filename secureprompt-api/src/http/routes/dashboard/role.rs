@@ -13,10 +13,13 @@ use crate::http::middleware::jwt_auth::{JwtAuthContext, UserRole};
 ///
 /// Hierarchy (D-08): Owner(4) > Admin(3) > Developer(2) > Viewer(1).
 pub fn require_role(ctx: &JwtAuthContext, minimum: UserRole) -> Result<(), ApiError> {
+    // Employee = Viewer's privilege level. Both have read-only access
+    // (Employee further restricted to own data at the query layer).
     let level = |r: UserRole| match r {
         UserRole::Owner => 4u8,
         UserRole::Admin => 3,
         UserRole::Developer => 2,
+        UserRole::Employee => 1,
         UserRole::Viewer => 1,
     };
     if level(ctx.role) >= level(minimum) {

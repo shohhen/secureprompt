@@ -181,7 +181,7 @@ export interface components {
             /** Format: uuid */
             workspace_id?: string;
             /** @enum {string} */
-            role?: "admin" | "member" | "viewer";
+            role?: "owner" | "admin" | "developer" | "viewer";
         };
         ApiError: {
             /**

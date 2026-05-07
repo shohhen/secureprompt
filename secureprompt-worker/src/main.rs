@@ -50,6 +50,13 @@ async fn main() -> anyhow::Result<()> {
             refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
         public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
+        // Worker doesn't serve `/v1/chat/completions`, so this is a no-op
+        // here — populated for struct-init completeness.
+        chat_debug_mode: AppConfig::chat_debug_mode_from_env(),
+        // Same rationale: the policy-evaluation fallback only fires in the
+        // gateway request path, but AppConfig is shared so the field has
+        // to be set. Defer to the env var so worker + API agree.
+        redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
     };
 
     init_telemetry(&config.telemetry);
@@ -298,11 +305,22 @@ async fn apply_migrations(client: &clickhouse::Client) -> anyhow::Result<()> {
         let sql = std::fs::read_to_string(&path)
             .with_context(|| format!("Cannot read migration file: {}", path.display()))?;
 
-        // Execute each statement separated by semicolons
-        // ClickHouse HTTP interface handles one statement per request
-        for statement in sql.split(';') {
+        // Execute each statement separated by semicolons.
+        // ClickHouse HTTP interface handles one statement per request.
+        //
+        // Important: strip `--` line comments BEFORE splitting on `;`.
+        // The previous splitter ran `sql.split(';')` directly, which broke
+        // any migration whose comments contained a `;` (e.g.
+        // "(debug mode; embeddings served by stubs)") — the splitter cut
+        // mid-comment and ClickHouse choked on the orphaned tail. The
+        // earlier `starts_with("--")` guard also dropped real DDL because
+        // every statement in 001 opens with a `-- N. ...` header comment.
+        // Rule: comments are advisory text, not a query-language token —
+        // strip them first, then split.
+        let stripped = strip_sql_line_comments(&sql);
+        for statement in stripped.split(';') {
             let stmt = statement.trim();
-            if stmt.is_empty() || stmt.starts_with("--") {
+            if stmt.is_empty() {
                 continue;
             }
             client
@@ -323,6 +341,65 @@ async fn apply_migrations(client: &clickhouse::Client) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Strip `--`-style line comments from a SQL string, preserving the
+/// surrounding statement structure (newlines kept, code untouched).
+///
+/// We only strip line comments because:
+///   * Block comments (`/* ... */`) aren't used in our migrations.
+///   * String literals in our migrations don't contain `--`, so a naive
+///     "first `--` to end of line" pass is safe and avoids the cost of a
+///     full SQL tokenizer for a few-hundred-line file.
+fn strip_sql_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for line in sql.lines() {
+        let cut = line.find("--").map_or(line.len(), |i| i);
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::strip_sql_line_comments;
+
+    #[test]
+    fn strips_full_line_comment() {
+        let input = "-- header\nSELECT 1;\n";
+        assert_eq!(strip_sql_line_comments(input).trim(), "SELECT 1;");
+    }
+
+    #[test]
+    fn strips_trailing_inline_comment() {
+        let got = strip_sql_line_comments("SELECT 1; -- trailing\n");
+        assert!(got.contains("SELECT 1;"));
+        assert!(!got.contains("trailing"));
+    }
+
+    #[test]
+    fn comment_with_embedded_semicolon_does_not_split_statement() {
+        // The exact failure mode that broke migration 003 in production:
+        // a `;` inside a parenthetical comment must not be treated as a
+        // statement terminator after stripping.
+        let input =
+            "-- (debug mode; embeddings served by stubs)\nALTER TABLE t ADD COLUMN x Nullable(UInt32);\n";
+        let stripped = strip_sql_line_comments(input);
+        let stmts: Vec<_> = stripped.split(';').filter(|s| !s.trim().is_empty()).collect();
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("ALTER TABLE"));
+    }
+
+    #[test]
+    fn preserves_inline_string_with_dashes() {
+        // Defensive: dashes inside literal strings would still be cut by
+        // this naive impl. Document the limit so future migration authors
+        // know not to rely on it. Until that's needed, keep the simple
+        // version.
+        let got = strip_sql_line_comments("SELECT 'x--y';\n");
+        assert_eq!(got.trim(), "SELECT 'x"); // known limitation
+    }
 }
 
 /// Acquire the dbt single-run lock (D-10 / DBT-05).

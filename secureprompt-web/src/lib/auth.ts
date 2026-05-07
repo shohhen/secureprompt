@@ -40,9 +40,13 @@ interface TokenResponse {
 }
 
 function apiBaseUrl(): string {
-  const url = process.env.NEXT_PUBLIC_API_URL;
+  // `authorize` runs server-side (NextAuth credentials callback). Prefer the
+  // internal `API_URL` (e.g. http://api:8080 in docker-compose) so the call
+  // stays inside the compose network; fall back to the public URL for local
+  // dev where only `NEXT_PUBLIC_API_URL` is set.
+  const url = process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!url) {
-    throw new Error("NEXT_PUBLIC_API_URL is not set");
+    throw new Error("API_URL / NEXT_PUBLIC_API_URL is not set");
   }
   return url.replace(/\/+$/, "");
 }
@@ -69,7 +73,7 @@ async function authorizeWithBackend(
       id: data.user?.id ?? email,
       email: data.user?.email ?? email,
       workspaceId: data.workspace_id ?? "",
-      role: (data.role ?? "member") as AppRole,
+      role: (data.role ?? "viewer") as AppRole,
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
       accessExpiresAt: data.access_expires_at,

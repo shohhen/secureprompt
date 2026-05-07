@@ -24,6 +24,13 @@ pub struct PolicyEvaluationOutcome {
     pub content: String,
     pub result: PolicyResult,
     pub denied: bool,
+    /// Total number of enabled policy rules visible to this evaluation.
+    /// Zero means the workspace has no policy yet (or every rule is
+    /// disabled). The pipeline uses this to decide whether to engage the
+    /// `redact_when_no_rules` safety net — distinguishing "workspace has
+    /// rules but they explicitly chose `allow`" from "workspace forgot
+    /// to define any rules."
+    pub rules_evaluated: usize,
 }
 
 pub async fn evaluate(
@@ -33,6 +40,7 @@ pub async fn evaluate(
     redaction_map: &mut HashMap<String, String>,
 ) -> Result<PolicyEvaluationOutcome, ApiError> {
     let rules = repo.list_enabled_rules(input.workspace_id).await?;
+    let rules_evaluated = rules.len();
     let mut content = input.content.to_owned();
     let mut events = Vec::new();
     let mut final_action = "allow".to_owned();
@@ -91,6 +99,7 @@ pub async fn evaluate(
             events,
         },
         denied,
+        rules_evaluated,
     })
 }
 

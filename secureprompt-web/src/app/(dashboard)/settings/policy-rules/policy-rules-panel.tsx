@@ -7,6 +7,7 @@
  */
 
 import { useState, useCallback } from "react";
+import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import type { ColumnDef } from "@tanstack/react-table";
 import { DataTable } from "@/components/data-table/data-table";
@@ -20,8 +21,11 @@ import {
 import { RuleForm } from "./rule-form";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { canWrite } from "@/lib/roles";
 
 export function PolicyRulesPanel() {
+  const { data: session } = useSession();
+  const writable = canWrite(session?.role);
   const { data: rules, isLoading } = usePolicyRules();
   const deleteRule = useDeletePolicyRule();
   const toggleEnabled = useTogglePolicyRuleEnabled();
@@ -86,7 +90,8 @@ export function PolicyRulesPanel() {
                 },
               );
             }}
-            className="cursor-pointer"
+            disabled={!writable}
+            className="cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
             aria-label={`Toggle enabled for ${rule.name}`}
           />
         );
@@ -109,7 +114,8 @@ export function PolicyRulesPanel() {
                 },
               );
             }}
-            className="cursor-pointer"
+            disabled={!writable}
+            className="cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
             aria-label={`Toggle dry-run for ${rule.name}`}
           />
         );
@@ -120,6 +126,7 @@ export function PolicyRulesPanel() {
       header: "",
       cell: ({ row }) => {
         const rule = row.original;
+        if (!writable) return null;
         return (
           <div className="flex gap-2">
             <Button
@@ -151,11 +158,18 @@ export function PolicyRulesPanel() {
           <p className="text-sm text-muted-foreground">
             Rules are evaluated in priority order (lower number = higher
             priority). Use dry-run to test without enforcement.
+            {!writable && (
+              <span className="block mt-1 text-xs">
+                Only owners and admins can add or edit policy rules.
+              </span>
+            )}
           </p>
         </div>
-        <Button size="sm" onClick={() => setAddOpen(true)}>
-          Add Rule
-        </Button>
+        {writable && (
+          <Button size="sm" onClick={() => setAddOpen(true)}>
+            Add Rule
+          </Button>
+        )}
       </div>
 
       <DataTable

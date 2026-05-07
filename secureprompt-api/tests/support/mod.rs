@@ -44,6 +44,8 @@ pub fn test_config() -> AppConfig {
             refresh_ttl_secs: JwtConfig::DEFAULT_REFRESH_TTL_SECS,
         },
         public_signup_enabled: false,
+        chat_debug_mode: false,
+        redact_when_no_rules: false,
     }
 }
 

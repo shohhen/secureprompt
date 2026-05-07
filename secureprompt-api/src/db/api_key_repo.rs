@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
-use secureprompt_common::{errors::ApiError, types::WorkspaceId};
+use secureprompt_common::{errors::ApiError, kms::KmsBackend, types::WorkspaceId};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -13,6 +13,9 @@ pub struct ApiKeyRow {
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Set when an admin assigned this key to a specific workspace member.
+    /// `None` for legacy/unassigned workspace-scoped keys.
+    pub assigned_user_id: Option<Uuid>,
 }
 
 pub struct ApiKeyRepository {
@@ -24,6 +27,11 @@ pub struct AuthenticatedApiKey {
     pub id: Uuid,
     pub workspace_id: WorkspaceId,
     pub name: String,
+    /// `assigned_user_id` from the api_keys row — `Some(...)` when an admin
+    /// minted this key for a specific workspace member, `None` for legacy
+    /// workspace-scoped keys. The audit detail page uses this to attribute
+    /// the request to a user.
+    pub assigned_user_id: Option<Uuid>,
 }
 
 impl ApiKeyRepository {
@@ -50,7 +58,7 @@ impl ApiKeyRepository {
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT id, workspace_id, name, key_hash, created_at, revoked_at
+            "SELECT id, workspace_id, name, key_hash, created_at, revoked_at, assigned_user_id
              FROM api_keys
              ORDER BY created_at DESC",
         )
@@ -71,22 +79,100 @@ impl ApiKeyRepository {
                 key_hash: record.get("key_hash"),
                 created_at: record.get("created_at"),
                 revoked_at: record.get("revoked_at"),
+                assigned_user_id: record.get("assigned_user_id"),
             })
             .collect())
     }
 
+    /// Retrieve the plaintext API key for the workspace member whose JWT
+    /// is presented (called by `GET /v1/me/api-key` from the LibreChat
+    /// backend). The plaintext is decrypted on the fly from
+    /// `key_ciphertext` using the configured provider key.
+    ///
+    /// Returns the most recent ACTIVE key assigned to `user_id` in this
+    /// workspace. Returns `None` if the user has no assigned key
+    /// (admin must create one first), or if the assigned key was a
+    /// pre-009 record with no encrypted plaintext.
+    ///
+    /// # Errors
+    /// Returns `ApiError::Database` on SQL failures and
+    /// `ApiError::Internal` if the stored ciphertext fails to decrypt
+    /// (indicates a misconfigured provider key or DB tampering).
+    pub async fn fetch_plaintext_for_user(
+        &self,
+        workspace_id: WorkspaceId,
+        user_id: Uuid,
+        kms: &dyn KmsBackend,
+    ) -> Result<Option<String>, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let row = sqlx::query(
+            "SELECT key_ciphertext
+             FROM api_keys
+             WHERE workspace_id = $1
+               AND assigned_user_id = $2
+               AND status = 'active'
+               AND key_ciphertext IS NOT NULL
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(workspace_id.0)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let Some(record) = row else {
+            return Ok(None);
+        };
+
+        let stored: String = record.get("key_ciphertext");
+        let plaintext_bytes = kms
+            .decrypt(stored.as_bytes())
+            .await
+            .map_err(|e| ApiError::Internal(format!("api key decrypt: {e}")))?;
+        let plaintext = String::from_utf8(plaintext_bytes)
+            .map_err(|_| ApiError::Internal("api key plaintext is not valid UTF-8".into()))?;
+        Ok(Some(plaintext))
+    }
+
     /// Create a new API key for the workspace.
     ///
-    /// Returns `(ApiKeyRow, plaintext)` — the plaintext is shown to the user
-    /// exactly once (POST response) and never stored. The caller must put it
-    /// in `CreateKeyResponse` and never log it.
+    /// `assigned_user_id` — when `Some(user_id)`, this key belongs to a
+    /// specific workspace member. The plaintext is also encrypted with
+    /// `provider_key` and stored in `key_ciphertext` so the LibreChat
+    /// backend can later retrieve it server-to-server via the user's
+    /// JWT (see `fetch_plaintext_for_user`). When `None`, only `key_hash`
+    /// is stored — legacy unassigned workspace-scoped keys.
+    ///
+    /// Returns `(ApiKeyRow, plaintext)` — the plaintext is shown to the
+    /// admin exactly once (POST response) and never stored unencrypted.
+    /// The caller must put it in `CreateKeyResponse` and never log it.
     ///
     /// # Errors
     /// Returns `ApiError::Database` on any SQL failure.
+    /// Returns `ApiError::Internal` when AES-GCM encryption fails (bad
+    /// provider key — should never happen with a 32-byte key).
     pub async fn create(
         &self,
         workspace_id: WorkspaceId,
         name: &str,
+        assigned_user_id: Option<Uuid>,
+        kms: Option<&dyn KmsBackend>,
     ) -> Result<(ApiKeyRow, String), ApiError> {
         // Generate: "sp_" + 48 random alphanumeric chars = 51 chars total.
         let suffix: String = rand::thread_rng()
@@ -96,6 +182,29 @@ impl ApiKeyRepository {
             .collect();
         let plaintext = format!("sp_{suffix}");
         let key_hash = hash_api_key(&plaintext);
+
+        // When the key is being assigned to a member, encrypt the plaintext
+        // via KMS for later server-to-server retrieval. The `kms` arg must
+        // be `Some` whenever `assigned_user_id` is `Some` — the handler
+        // enforces this; the repo defends with an Internal error.
+        let key_ciphertext = match (assigned_user_id, kms) {
+            (Some(_), Some(kms)) => {
+                let stored = kms
+                    .encrypt(plaintext.as_bytes())
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("api key encrypt: {e}")))?;
+                Some(
+                    String::from_utf8(stored)
+                        .map_err(|_| ApiError::Internal("KMS ciphertext not UTF-8".into()))?,
+                )
+            }
+            (Some(_), None) => {
+                return Err(ApiError::Internal(
+                    "assigned API key requires kms backend for plaintext encryption".into(),
+                ));
+            }
+            (None, _) => None,
+        };
 
         let mut tx = self
             .pool
@@ -110,14 +219,18 @@ impl ApiKeyRepository {
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
         let row = sqlx::query(
-            "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             RETURNING id, workspace_id, name, key_hash, created_at, revoked_at",
+            "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at,
+                                   assigned_user_id, key_ciphertext)
+             VALUES ($1, $2, $3, $4, NOW(), $5, $6)
+             RETURNING id, workspace_id, name, key_hash, created_at, revoked_at,
+                       assigned_user_id",
         )
         .bind(Uuid::new_v4())
         .bind(workspace_id.0)
         .bind(name)
         .bind(&key_hash)
+        .bind(assigned_user_id)
+        .bind(key_ciphertext)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -133,6 +246,7 @@ impl ApiKeyRepository {
             key_hash: row.get("key_hash"),
             created_at: row.get("created_at"),
             revoked_at: row.get("revoked_at"),
+            assigned_user_id: row.get("assigned_user_id"),
         };
         Ok((record, plaintext))
     }
@@ -330,7 +444,7 @@ impl ApiKeyRepository {
             // Accept: status = 'rotating' AND within grace window
             // Reject: status = 'revoked' (even if revoked_at IS NULL from pre-migration data)
             let row = sqlx::query(
-                "SELECT id, workspace_id, name
+                "SELECT id, workspace_id, name, assigned_user_id
                  FROM api_keys
                  WHERE key_hash = $1
                    AND (
@@ -357,6 +471,7 @@ impl ApiKeyRepository {
                     id: record.get("id"),
                     workspace_id: WorkspaceId(record.get("workspace_id")),
                     name: record.get("name"),
+                    assigned_user_id: record.get("assigned_user_id"),
                 }));
             }
 

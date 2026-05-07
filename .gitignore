@@ -26,3 +26,28 @@ secureprompt-web/test-results/
 # dbt profiles — contain credentials via env vars; never commit
 secureprompt-analytics/profiles.yml
 .worktrees/
+
+# LibreChat fork — tracked as its own git repo; do not commit into parent
+secureprompt-chat/
+
+
+# Python caches and venvs (added for SP session work)
+**/__pycache__/
+*.pyc
+.venv-pf/
+.venv-train/
+
+# Local model resources / runtime data
+secureprompt-ml/app/resources/
+data/
+out/
+
+# dbt local user config + logs
+secureprompt-analytics/.user.yml
+secureprompt-analytics/logs/
+
+# Per-deployment env override
+.env.librechat
+
+# Claude Code agent worktrees (ephemeral, not source)
+.claude/worktrees/

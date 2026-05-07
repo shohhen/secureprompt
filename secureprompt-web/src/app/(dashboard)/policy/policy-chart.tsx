@@ -8,8 +8,10 @@ import { useQueryState } from "nuqs";
 import { format, subDays } from "date-fns";
 import { usePolicyViolations } from "@/lib/hooks/use-analytics";
 import { StackedBarChart } from "@/components/charts/stacked-bar-chart";
+import { emptyDailySeries } from "@/components/charts/empty-range";
 import { DateRangeFilter } from "@/components/filters/date-range-filter";
 import { WorkspaceFilter } from "@/components/filters/workspace-filter";
+import { formatDayTick } from "@/components/charts/format-axis";
 
 const FORMAT = "yyyy-MM-dd";
 
@@ -46,25 +48,34 @@ export function PolicyChart({ workspaceId }: PolicyChartProps) {
           Failed to load policy data. Marts may not be populated yet.
         </p>
       )}
-      {data && data.length === 0 && !isLoading && (
-        <p className="text-sm text-muted-foreground">
-          No policy violations in the selected period.
-        </p>
-      )}
-      {data && data.length > 0 && (
-        <StackedBarChart
-          data={data.map((r) => ({
-            date: r.violation_date,
-            rule: r.rule_name,
-            enforced: r.enforced_count,
-            dry_run: r.dry_run_count,
-          }))}
-          xKey="date"
-          bars={[
-            { key: "enforced", label: "Enforced", color: "#ef4444" },
-            { key: "dry_run", label: "Dry-run", color: "#f59e0b" },
-          ]}
-        />
+
+      {!error && (
+        <div className="relative">
+          <StackedBarChart
+            data={
+              data && data.length > 0
+                ? data.map((r) => ({
+                    date: r.violation_date,
+                    rule: r.rule_name,
+                    enforced: r.enforced_count,
+                    dry_run: r.dry_run_count,
+                  }))
+                : emptyDailySeries(from, to, ["enforced", "dry_run"])
+            }
+            xKey="date"
+            xTickFormatter={formatDayTick}
+            tooltipLabelFormatter={formatDayTick}
+            bars={[
+              { key: "enforced", label: "Enforced", color: "#ef4444" },
+              { key: "dry_run", label: "Dry-run", color: "#f59e0b" },
+            ]}
+          />
+          {data && data.length === 0 && !isLoading && (
+            <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
+              No policy violations in the selected period.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

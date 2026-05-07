@@ -104,6 +104,7 @@ impl AnalyticsHandle {
                         model: event.model.clone(),
                         latency_ms,
                         created_at: now,
+                        ttft_ms: event.ttft_ms,
                     };
                     if let Err(e) = lat_inserter.write(&lat_row).await {
                         tracing::error!(error = %e, "latency_samples write error; dropping");

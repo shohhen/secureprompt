@@ -58,7 +58,14 @@ async fn streaming_route_restores_redacted_values_and_includes_usage(
 
     let body = support::response_text(response).await;
     assert!(body.contains("alice@example.com"));
+    // No placeholder should leak into the restored body — check both the
+    // legacy and new placeholder openers just in case older code paths
+    // resurface them.
     assert!(!body.contains("[REDACTED:"));
+    assert!(
+        !body.contains("[Email_Address_") && !body.contains("[Email_"),
+        "indexed placeholder leaked into restored body: {body}"
+    );
     assert!(body.contains("\"usage\""));
     Ok(())
 }

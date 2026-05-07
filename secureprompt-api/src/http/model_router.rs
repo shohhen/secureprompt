@@ -20,6 +20,10 @@ pub struct CachedApiKey {
     pub api_key_id: Uuid,
     pub workspace_id: WorkspaceId,
     pub name: String,
+    /// Mirrors `AuthenticatedApiKey.assigned_user_id` so downstream handlers
+    /// (analytics writer, audit detail) can attribute requests to a user
+    /// without re-querying Postgres on the cache hot-path.
+    pub assigned_user_id: Option<Uuid>,
     /// Instant at which this entry was inserted; used to enforce CACHE_TTL.
     pub cached_at: Instant,
 }
@@ -107,6 +111,33 @@ pub async fn resolve_model(
         .await?;
 
     if targets.is_empty() {
+        // Phase 1 fallback: if no exact model row matches, fall back to the
+        // first provider in the workspace and pass the model name through
+        // verbatim. The provider's adapter will reject unknown models with
+        // an upstream 4xx if the user typed something Google/OpenAI doesn't
+        // accept — better UX than a SP-side 404 that hides which layer
+        // rejected. Phase 2 introduces an explicit "models" UI so the
+        // dashboard can register the exact strings allowed per provider,
+        // at which point this fallback can be tightened.
+        let providers = repo.list_providers(workspace_id).await?;
+        if let Some(p) = providers.into_iter().next() {
+            use crate::db::provider_repo::ResolvedModelTarget;
+            use secureprompt_common::types::ProviderId;
+            use uuid::Uuid;
+            let synthetic = ResolvedModelTarget {
+                model_id: Uuid::nil(),
+                workspace_id,
+                provider_id: ProviderId(p.id),
+                provider_name: p.name,
+                provider_type: p.provider_type,
+                model_name: public_model.to_owned(),
+                encrypted_credential: p.encrypted_credential,
+            };
+            return Ok(ResolvedModel {
+                public_model: public_model.to_owned(),
+                targets: vec![ModelTarget::from(synthetic)],
+            });
+        }
         return Err(ApiError::NotFound(format!(
             "no provider configured for model {public_model}"
         )));
@@ -156,6 +187,7 @@ mod tests {
                     api_key_id: key_id,
                     workspace_id,
                     name: "test".to_owned(),
+                    assigned_user_id: None,
                     cached_at: Instant::now(),
                 },
             )

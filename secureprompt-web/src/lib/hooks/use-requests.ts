@@ -7,7 +7,7 @@
  * useRequestDetail: single request detail by id.
  */
 
-import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { apiFetch } from "@/lib/api-fetch";
 
 export interface RequestListItem {
@@ -44,6 +44,30 @@ export interface RequestDetail {
   cost_usd: number;
   created_at: string;
   policy_events: PolicyEventSummary[];
+  // Migration 002 — actor + transport context shown on the audit detail page.
+  user_id: string | null;
+  user_email: string | null;
+  api_key_id: string | null;
+  api_key_name: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  /** User-side checked content (latest user message, redacted). */
+  redacted_prompt: string | null;
+  /** AI-side checked content (response we returned, post-restore). */
+  restored_response: string | null;
+  /** Raw user input pre-redaction. */
+  raw_prompt: string | null;
+  /** Raw upstream output pre-restoration. */
+  raw_response: string | null;
+  /** Profile fields for the actor — `users.first_name/last_name/position`. */
+  user_first_name: string | null;
+  user_last_name: string | null;
+  user_position: string | null;
+  /** Self-reported MAC from the desktop wrapper. `null` for browser users. */
+  user_device_mac: string | null;
+  /** Coarse origin label derived from the user-agent (LibreChat, Browser,
+   *  External API, …). `null` when no UA was sent. */
+  source: string | null;
 }
 
 export interface ListRequestsResponse {
@@ -73,16 +97,21 @@ function buildRequestsUrl(filters: RequestsFilters, cursor?: string): string {
   return `/v1/requests?${params.toString()}`;
 }
 
-/** Infinite-scroll hook for the requests list. */
-export function useRequests(filters: RequestsFilters) {
-  return useInfiniteQuery<ListRequestsResponse>({
-    queryKey: ["requests", filters],
-    queryFn: ({ pageParam }) =>
-      apiFetch<ListRequestsResponse>(
-        buildRequestsUrl(filters, pageParam as string | undefined)
-      ),
-    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
-    initialPageParam: undefined,
+/**
+ * Single-page cursor-paginated requests list.
+ *
+ * The previous infinite-scroll implementation hid the page boundary
+ * entirely at low volume (16 rows + page size 50 = no "Load more"
+ * button ever rendered, so users thought pagination was broken). This
+ * hook returns one page at a time keyed by the caller-supplied cursor;
+ * the table component owns the cursor stack for Prev/Next navigation.
+ */
+export function useRequestsPage(filters: RequestsFilters, cursor?: string) {
+  return useQuery<ListRequestsResponse>({
+    queryKey: ["requests-page", filters, cursor ?? "first"],
+    queryFn: () =>
+      apiFetch<ListRequestsResponse>(buildRequestsUrl(filters, cursor)),
+    placeholderData: (prev) => prev,
   });
 }
 

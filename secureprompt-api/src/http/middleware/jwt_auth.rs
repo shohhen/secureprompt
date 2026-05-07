@@ -64,15 +64,25 @@ impl JwtKeys {
     }
 }
 
-/// Role values permitted in `users.role`. Extended from 3→4 levels in Phase 6 (D-08, D-09).
-/// `member` DB string is renamed `developer`; `owner` is added above `admin`.
-/// Hierarchy: Owner > Admin > Developer > Viewer (highest to lowest privilege).
+/// Role values permitted in `users.role`.
+///
+/// Three primary roles surfaced on the dashboard:
+///   * `Owner`     — full read + write across the workspace.
+///   * `Developer` — full read across the workspace; no write.
+///   * `Employee`  — read **only their own** audit rows; no write.
+///
+/// `Admin` and `Viewer` remain accepted for backwards compatibility with
+/// pre-migration-010 rows: `Admin` collapses to Owner-equivalent privilege,
+/// `Viewer` collapses to Employee-equivalent (read-only, scoped). The
+/// dashboard role-picker only exposes the three primary names; old rows
+/// are migrated lazily on next role edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
     Owner,
     Admin,
-    Developer, // renamed from Member (D-09)
+    Developer,
+    Employee,
     Viewer,
 }
 
@@ -83,6 +93,7 @@ impl UserRole {
             Self::Owner => "owner",
             Self::Admin => "admin",
             Self::Developer => "developer",
+            Self::Employee => "employee",
             Self::Viewer => "viewer",
         }
     }
@@ -96,11 +107,27 @@ impl UserRole {
             "owner" => Ok(Self::Owner),
             "admin" => Ok(Self::Admin),
             "developer" => Ok(Self::Developer),
-            // Backward compat: 'member' rows updated in migration 005, but accept during rollout.
+            "employee" => Ok(Self::Employee),
+            // Backward compat: pre-migration-005 'member' rows.
             "member" => Ok(Self::Developer),
             "viewer" => Ok(Self::Viewer),
             other => Err(ApiError::Internal(format!("unknown role: {other}"))),
         }
+    }
+
+    /// True when the role is allowed to **write** workspace-shared
+    /// resources (rules, providers, secure_mode, budgets, members).
+    /// Owner + Admin (legacy) only.
+    #[must_use]
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::Owner | Self::Admin)
+    }
+
+    /// True when the role can read every audit row in the workspace.
+    /// Employee/Viewer must self-filter to their own user_id.
+    #[must_use]
+    pub const fn can_read_all_audit(self) -> bool {
+        matches!(self, Self::Owner | Self::Admin | Self::Developer)
     }
 }
 

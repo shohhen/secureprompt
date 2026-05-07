@@ -8,12 +8,12 @@
  * "Load more" button.
  */
 
-import { useCallback } from "react";
+import { useState } from "react";
 import { useQueryState, parseAsString, parseAsBoolean } from "nuqs";
 import { format, subDays } from "date-fns";
 import type { ColumnDef } from "@tanstack/react-table";
 import { DataTable } from "@/components/data-table/data-table";
-import { useRequests, type RequestListItem } from "@/lib/hooks/use-requests";
+import { useRequestsPage, type RequestListItem } from "@/lib/hooks/use-requests";
 import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
 
@@ -107,21 +107,30 @@ export function RequestsTable({ workspaceId }: RequestsTableProps) {
   const [model] = useQueryState("model", parseAsString);
   const [hasViolation] = useQueryState("has_violation", parseAsBoolean);
 
-  const { data, isLoading, error, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    useRequests({
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
+  const currentCursor = cursorStack[cursorStack.length - 1];
+
+  const { data, isLoading, isFetching, error } = useRequestsPage(
+    {
       workspaceId,
       from: from ?? undefined,
       to: to ?? undefined,
       model: model ?? undefined,
       has_violation: hasViolation ?? undefined,
-      limit: 50,
-    });
+      limit: 25,
+    },
+    currentCursor,
+  );
 
-  const rows: RequestListItem[] = data?.pages.flatMap((p) => p.items) ?? [];
-
-  const handleLoadMore = useCallback(() => {
-    void fetchNextPage();
-  }, [fetchNextPage]);
+  const rows: RequestListItem[] = data?.items ?? [];
+  const hasNextPage = Boolean(data?.next_cursor);
+  const hasPrev = cursorStack.length > 0;
+  const isFetchingNextPage = isFetching;
+  const handleLoadMore = () => {
+    const next = data?.next_cursor;
+    if (next) setCursorStack((s) => [...s, next]);
+  };
+  const handlePrev = () => setCursorStack((s) => s.slice(0, -1));
 
   return (
     <div className="space-y-4">
@@ -136,14 +145,21 @@ export function RequestsTable({ workspaceId }: RequestsTableProps) {
         isLoading={isLoading}
         emptyMessage="No requests found for the selected filters."
       />
-      {hasNextPage && (
-        <div className="flex justify-center pt-2">
+      {(hasPrev || hasNextPage) && (
+        <div className="flex items-center justify-between pt-2">
           <button
-            onClick={handleLoadMore}
-            disabled={isFetchingNextPage}
+            onClick={handlePrev}
+            disabled={!hasPrev || isFetchingNextPage}
             className="text-sm text-primary hover:underline disabled:opacity-50"
           >
-            {isFetchingNextPage ? "Loading…" : "Load more"}
+            ← Previous
+          </button>
+          <button
+            onClick={handleLoadMore}
+            disabled={!hasNextPage || isFetchingNextPage}
+            className="text-sm text-primary hover:underline disabled:opacity-50"
+          >
+            {isFetchingNextPage ? "Loading…" : "Next →"}
           </button>
         </div>
       )}

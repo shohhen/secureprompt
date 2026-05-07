@@ -16,6 +16,31 @@ pub struct RequestEvent {
     pub cost_usd: f64,
     pub policy_events: Vec<PolicyEvent>,
     pub latency_ms: Option<u32>,
+    /// Time-to-first-byte from upstream (provider-side). `None` for paths
+    /// that don't make a network call (debug mode, denied requests).
+    pub ttft_ms: Option<u32>,
+    /// Workspace member who issued the request (api_keys.assigned_user_id).
+    /// `None` for legacy unassigned workspace-scoped keys.
+    pub user_id: Option<uuid::Uuid>,
+    pub api_key_id: Option<uuid::Uuid>,
+    pub api_key_name: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    /// Placeholder-safe prompt body — what was forwarded to the upstream
+    /// after PII redaction. Required for the audit detail view.
+    pub redacted_prompt: Option<String>,
+    /// What we returned to the client after placeholder restoration.
+    /// Powers the "AI:" half of the audit log; `None` for denied/embedding
+    /// requests where no chat response exists.
+    pub restored_response: Option<String>,
+    /// Raw last user message before any redaction — paired with
+    /// `redacted_prompt` on the audit detail page so reviewers can see
+    /// what was inspected.
+    pub raw_prompt: Option<String>,
+    /// Raw upstream response before placeholder restoration. Paired with
+    /// `restored_response` so reviewers can see exactly what the model
+    /// emitted (placeholders intact) vs what the client received.
+    pub raw_response: Option<String>,
 }
 
 impl RequestEvent {
@@ -46,6 +71,16 @@ impl RequestEvent {
             cost_usd,
             policy_events,
             latency_ms: None,
+            ttft_ms: None,
+            user_id: None,
+            api_key_id: None,
+            api_key_name: None,
+            ip_address: None,
+            user_agent: None,
+            redacted_prompt: None,
+            restored_response: None,
+            raw_prompt: None,
+            raw_response: None,
         }
     }
 }
@@ -71,6 +106,22 @@ pub struct RequestEventRow {
     pub cost_usd: f64,
     #[serde(with = "clickhouse::serde::chrono::datetime")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    // ── Migration 002: per-request actor + transport context ───────────────
+    // Column order MUST match the ALTER TABLE order; ClickHouse appends
+    // ADD COLUMN at the end of the row.
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub user_id: Option<uuid::Uuid>,
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub api_key_id: Option<uuid::Uuid>,
+    pub api_key_name: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub redacted_prompt: Option<String>,
+    // ── Migration 004: AI response capture for the audit log ───────────────
+    pub restored_response: Option<String>,
+    // ── Migration 005: raw input + raw upstream output ─────────────────────
+    pub raw_prompt: Option<String>,
+    pub raw_response: Option<String>,
 }
 
 impl RequestEventRow {
@@ -89,6 +140,15 @@ impl RequestEventRow {
             estimated_usage: e.estimated_usage,
             cost_usd: e.cost_usd,
             created_at,
+            user_id: e.user_id,
+            api_key_id: e.api_key_id,
+            api_key_name: e.api_key_name.clone(),
+            ip_address: e.ip_address.clone(),
+            user_agent: e.user_agent.clone(),
+            redacted_prompt: e.redacted_prompt.clone(),
+            restored_response: e.restored_response.clone(),
+            raw_prompt: e.raw_prompt.clone(),
+            raw_response: e.raw_response.clone(),
         }
     }
 }
@@ -137,6 +197,11 @@ pub struct LatencySampleRow {
     pub latency_ms: u32,
     #[serde(with = "clickhouse::serde::chrono::datetime")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    // ── Migration 003: time-to-first-byte from upstream ────────────────────
+    // Nullable because debug mode and adapters that don't issue a real
+    // HTTP call (stubs, embeddings emitted from cached models) cannot
+    // measure TTFT. Column order MUST match the ALTER TABLE order.
+    pub ttft_ms: Option<u32>,
 }
 
 #[derive(Row, Serialize)]
@@ -144,7 +209,12 @@ pub struct TokenUsageRow {
     #[serde(with = "clickhouse::serde::uuid")]
     pub workspace_id: uuid::Uuid,
     pub model: String,
-    #[serde(with = "clickhouse::serde::chrono::date32")]
+    // Column is `Date` (i16 days since epoch) — must use the `date` adapter,
+    // not `date32` (i32). Mismatch produces:
+    //   "attempting to (de)serialize ClickHouse type Date as i32"
+    // and the row write fails silently in the analytics writer, leaving the
+    // dashboard analytics queries with no rows to read.
+    #[serde(with = "clickhouse::serde::chrono::date")]
     pub date: chrono::NaiveDate,
     pub input_tokens: u64,
     pub output_tokens: u64,

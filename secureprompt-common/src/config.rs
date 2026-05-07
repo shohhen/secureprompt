@@ -14,6 +14,33 @@ pub struct AppConfig {
     /// Populated from `SECUREPROMPT_PUBLIC_SIGNUP_ENABLED`.
     #[serde(default)]
     pub public_signup_enabled: bool,
+    /// Phase 1 chat-completions debug mode. When `true`, `/v1/chat/completions`
+    /// runs the full redaction pipeline but **does not call the cloud provider**.
+    /// Instead it returns the tokenized prompt + raw provider invocation body
+    /// as the assistant message. Used to verify the LibreChat → SecurePrompt
+    /// round-trip end-to-end before cloud adapters are wired.
+    /// Populated from `SECUREPROMPT_CHAT_DEBUG_MODE`. Defaults to `false`.
+    #[serde(default)]
+    pub chat_debug_mode: bool,
+    /// Safety net for first-run / mis-configured workspaces: when enabled
+    /// AND a chat hits a workspace that has zero policy rules, the gateway
+    /// auto-redacts every detected PII span before egress. Without this
+    /// the policy engine would short-circuit to `allow` and forward the
+    /// raw prompt to the upstream — exactly the leak the product exists
+    /// to prevent.
+    ///
+    /// Once an admin defines at least one rule the workspace's explicit
+    /// policy takes over and this fallback no longer fires (so the
+    /// "I want PERSON to pass through" choice still works).
+    ///
+    /// Populated from `SECUREPROMPT_REDACT_WHEN_NO_RULES`. Defaults to
+    /// `true` — the safe behavior.
+    #[serde(default = "default_redact_when_no_rules")]
+    pub redact_when_no_rules: bool,
+}
+
+fn default_redact_when_no_rules() -> bool {
+    true
 }
 
 impl AppConfig {
@@ -26,6 +53,32 @@ impl AppConfig {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    }
+
+    /// Parse `SECUREPROMPT_CHAT_DEBUG_MODE` from the environment.
+    /// Truthy values: `1`, `true`, `yes` (case-insensitive). Everything else
+    /// (including unset) → `false`.
+    #[must_use]
+    pub fn chat_debug_mode_from_env() -> bool {
+        std::env::var("SECUREPROMPT_CHAT_DEBUG_MODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    }
+
+    /// Parse `SECUREPROMPT_REDACT_WHEN_NO_RULES`. Truthy: `1`, `true`,
+    /// `yes`. Falsy: `0`, `false`, `no`. **Unset → `true`** — the safe
+    /// default (we'd rather over-redact a brand-new workspace than leak
+    /// PII because the admin hasn't built rules yet).
+    #[must_use]
+    pub fn redact_when_no_rules_from_env() -> bool {
+        match std::env::var("SECUREPROMPT_REDACT_WHEN_NO_RULES")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+        {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "no") => false,
+            _ => true,
+        }
     }
 }
 

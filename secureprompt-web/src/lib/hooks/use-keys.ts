@@ -13,6 +13,8 @@ export interface KeyResponse {
   prefix: string;
   created_at: string;
   revoked_at: string | null;
+  /** Set when the key was assigned to a workspace member (009 migration). */
+  assigned_user_id?: string | null;
 }
 
 export interface CreateKeyResponse {
@@ -22,6 +24,15 @@ export interface CreateKeyResponse {
   api_key: string;
   prefix: string;
   created_at: string;
+  assigned_user_id?: string | null;
+}
+
+export interface CreateKeyBody {
+  name: string;
+  /** When set, the key is assigned to this workspace member; the plaintext
+   *  is encrypted-at-rest so the LibreChat backend can fetch it
+   *  server-to-server (member never types or sees it). */
+  user_id?: string;
 }
 
 export function useKeys() {
@@ -33,7 +44,7 @@ export function useKeys() {
 
 export function useCreateKey() {
   const qc = useQueryClient();
-  return useMutation<CreateKeyResponse, Error, { name: string }>({
+  return useMutation<CreateKeyResponse, Error, CreateKeyBody>({
     mutationFn: (body) =>
       apiFetch<CreateKeyResponse>("/v1/keys", { method: "POST", body }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["keys"] }),

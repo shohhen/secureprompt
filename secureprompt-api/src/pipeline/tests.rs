@@ -37,6 +37,8 @@ mod pipeline_contract_tests {
             stream,
             request_kind: RequestKind::Chat,
             extra_params: serde_json::json!({}),
+            client_ip: None,
+            user_agent: None,
         }
     }
 

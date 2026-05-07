@@ -74,6 +74,8 @@ fn test_config() -> AppConfig {
             refresh_ttl_secs: 3600,
         },
         public_signup_enabled: false,
+        chat_debug_mode: false,
+        redact_when_no_rules: false,
     }
 }
 
@@ -261,13 +263,19 @@ async fn latency_pctiles_idor_guard(pool: PgPool) {
     assert_eq!(resp_bad.status(), StatusCode::FORBIDDEN);
 }
 
-// ── mart_not_populated: non-200 when db missing ───────────────────────────────
+// ── mart_not_populated: returns 200 with empty list when marts are absent ─────
+//
+// Previously this handler returned 404 when the mart tables didn't exist, which
+// surfaced as a broken dashboard on fresh installs (before dbt had ever run).
+// We now return `200 []` so the UI renders its natural empty state; operators
+// see the underlying condition via the `dashboard_errors_total` metric and a
+// `tracing::warn!` from `map_ch_error`.
 
 #[sqlx::test]
-async fn mart_not_populated_returns_non_200(pool: PgPool) {
+async fn mart_not_populated_returns_empty(pool: PgPool) {
     let mut config = test_config();
     // Point at a database name that won't have the mart tables.
-    config.clickhouse.database = "nonexistent_db_for_test_404".into();
+    config.clickhouse.database = "nonexistent_db_for_test_empty".into();
 
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));
     let state = AppState::new(pool, config, ml_sidecar);
@@ -283,12 +291,19 @@ async fn mart_not_populated_returns_non_200(pool: PgPool) {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
 
-    // 404 (ClickHouse reachable, mart absent) or 500 (ClickHouse unreachable).
-    // Either way, must NOT be 200.
+    // If ClickHouse is reachable the missing-table/db branch maps to 200 []; if
+    // ClickHouse is totally unreachable we still tolerate 500. We must NOT
+    // return 404 anymore — that was the UX bug we just fixed.
     assert_ne!(
         resp.status(),
-        StatusCode::OK,
-        "Should not return 200 when mart db doesn't exist"
+        StatusCode::NOT_FOUND,
+        "Missing mart should no longer surface as 404 to the dashboard"
+    );
+    assert!(
+        resp.status() == StatusCode::OK
+            || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+        "Expected 200 (mart missing) or 500 (CH unreachable), got {}",
+        resp.status()
     );
 }
 

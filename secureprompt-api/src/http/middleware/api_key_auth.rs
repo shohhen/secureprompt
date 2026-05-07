@@ -13,6 +13,10 @@ pub struct AuthContext {
     pub api_key_id: Uuid,
     pub workspace_id: WorkspaceId,
     pub api_key_name: String,
+    /// `assigned_user_id` from the api_keys row — `Some(...)` when the key
+    /// was minted for a workspace member (the typical LibreChat path),
+    /// `None` for legacy unassigned workspace-scoped keys.
+    pub user_id: Option<Uuid>,
 }
 
 pub async fn authenticate_request(
@@ -40,6 +44,7 @@ pub async fn authenticate_request(
             api_key_id: cached.api_key_id,
             workspace_id: cached.workspace_id,
             api_key_name: cached.name,
+            user_id: cached.assigned_user_id,
         });
     }
 
@@ -55,6 +60,7 @@ pub async fn authenticate_request(
         api_key_id: authenticated.id,
         workspace_id: authenticated.workspace_id,
         api_key_name: authenticated.name,
+        user_id: authenticated.assigned_user_id,
     })
 }
 
@@ -67,6 +73,7 @@ async fn cache_api_key(state: &AppState, token: &str, authenticated: &Authentica
                 api_key_id: authenticated.id,
                 workspace_id: authenticated.workspace_id,
                 name: authenticated.name.clone(),
+                assigned_user_id: authenticated.assigned_user_id,
                 cached_at: Instant::now(),
             },
         )

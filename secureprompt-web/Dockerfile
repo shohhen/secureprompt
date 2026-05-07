@@ -2,7 +2,11 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Pin pnpm to a known-good major. `pnpm@latest` introduced
+# `ERR_PNPM_IGNORED_BUILDS` as a hard failure when build scripts aren't
+# pre-approved in package.json — easy to break the image when the
+# upstream tag rolls forward unrelated to anything in this repo.
+RUN corepack enable && corepack prepare pnpm@10.18.0 --activate
 
 # Copy lockfile + manifests first for better layer caching
 COPY secureprompt-web/package.json secureprompt-web/pnpm-lock.yaml ./

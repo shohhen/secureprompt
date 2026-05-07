@@ -6,7 +6,12 @@
 import type { DefaultSession, DefaultUser } from "next-auth";
 import type { DefaultJWT } from "next-auth/jwt";
 
-export type AppRole = "admin" | "member" | "viewer";
+export type AppRole =
+  | "owner"
+  | "admin"
+  | "developer"
+  | "employee"
+  | "viewer";
 
 export interface AppSessionUser {
   id: string;

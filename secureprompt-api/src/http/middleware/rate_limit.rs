@@ -263,6 +263,124 @@ pub async fn budget_check(
     Ok(outcome)
 }
 
+/// Adjust the workspace's daily + monthly Redis counters by an arbitrary
+/// signed delta. Negative deltas are valid — `INCRBY` accepts them and the
+/// counter goes down. Used post-flight to reconcile the difference between
+/// the pre-flight estimate (charged by `budget_check`) and the actual
+/// `total_tokens` reported by the upstream provider.
+///
+/// `delta == 0` short-circuits.
+///
+/// Failure is non-fatal — Redis outage shouldn't block the response.
+/// `budget_redis_failure_total` still reports the issue.
+pub async fn adjust_workspace_tokens(
+    state: &AppState,
+    workspace_id: Uuid,
+    delta: i64,
+) {
+    if delta == 0 {
+        return;
+    }
+    let daily_ttl: u64 = 2 * 24 * 3600;
+    let monthly_ttl: u64 = 32 * 24 * 3600;
+
+    let daily_key = budget_daily_key(workspace_id);
+    let monthly_key = budget_monthly_key(workspace_id);
+
+    if redis::incr_and_get(&state.redis_pool, &daily_key, delta, daily_ttl)
+        .await
+        .is_err()
+    {
+        state.metrics.record_budget_redis_failure();
+    }
+    if redis::incr_and_get(&state.redis_pool, &monthly_key, delta, monthly_ttl)
+        .await
+        .is_err()
+    {
+        state.metrics.record_budget_redis_failure();
+    }
+}
+
+/// Cheap input-token estimate from raw text. ~4 characters per token is
+/// the OpenAI rule-of-thumb that holds for English-dominant prompts; the
+/// pre-flight check only needs a number that's order-of-magnitude
+/// correct because the post-flight reconcile applies the actual delta.
+///
+/// We deliberately don't run a real tokenizer here — the pipeline already
+/// owns that path and pre-flight is hot.
+#[must_use]
+pub fn estimate_tokens_from_text(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    chars.div_ceil(4)
+}
+
+/// Pre-flight outcome the gateway hands to its response builder.
+#[derive(Debug, Clone, Copy)]
+pub enum BudgetGate {
+    /// Continue. No warning header needed.
+    Pass,
+    /// Continue, but the caller must emit
+    /// `x-secureprompt-budget-warning: daily|monthly`.
+    Warn(BudgetBucket),
+}
+
+impl BudgetGate {
+    #[must_use]
+    pub const fn warning_bucket(self) -> Option<&'static str> {
+        match self {
+            Self::Warn(BudgetBucket::Daily) => Some("daily"),
+            Self::Warn(BudgetBucket::Monthly) => Some("monthly"),
+            Self::Pass => None,
+        }
+    }
+}
+
+/// Run the pre-flight budget check before the pipeline dispatches.
+///
+/// On success, returns `BudgetGate::Pass` (allow + no header) or
+/// `BudgetGate::Warn(bucket)` (allow + warning header).
+/// On hard block, returns `Err(ApiError::BudgetExceeded(...))` so the
+/// caller can convert to a 402 response.
+///
+/// `behavior=flag` is logged but transparent to the client — returns
+/// `BudgetGate::Pass`.
+///
+/// # Errors
+/// `ApiError::BudgetExceeded` when `behavior=block` and a counter is over.
+/// `ApiError::Database` for budget-row read failures (rare).
+pub async fn pre_check_budget(
+    state: &AppState,
+    workspace_id: Uuid,
+    estimated_input_tokens: u64,
+) -> Result<BudgetGate, ApiError> {
+    match budget_check(state, workspace_id, estimated_input_tokens).await? {
+        BudgetOutcome::Allow => Ok(BudgetGate::Pass),
+        BudgetOutcome::Flag(bucket) => {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                bucket = ?bucket,
+                "budget_flagged_silently"
+            );
+            Ok(BudgetGate::Pass)
+        }
+        BudgetOutcome::Warn(bucket) => Ok(BudgetGate::Warn(bucket)),
+        BudgetOutcome::Exceeded(bucket) => {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                bucket = ?bucket,
+                "budget_exceeded_blocked"
+            );
+            let label = match bucket {
+                BudgetBucket::Daily => "daily",
+                BudgetBucket::Monthly => "monthly",
+            };
+            Err(ApiError::BudgetExceeded(format!(
+                "{label} token budget exceeded"
+            )))
+        }
+    }
+}
+
 // ── Test probe router ─────────────────────────────────────────────────────────
 //
 // Exposes `budget_check` through the full JWT middleware stack so integration

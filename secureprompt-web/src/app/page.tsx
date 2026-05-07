@@ -1,7 +1,9 @@
 import { redirect } from "next/navigation";
 
-// Dashboard index is added by Plan 05-03.
-// Until then, authenticated users also hit /login (proxy.ts sends them onward).
+// Land on the first dashboard page. The proxy handles auth — unauthenticated
+// users get bounced to /login from here. Redirecting to /login unconditionally
+// causes an infinite loop because the proxy then bounces signed-in users back
+// to "/" (the default callbackUrl).
 export default function HomePage() {
-  redirect("/login");
+  redirect("/usage");
 }

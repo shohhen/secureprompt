@@ -17,6 +17,37 @@ import type {
   LatencyPctilesRow,
 } from "@/types/api";
 
+/** Hourly latency row returned when `bucket=hour`. Mirrors
+ *  `LatencyPctilesHourlyRow` on the Rust side. Defined here rather than
+ *  generated from OpenAPI because the schema regen lives in a separate
+ *  PR; the runtime contract is what matters. */
+export interface LatencyPctilesHourlyRow {
+  workspace_id: string;
+  model: string;
+  bucket_ts: string; // ISO-Z timestamp
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  p99_latency_ms: number;
+  p50_ttft_ms: number;
+  p95_ttft_ms: number;
+  p99_ttft_ms: number;
+  ttft_sample_count: number;
+  sample_count: number;
+}
+
+/** Extended daily row — same schema as the OpenAPI-generated one with the
+ *  three TTFT percentiles + sample count added. */
+export interface LatencyPctilesDailyRow extends LatencyPctilesRow {
+  p50_ttft_ms: number;
+  p95_ttft_ms: number;
+  p99_ttft_ms: number;
+  ttft_sample_count: number;
+}
+
+export type LatencyPctilesResponse =
+  | { bucket: "day"; rows: LatencyPctilesDailyRow[] }
+  | { bucket: "hour"; rows: LatencyPctilesHourlyRow[] };
+
 export interface DateRangeParams {
   from: string; // ISO date "YYYY-MM-DD"
   to: string;
@@ -102,8 +133,14 @@ export function usePolicyViolations(params: DateRangeParams) {
 
 // ── latency-pctiles ──────────────────────────────────────────────────────────
 
-export function useLatencyPctiles(params: DateRangeParams) {
-  return useQuery<LatencyPctilesRow[]>({
+export interface LatencyParams extends DateRangeParams {
+  /** `"day"` (default) returns daily mart rows; `"hour"` returns
+   *  intra-day rows aggregated off the raw samples table. */
+  bucket?: "day" | "hour";
+}
+
+export function useLatencyPctiles(params: LatencyParams) {
+  return useQuery<LatencyPctilesResponse>({
     queryKey: ["analytics", "latency-pctiles", params],
     queryFn: async () => {
       const client = makeApiClient();
@@ -112,6 +149,7 @@ export function useLatencyPctiles(params: DateRangeParams) {
         to: params.to,
         workspace_id: params.workspaceId,
         ...(params.model ? { model: params.model } : {}),
+        ...(params.bucket ? { bucket: params.bucket } : {}),
       });
       const res = await client.GET(
         "/v1/analytics/latency-pctiles" as never,
@@ -120,7 +158,7 @@ export function useLatencyPctiles(params: DateRangeParams) {
       if ((res as { error?: unknown }).error) {
         throw new Error("Failed to fetch latency-pctiles");
       }
-      return (res as { data: LatencyPctilesRow[] }).data;
+      return (res as { data: LatencyPctilesResponse }).data;
     },
     enabled: Boolean(params.from && params.to && params.workspaceId),
   });

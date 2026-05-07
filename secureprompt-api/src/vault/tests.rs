@@ -1,14 +1,15 @@
 /// Tests for the vault module: request-scoped redaction and restoration.
 ///
-/// These tests verify:
-/// - Placeholder generation uses [REDACTED: prefix format
-/// - Vault is request-scoped and in-memory only (no DB calls)
-/// - Restoration recovers original values from vault
-/// - Transform applies templates correctly
-/// - Restoration failure returns redacted form (not original or crash)
+/// `apply_redaction` emits `<Class_N>` placeholders with per-call stable
+/// indexing — same (class, value) → same placeholder, different values get
+/// the next index. The legacy `placeholder_for` helper keeps its
+/// `[REDACTED:CLASS:hash]` format for backward compatibility.
+
 #[cfg(test)]
 mod placeholder_tests {
     use crate::vault::redaction::placeholder_for;
+
+    // ---- legacy hash-based helper (kept for BC) --------------------------
 
     #[test]
     fn placeholder_uses_redacted_prefix() {
@@ -76,12 +77,19 @@ mod redaction_tests {
         }
     }
 
+    // ---- new placeholder format -----------------------------------------
+
     #[test]
     fn apply_redaction_replaces_detected_value() {
         let content = "My email is user@example.com and it's mine.";
         let email_start = content.find("user@example.com").unwrap();
         let email_end = email_start + "user@example.com".len();
-        let detections = vec![make_detection("email", "user@example.com", email_start, email_end)];
+        let detections = vec![make_detection(
+            "EMAIL_ADDRESS",
+            "user@example.com",
+            email_start,
+            email_end,
+        )];
 
         let mut vault = TokenVault::default();
         let mut map = HashMap::new();
@@ -92,28 +100,29 @@ mod redaction_tests {
             "Original value must not appear in redacted output: {redacted}"
         );
         assert!(
-            redacted.contains("[REDACTED:"),
-            "Redacted output must contain placeholder: {redacted}"
+            redacted.contains("{{Email_Address_1}}"),
+            "Indexed placeholder must appear in redacted output: {redacted}"
         );
     }
 
     #[test]
     fn vault_stores_mapping_in_memory_only() {
-        // Vault is not persisted — this test verifies the vault works as an in-memory map
         let content = "key: AKIAIOSFODNN7EXAMPLE";
         let key_start = content.find("AKIAIOSFODNN7EXAMPLE").unwrap();
         let key_end = key_start + "AKIAIOSFODNN7EXAMPLE".len();
-        let detections = vec![make_detection("aws_access_key", "AKIAIOSFODNN7EXAMPLE", key_start, key_end)];
+        let detections = vec![make_detection(
+            "AWS_ACCESS_KEY",
+            "AKIAIOSFODNN7EXAMPLE",
+            key_start,
+            key_end,
+        )];
 
         let mut vault = TokenVault::default();
         let mut map = HashMap::new();
-        let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
+        let _ = apply_redaction(content, &detections, &mut vault, &mut map);
 
         assert!(!vault.is_empty(), "Vault must contain the placeholder mapping");
-        // The redaction_map should also contain the mapping
         assert_eq!(map.len(), 1, "redaction_map must have exactly 1 entry");
-        // Vault is in-memory: not persisted to any store (structural assertion — no DB calls possible in pure fn)
-        let _ = redacted;
     }
 
     #[test]
@@ -121,28 +130,28 @@ mod redaction_tests {
         let content = "My email is user@example.com and it's mine.";
         let email_start = content.find("user@example.com").unwrap();
         let email_end = email_start + "user@example.com".len();
-        let detections = vec![make_detection("email", "user@example.com", email_start, email_end)];
+        let detections = vec![make_detection(
+            "EMAIL_ADDRESS",
+            "user@example.com",
+            email_start,
+            email_end,
+        )];
 
         let mut vault = TokenVault::default();
         let mut map = HashMap::new();
         let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
         let restored = restore_content(&redacted, &vault);
 
-        assert_eq!(
-            restored, content,
-            "Restored content must match original"
-        );
+        assert_eq!(restored, content, "Restored content must match original");
     }
 
     #[test]
     fn unresolved_placeholder_stays_redacted() {
-        // If vault doesn't have the placeholder, restore returns it as-is (redacted)
         let vault = TokenVault::default();
-        let redacted_content = "Contact [REDACTED:EMAIL:abcd1234abcd1234]";
+        let redacted_content = "Contact {{Email_Address_1}} please.";
         let restored = restore_content(redacted_content, &vault);
-        // Since the placeholder is not in vault, it stays as-is (fail-safe)
         assert!(
-            restored.contains("[REDACTED:"),
+            restored.contains("{{Email_Address_1}}"),
             "Unresolved placeholder must stay in redacted form: {restored}"
         );
     }
@@ -156,8 +165,8 @@ mod redaction_tests {
         let b_end = b_start + "b@test.com".len();
 
         let detections = vec![
-            make_detection("email", "a@test.com", a_start, a_end),
-            make_detection("email", "b@test.com", b_start, b_end),
+            make_detection("EMAIL_ADDRESS", "a@test.com", a_start, a_end),
+            make_detection("EMAIL_ADDRESS", "b@test.com", b_start, b_end),
         ];
 
         let mut vault = TokenVault::default();
@@ -166,28 +175,132 @@ mod redaction_tests {
 
         assert!(!redacted.contains("a@test.com"), "First email must be redacted");
         assert!(!redacted.contains("b@test.com"), "Second email must be redacted");
+        assert!(redacted.contains("{{Email_Address_1}}"));
+        assert!(redacted.contains("{{Email_Address_2}}"));
         assert_eq!(vault.len(), 2, "Vault must have 2 entries");
     }
 
+    // ---- new indexed-identity behavior ----------------------------------
+
     #[test]
-    fn overlapping_detections_are_skipped_safely() {
-        // If two detections overlap, the second (which starts before cursor after first is applied) is skipped
-        let content = "AKIAIOSFODNN7EXAMPLE";
-        let full_start = 0;
-        let full_end = content.len();
-        let overlap_start = 2;
-        let overlap_end = full_end;
+    fn repeated_value_keeps_same_index_within_call() {
+        // "Shohjahon Karimberganov" appears twice → both become {{Person_1}}.
+        let name = "Shohjahon Karimberganov";
+        let content = "First mention: Shohjahon Karimberganov. Later: Shohjahon Karimberganov.";
+        let (a_start, b_start) = {
+            let first = content.find(name).unwrap();
+            let second = content.rfind(name).unwrap();
+            assert_ne!(first, second, "test setup: two distinct spans required");
+            (first, second)
+        };
 
         let detections = vec![
-            make_detection("aws_access_key", content, full_start, full_end),
-            make_detection("aws_access_key_overlap", &content[overlap_start..], overlap_start, overlap_end),
+            make_detection("PERSON", name, a_start, a_start + name.len()),
+            make_detection("PERSON", name, b_start, b_start + name.len()),
         ];
 
         let mut vault = TokenVault::default();
         let mut map = HashMap::new();
-        // Should not panic
         let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
-        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "Value must be redacted: {redacted}");
+
+        assert!(
+            redacted.contains("{{Person_1}}"),
+            "First person mention should become {{Person_1}}: {redacted}"
+        );
+        assert!(
+            !redacted.contains("{{Person_2}}"),
+            "Repeated identical person should NOT create {{Person_2}}: {redacted}"
+        );
+        assert_eq!(
+            redacted.matches("{{Person_1}}").count(),
+            2,
+            "Same identity must produce the same placeholder twice: {redacted}"
+        );
+        assert_eq!(vault.len(), 1, "Vault should dedupe by (class, value)");
+    }
+
+    #[test]
+    fn different_values_increment_index_per_class() {
+        // Shohjahon → {{Person_1}}, Ali Aliev → {{Person_2}}, Shohjahon again → {{Person_1}}.
+        let content = "Meeting: Shohjahon Karimberganov, Ali Aliev, and again Shohjahon Karimberganov.";
+        let s1 = content.find("Shohjahon Karimberganov").unwrap();
+        let ali = content.find("Ali Aliev").unwrap();
+        let s2 = content.rfind("Shohjahon Karimberganov").unwrap();
+
+        let detections = vec![
+            make_detection("PERSON", "Shohjahon Karimberganov", s1, s1 + "Shohjahon Karimberganov".len()),
+            make_detection("PERSON", "Ali Aliev", ali, ali + "Ali Aliev".len()),
+            make_detection("PERSON", "Shohjahon Karimberganov", s2, s2 + "Shohjahon Karimberganov".len()),
+        ];
+
+        let mut vault = TokenVault::default();
+        let mut map = HashMap::new();
+        let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
+
+        // Order of appearance drives the counter; first distinct person → _1, second → _2.
+        assert!(redacted.contains("{{Person_1}}"));
+        assert!(redacted.contains("{{Person_2}}"));
+        assert_eq!(
+            redacted.matches("{{Person_1}}").count(),
+            2,
+            "Shohjahon should map to the same token both times: {redacted}"
+        );
+        assert_eq!(
+            redacted.matches("{{Person_2}}").count(),
+            1,
+            "Ali should map to a single {{Person_2}}: {redacted}"
+        );
+        assert_eq!(vault.len(), 2, "Vault dedups repeated identity");
+
+        // Restoring must put both originals back verbatim.
+        let restored = restore_content(&redacted, &vault);
+        assert_eq!(restored, content);
+    }
+
+    #[test]
+    fn counters_are_per_class() {
+        // A person and an email should each start at _1.
+        let content = "Hi Bob, email me at bob@example.com.";
+        let bob_s = content.find("Bob").unwrap();
+        let email_s = content.find("bob@example.com").unwrap();
+        let detections = vec![
+            make_detection("PERSON", "Bob", bob_s, bob_s + "Bob".len()),
+            make_detection(
+                "EMAIL_ADDRESS",
+                "bob@example.com",
+                email_s,
+                email_s + "bob@example.com".len(),
+            ),
+        ];
+
+        let mut vault = TokenVault::default();
+        let mut map = HashMap::new();
+        let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
+
+        assert!(redacted.contains("{{Person_1}}"), "{redacted}");
+        assert!(redacted.contains("{{Email_Address_1}}"), "{redacted}");
+    }
+
+    #[test]
+    fn overlapping_detections_are_skipped_safely() {
+        let content = "AKIAIOSFODNN7EXAMPLE";
+        let detections = vec![
+            make_detection("AWS_ACCESS_KEY", content, 0, content.len()),
+            make_detection(
+                "AWS_ACCESS_KEY_OVERLAP",
+                &content[2..],
+                2,
+                content.len(),
+            ),
+        ];
+
+        let mut vault = TokenVault::default();
+        let mut map = HashMap::new();
+        let redacted = apply_redaction(content, &detections, &mut vault, &mut map);
+        assert!(
+            !redacted.contains("AKIAIOSFODNN7EXAMPLE"),
+            "Value must be redacted: {redacted}"
+        );
     }
 }
 

@@ -280,6 +280,180 @@ impl ProviderRepository {
         Ok(())
     }
 
+    /// List all model rows registered for a single provider in this workspace.
+    /// Used by the dashboard's per-provider model panel and by the
+    /// `/v1/providers` list response (nested `models` array) so LibreChat's
+    /// discovery client gets the authoritative model list per provider.
+    pub async fn list_models_for_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+    ) -> Result<Vec<ModelRow>, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, provider_id, name, created_at
+             FROM models
+             WHERE provider_id = $1
+             ORDER BY name ASC",
+        )
+        .bind(provider_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|record| ModelRow {
+                id: record.get("id"),
+                workspace_id: record.get("workspace_id"),
+                provider_id: record.get("provider_id"),
+                name: record.get("name"),
+                created_at: record.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Register a model name against a provider. Idempotent — duplicate
+    /// (provider_id, name) inserts return the existing row instead of
+    /// failing, so the UI doesn't need to track race conditions.
+    pub async fn create_model(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+        name: &str,
+    ) -> Result<ModelRow, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // Validate provider belongs to this workspace.
+        let provider_row = sqlx::query(
+            "SELECT 1 FROM providers WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(provider_id)
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+        if provider_row.is_none() {
+            return Err(ApiError::NotFound(format!(
+                "provider {provider_id} not found in workspace"
+            )));
+        }
+
+        // Try insert; if (workspace_id, provider_id, name) already exists,
+        // return the existing row.
+        let existing = sqlx::query(
+            "SELECT id, workspace_id, provider_id, name, created_at
+             FROM models
+             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
+        )
+        .bind(workspace_id.0)
+        .bind(provider_id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+        if let Some(row) = existing {
+            tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+            return Ok(ModelRow {
+                id: row.get("id"),
+                workspace_id: row.get("workspace_id"),
+                provider_id: row.get("provider_id"),
+                name: row.get("name"),
+                created_at: row.get("created_at"),
+            });
+        }
+
+        let row = sqlx::query(
+            "INSERT INTO models (id, workspace_id, provider_id, name, created_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             RETURNING id, workspace_id, provider_id, name, created_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id.0)
+        .bind(provider_id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+
+        Ok(ModelRow {
+            id: row.get("id"),
+            workspace_id: row.get("workspace_id"),
+            provider_id: row.get("provider_id"),
+            name: row.get("name"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    /// Remove a registered model by `(provider_id, name)`. Returns
+    /// `NotFound` if no row matched (idempotency: subsequent calls don't
+    /// error after the row is gone, only the first miss does).
+    pub async fn delete_model(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+        name: &str,
+    ) -> Result<(), ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "DELETE FROM models
+             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
+        )
+        .bind(workspace_id.0)
+        .bind(provider_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound(format!(
+                "model {name} not found for provider {provider_id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
         let mut tx = self
             .pool

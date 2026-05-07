@@ -2,21 +2,28 @@ use crate::{
     app_state::AppState,
     http::{
         api_error_response,
-        middleware::{api_key_auth::authenticate_request, rate_limit::enforce_rate_limit},
+        middleware::{
+            api_key_auth::authenticate_request,
+            rate_limit::{
+                adjust_workspace_tokens, enforce_rate_limit, estimate_tokens_from_text,
+                pre_check_budget, BudgetGate,
+            },
+        },
         model_router::resolve_model,
         streaming::force_include_usage,
     },
     pipeline::service::{GatewayRequest, PipelineExecution, PipelineService, RequestKind},
 };
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
     Json,
 };
+use std::net::SocketAddr;
 use secureprompt_common::types::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -68,6 +75,7 @@ pub struct EmbeddingsRequest {
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    ConnectInfo(connect): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<ChatCompletionsRequest>,
 ) -> Response {
@@ -79,6 +87,25 @@ pub async fn chat_completions(
     if let Err(error) = enforce_rate_limit(&state, &auth).await {
         return api_error_response(error);
     }
+
+    // Best-effort: forward the device MAC from the LibreChat → gateway
+    // hop to users.device_mac so the audit detail page picks it up via
+    // the existing user-row join. Idempotent — `IS DISTINCT FROM` skips
+    // the write when the value already matches.
+    persist_device_mac_header(&state, &auth, &headers).await;
+
+    // Pre-flight budget reservation. Charges the *input* estimate now;
+    // the actual total is reconciled post-flight. `behavior=block` returns
+    // 402 here, `warn` falls through but flags a header.
+    let estimated_input: u64 = request
+        .messages
+        .iter()
+        .map(|m| estimate_tokens_from_text(&m.content))
+        .sum();
+    let budget_gate = match pre_check_budget(&state, auth.workspace_id.0, estimated_input).await {
+        Ok(gate) => gate,
+        Err(error) => return api_error_response(error),
+    };
 
     let resolved = match resolve_model(&state, auth.workspace_id, &request.model).await {
         Ok(resolved) => resolved,
@@ -92,6 +119,12 @@ pub async fn chat_completions(
     if request.stream {
         force_include_usage(&mut extra_params);
     }
+
+    let client_ip = client_ip_from_headers(&headers).or_else(|| Some(connect.ip().to_string()));
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let service = PipelineService::new(state.clone());
     let execution = service
@@ -111,34 +144,46 @@ pub async fn chat_completions(
                 stream: request.stream,
                 request_kind: RequestKind::Chat,
                 extra_params,
+                client_ip,
+                user_agent,
             },
         )
         .await;
 
     match execution {
-        Ok(execution) if request.stream => stream_chat_response(execution),
-        Ok(execution) => Json(json!({
-            "id": execution.request_id.to_string(),
-            "object": "chat.completion",
-            "created": chrono::Utc::now().timestamp(),
-            "model": execution.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": execution.content.clone().unwrap_or_default(),
-                },
-                "finish_reason": execution.finish_reason.clone().unwrap_or_else(|| "stop".to_owned()),
-            }],
-            "usage": usage_json(&execution),
-        }))
-        .into_response(),
+        Ok(execution) if request.stream => {
+            reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
+                .await;
+            with_budget_warning(stream_chat_response(execution), budget_gate)
+        }
+        Ok(execution) => {
+            reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
+                .await;
+            let body = Json(json!({
+                "id": execution.request_id.to_string(),
+                "object": "chat.completion",
+                "created": chrono::Utc::now().timestamp(),
+                "model": execution.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": execution.content.clone().unwrap_or_default(),
+                    },
+                    "finish_reason": execution.finish_reason.clone().unwrap_or_else(|| "stop".to_owned()),
+                }],
+                "usage": usage_json(&execution),
+            }))
+            .into_response();
+            with_budget_warning(body, budget_gate)
+        }
         Err(error) => api_error_response(error),
     }
 }
 
 pub async fn completions(
     State(state): State<AppState>,
+    ConnectInfo(connect): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Response {
@@ -150,6 +195,19 @@ pub async fn completions(
     if let Err(error) = enforce_rate_limit(&state, &auth).await {
         return api_error_response(error);
     }
+
+    // Best-effort: forward the device MAC from the LibreChat → gateway
+    // hop to users.device_mac so the audit detail page picks it up via
+    // the existing user-row join. Idempotent — `IS DISTINCT FROM` skips
+    // the write when the value already matches.
+    persist_device_mac_header(&state, &auth, &headers).await;
+
+    let prompt = value_to_string(&request.prompt);
+    let estimated_input = estimate_tokens_from_text(&prompt);
+    let budget_gate = match pre_check_budget(&state, auth.workspace_id.0, estimated_input).await {
+        Ok(gate) => gate,
+        Err(error) => return api_error_response(error),
+    };
 
     let resolved = match resolve_model(&state, auth.workspace_id, &request.model).await {
         Ok(resolved) => resolved,
@@ -164,8 +222,13 @@ pub async fn completions(
         force_include_usage(&mut extra_params);
     }
 
+    let client_ip = client_ip_from_headers(&headers).or_else(|| Some(connect.ip().to_string()));
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     let service = PipelineService::new(state.clone());
-    let prompt = value_to_string(&request.prompt);
     let execution = service
         .execute(
             &auth,
@@ -179,31 +242,43 @@ pub async fn completions(
                 stream: request.stream,
                 request_kind: RequestKind::Completion,
                 extra_params,
+                client_ip,
+                user_agent,
             },
         )
         .await;
 
     match execution {
-        Ok(execution) if request.stream => stream_completion_response(execution),
-        Ok(execution) => Json(json!({
-            "id": execution.request_id.to_string(),
-            "object": "text_completion",
-            "created": chrono::Utc::now().timestamp(),
-            "model": execution.model,
-            "choices": [{
-                "index": 0,
-                "text": execution.content.clone().unwrap_or_default(),
-                "finish_reason": execution.finish_reason.clone().unwrap_or_else(|| "stop".to_owned()),
-            }],
-            "usage": usage_json(&execution),
-        }))
-        .into_response(),
+        Ok(execution) if request.stream => {
+            reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
+                .await;
+            with_budget_warning(stream_completion_response(execution), budget_gate)
+        }
+        Ok(execution) => {
+            reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
+                .await;
+            let body = Json(json!({
+                "id": execution.request_id.to_string(),
+                "object": "text_completion",
+                "created": chrono::Utc::now().timestamp(),
+                "model": execution.model,
+                "choices": [{
+                    "index": 0,
+                    "text": execution.content.clone().unwrap_or_default(),
+                    "finish_reason": execution.finish_reason.clone().unwrap_or_else(|| "stop".to_owned()),
+                }],
+                "usage": usage_json(&execution),
+            }))
+            .into_response();
+            with_budget_warning(body, budget_gate)
+        }
         Err(error) => api_error_response(error),
     }
 }
 
 pub async fn embeddings(
     State(state): State<AppState>,
+    ConnectInfo(connect): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<EmbeddingsRequest>,
 ) -> Response {
@@ -216,10 +291,29 @@ pub async fn embeddings(
         return api_error_response(error);
     }
 
+    // Best-effort: forward the device MAC from the LibreChat → gateway
+    // hop to users.device_mac so the audit detail page picks it up via
+    // the existing user-row join. Idempotent — `IS DISTINCT FROM` skips
+    // the write when the value already matches.
+    persist_device_mac_header(&state, &auth, &headers).await;
+
+    let input_text = value_to_string(&request.input);
+    let estimated_input = estimate_tokens_from_text(&input_text);
+    let budget_gate = match pre_check_budget(&state, auth.workspace_id.0, estimated_input).await {
+        Ok(gate) => gate,
+        Err(error) => return api_error_response(error),
+    };
+
     let resolved = match resolve_model(&state, auth.workspace_id, &request.model).await {
         Ok(resolved) => resolved,
         Err(error) => return api_error_response(error),
     };
+
+    let client_ip = client_ip_from_headers(&headers).or_else(|| Some(connect.ip().to_string()));
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let execution = PipelineService::new(state.clone())
         .execute(
@@ -229,29 +323,81 @@ pub async fn embeddings(
                 public_model: request.model.clone(),
                 messages: vec![Message {
                     role: "user".to_owned(),
-                    content: value_to_string(&request.input),
+                    content: input_text,
                 }],
                 stream: false,
                 request_kind: RequestKind::Embedding,
                 extra_params: Value::Object(request.extra.clone()),
+                client_ip,
+                user_agent,
             },
         )
         .await;
 
     match execution {
-        Ok(execution) => Json(json!({
-            "object": "list",
-            "data": [{
-                "object": "embedding",
-                "index": 0,
-                "embedding": execution.embedding.clone().unwrap_or_default(),
-            }],
-            "model": execution.model,
-            "usage": usage_json(&execution),
-        }))
-        .into_response(),
+        Ok(execution) => {
+            reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
+                .await;
+            let body = Json(json!({
+                "object": "list",
+                "data": [{
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": execution.embedding.clone().unwrap_or_default(),
+                }],
+                "model": execution.model,
+                "usage": usage_json(&execution),
+            }))
+            .into_response();
+            with_budget_warning(body, budget_gate)
+        }
         Err(error) => api_error_response(error),
     }
+}
+
+/// Sum of input + output tokens for a completed pipeline execution.
+/// Reasoning + cache tokens are reported separately in `usage_json` but
+/// are not counted toward the workspace budget — operators care about
+/// the prompt+completion total, which matches OpenAI's `total_tokens`.
+fn total_tokens(execution: &PipelineExecution) -> u64 {
+    let input = u64::from(execution.usage.input_tokens.unwrap_or_default());
+    let output = u64::from(execution.usage.output_tokens.unwrap_or_default());
+    input + output
+}
+
+/// Reconcile the pre-flight estimate against the actual token total.
+///
+/// `pre_check_budget` charged `estimated_input_tokens` into the daily +
+/// monthly Redis counters during reservation. The provider then returned
+/// real input + output figures via `usage`. This applies a **delta**
+/// (`actual_total − estimate`) so the counter ends up matching what
+/// the dashboard expects (= actual usage). Negative deltas are valid —
+/// `INCRBY` accepts them and counters go down.
+async fn reconcile_workspace_tokens(
+    state: &AppState,
+    workspace_id: uuid::Uuid,
+    execution: &PipelineExecution,
+    estimated_input_tokens: u64,
+) {
+    let actual = total_tokens(execution);
+    let est = i64::try_from(estimated_input_tokens).unwrap_or(i64::MAX);
+    let actual_i = i64::try_from(actual).unwrap_or(i64::MAX);
+    let delta = actual_i - est;
+    adjust_workspace_tokens(state, workspace_id, delta).await;
+}
+
+/// If the pre-flight check returned a `Warn`, attach the
+/// `x-secureprompt-budget-warning: daily|monthly` header so clients
+/// (LibreChat, dashboards, downstream tooling) can surface it visibly.
+fn with_budget_warning(mut response: Response, gate: BudgetGate) -> Response {
+    if let Some(bucket) = gate.warning_bucket() {
+        if let Ok(value) = HeaderValue::from_str(bucket) {
+            response
+                .headers_mut()
+                .insert("x-secureprompt-budget-warning", value);
+        }
+    }
+    response
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Response {
@@ -360,6 +506,77 @@ fn usage_json(execution: &PipelineExecution) -> Value {
         "cache_write_tokens": execution.usage.cache_write_tokens.unwrap_or_default(),
         "estimated": execution.estimated_usage,
     })
+}
+
+/// Pull the self-reported `X-SecurePrompt-Device-MAC` header off an
+/// incoming gateway request and best-effort persist it to the caller's
+/// user row. Validates the same shape `/v1/me/profile` does (12 hex
+/// digits, `:` or `-` separated, length-capped) and silently drops
+/// anything that doesn't look like a MAC. Postgres write is fire-and-
+/// forget — gateway latency is more important than a missed audit aid.
+async fn persist_device_mac_header(
+    state: &AppState,
+    auth: &crate::http::middleware::api_key_auth::AuthContext,
+    headers: &HeaderMap,
+) {
+    let raw = match headers.get("x-secureprompt-device-mac") {
+        Some(h) => h.to_str().unwrap_or("").trim(),
+        None => return,
+    };
+    if raw.is_empty() || raw.len() > 64 {
+        return;
+    }
+    let normalised = raw.replace('-', ":").to_ascii_lowercase();
+    let parts: Vec<&str> = normalised.split(':').collect();
+    if parts.len() != 6
+        || !parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return;
+    }
+    let user_id = match auth.user_id {
+        Some(id) => id,
+        None => return,
+    };
+    let workspace_id = auth.workspace_id.0;
+    // `IS DISTINCT FROM` short-circuits when the value already matches —
+    // skips a wal write per chat turn for the steady-state case where
+    // the MAC hasn't changed since last time.
+    if let Err(e) = sqlx::query(
+        "UPDATE users SET device_mac = $1, updated_at = NOW()
+         WHERE id = $2 AND workspace_id = $3 AND device_mac IS DISTINCT FROM $1",
+    )
+    .bind(&normalised)
+    .bind(user_id)
+    .bind(workspace_id)
+    .execute(&state.db)
+    .await
+    {
+        tracing::warn!(error = %e, user_id = %user_id, "device_mac update from gateway header failed");
+    }
+}
+
+/// Extract the originating client IP from headers. Behind nginx (the
+/// supported on-prem topology) the real address is in `X-Forwarded-For`
+/// — first value of the comma-separated list. Falls back to `X-Real-IP`
+/// when nginx is configured to set only that, then to `None` when neither
+/// header is present (direct curl in dev). The router is bound without
+/// `into_make_service_with_connect_info`, so `ConnectInfo` is unavailable.
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(forwarded) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+    {
+        let trimmed = forwarded.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 fn value_to_string(value: &Value) -> String {

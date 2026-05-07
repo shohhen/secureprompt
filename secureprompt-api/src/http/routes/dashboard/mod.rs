@@ -9,6 +9,9 @@ pub mod auth;
 pub mod budgets;
 // Plan 05-04 namespaces.
 pub mod keys;
+// Phase 7 / Task 30 — `/v1/me/*` for trusted server-to-server callers
+// (LibreChat backend fetches the JWT-authed user's plaintext API key).
+pub mod me;
 // Plan 06-02: OIDC PKCE flow (AUTH-03).
 pub mod oidc;
 pub mod policy_rules;

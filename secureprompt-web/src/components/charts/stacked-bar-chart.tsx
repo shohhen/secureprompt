@@ -21,6 +21,9 @@ interface StackedBarChartProps {
   xKey: string;
   bars: { key: string; color?: string; label?: string }[];
   height?: number;
+  xTickFormatter?: (value: unknown) => string;
+  tooltipLabelFormatter?: (value: unknown) => string;
+  xAxisMinTickGap?: number;
 }
 
 const DEFAULT_COLORS = [
@@ -36,7 +39,11 @@ export function StackedBarChart({
   xKey,
   bars,
   height = 300,
+  xTickFormatter,
+  tooltipLabelFormatter,
+  xAxisMinTickGap = 24,
 }: StackedBarChartProps) {
+  const labelFn = tooltipLabelFormatter ?? xTickFormatter;
   return (
     <ResponsiveContainer width="100%" height={height}>
       <ReBarChart
@@ -44,9 +51,14 @@ export function StackedBarChart({
         margin={{ top: 8, right: 24, left: 0, bottom: 0 }}
       >
         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-        <XAxis dataKey={xKey} tick={{ fontSize: 12 }} />
+        <XAxis
+          dataKey={xKey}
+          tick={{ fontSize: 12 }}
+          tickFormatter={xTickFormatter ? (v) => xTickFormatter(v) : undefined}
+          minTickGap={xAxisMinTickGap}
+        />
         <YAxis tick={{ fontSize: 12 }} />
-        <Tooltip />
+        <Tooltip labelFormatter={labelFn ? (v) => labelFn(v) : undefined} />
         <Legend />
         {bars.map((b, i) => (
           <Bar

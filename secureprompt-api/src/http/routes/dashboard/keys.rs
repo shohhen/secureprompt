@@ -44,6 +44,10 @@ pub struct KeyResponse {
     pub prefix: String,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Workspace member this key was assigned to. `None` for legacy
+    /// unassigned workspace-scoped keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_user_id: Option<Uuid>,
 }
 
 /// Response for POST /v1/keys — includes `api_key` exactly once.
@@ -57,6 +61,8 @@ pub struct CreateKeyResponse {
     /// First 8 characters for display after the dialog is closed.
     pub prefix: String,
     pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_user_id: Option<Uuid>,
 }
 
 /// Response for POST /v1/keys/{id}/rotate (D-17).
@@ -70,6 +76,12 @@ pub struct RotateKeyResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyRequest {
     pub name: String,
+    /// When `Some`, this key is assigned to a specific workspace member,
+    /// and the plaintext is encrypted-at-rest so the LibreChat backend
+    /// can fetch it server-to-server via the user's JWT (009 migration).
+    /// `None` creates a legacy unassigned workspace-scoped key.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -104,6 +116,7 @@ async fn list_keys(
                 prefix,
                 created_at: r.created_at,
                 revoked_at: r.revoked_at,
+                assigned_user_id: r.assigned_user_id,
             }
         })
         .collect();
@@ -121,8 +134,12 @@ async fn create_key(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = ApiKeyRepository::new(state.db.clone());
+    let kms = body
+        .user_id
+        .as_ref()
+        .map(|_| state.kms.as_ref());
     let (record, plaintext) = repo
-        .create(ctx.workspace_id, &body.name)
+        .create(ctx.workspace_id, &body.name, body.user_id, kms)
         .await
         .map_err(api_error_response)?;
 
@@ -137,6 +154,7 @@ async fn create_key(
             api_key: plaintext,
             prefix,
             created_at: record.created_at,
+            assigned_user_id: record.assigned_user_id,
         }),
     ))
 }

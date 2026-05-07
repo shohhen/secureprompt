@@ -52,3 +52,19 @@ class RagCheckMatch(BaseModel):
 class RagCheckResponse(BaseModel):
     matches: List[RagCheckMatch]
     is_match: bool
+
+
+class ScanFileEntity(BaseModel):
+    text: str
+    label: str
+    score: float
+
+
+class ScanFileResponse(BaseModel):
+    pii_found: bool
+    secrets_found: bool
+    injection_detected: bool
+    entities: List[ScanFileEntity]
+    redacted_text: str | None = None
+    file_size_bytes: int
+    preview_truncated: bool

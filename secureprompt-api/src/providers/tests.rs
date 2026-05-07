@@ -50,6 +50,7 @@ mod provider_adapter_tests {
             extra_params: serde_json::json!({}),
             stream,
             kind: InvocationKind::Chat,
+            decrypted_credential: None,
         }
     }
 
@@ -62,6 +63,7 @@ mod provider_adapter_tests {
             extra_params: serde_json::json!({}),
             stream: false,
             kind: InvocationKind::Embedding,
+            decrypted_credential: None,
         }
     }
 
@@ -415,7 +417,7 @@ mod streaming_bridge_tests {
 
     #[test]
     fn complete_placeholder_in_single_chunk_passes_through() {
-        let placeholder = "[REDACTED:AWS_ACCESS_KEY:ABCD1234]";
+        let placeholder = "<Aws_Access_Key_1>";
         let chunks = vec![placeholder.to_owned()];
         let vault = empty_vault();
         let safe = placeholder_safe_chunks(&chunks, &vault);
@@ -427,7 +429,7 @@ mod streaming_bridge_tests {
     fn placeholder_split_across_two_chunks_is_reassembled() {
         // Split the placeholder between two chunks — rolling buffer must hold the
         // partial prefix until the closing ']' arrives.
-        let placeholder = "[REDACTED:EMAIL:abc12345]";
+        let placeholder = "<Email_Address_1>";
         let mid = placeholder.len() / 2;
         let chunk1 = placeholder[..mid].to_owned();
         let chunk2 = placeholder[mid..].to_owned();
@@ -445,7 +447,7 @@ mod streaming_bridge_tests {
     #[test]
     fn placeholder_split_into_many_chunks_is_reassembled() {
         // Simulate very small chunk size splitting the placeholder into many pieces
-        let placeholder = "[REDACTED:API_KEY:deadbeef]";
+        let placeholder = "<Api_Key_1>";
         let chunks: Vec<String> = placeholder.chars().map(|c| c.to_string()).collect();
 
         let vault = empty_vault();
@@ -460,7 +462,7 @@ mod streaming_bridge_tests {
     #[test]
     fn vault_with_entry_restores_placeholder_in_stream() {
         let mut vault = TokenVault::default();
-        let placeholder = "[REDACTED:EMAIL:abc12345]";
+        let placeholder = "<Email_Address_1>";
         vault.insert(placeholder.to_owned(), "user@example.com".to_owned());
 
         // Content arrives as a complete placeholder in one chunk
@@ -483,7 +485,7 @@ mod streaming_bridge_tests {
 
     #[test]
     fn content_before_and_after_placeholder_is_preserved() {
-        let placeholder = "[REDACTED:SSN:12345678]";
+        let placeholder = "<Us_Ssn_1>";
         let chunks = vec![format!("prefix {placeholder} suffix")];
         let vault = empty_vault();
         let safe = placeholder_safe_chunks(&chunks, &vault);
@@ -495,8 +497,8 @@ mod streaming_bridge_tests {
 
     #[test]
     fn multiple_placeholders_in_stream_all_preserved() {
-        let ph1 = "[REDACTED:EMAIL:aabb1234]";
-        let ph2 = "[REDACTED:AWS_KEY:ccdd5678]";
+        let ph1 = "<Email_Address_3>";
+        let ph2 = "<Aws_Key_1>";
         let content = format!("{ph1} and {ph2} done");
         let chunks = vec![content];
         let vault = empty_vault();
@@ -515,14 +517,15 @@ mod streaming_bridge_tests {
 
     #[test]
     fn trailing_partial_prefix_held_until_next_chunk() {
-        // "[REDACTED:" split: first chunk ends with "[REDACT", second chunk completes it
-        let ch1 = "text [REDACT".to_owned();
-        let ch2 = "ED:JWT:eeee1234] end".to_owned();
+        // New `<Class_N>` placeholder split across chunk boundary — the
+        // reassembler must hold `<Perso` until the closer `>` arrives.
+        let ch1 = "text <Perso".to_owned();
+        let ch2 = "n_1> end".to_owned();
         let vault = empty_vault();
         let safe = placeholder_safe_chunks(&[ch1, ch2], &vault);
         let joined: String = safe.join("");
         assert!(
-            joined.contains("[REDACTED:JWT:eeee1234]"),
+            joined.contains("<Person_1>"),
             "partial prefix held across chunk boundary; got: {joined:?}"
         );
         assert!(joined.contains("text "));

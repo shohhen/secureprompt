@@ -86,8 +86,11 @@ struct RequestEventRow {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cost_usd: f64,
-    /// ClickHouse `DateTime` → Unix seconds via `time32`.
-    pub created_at_unix: i64,
+    /// `toUnixTimestamp(re.created_at)` in ClickHouse returns `UInt32` —
+    /// must match here, otherwise rowbinary deserialization fails with
+    /// `schema mismatch: ... UInt32 as i64`. Cast to i64 at usage sites
+    /// (DateTime::from_timestamp wants i64) using `i64::from(...)`.
+    pub created_at_unix: u32,
     pub has_violation: u8,
 }
 
@@ -107,7 +110,20 @@ struct RequestDetailRow {
     pub cache_read_tokens: Option<u32>,
     pub cache_write_tokens: Option<u32>,
     pub cost_usd: f64,
-    pub created_at_unix: i64,
+    pub created_at_unix: u32,
+    // ── Migration 002: per-request actor + transport context ──────────────
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub user_id: Option<Uuid>,
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub api_key_id: Option<Uuid>,
+    pub api_key_name: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub redacted_prompt: Option<String>,
+    pub restored_response: Option<String>,
+    // ── Migration 005: raw input + raw upstream output ─────────────────────
+    pub raw_prompt: Option<String>,
+    pub raw_response: Option<String>,
 }
 
 /// Raw row from `policy_events`.
@@ -165,6 +181,38 @@ pub struct RequestDetail {
     pub cost_usd: f64,
     pub created_at: DateTime<Utc>,
     pub policy_events: Vec<PolicyEventSummary>,
+    // ── Per-request actor + transport context (migration 002) ─────────────
+    pub user_id: Option<Uuid>,
+    /// Email of the workspace member who issued the request, looked up
+    /// from `users` at read time so the dashboard can render it directly.
+    pub user_email: Option<String>,
+    pub api_key_id: Option<Uuid>,
+    pub api_key_name: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    /// User-side checked content — the latest user message in this turn,
+    /// post-PII redaction (placeholders substituted in).
+    pub redacted_prompt: Option<String>,
+    /// AI-side checked content — what we returned to the client after
+    /// placeholder restoration. `None` for embeddings or denied requests.
+    pub restored_response: Option<String>,
+    /// Raw user input pre-redaction. Paired with `redacted_prompt` on the
+    /// detail page so reviewers can see what the user actually typed.
+    pub raw_prompt: Option<String>,
+    /// Raw upstream output pre-restoration. Paired with `restored_response`.
+    pub raw_response: Option<String>,
+    /// Profile fields pulled from `users` so the detail page can show the
+    /// actor's display name + position alongside their email.
+    pub user_first_name: Option<String>,
+    pub user_last_name: Option<String>,
+    pub user_position: Option<String>,
+    /// Self-reported MAC address from the desktop wrapper. `None` for
+    /// browser users or for users who haven't opened the dashboard from
+    /// the desktop yet.
+    pub user_device_mac: Option<String>,
+    /// Coarse classifier of where the request came from, derived from
+    /// the user-agent header. `None` when no UA was sent.
+    pub source: Option<String>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -232,6 +280,14 @@ async fn list_requests(
         format!("AND re.model = '{}'", m.replace('\'', "''"))
     });
 
+    // Employee/Viewer roles can only see their own requests. Owner +
+    // Developer (and legacy Admin) see the full workspace.
+    let user_scope_clause = if ctx.role.can_read_all_audit() {
+        String::new()
+    } else {
+        format!("AND re.user_id = toUUID('{uid}')", uid = ctx.user_id)
+    };
+
     // has_violation filter: INNER JOIN keeps only rows with at least one event,
     // LEFT JOIN keeps all rows (violation flag derived from count).
     let join_type = if params.has_violation.unwrap_or(false) {
@@ -263,6 +319,7 @@ async fn list_requests(
           AND re.created_at <= toDateTime({to_ts}) \
           {cursor_clause} \
           {model_clause} \
+          {user_scope_clause} \
         GROUP BY \
             re.request_id, re.workspace_id, re.provider, re.model, \
             re.final_action, re.input_tokens, re.output_tokens, \
@@ -275,6 +332,7 @@ async fn list_requests(
         to_ts = to.timestamp(),
         cursor_clause = cursor_clause,
         model_clause = model_clause,
+        user_scope_clause = user_scope_clause,
         fetch_limit = fetch_limit,
     );
 
@@ -298,7 +356,7 @@ async fn list_requests(
     };
 
     let next_cursor = if has_more {
-        items_raw.last().map(|r| encode_cursor(r.created_at_unix, r.request_id))
+        items_raw.last().map(|r| encode_cursor(i64::from(r.created_at_unix), r.request_id))
     } else {
         None
     };
@@ -315,7 +373,7 @@ async fn list_requests(
             output_tokens: r.output_tokens,
             cost_usd: r.cost_usd,
             has_violation: r.has_violation != 0,
-            created_at: DateTime::from_timestamp(r.created_at_unix, 0)
+            created_at: DateTime::from_timestamp(i64::from(r.created_at_unix), 0)
                 .unwrap_or(DateTime::UNIX_EPOCH),
         })
         .collect();
@@ -334,12 +392,17 @@ async fn get_request_detail(
     let ws = ctx.workspace_id.0;
 
     // Fetch main request row. The workspace_id guard is in the WHERE clause.
+    // Migration 002 adds the trailing actor + transport columns; older rows
+    // (pre-002) carry NULLs which deserialize cleanly into Option<...>.
     let req_query = format!(
         "SELECT \
             request_id, workspace_id, provider, model, final_action, \
             input_tokens, output_tokens, reasoning_tokens, \
             cache_read_tokens, cache_write_tokens, cost_usd, \
-            toUnixTimestamp(created_at) AS created_at_unix \
+            toUnixTimestamp(created_at) AS created_at_unix, \
+            user_id, api_key_id, api_key_name, \
+            ip_address, user_agent, redacted_prompt, restored_response, \
+            raw_prompt, raw_response \
         FROM request_events \
         WHERE workspace_id = toUUID('{ws}') \
           AND request_id = toUUID('{rid}') \
@@ -354,6 +417,18 @@ async fn get_request_detail(
         .query(&req_query)
         .fetch_all::<RequestDetailRow>()
         .await
+        .map(|rows| {
+            // Employee scope: silently treat other users' rows as "not
+            // found" rather than returning 403 — leaks less information
+            // about whether a given request_id exists in the workspace.
+            if ctx.role.can_read_all_audit() {
+                rows
+            } else {
+                rows.into_iter()
+                    .filter(|r| r.user_id == Some(ctx.user_id))
+                    .collect()
+            }
+        })
         .map_err(|e| {
             api_error_response(ApiError::Internal(format!(
                 "clickhouse get_request_detail failed: {e}"
@@ -401,6 +476,50 @@ async fn get_request_detail(
         })
         .collect();
 
+    // Resolve user_id → email + profile via Postgres. The `users` table is
+    // small and the lookup is cached in pg's plan; doing this server-side
+    // keeps the dashboard from having to render a UUID and then fetch
+    // each field separately. Failures are non-fatal — fields stay None.
+    let (
+        user_email,
+        user_first_name,
+        user_last_name,
+        user_position,
+        user_device_mac,
+    ) = if let Some(uid) = req_row.user_id {
+        match sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT email, first_name, last_name, position, device_mac
+             FROM users WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(uid)
+        .bind(ws)
+        .fetch_optional(&state.db)
+        .await
+        {
+            Ok(Some((email, first, last, pos, mac))) => {
+                (Some(email), first, last, pos, mac)
+            }
+            Ok(None) => (None, None, None, None, None),
+            Err(e) => {
+                tracing::warn!(error = %e, user_id = %uid, "user profile lookup failed");
+                (None, None, None, None, None)
+            }
+        }
+    } else {
+        (None, None, None, None, None)
+    };
+
+    let source = classify_source(req_row.user_agent.as_deref());
+
     Ok(Json(RequestDetail {
         request_id: req_row.request_id,
         workspace_id: req_row.workspace_id,
@@ -413,8 +532,64 @@ async fn get_request_detail(
         cache_read_tokens: req_row.cache_read_tokens,
         cache_write_tokens: req_row.cache_write_tokens,
         cost_usd: req_row.cost_usd,
-        created_at: DateTime::from_timestamp(req_row.created_at_unix, 0)
+        created_at: DateTime::from_timestamp(i64::from(req_row.created_at_unix), 0)
             .unwrap_or(DateTime::UNIX_EPOCH),
         policy_events,
+        user_id: req_row.user_id,
+        user_email,
+        api_key_id: req_row.api_key_id,
+        api_key_name: req_row.api_key_name,
+        ip_address: req_row.ip_address,
+        user_agent: req_row.user_agent,
+        redacted_prompt: req_row.redacted_prompt,
+        restored_response: req_row.restored_response,
+        raw_prompt: req_row.raw_prompt,
+        raw_response: req_row.raw_response,
+        user_first_name,
+        user_last_name,
+        user_position,
+        user_device_mac,
+        source,
     }))
 }
+
+/// Classify a request's origin from its user-agent header.
+///
+/// Returns a short label suitable for the audit "From" card. The set is
+/// intentionally small — it's a guide for the reviewer, not a security
+/// boundary. New shapes can be added as we observe them; the default
+/// catches anything we don't recognise as "External API client" rather
+/// than emitting raw UA text twice.
+fn classify_source(ua: Option<&str>) -> Option<String> {
+    let ua = ua?;
+    if ua.is_empty() {
+        return None;
+    }
+    let lower = ua.to_ascii_lowercase();
+    let label = if lower.contains("librechat") {
+        "LibreChat"
+    } else if lower.contains("electron") {
+        "Desktop chat (Electron)"
+    } else if lower.contains("customopenaiclient") {
+        // LibreChat's internal HTTP client name. Treat as the chat app.
+        "LibreChat"
+    } else if lower.contains("openai-python") {
+        "External API (openai-python)"
+    } else if lower.contains("openai-node") || lower.contains("openai/js") {
+        "External API (openai-js)"
+    } else if lower.contains("anthropic") {
+        "External API (anthropic-sdk)"
+    } else if lower.contains("python-requests") || lower.contains("httpx/") {
+        "External API (Python)"
+    } else if lower.starts_with("curl/") {
+        "External (curl)"
+    } else if lower.contains("postman") || lower.contains("insomnia") {
+        "External API (Postman/Insomnia)"
+    } else if lower.contains("mozilla") || lower.contains("chrome") || lower.contains("safari") {
+        "Browser"
+    } else {
+        "External API"
+    };
+    Some(label.to_owned())
+}
+

@@ -49,6 +49,8 @@ fn test_config(public_signup_enabled: bool) -> AppConfig {
             refresh_ttl_secs: 3600,
         },
         public_signup_enabled,
+        chat_debug_mode: false,
+        redact_when_no_rules: false,
     }
 }
 

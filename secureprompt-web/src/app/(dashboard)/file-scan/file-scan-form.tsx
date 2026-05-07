@@ -82,15 +82,28 @@ export function FileScanForm() {
           </div>
           {result.entities.length > 0 && (
             <div>
-              <p className="text-sm font-medium mb-2">Detected Entities</p>
+              <p className="text-sm font-medium mb-2">
+                Detected Entities{" "}
+                <span className="text-muted-foreground font-normal">
+                  ({result.entities.length} occurrence
+                  {result.entities.length === 1 ? "" : "s"})
+                </span>
+              </p>
               <div className="flex flex-wrap gap-2">
-                {result.entities.map((e, i) => (
+                {dedupeEntities(result.entities).map((e) => (
                   <span
-                    key={i}
+                    key={`${e.label}|${e.text}`}
                     className="rounded-full bg-muted px-3 py-1 text-xs"
-                    title={`score: ${e.score.toFixed(2)}`}
+                    title={`max score: ${e.score.toFixed(2)}${
+                      e.count > 1 ? ` · ${e.count} occurrences` : ""
+                    }`}
                   >
                     <span className="font-medium">{e.label}</span>: {e.text}
+                    {e.count > 1 && (
+                      <span className="ml-1 text-muted-foreground">
+                        ×{e.count}
+                      </span>
+                    )}
                   </span>
                 ))}
               </div>
@@ -108,6 +121,33 @@ export function FileScanForm() {
       )}
     </div>
   );
+}
+
+type RawEntity = ScanResult["entities"][number];
+
+interface DedupedEntity {
+  label: string;
+  text: string;
+  count: number;
+  score: number;
+}
+
+function dedupeEntities(entities: RawEntity[]): DedupedEntity[] {
+  const byKey = new Map<string, DedupedEntity>();
+  for (const e of entities) {
+    const key = `${e.label}|${e.text}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.count += 1;
+      if (e.score > existing.score) existing.score = e.score;
+    } else {
+      byKey.set(key, { label: e.label, text: e.text, count: 1, score: e.score });
+    }
+  }
+  return Array.from(byKey.values()).sort((a, b) => {
+    if (a.label !== b.label) return a.label.localeCompare(b.label);
+    return b.count - a.count;
+  });
 }
 
 function Flag({ label, active }: { label: string; active: boolean }) {

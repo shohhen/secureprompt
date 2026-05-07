@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useSession } from "next-auth/react";
 
 interface RagMatch {
   rule_id: string;
@@ -13,6 +14,7 @@ interface RagResult {
 }
 
 export function SearchForm() {
+  const { data: session } = useSession();
   const [text, setText] = useState("");
   const [result, setResult] = useState<RagResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -21,6 +23,10 @@ export function SearchForm() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!text.trim()) return;
+    if (!session?.workspaceId) {
+      setError("No active workspace — sign in again.");
+      return;
+    }
 
     setLoading(true);
     setError(null);
@@ -30,9 +36,12 @@ export function SearchForm() {
       const res = await fetch("/api/proxy/ml/v1/rag-check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, workspace_id: session.workspaceId }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(body ? `${res.status}: ${body.slice(0, 200)}` : `HTTP ${res.status}`);
+      }
       setResult(await res.json());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Search failed");

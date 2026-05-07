@@ -6,10 +6,32 @@
 
 use chrono::{DateTime, Utc};
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::user_repo::UserRow;
+
+/// Canonical PII classes seeded into every new workspace's "Redact common
+/// PII" rule. Curated for high-precision / unambiguous categories — leaving
+/// out `LOCATION` / `ORGANIZATION` / `GPE` since those fire on harmless
+/// prompts like "tell me about Apple."
+///
+/// The detector pipeline normalizes classes via
+/// `crate::detection::merge::normalize_class` before they reach policy
+/// evaluation, so these MUST match the post-normalization spelling
+/// (e.g. `EMAIL_ADDRESS`, not `EMAIL`).
+pub const DEFAULT_POLICY_CLASSES: &[&str] = &[
+    "PERSON",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "CREDIT_CARD",
+    "US_SSN",
+    "IBAN_CODE",
+    "AWS_ACCESS_KEY",
+    "GCP_KEY",
+    "AZURE_KEY",
+];
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceRow {
@@ -120,7 +142,37 @@ impl WorkspaceRepository {
             }
         })?;
 
-        // If we got this far, both INSERTs succeeded — commit.
+        // Seed the workspace with a "Redact common PII" rule so chat
+        // traffic is safe by default. Without this, brand-new workspaces
+        // run with zero rules → policy engine returns `allow` → the
+        // gateway forwards raw PII to the upstream model, which is
+        // exactly what SecurePrompt exists to prevent. The fallback
+        // gate in `pipeline/service.rs` (`redact_when_no_rules`) is the
+        // safety net for workspaces created before this seed shipped;
+        // this row is the explicit, dashboard-editable expression of
+        // the same intent.
+        //
+        // Matched on the standard `detection_class IN [...]` engine
+        // condition; admins can edit/disable it from the policy UI like
+        // any other rule.
+        let conditions = json!([
+            { "field": "detection_class", "op": "in", "value": DEFAULT_POLICY_CLASSES }
+        ]);
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, 'Redact common PII', 100, $3, 'redact', '{}'::jsonb,
+                     true, false, NOW(), NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ws.id)
+        .bind(&conditions)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // If we got this far, all three INSERTs succeeded — commit.
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -163,6 +215,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(role, "owner");
+    }
+
+    #[sqlx::test]
+    async fn seeds_default_redact_rule_for_new_workspace(pool: PgPool) {
+        let repo = WorkspaceRepository::new(pool.clone());
+        let hash = hash_password("pw-for-test-only").unwrap();
+
+        let (ws, _) = repo
+            .create_with_owner("Seeded Co", "seed@example.com", &hash)
+            .await
+            .expect("workspace + seed must succeed");
+
+        let row = sqlx::query(
+            "SELECT name, action, enabled, dry_run, conditions
+             FROM policy_rules
+             WHERE workspace_id = $1",
+        )
+        .bind(ws.id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed rule must exist");
+
+        let name: String = row.get("name");
+        let action: String = row.get("action");
+        let enabled: bool = row.get("enabled");
+        let dry_run: bool = row.get("dry_run");
+        let conditions: serde_json::Value = row.get("conditions");
+
+        assert_eq!(name, "Redact common PII");
+        assert_eq!(action, "redact");
+        assert!(enabled);
+        assert!(!dry_run);
+        // PERSON must be in the seeded class list — that's the entity that
+        // motivated this seed (regression test for "name leaked because no
+        // rule was configured").
+        let class_list: Vec<&str> = conditions[0]["value"]
+            .as_array()
+            .expect("value array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            class_list.contains(&"PERSON"),
+            "PERSON must be in the seeded redact list, got {class_list:?}"
+        );
     }
 
     #[sqlx::test]

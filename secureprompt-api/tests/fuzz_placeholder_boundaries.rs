@@ -24,8 +24,8 @@ fn placeholder_boundaries_restore_cleanly_across_chunk_sizes() {
 
         assert_eq!(restored, expected, "failed at chunk size {chunk_size}");
         assert!(
-            !restored.contains("[REDACTED:"),
-            "placeholder leaked at chunk size {chunk_size}"
+            !restored.contains("[REDACTED:") && !restored.contains("[Email_"),
+            "placeholder leaked at chunk size {chunk_size}: {restored}"
         );
     }
 }
@@ -58,9 +58,10 @@ fn multibyte_utf8_content_redacts_and_restores_cleanly() {
         !redacted.contains(email),
         "multi-byte email must be redacted: {redacted}"
     );
+    // Class name `email` → title-cased `Email`, first occurrence → `_1`.
     assert!(
-        redacted.contains("[REDACTED:"),
-        "placeholder must be present: {redacted}"
+        redacted.contains("{{Email_1}}"),
+        "indexed placeholder must be present: {redacted}"
     );
 
     // Verify chunk-safe restoration works for all chunk sizes.

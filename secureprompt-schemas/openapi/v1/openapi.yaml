@@ -1253,7 +1253,7 @@ components:
           format: uuid
         role:
           type: string
-          enum: [admin, member, viewer]
+          enum: [owner, admin, developer, viewer]
 
     # ── Gateway ─────────────────────────────────────────────────────────────────
     ChatMessage:

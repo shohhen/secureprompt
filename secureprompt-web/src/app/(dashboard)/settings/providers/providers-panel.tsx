@@ -5,6 +5,7 @@
  */
 
 import { useState, useCallback } from "react";
+import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import type { ColumnDef } from "@tanstack/react-table";
 import { DataTable } from "@/components/data-table/data-table";
@@ -16,8 +17,11 @@ import {
 import { ProviderForm } from "./provider-form";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { canWrite } from "@/lib/roles";
 
 export function ProvidersPanel() {
+  const { data: session } = useSession();
+  const writable = canWrite(session?.role);
   const { data: providers, isLoading } = useProviders();
   const deleteProvider = useDeleteProvider();
   const [editTarget, setEditTarget] = useState<ProviderResponse | undefined>();
@@ -76,6 +80,7 @@ export function ProvidersPanel() {
       header: "",
       cell: ({ row }) => {
         const prov = row.original;
+        if (!writable) return null;
         return (
           <div className="flex gap-2">
             <Button
@@ -107,11 +112,18 @@ export function ProvidersPanel() {
           <p className="text-sm text-muted-foreground">
             Manage provider credentials. Credentials are stored encrypted and
             are never exposed in API responses.
+            {!writable && (
+              <span className="block mt-1 text-xs">
+                Only owners and admins can add or edit providers.
+              </span>
+            )}
           </p>
         </div>
-        <Button size="sm" onClick={() => setAddOpen(true)}>
-          Add Provider
-        </Button>
+        {writable && (
+          <Button size="sm" onClick={() => setAddOpen(true)}>
+            Add Provider
+          </Button>
+        )}
       </div>
 
       <DataTable

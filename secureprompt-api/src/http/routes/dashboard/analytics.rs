@@ -27,7 +27,8 @@ use uuid::Uuid;
 
 use crate::{
     analytics::dashboard_reader::{
-        CostByModelRow, LatencyPctilesRow, PolicyViolationsRow, UsageDailyRow,
+        CostByModelRow, LatencyPctilesHourlyRow, LatencyPctilesRow, PolicyViolationsRow,
+        UsageDailyRow,
     },
     app_state::AppState,
     http::{api_error_response, middleware::jwt_auth::JwtAuthContext},
@@ -43,6 +44,21 @@ pub struct DateRangeParams {
     pub workspace_id: Option<Uuid>,
     /// Optional model filter (usage-daily + latency-pctiles only).
     pub model: Option<String>,
+    /// Bucket granularity (latency-pctiles only). `"hour"` switches the
+    /// response to `LatencyPctilesHourlyRow` shape with a `bucket_ts`
+    /// timestamp field; otherwise the daily mart row is returned.
+    /// Capped at 31 days for hourly to keep payload size bounded.
+    pub bucket: Option<String>,
+}
+
+/// Tagged response so the frontend can switch chart formatting based on
+/// granularity without inspecting field names. Hourly rows carry full
+/// timestamps; daily rows carry calendar dates.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "bucket", rename_all = "lowercase")]
+pub enum LatencyPctilesResponse {
+    Day { rows: Vec<LatencyPctilesRow> },
+    Hour { rows: Vec<LatencyPctilesHourlyRow> },
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -214,7 +230,7 @@ async fn latency_pctiles(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
     Query(params): Query<DateRangeParams>,
-) -> Result<Json<Vec<LatencyPctilesRow>>, axum::response::Response> {
+) -> Result<Json<LatencyPctilesResponse>, axum::response::Response> {
     // T-05-05 IDOR guard
     if let Some(w) = params.workspace_id {
         if w != ctx.workspace_id.0 {
@@ -224,33 +240,51 @@ async fn latency_pctiles(
         }
     }
 
+    let hourly = matches!(params.bucket.as_deref(), Some("hour"));
+
     tracing::info!(
         workspace_id = %ctx.workspace_id.0,
         endpoint = "latency-pctiles",
         from = ?params.from,
         to = ?params.to,
         model = ?params.model,
+        bucket = if hourly { "hour" } else { "day" },
     );
 
     let start = Instant::now();
-    let result = state
-        .dashboard_reader
-        .query_latency_pctiles(
-            &state.metrics,
-            ctx.workspace_id.0,
-            params.from,
-            params.to,
-            params.model.as_deref(),
-        )
-        .await;
+    let response = if hourly {
+        state
+            .dashboard_reader
+            .query_latency_pctiles_hourly(
+                &state.metrics,
+                ctx.workspace_id.0,
+                params.from,
+                params.to,
+                params.model.as_deref(),
+            )
+            .await
+            .map(|rows| LatencyPctilesResponse::Hour { rows })
+    } else {
+        state
+            .dashboard_reader
+            .query_latency_pctiles(
+                &state.metrics,
+                ctx.workspace_id.0,
+                params.from,
+                params.to,
+                params.model.as_deref(),
+            )
+            .await
+            .map(|rows| LatencyPctilesResponse::Day { rows })
+    };
     let elapsed = start.elapsed();
 
-    match result {
-        Ok(rows) => {
+    match response {
+        Ok(body) => {
             state
                 .metrics
                 .record_dashboard_request("latency-pctiles", elapsed, "success");
-            Ok(Json(rows))
+            Ok(Json(body))
         }
         Err(e) => {
             state

@@ -4,7 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 
-use crate::ml_sidecar::types::{MlDetection, NerRequest, NerResponse, RagCheckRequest, RagCheckResponse};
+use crate::ml_sidecar::types::{
+    InjectionRequest, InjectionResponse, MlDetection, NerRequest, NerResponse, RagCheckRequest,
+    RagCheckResponse,
+};
 
 const FAILURE_THRESHOLD: u32 = 5;
 const OPEN_DURATION_SECS: u64 = 30;
@@ -155,6 +158,54 @@ impl MlSidecarClient {
                 }
                 self.failures_total.fetch_add(1, Ordering::Relaxed);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Call `/detect/injection` on the ML sidecar.
+    ///
+    /// Returns the classifier's confidence that the prompt contains an
+    /// injection attempt. Fails open (`is_injection=false`, score=0.0) when
+    /// the sidecar is disabled or the circuit is open — same fail-open
+    /// contract as `detect_if_available` (D-13). Used by `secure_mode`
+    /// enforcement when `block_on_injection_detection=true`.
+    pub async fn injection_check_if_available(&self, prompt: &str) -> InjectionResponse {
+        let empty = InjectionResponse {
+            is_injection: false,
+            score: 0.0,
+        };
+        let (http, circuit) = match (&self.http, &self.circuit) {
+            (Some(h), Some(c)) if self.enabled => (h, c),
+            _ => return empty,
+        };
+        if circuit.is_open() {
+            return empty;
+        }
+        let url = format!("{}/detect/injection", self.base_url);
+        let body = InjectionRequest {
+            text: prompt.to_owned(),
+        };
+        match http.post(&url).json(&body).send().await {
+            Ok(resp) => match resp.json::<InjectionResponse>().await {
+                Ok(out) => {
+                    circuit.record_success();
+                    self.calls_total.fetch_add(1, Ordering::Relaxed);
+                    out
+                }
+                Err(_) => {
+                    if circuit.record_failure() {
+                        self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.failures_total.fetch_add(1, Ordering::Relaxed);
+                    empty
+                }
+            },
+            Err(_) => {
+                if circuit.record_failure() {
+                    self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.failures_total.fetch_add(1, Ordering::Relaxed);
+                empty
             }
         }
     }

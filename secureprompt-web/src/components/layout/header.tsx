@@ -10,10 +10,12 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
+import { useMyProfile } from "@/lib/hooks/use-profile";
 
 interface HeaderProps {
   onToggleSidebar: () => void;
@@ -23,6 +25,12 @@ interface HeaderProps {
 export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
   const router = useRouter();
   const [theme, setTheme] = useState<"light" | "dark">("light");
+  const { data: profile } = useMyProfile();
+  const displayName = profile?.display_name ?? "Account";
+  const initials = profile
+    ? (profile.first_name?.[0] ?? profile.email[0] ?? "U") +
+      (profile.last_name?.[0] ?? "")
+    : null;
 
   useEffect(() => {
     const saved = window.localStorage.getItem("sp_theme");
@@ -72,14 +80,46 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
             <Button variant="ghost" className="gap-2 px-2">
               <Avatar className="size-8">
                 <AvatarFallback className="bg-secondary text-secondary-foreground">
-                  <User className="size-4" />
+                  {initials ? (
+                    <span className="text-xs font-medium uppercase">
+                      {initials}
+                    </span>
+                  ) : (
+                    <User className="size-4" />
+                  )}
                 </AvatarFallback>
               </Avatar>
-              <span className="hidden text-sm md:inline">Account</span>
+              <span className="hidden max-w-[12rem] truncate text-sm md:inline">
+                {displayName}
+              </span>
               <ChevronsUpDown className="hidden size-4 text-muted-foreground md:inline" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuContent align="end" className="w-60">
+            {profile && (
+              <DropdownMenuLabel className="font-normal">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">
+                    {profile.display_name}
+                  </span>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {profile.email}
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">
+                    Role: {profile.role}
+                    {profile.position ? ` · ${profile.position}` : ""}
+                  </span>
+                </div>
+              </DropdownMenuLabel>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => router.push("/settings/profile")}
+              className="cursor-pointer gap-2"
+            >
+              <User className="size-4" />
+              Profile
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
               onClick={() => { void handleLogout(); }}

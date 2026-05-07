@@ -10,5 +10,10 @@ sentence-transformers==5.4.1
 onnxruntime==1.20.1
 numpy==1.26.4
 qdrant-client==1.17.1
+# Optional extractors for /v1/scan-file — the handler falls back to raw
+# decoding if these are missing so rebuilds without them still work.
+pypdf==5.1.0
+python-docx==1.1.2
+python-multipart==0.0.12
 # torch CPU-only installed separately in Dockerfile:
 # pip install torch==2.6.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu

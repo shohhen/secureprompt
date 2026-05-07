@@ -19,9 +19,20 @@ pub fn force_include_usage(extra_params: &mut Value) {
     stream_options["include_usage"] = Value::Bool(true);
 }
 
+/// Chunk-assembly buffer for placeholder-aware streaming.
+///
+/// Placeholders emitted by `apply_redaction` look like `{{Class_N}}` (e.g.
+/// `{{Person_1}}`, `{{Email_Address_2}}`). When the LLM echoes them back in
+/// a streamed response, a single placeholder may straddle chunk boundaries;
+/// we must keep the fragment buffered until the closing `}}` arrives,
+/// otherwise `TokenVault::restore` would miss it and the raw placeholder
+/// would leak to the client.
+///
+/// Detection rule: a candidate placeholder starts at any byte offset where
+/// `{{` is followed by an ASCII uppercase letter. Bare `{` is emitted
+/// immediately so `{ "json": "value" }` flows through normally.
 #[must_use]
 pub fn placeholder_safe_chunks(chunks: &[String], vault: &TokenVault) -> Vec<String> {
-    const PLACEHOLDER_PREFIX: &str = "[REDACTED:";
     let mut pending = String::new();
     let mut safe_chunks = Vec::new();
 
@@ -29,38 +40,49 @@ pub fn placeholder_safe_chunks(chunks: &[String], vault: &TokenVault) -> Vec<Str
         pending.push_str(chunk);
 
         loop {
-            if let Some(start) = pending.find(PLACEHOLDER_PREFIX) {
-                if let Some(end_offset) = pending[start..].find(']') {
-                    let emit_end = start + end_offset + 1;
-                    if emit_end == 0 {
-                        break;
+            match find_placeholder_start(&pending) {
+                Some(start) => {
+                    if let Some(end_offset) = pending[start..].find("}}") {
+                        let emit_end = start + end_offset + 2;
+                        let safe = pending[..emit_end].to_owned();
+                        if !safe.is_empty() {
+                            safe_chunks.push(vault.restore(&safe));
+                        }
+                        pending = pending[emit_end..].to_owned();
+                        continue;
                     }
-                    let safe = pending[..emit_end].to_owned();
-                    if !safe.is_empty() {
-                        safe_chunks.push(vault.restore(&safe));
-                    }
-                    pending = pending[emit_end..].to_owned();
-                    continue;
-                }
 
-                if start > 0 {
-                    let safe = pending[..start].to_owned();
-                    if !safe.is_empty() {
-                        safe_chunks.push(vault.restore(&safe));
+                    // Placeholder's opener is in-buffer but closer hasn't
+                    // arrived — flush everything before the `{{` and hold.
+                    if start > 0 {
+                        let safe = pending[..start].to_owned();
+                        if !safe.is_empty() {
+                            safe_chunks.push(vault.restore(&safe));
+                        }
+                        pending = pending[start..].to_owned();
                     }
-                    pending = pending[start..].to_owned();
+                    break;
                 }
-                break;
+                None => {
+                    // No placeholder candidate in buffer. Hold back a
+                    // trailing `{` (or `{{`) in case the next chunk
+                    // completes the opener; otherwise emit.
+                    let hold = if pending.ends_with("{{") {
+                        2
+                    } else if pending.ends_with('{') {
+                        1
+                    } else {
+                        0
+                    };
+                    let emit_len = pending.len().saturating_sub(hold);
+                    if emit_len > 0 {
+                        let safe = pending[..emit_len].to_owned();
+                        safe_chunks.push(vault.restore(&safe));
+                        pending = pending[emit_len..].to_owned();
+                    }
+                    break;
+                }
             }
-
-            let keep = trailing_placeholder_prefix_len(&pending, PLACEHOLDER_PREFIX);
-            let emit_len = pending.len().saturating_sub(keep);
-            if emit_len > 0 {
-                let safe = pending[..emit_len].to_owned();
-                safe_chunks.push(vault.restore(&safe));
-                pending = pending[emit_len..].to_owned();
-            }
-            break;
         }
     }
 
@@ -76,11 +98,18 @@ pub fn fallback_allowed(emitted_chunks: usize) -> bool {
     emitted_chunks == 0
 }
 
-fn trailing_placeholder_prefix_len(content: &str, placeholder_prefix: &str) -> usize {
-    for len in (1..placeholder_prefix.len()).rev() {
-        if content.ends_with(&placeholder_prefix[..len]) {
-            return len;
+/// Return the byte offset of the first `{{X…` sequence where X is ASCII
+/// uppercase. All our placeholder classes are Title_Case so the opening
+/// letter is always uppercase; this keeps benign `{{` (e.g. mustache
+/// templates that aren't ours) from triggering chunk-buffer hold-back.
+fn find_placeholder_start(content: &str) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'{' && bytes[i + 1] == b'{' && bytes[i + 2].is_ascii_uppercase() {
+            return Some(i);
         }
+        i += 1;
     }
-    0
+    None
 }

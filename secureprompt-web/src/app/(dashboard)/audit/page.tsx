@@ -11,7 +11,8 @@ export default async function AuditPage() {
       <div>
         <h1 className="text-2xl font-semibold">Audit Log</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Recent requests that triggered policy violations.
+          Every request routed through the gateway — filter to violations with
+          the toggle below.
         </p>
       </div>
       <AuditTable workspaceId={session.workspaceId} />

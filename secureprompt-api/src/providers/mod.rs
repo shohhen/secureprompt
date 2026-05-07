@@ -1,6 +1,8 @@
 pub mod anthropic;
+pub mod credential_test;
 pub mod ollama;
 pub mod openai;
+pub mod openai_compat;
 pub mod vllm;
 #[cfg(test)]
 mod tests;
@@ -33,6 +35,11 @@ pub struct ProviderInvocation {
     pub extra_params: Value,
     pub stream: bool,
     pub kind: InvocationKind,
+    /// Plaintext credential (e.g. "sk-..." or a Google API key), decrypted
+    /// from `target.encrypted_credential` by the pipeline before invoking
+    /// the adapter. `None` means no credential is configured — the adapter
+    /// can fail-fast or use anonymous defaults (e.g. ollama).
+    pub decrypted_credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,6 +50,11 @@ pub struct ProviderOutput {
     pub embedding: Option<Vec<f32>>,
     pub stream_chunks: Vec<String>,
     pub finish_reason: Option<String>,
+    /// Time-to-first-byte from upstream — measured between issuing the
+    /// HTTP request and the moment the response headers arrive.
+    /// `None` for adapters that don't make a network call (debug mode,
+    /// stub adapters in tests).
+    pub ttft_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +84,20 @@ impl ProviderCatalog {
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut adapters: HashMap<String, Arc<dyn ProviderAdapter>> = HashMap::new();
-        adapters.insert("openai".to_owned(), Arc::new(openai::OpenAiAdapter));
+        // Real HTTP adapter for OpenAI's API and Google's OpenAI-compat
+        // endpoint. Both speak the same /chat/completions protocol so one
+        // implementation covers both — registered under each canonical
+        // provider_type. The legacy `openai::OpenAiAdapter` stub is left in
+        // the codebase for tests but no longer registered as the runtime
+        // adapter for `openai`.
+        adapters.insert(
+            "openai".to_owned(),
+            Arc::new(openai_compat::OpenAiCompatAdapter::openai()),
+        );
+        adapters.insert(
+            "google".to_owned(),
+            Arc::new(openai_compat::OpenAiCompatAdapter::google()),
+        );
         adapters.insert(
             "anthropic".to_owned(),
             Arc::new(anthropic::AnthropicAdapter),
@@ -163,6 +188,7 @@ pub(crate) fn render_output(
             embedding: Some(fake_embedding(&invocation.prompt)),
             stream_chunks: Vec::new(),
             finish_reason: Some("stop".to_owned()),
+            ttft_ms: None,
         };
     }
 
@@ -187,6 +213,7 @@ pub(crate) fn render_output(
         embedding: None,
         stream_chunks: chunks,
         finish_reason: Some("stop".to_owned()),
+        ttft_ms: None,
     }
 }
 

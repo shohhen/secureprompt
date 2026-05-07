@@ -5,7 +5,7 @@ pub mod streaming;
 
 use crate::app_state::AppState;
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::from_fn_with_state,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,6 +13,7 @@ use axum::{
 };
 use secureprompt_common::errors::ApiError;
 use serde_json::json;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub fn build_router(state: AppState) -> Router {
     // MCP utility routes — registered below the OpenAI compat routes.
@@ -71,6 +72,14 @@ pub fn build_router(state: AppState) -> Router {
                 )),
         )
         .nest(
+            "/v1/me",
+            routes::dashboard::me::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
             "/v1/providers",
             routes::dashboard::providers::routes()
                 .route_layer(from_fn_with_state(
@@ -116,6 +125,39 @@ pub fn build_router(state: AppState) -> Router {
         )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
         .with_state(state)
+        .layer(cors_layer())
+}
+
+/// Browser-facing CORS for the dashboard. Origins are comma-separated in
+/// `SECUREPROMPT_CORS_ORIGINS` (e.g. `http://localhost:3000,https://app.example.com`).
+/// Defaults to `http://localhost:3000` when unset so local dev "just works".
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("SECUREPROMPT_CORS_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::ORIGIN,
+        ])
+        .allow_credentials(true)
+        .max_age(std::time::Duration::from_secs(600))
 }
 
 async fn openapi_json() -> impl IntoResponse {

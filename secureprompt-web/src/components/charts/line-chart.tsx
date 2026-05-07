@@ -23,6 +23,22 @@ interface LineChartProps {
   xKey: string;
   lines: { key: string; color?: string; label?: string }[];
   height?: number;
+  /**
+   * Optional formatter applied to each x-axis tick label. Receives the raw
+   * value at `data[i][xKey]` and returns the display string.
+   *
+   * Keeping this opt-in (rather than auto-detecting "looks like a date")
+   * avoids surprising downstream callers that pass categorical strings —
+   * the rule is: only the caller knows what the value means.
+   */
+  xTickFormatter?: (value: unknown) => string;
+  /**
+   * Optional formatter applied to each tooltip header.
+   * Defaults to `xTickFormatter` when not provided.
+   */
+  tooltipLabelFormatter?: (value: unknown) => string;
+  /** How aggressively Recharts thins out crowded axis labels. */
+  xAxisMinTickGap?: number;
 }
 
 const DEFAULT_COLORS = [
@@ -33,14 +49,31 @@ const DEFAULT_COLORS = [
   "#3b82f6",
 ];
 
-export function LineChart({ data, xKey, lines, height = 300 }: LineChartProps) {
+export function LineChart({
+  data,
+  xKey,
+  lines,
+  height = 300,
+  xTickFormatter,
+  tooltipLabelFormatter,
+  xAxisMinTickGap = 24,
+}: LineChartProps) {
+  const tickFn = xTickFormatter
+    ? (v: unknown) => xTickFormatter(v)
+    : undefined;
+  const labelFn = tooltipLabelFormatter ?? xTickFormatter;
   return (
     <ResponsiveContainer width="100%" height={height}>
       <ReLineChart data={data} margin={{ top: 8, right: 24, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-        <XAxis dataKey={xKey} tick={{ fontSize: 12 }} />
+        <XAxis
+          dataKey={xKey}
+          tick={{ fontSize: 12 }}
+          tickFormatter={tickFn}
+          minTickGap={xAxisMinTickGap}
+        />
         <YAxis tick={{ fontSize: 12 }} />
-        <Tooltip />
+        <Tooltip labelFormatter={labelFn ? (v) => labelFn(v) : undefined} />
         <Legend />
         {lines.map((l, i) => (
           <Line

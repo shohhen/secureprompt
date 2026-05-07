@@ -20,6 +20,9 @@ interface BarChartProps {
   xKey: string;
   bars: { key: string; color?: string; label?: string }[];
   height?: number;
+  xTickFormatter?: (value: unknown) => string;
+  tooltipLabelFormatter?: (value: unknown) => string;
+  xAxisMinTickGap?: number;
 }
 
 const DEFAULT_COLORS = [
@@ -30,14 +33,28 @@ const DEFAULT_COLORS = [
   "#3b82f6",
 ];
 
-export function BarChart({ data, xKey, bars, height = 300 }: BarChartProps) {
+export function BarChart({
+  data,
+  xKey,
+  bars,
+  height = 300,
+  xTickFormatter,
+  tooltipLabelFormatter,
+  xAxisMinTickGap = 24,
+}: BarChartProps) {
+  const labelFn = tooltipLabelFormatter ?? xTickFormatter;
   return (
     <ResponsiveContainer width="100%" height={height}>
       <ReBarChart data={data} margin={{ top: 8, right: 24, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-        <XAxis dataKey={xKey} tick={{ fontSize: 12 }} />
+        <XAxis
+          dataKey={xKey}
+          tick={{ fontSize: 12 }}
+          tickFormatter={xTickFormatter ? (v) => xTickFormatter(v) : undefined}
+          minTickGap={xAxisMinTickGap}
+        />
         <YAxis tick={{ fontSize: 12 }} />
-        <Tooltip />
+        <Tooltip labelFormatter={labelFn ? (v) => labelFn(v) : undefined} />
         <Legend />
         {bars.map((b, i) => (
           <Bar
