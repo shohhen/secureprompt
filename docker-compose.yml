@@ -154,6 +154,18 @@ services:
       timeout: 5s
       retries: 3
 
+  marketing:
+    build:
+      context: .
+      dockerfile: secureprompt-marketing/Dockerfile
+    ports:
+      - "3002:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3001/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   grafana:
     image: grafana/grafana:11.4.0
     environment:
