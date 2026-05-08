@@ -49,5 +49,28 @@ secureprompt-analytics/logs/
 # Per-deployment env override
 .env.librechat
 
-# Claude Code agent worktrees (ephemeral, not source)
+# Claude Code agent state (ephemeral, not source)
+.claude/
 .claude/worktrees/
+
+# TypeScript / Next.js incremental build artefacts
+*.tsbuildinfo
+next-env.d.ts
+**/.next/
+**/node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor swap files
+*.swp
+*.swo
+*~
