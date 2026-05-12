@@ -625,21 +625,49 @@ a { color: inherit; text-decoration: none; }
   border-color: var(--color-accent-deep);
 }
 
-/* TalkToUs button — link variant (hero footer) */
+/* TalkToUs button — link variant (hero footer, bordered CTA) */
 .hero-foot .col.cta .talk-btn-link {
-  color: var(--color-accent);
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  padding: 14px 22px;
+  margin-top: 4px;
+  border: 1.5px solid var(--color-accent);
+  background: transparent;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 200ms, color 200ms, border-color 200ms;
+  align-self: flex-start;
 }
 
 .hero-foot .col.cta .talk-btn-link::after {
   content: "↗";
+  font-size: 15px;
   transition: transform 200ms;
+}
+
+.hero-foot .col.cta .talk-btn-link:hover {
+  background: var(--color-accent);
+  color: var(--color-ink-on-accent);
+  border-color: var(--color-accent);
 }
 
 .hero-foot .col.cta .talk-btn-link:hover::after {
   transform: translate(2px, -2px);
+}
+
+/* Ensure cta cell stacks the label above the button */
+.hero-foot .col.cta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
 }
 
 /* Contact form labels + subtitle */
