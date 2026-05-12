@@ -1,3 +1,5 @@
+import { TalkToUsButton } from "../TalkToUsButton";
+
 export function Hero() {
   return (
     <section className="hero" id="top">
@@ -41,7 +43,7 @@ export function Hero() {
         </div>
         <div className="col cta">
           <span className="k">// next</span>
-          <a href="#talk">Talk to us</a>
+          <TalkToUsButton label="Talk to us" variant="link" />
         </div>
       </div>
       <div className="scroll-discover">scroll to discover</div>

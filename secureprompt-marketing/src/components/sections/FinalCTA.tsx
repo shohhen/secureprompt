@@ -1,3 +1,5 @@
+import { TalkToUsButton } from "../TalkToUsButton";
+
 export function FinalCTA() {
   return (
     <section className="final-cta" id="talk">
@@ -18,11 +20,7 @@ export function FinalCTA() {
         </span>
       </h2>
       <div className="ctas">
-        <a href="mailto:hello@secureprompt.io" className="primary">
-          talk to us →
-        </a>
-        <a href="#">read the docs ↗</a>
-        <a href="#">request demo</a>
+        <TalkToUsButton label="talk to us →" variant="primary" />
       </div>
     </section>
   );

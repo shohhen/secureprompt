@@ -160,6 +160,8 @@ services:
       dockerfile: secureprompt-marketing/Dockerfile
     ports:
       - "3002:3001"
+    environment:
+      CONTACT_FORM_ENDPOINT: ${CONTACT_FORM_ENDPOINT:-}
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3001/"]
       interval: 30s

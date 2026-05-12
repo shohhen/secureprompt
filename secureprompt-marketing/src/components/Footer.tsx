@@ -3,10 +3,7 @@ export function Footer() {
     <footer className="site-footer">
       <div>secureprompt · © 2026</div>
       <div className="links">
-        <a href="#">documentation</a>
-        <a href="#">security</a>
-        <a href="#">contact</a>
-        <a href="#">github ↗</a>
+        <a href="mailto:s.karimberganov@secureprompt.tech">contact</a>
       </div>
     </footer>
   );
