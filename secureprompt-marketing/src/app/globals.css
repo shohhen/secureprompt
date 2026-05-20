@@ -7,14 +7,14 @@
   --font-pixel: var(--font-pixel), "VT323", ui-monospace, monospace;
   --font-pixel-sm: var(--font-pixel-sm), "Silkscreen", monospace;
 
-  /* Black bg + bloody red accent (Revelo-inspired, v5) */
-  --color-bg: #0a0a0a;
-  --color-bg-2: #111111;
-  --color-fg: #eeebe4;
-  --color-muted: #6b6560;
-  --color-line: #222018;
-  --color-line-2: #3a3530;
-  --color-card: #0d0d0d;
+  /* Ghost-white bg + bloody red accent (light theme) */
+  --color-bg: #F8F8FF;
+  --color-bg-2: #EFEFF6;       /* card / nested surface */
+  --color-fg: #0e0e12;         /* near-black text */
+  --color-muted: #6a6573;      /* dimmed text */
+  --color-line: #E2E1EA;       /* subtle hairline */
+  --color-line-2: #C9C8D2;     /* stronger hairline / borders */
+  --color-card: #FFFFFF;       /* card background */
 
   --color-accent: #e30613;
   --color-accent-deep: #b00010;
@@ -236,7 +236,7 @@ a { color: inherit; text-decoration: none; }
   padding: 28px 28px; border-bottom: 1px solid var(--color-line);
   cursor: pointer; transition: background 240ms;
 }
-.nrow:hover { background: rgba(255, 255, 255, 0.02); }
+.nrow:hover { background: rgba(0, 0, 0, 0.03); }
 .nrow .nidx { font-family: var(--font-mono); font-size: 11px; color: var(--color-muted); letter-spacing: 0.1em; padding-top: 12px; }
 .nrow .nbody h3 {
   font-family: var(--font-sans); font-weight: 600;
