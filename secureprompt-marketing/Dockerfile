@@ -2,7 +2,10 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@10.18.0 --activate
+# Install pnpm directly instead of via corepack — Node 22's bundled
+# corepack can fail signature verification when fetching pnpm from npm
+# (the npm signing-key roll-over broke older corepack snapshots).
+RUN npm install -g pnpm@10.18.0
 
 COPY secureprompt-marketing/package.json secureprompt-marketing/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
