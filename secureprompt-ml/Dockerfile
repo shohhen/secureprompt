@@ -1,4 +1,7 @@
-FROM python:3.11-slim AS builder
+# syntax=docker/dockerfile:1.7
+
+# ---- Stage 1: dependencies + model caches ----
+FROM python:3.11-slim AS deps
 
 WORKDIR /build
 
@@ -20,20 +23,34 @@ RUN python -c "from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner
 RUN python -c "from transformers import pipeline; pipeline('text-classification', model='protectai/deberta-v3-base-prompt-injection-v2', device=-1)"
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')"
 
+# ---- Stage 2: Cython compile (.py -> .so, sources stripped) ----
+FROM deps AS compile
+
+WORKDIR /build
+
+RUN pip install --no-cache-dir "cython>=3.0,<3.1" "setuptools>=68"
+
+COPY secureprompt-ml/app ./app
+COPY secureprompt-ml/cython_build.py ./cython_build.py
+
+RUN python cython_build.py
+
+# ---- Stage 3: minimal runtime (no .py sources, no .pyc) ----
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
 RUN mkdir -p /app/.cache/torch /app/.cache/huggingface
 
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
-COPY --from=builder /root/.cache/huggingface /app/.cache/huggingface
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+COPY --from=deps /root/.cache/huggingface /app/.cache/huggingface
 
-COPY secureprompt-ml/app ./app
-# Dataset-derived Presidio artifacts (Uzbek name gazetteer + doc-ID
-# patterns) live under app/resources/ — no runtime download.
+# Compiled app: only __init__.py stubs + .so binaries + any data files
+COPY --from=compile /build/app ./app
 
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 ENV TRANSFORMERS_OFFLINE=1
 ENV HF_DATASETS_OFFLINE=1
 ENV HF_HOME=/app/.cache/huggingface
