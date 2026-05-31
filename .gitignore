@@ -27,9 +27,6 @@ secureprompt-web/test-results/
 secureprompt-analytics/profiles.yml
 .worktrees/
 
-# LibreChat fork — tracked as its own git repo; do not commit into parent
-secureprompt-chat/
-
 
 # Python caches and venvs (added for SP session work)
 **/__pycache__/
