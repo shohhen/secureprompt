@@ -188,8 +188,104 @@ services:
       clickhouse:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # LibreChat stack (task 30) — chat UI + its own MongoDB + an nginx that
+  # terminates TLS on host port 8443. Lives in the same docker-compose so
+  # `librechat` reaches the SP API as `api:8080` over the default bridge
+  # network (no host.docker.internal hop). Bring up just this slice with:
+  #   docker compose up -d librechat-mongo librechat librechat-nginx
+  # ---------------------------------------------------------------------------
+  librechat-mongo:
+    image: mongo:7.0
+    container_name: librechat-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-librechat}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
+    volumes:
+      - librechat_mongo_data:/data/db
+    healthcheck:
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  librechat:
+    # Build from the SP-modified fork so the auth/strategies, model
+    # discovery, and file-scan code paths are baked into the image.
+    # Pulling upstream `ghcr.io/danny-avila/librechat-dev:latest` here
+    # would silently drop every modification under `// SP: ` markers.
+    build:
+      context: ./secureprompt-chat
+      dockerfile: Dockerfile
+    container_name: librechat
+    restart: unless-stopped
+    depends_on:
+      librechat-mongo:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USERNAME:-librechat}:${MONGO_PASSWORD:-changeme}@librechat-mongo:27017/LibreChat?authSource=admin
+      HOST: 0.0.0.0
+      PORT: "3080"
+      DOMAIN_CLIENT: https://chat.${DOMAIN:-localhost}
+      DOMAIN_SERVER: https://chat.${DOMAIN:-localhost}
+      JWT_SECRET: ${LIBRECHAT_JWT_SECRET:-changeme-librechat-jwt}
+      JWT_REFRESH_SECRET: ${LIBRECHAT_JWT_REFRESH_SECRET:-changeme-librechat-refresh}
+      CREDS_KEY: ${LIBRECHAT_CREDS_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      CREDS_IV: ${LIBRECHAT_CREDS_IV:-00000000000000000000000000000000}
+      # SecurePrompt integration (task 30) — same docker network, so the SP API
+      # is reachable directly as `api:8080`. The fork's auth strategy calls
+      # `${SECUREPROMPT_API_URL}/v1/auth/login` and `/v1/me/api-key`; every
+      # provider request reverses through `/v1/chat/completions`; every file
+      # upload routes through `/v1/scan-file`.
+      SECUREPROMPT_API_URL: http://api:8080
+      # SP: `/v1/scan-file` lives on the ML sidecar (Python FastAPI), not
+      # SP: on the Rust SP API. Phase 1: librechat hits the sidecar directly
+      # SP: over the docker bridge network. Phase 2 will replace this with a
+      # SP: SP-side proxy at /v1/scan-file that does API-key auth + audit.
+      SECUREPROMPT_ML_URL: http://secureprompt-ml:8080
+      SECUREPROMPT_SCAN_FILES_ENABLED: ${SECUREPROMPT_SCAN_FILES_ENABLED:-true}
+      ALLOW_REGISTRATION: "false"
+      ALLOW_EMAIL_LOGIN: "true"
+      ALLOW_SOCIAL_LOGIN: "false"
+    volumes:
+      - ./secureprompt-chat-config/librechat.yaml:/app/librechat.yaml:ro
+    ports:
+      - "3080:3080"
+
+  librechat-nginx:
+    image: nginx:1.27-alpine
+    container_name: librechat-nginx
+    restart: unless-stopped
+    depends_on:
+      - librechat
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./monitoring/nginx/certs:/etc/nginx/certs
+      - ./monitoring/nginx/conf.d/librechat.conf:/etc/nginx/conf.d/librechat.conf:ro
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -f /etc/nginx/certs/chat.fullchain.pem ] || [ ! -f /etc/nginx/certs/chat.privkey.pem ]; then
+          echo "[librechat-nginx] no TLS cert found, generating self-signed for chat.localhost..."
+          apk add --no-cache openssl >/dev/null
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/nginx/certs/chat.privkey.pem \
+            -out    /etc/nginx/certs/chat.fullchain.pem \
+            -subj "/CN=chat.localhost"
+          echo "[librechat-nginx] cert generated."
+        fi
+        exec nginx -g 'daemon off;'
+
+
 volumes:
   postgres_data:
   clickhouse_data:
   grafana_data:
   qdrant_data:
+  librechat_mongo_data:
