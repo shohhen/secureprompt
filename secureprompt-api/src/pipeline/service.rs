@@ -4,16 +4,21 @@ use crate::{
     db::secure_mode_repo::{SecureModeRepository, SecureModeRow},
     detection::{detect_content, merge::merge_detections},
     http::{
-        middleware::api_key_auth::AuthContext,
+        middleware::{api_key_auth::AuthContext, rate_limit::adjust_workspace_tokens},
         model_router::{ModelTarget, ResolvedModel},
-        streaming::placeholder_safe_chunks,
+        streaming::{placeholder_safe_chunks, settled_prefix_len, PlaceholderStreamer},
     },
     observability::tracing::{log_request_finish, log_request_start},
-    policy::engine::{evaluate, PolicyEvaluationInput},
-    providers::{sanitize_extra_params, InvocationKind, ProviderInvocation},
+    policy::engine::{evaluate, PolicyEvaluationInput, PolicyEvaluationOutcome},
+    providers::{
+        sanitize_extra_params, InvocationKind, ProviderEvent, ProviderEventStream,
+        ProviderInvocation,
+    },
     token_usage::dispatch::{derive_usage, UsageComputation},
     vault::restore_content,
 };
+use futures_util::stream::{Stream, StreamExt};
+use std::pin::Pin;
 use std::time::Instant;
 use secureprompt_common::{
     errors::ApiError,
@@ -56,9 +61,43 @@ pub struct PipelineExecution {
     pub pipeline_output: PipelineOutput,
 }
 
+/// One item emitted by the streaming pipeline path (`execute_stream`).
+///
+/// `Delta` is a client-safe text fragment (placeholders restored, and — when
+/// the workspace enables response-side PII redaction — re-redacted). `Done`
+/// arrives exactly once at the end, after the request has been finalized
+/// (audit event enqueued, usage reconciled), carrying the figures the HTTP
+/// layer needs for the terminal usage SSE frame.
+#[derive(Debug, Clone)]
+pub enum ChatStreamItem {
+    Delta(String),
+    Done {
+        usage: TokenUsage,
+        estimated: bool,
+        model: String,
+        request_id: RequestId,
+    },
+}
+
 #[derive(Clone)]
 pub struct PipelineService {
     state: AppState,
+}
+
+/// Output of the request-preparation phase shared by the buffered
+/// (`execute`) and streaming (`execute_stream`) paths. Holds everything
+/// produced before the upstream provider call: the prompt-side redaction
+/// state (`pipeline_state`), the policy decision, the workspace secure-mode
+/// config, and the provider invocation input. Prompt redaction, policy
+/// evaluation, secure-mode override, the no-rules fallback, and the deny
+/// gate all run in `prepare`, so both response paths are guaranteed to
+/// enforce identical input-side behaviour.
+struct Prepared {
+    request_id: RequestId,
+    pipeline_state: PipelineState,
+    policy_outcome: PolicyEvaluationOutcome,
+    secure_mode: SecureModeRow,
+    pipeline_input: PipelineInput,
 }
 
 impl PipelineService {
@@ -67,12 +106,15 @@ impl PipelineService {
         Self { state }
     }
 
-    pub async fn execute(
+    /// Run all input-side processing up to (but not including) the upstream
+    /// provider call. Returns `Err(Forbidden)` — after recording the audit
+    /// event — when policy/secure-mode denies the request.
+    async fn prepare(
         &self,
         auth: &AuthContext,
         resolved: &ResolvedModel,
-        request: GatewayRequest,
-    ) -> Result<PipelineExecution, ApiError> {
+        request: &GatewayRequest,
+    ) -> Result<Prepared, ApiError> {
         let request_id = RequestId::new();
         let prompt = prompt_from_messages(&request.messages);
         let mut pipeline_state = PipelineState::default();
@@ -245,6 +287,32 @@ impl PipelineService {
             model: request.public_model.clone(),
             extra_params: request.extra_params.clone(),
         };
+
+        Ok(Prepared {
+            request_id,
+            pipeline_state,
+            policy_outcome,
+            secure_mode,
+            pipeline_input,
+        })
+    }
+
+    /// Buffered (non-streaming) execution: run the upstream provider call to
+    /// completion, apply vault restoration + optional response-side PII
+    /// redaction over the whole reply, then finalize.
+    pub async fn execute(
+        &self,
+        auth: &AuthContext,
+        resolved: &ResolvedModel,
+        request: GatewayRequest,
+    ) -> Result<PipelineExecution, ApiError> {
+        let Prepared {
+            request_id,
+            mut pipeline_state,
+            policy_outcome,
+            secure_mode,
+            pipeline_input,
+        } = self.prepare(auth, resolved, &request).await?;
 
         let t0 = Instant::now();
         let (chosen_target, provider_output) = if self.state.config.chat_debug_mode {
@@ -460,6 +528,288 @@ impl PipelineService {
             finish_reason: provider_output.finish_reason.clone(),
             pipeline_output,
         })
+    }
+
+    /// Streaming execution. Runs the same input-side preparation as
+    /// `execute`, opens a genuine incremental SSE stream from the upstream
+    /// provider, and returns a stream of client-safe deltas.
+    ///
+    /// Response-side safety is mode-dependent:
+    ///   * **redaction off** (default): tokens pass straight through, with
+    ///     only vault placeholder restoration (which `PlaceholderStreamer`
+    ///     handles across token boundaries). Lowest latency.
+    ///   * **redaction on**: tokens are buffered to sentence/line boundaries
+    ///     (`settled_prefix_len`); each completed segment is scanned for PII
+    ///     and re-redacted *before* it is emitted, so no entity ever leaks —
+    ///     the streaming analogue of the buffered response-redaction path.
+    ///
+    /// Finalization (audit event, usage reconciliation, metrics) is deferred
+    /// to when the upstream stream drains, then surfaced via the terminal
+    /// `ChatStreamItem::Done`.
+    pub async fn execute_stream(
+        &self,
+        auth: &AuthContext,
+        resolved: &ResolvedModel,
+        request: GatewayRequest,
+        estimated_input: u64,
+    ) -> Result<Pin<Box<dyn Stream<Item = ChatStreamItem> + Send>>, ApiError> {
+        let Prepared {
+            request_id,
+            pipeline_state,
+            policy_outcome,
+            secure_mode,
+            pipeline_input,
+        } = self.prepare(auth, resolved, &request).await?;
+
+        let kind = match request.request_kind {
+            RequestKind::Chat => InvocationKind::Chat,
+            RequestKind::Completion => InvocationKind::Completion,
+            RequestKind::Embedding => InvocationKind::Embedding,
+        };
+        let (chosen_target, provider_stream) = self
+            .open_provider_stream(&resolved.targets, &pipeline_input, kind)
+            .await?;
+
+        // Values captured by the generator (owned / cloned so the returned
+        // stream is `'static` and outlives the request borrows).
+        let state = self.state.clone();
+        let workspace_id = auth.workspace_id;
+        let user_id = auth.user_id;
+        let api_key_id = auth.api_key_id;
+        let api_key_name = auth.api_key_name.clone();
+        let public_model = request.public_model.clone();
+        let final_action = policy_outcome.result.final_action.clone();
+        let policy_events = policy_outcome.result.events.clone();
+        let redacted_prompt_text = pipeline_input
+            .messages
+            .first()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let redact_responses = secure_mode.enabled
+            && secure_mode.redact_pii_in_responses
+            && !state.config.chat_debug_mode;
+
+        let mut vault = pipeline_state.vault;
+        let mut redaction_map = pipeline_state.redaction_map;
+
+        let stream = async_stream::stream! {
+            let mut provider_stream = provider_stream;
+            let mut raw_full = String::new();        // upstream output, verbatim
+            let mut restored_full = String::new();   // post-restore (audit "Restored")
+            let mut placeholder = PlaceholderStreamer::new(); // off-mode restorer
+            let mut pending = String::new();         // on-mode hold-back buffer
+            let mut provider_usage: Option<TokenUsage> = None;
+            let mut finish_reason: Option<String> = None;
+            let mut ttft_ms: Option<u32> = None;
+            let mut stream_ok = true;
+            let t0 = Instant::now();
+
+            // Scan a completed (restored) segment for PII and re-redact it
+            // before the client sees it. Used only in `redact_responses` mode.
+            macro_rules! scrub_segment {
+                ($restored:expr) => {{
+                    let restored: String = $restored;
+                    restored_full.push_str(&restored);
+                    let regex = detect_content(&restored);
+                    let ml = state.ml_sidecar.detect_if_available(&restored).await;
+                    let merged = merge_detections(regex, ml);
+                    let detections = filter_response_side_detections(&merged);
+                    if detections.is_empty() {
+                        restored
+                    } else {
+                        crate::vault::apply_redaction(
+                            &restored,
+                            &detections,
+                            &mut vault,
+                            &mut redaction_map,
+                        )
+                    }
+                }};
+            }
+
+            while let Some(ev) = provider_stream.next().await {
+                match ev {
+                    Ok(ProviderEvent::Token(tok)) => {
+                        raw_full.push_str(&tok);
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(
+                                u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX),
+                            );
+                        }
+                        if redact_responses {
+                            pending.push_str(&tok);
+                            let n = settled_prefix_len(&pending);
+                            if n > 0 {
+                                let segment_raw = pending[..n].to_owned();
+                                pending = pending[n..].to_owned();
+                                let restored = restore_content(&segment_raw, &vault);
+                                let scrubbed = scrub_segment!(restored);
+                                if !scrubbed.is_empty() {
+                                    yield ChatStreamItem::Delta(scrubbed);
+                                }
+                            }
+                        } else {
+                            let emit = placeholder.push(&tok, &vault);
+                            if !emit.is_empty() {
+                                restored_full.push_str(&emit);
+                                yield ChatStreamItem::Delta(emit);
+                            }
+                        }
+                    }
+                    Ok(ProviderEvent::Done { usage, finish_reason: fr, ttft_ms: t, .. }) => {
+                        provider_usage = usage;
+                        finish_reason = fr;
+                        if t.is_some() {
+                            ttft_ms = t;
+                        }
+                    }
+                    Err(failure) => {
+                        tracing::warn!(
+                            %request_id,
+                            message = failure.message,
+                            "provider stream error mid-response; finalizing with partial output"
+                        );
+                        stream_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            // Flush whatever is still buffered now that upstream is done.
+            if redact_responses {
+                if !pending.is_empty() {
+                    let restored = restore_content(&pending, &vault);
+                    let scrubbed = scrub_segment!(restored);
+                    if !scrubbed.is_empty() {
+                        yield ChatStreamItem::Delta(scrubbed);
+                    }
+                }
+            } else {
+                let emit = placeholder.flush(&vault);
+                if !emit.is_empty() {
+                    restored_full.push_str(&emit);
+                    yield ChatStreamItem::Delta(emit);
+                }
+            }
+            let _ = finish_reason;
+
+            // ── Deferred finalization (audit + usage + metrics) ──
+            let latency_ms = u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let UsageComputation { usage, estimated } = derive_usage(
+                &chosen_target.provider_type,
+                provider_usage.clone(),
+                &redacted_prompt_text,
+                &restored_full,
+            );
+            let cost_usd = state.pricing.compute_cost(&public_model, &usage);
+
+            let mut event = RequestEvent::new(
+                request_id,
+                workspace_id,
+                chosen_target.provider_name.clone(),
+                public_model.clone(),
+                final_action.clone(),
+                &usage,
+                estimated,
+                cost_usd,
+                policy_events.clone(),
+            );
+            event.latency_ms = Some(latency_ms);
+            event.ttft_ms = ttft_ms;
+            event.user_id = user_id;
+            event.api_key_id = Some(api_key_id);
+            event.api_key_name = Some(api_key_name.clone());
+            event.ip_address = request.client_ip.clone();
+            event.user_agent = request.user_agent.clone();
+            event.raw_prompt = last_user_message_raw(&request.messages);
+            event.redacted_prompt =
+                Some(redact_last_user_message(&state, &request.messages).await);
+            event.raw_response = if raw_full.is_empty() { None } else { Some(raw_full.clone()) };
+            event.restored_response =
+                if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
+            state.analytics.enqueue(event, state.metrics.as_ref()).await;
+            state.metrics.record_request(stream_ok);
+            log_request_finish(request_id, workspace_id, &final_action, stream_ok);
+
+            // Reconcile the pre-flight estimate against the actual total —
+            // identical delta math to the buffered path's reconcile step.
+            let actual = u64::from(usage.input_tokens.unwrap_or_default())
+                + u64::from(usage.output_tokens.unwrap_or_default());
+            let delta = i64::try_from(actual).unwrap_or(i64::MAX)
+                - i64::try_from(estimated_input).unwrap_or(i64::MAX);
+            adjust_workspace_tokens(&state, workspace_id.0, delta).await;
+
+            yield ChatStreamItem::Done {
+                usage,
+                estimated,
+                model: chosen_target.model_name.clone(),
+                request_id,
+            };
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Open an incremental provider event stream, walking the failover chain
+    /// for the initial connect only (once tokens flow we are committed to the
+    /// chosen provider). Mirrors `invoke_provider_chain`'s credential handling.
+    async fn open_provider_stream(
+        &self,
+        targets: &[ModelTarget],
+        pipeline_input: &PipelineInput,
+        kind: InvocationKind,
+    ) -> Result<(ModelTarget, ProviderEventStream), ApiError> {
+        let invocation_template = ProviderInvocation {
+            request_id: pipeline_input.request_id,
+            model: pipeline_input.model.clone(),
+            prompt: prompt_from_messages(&pipeline_input.messages),
+            messages: pipeline_input.messages.clone(),
+            extra_params: sanitize_extra_params(pipeline_input.extra_params.clone()),
+            stream: true,
+            kind,
+            decrypted_credential: None,
+        };
+
+        let mut last_retryable_error = None;
+        for target in targets {
+            let Some(adapter) = self.state.providers.adapter_for(&target.provider_type).await
+            else {
+                continue;
+            };
+            let decrypted = match target.encrypted_credential.as_deref() {
+                Some(stored) => match decrypt_credential(stored, &self.state).await {
+                    Ok(plain) => Some(plain),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = target.provider_name,
+                            error = %e,
+                            "credential decrypt failed; trying next target"
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let invocation = ProviderInvocation {
+                decrypted_credential: decrypted,
+                ..invocation_template.clone()
+            };
+            match adapter.stream_events(target, &invocation).await {
+                Ok(stream) => return Ok((target.clone(), stream)),
+                Err(error) if error.retryable => {
+                    tracing::warn!(
+                        provider = target.provider_name,
+                        message = error.message,
+                        "retryable provider failure opening stream; trying fallback"
+                    );
+                    last_retryable_error = Some(error.message);
+                }
+                Err(error) => return Err(ApiError::Internal(error.message)),
+            }
+        }
+        Err(ApiError::Internal(
+            last_retryable_error.unwrap_or_else(|| "all providers failed".to_owned()),
+        ))
     }
 
     async fn invoke_provider_chain(

@@ -320,6 +320,72 @@ mod provider_adapter_tests {
         let output = adapter.complete(&target, &inv).await.unwrap();
         assert_eq!(output.content, "custom-adapter-response");
     }
+
+    #[tokio::test]
+    async fn default_stream_events_fans_chunks_then_done() {
+        use crate::providers::{ProviderEvent, ProviderFailure, ProviderOutput};
+        use async_trait::async_trait;
+        use futures_util::StreamExt;
+
+        // An adapter that only implements the buffered `stream()` — it relies
+        // on the trait's default `stream_events`, which must fan the buffered
+        // chunks into `Token`s and append exactly one terminal `Done`.
+        struct ChunkAdapter;
+        #[async_trait]
+        impl ProviderAdapter for ChunkAdapter {
+            fn provider_type(&self) -> &'static str {
+                "openai"
+            }
+            async fn complete(
+                &self,
+                _t: &ModelTarget,
+                _i: &ProviderInvocation,
+            ) -> Result<ProviderOutput, ProviderFailure> {
+                Ok(ProviderOutput::default())
+            }
+            async fn stream(
+                &self,
+                _t: &ModelTarget,
+                _i: &ProviderInvocation,
+            ) -> Result<ProviderOutput, ProviderFailure> {
+                Ok(ProviderOutput {
+                    content: "ab".to_owned(),
+                    stream_chunks: vec!["a".to_owned(), "b".to_owned()],
+                    usage: Some(secureprompt_common::types::TokenUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(2),
+                        reasoning_tokens: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                    }),
+                    finish_reason: Some("stop".to_owned()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let adapter = ChunkAdapter;
+        let target = test_target("openai", "gpt-4o");
+        let inv = chat_invocation("hi", true);
+        let mut stream = adapter.stream_events(&target, &inv).await.unwrap();
+
+        let mut tokens = Vec::new();
+        let mut done_output_tokens = None;
+        let mut done_count = 0;
+        while let Some(ev) = stream.next().await {
+            match ev.unwrap() {
+                ProviderEvent::Token(t) => tokens.push(t),
+                ProviderEvent::Done { usage, finish_reason, .. } => {
+                    done_count += 1;
+                    assert_eq!(finish_reason.as_deref(), Some("stop"));
+                    done_output_tokens = usage.and_then(|u| u.output_tokens);
+                }
+            }
+        }
+        assert_eq!(tokens, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(done_count, 1, "exactly one terminal Done");
+        assert_eq!(done_output_tokens, Some(2));
+    }
 }
 
 #[cfg(test)]

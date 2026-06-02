@@ -9,9 +9,10 @@ mod tests;
 
 use crate::{http::model_router::ModelTarget, token_usage::dispatch::estimate_tokens};
 use async_trait::async_trait;
+use futures_util::stream::{self, Stream};
 use secureprompt_common::types::{Message, RequestId, TokenUsage};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -63,6 +64,30 @@ pub struct ProviderFailure {
     pub retryable: bool,
 }
 
+/// One event in an incremental provider response stream.
+///
+/// `Token` carries a raw text delta exactly as the upstream model emitted it
+/// (still containing any `{{Placeholder}}` the prompt redaction injected —
+/// the pipeline's streaming redactor restores/re-redacts before the client
+/// sees it). `Done` arrives exactly once, last, with the terminal bookkeeping
+/// the pipeline needs to finalize the request (usage for billing, finish
+/// reason, resolved model, and the time-to-first-token sample).
+#[derive(Debug, Clone)]
+pub enum ProviderEvent {
+    Token(String),
+    Done {
+        usage: Option<TokenUsage>,
+        finish_reason: Option<String>,
+        model: Option<String>,
+        ttft_ms: Option<u32>,
+    },
+}
+
+/// A boxed, owned (`'static`) stream of provider events. Owned so it can be
+/// handed to the Axum SSE response and outlive the request borrow.
+pub type ProviderEventStream =
+    Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderFailure>> + Send>>;
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     fn provider_type(&self) -> &'static str;
@@ -78,6 +103,42 @@ pub trait ProviderAdapter: Send + Sync {
         target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure>;
+
+    /// Incremental event stream for `stream: true` requests.
+    ///
+    /// Default implementation adapts the buffered `stream()` result into an
+    /// event stream: it emits each `stream_chunks` entry (or the whole
+    /// `content` if there are none) as a `Token`, then a single `Done`. This
+    /// keeps the stub/echo adapters (anthropic, ollama, vllm) working without
+    /// change — they already fan `content` into multiple chunks via
+    /// `chunk_content`. Adapters with a real upstream SSE surface (see
+    /// `openai_compat`) override this to stream token-by-token as the
+    /// provider produces them, which is what actually reduces time-to-first-
+    /// token for long answers.
+    async fn stream_events(
+        &self,
+        target: &ModelTarget,
+        invocation: &ProviderInvocation,
+    ) -> Result<ProviderEventStream, ProviderFailure> {
+        let out = self.stream(target, invocation).await?;
+        let mut events: Vec<Result<ProviderEvent, ProviderFailure>> = Vec::new();
+        if out.stream_chunks.is_empty() {
+            if !out.content.is_empty() {
+                events.push(Ok(ProviderEvent::Token(out.content.clone())));
+            }
+        } else {
+            for chunk in out.stream_chunks {
+                events.push(Ok(ProviderEvent::Token(chunk)));
+            }
+        }
+        events.push(Ok(ProviderEvent::Done {
+            usage: out.usage,
+            finish_reason: out.finish_reason,
+            model: Some(out.model),
+            ttft_ms: out.ttft_ms,
+        }));
+        Ok(Box::pin(stream::iter(events)))
+    }
 }
 
 impl ProviderCatalog {

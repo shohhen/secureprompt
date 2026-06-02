@@ -12,7 +12,9 @@ use crate::{
         model_router::resolve_model,
         streaming::force_include_usage,
     },
-    pipeline::service::{GatewayRequest, PipelineExecution, PipelineService, RequestKind},
+    pipeline::service::{
+        ChatStreamItem, GatewayRequest, PipelineExecution, PipelineService, RequestKind,
+    },
 };
 use axum::{
     extract::{ConnectInfo, State},
@@ -24,7 +26,8 @@ use axum::{
     Json,
 };
 use std::net::SocketAddr;
-use secureprompt_common::types::Message;
+use futures_util::stream::{once, StreamExt};
+use secureprompt_common::types::{Message, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::convert::Infallible;
@@ -127,28 +130,41 @@ pub async fn chat_completions(
         .map(str::to_owned);
 
     let service = PipelineService::new(state.clone());
-    let execution = service
-        .execute(
-            &auth,
-            &resolved,
-            GatewayRequest {
-                public_model: request.model.clone(),
-                messages: request
-                    .messages
-                    .into_iter()
-                    .map(|message| Message {
-                        role: message.role,
-                        content: message.content,
-                    })
-                    .collect(),
-                stream: request.stream,
-                request_kind: RequestKind::Chat,
-                extra_params,
-                client_ip,
-                user_agent,
-            },
-        )
-        .await;
+    let gateway_request = GatewayRequest {
+        public_model: request.model.clone(),
+        messages: request
+            .messages
+            .into_iter()
+            .map(|message| Message {
+                role: message.role,
+                content: message.content,
+            })
+            .collect(),
+        stream: request.stream,
+        request_kind: RequestKind::Chat,
+        extra_params,
+        client_ip,
+        user_agent,
+    };
+
+    // Live streaming path: genuine incremental SSE from upstream, flushed
+    // chunk-by-chunk. Debug mode keeps the buffered path so its redaction-
+    // visualization payload is preserved. The streaming path reconciles
+    // workspace tokens itself (when the stream drains), so we must NOT also
+    // reconcile here — that would double-count.
+    if request.stream && !state.config.chat_debug_mode {
+        return match service
+            .execute_stream(&auth, &resolved, gateway_request, estimated_input)
+            .await
+        {
+            Ok(stream) => {
+                with_budget_warning(stream_chat_response_live(stream, request.model), budget_gate)
+            }
+            Err(error) => api_error_response(error),
+        };
+    }
+
+    let execution = service.execute(&auth, &resolved, gateway_request).await;
 
     match execution {
         Ok(execution) if request.stream => {
@@ -496,16 +512,74 @@ fn stream_completion_response(execution: PipelineExecution) -> Response {
 }
 
 fn usage_json(execution: &PipelineExecution) -> Value {
+    usage_value(&execution.usage, execution.estimated_usage)
+}
+
+/// Build the OpenAI-compatible `usage` object from a `TokenUsage`. Shared by
+/// the buffered response, the buffered SSE path, and the live streaming path.
+fn usage_value(usage: &TokenUsage, estimated: bool) -> Value {
     json!({
-        "prompt_tokens": execution.usage.input_tokens.unwrap_or_default(),
-        "completion_tokens": execution.usage.output_tokens.unwrap_or_default(),
-        "total_tokens": execution.usage.input_tokens.unwrap_or_default()
-            + execution.usage.output_tokens.unwrap_or_default(),
-        "reasoning_tokens": execution.usage.reasoning_tokens.unwrap_or_default(),
-        "cache_read_tokens": execution.usage.cache_read_tokens.unwrap_or_default(),
-        "cache_write_tokens": execution.usage.cache_write_tokens.unwrap_or_default(),
-        "estimated": execution.estimated_usage,
+        "prompt_tokens": usage.input_tokens.unwrap_or_default(),
+        "completion_tokens": usage.output_tokens.unwrap_or_default(),
+        "total_tokens": usage.input_tokens.unwrap_or_default()
+            + usage.output_tokens.unwrap_or_default(),
+        "reasoning_tokens": usage.reasoning_tokens.unwrap_or_default(),
+        "cache_read_tokens": usage.cache_read_tokens.unwrap_or_default(),
+        "cache_write_tokens": usage.cache_write_tokens.unwrap_or_default(),
+        "estimated": estimated,
     })
+}
+
+/// Live SSE response for `stream: true` chat completions. Each
+/// `ChatStreamItem::Delta` is flushed as its own `chat.completion.chunk`
+/// event the moment the gateway produces it — so the client renders the
+/// answer progressively instead of waiting for the whole reply. The terminal
+/// `Done` carries reconciled usage (emitted as a final usage-only chunk),
+/// followed by the `[DONE]` sentinel.
+fn stream_chat_response_live(
+    stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = ChatStreamItem> + Send>>,
+    model: String,
+) -> Response {
+    let created = chrono::Utc::now().timestamp();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+    let events = stream
+        .map(move |item| {
+            let data = match item {
+                ChatStreamItem::Delta(content) => json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": content },
+                        "finish_reason": Value::Null,
+                    }],
+                }),
+                ChatStreamItem::Done { usage, estimated, model: done_model, .. } => json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": done_model,
+                    "choices": [],
+                    "usage": usage_value(&usage, estimated),
+                }),
+            };
+            Ok::<_, Infallible>(Event::default().data(data.to_string()))
+        })
+        .chain(once(async {
+            Ok::<_, Infallible>(Event::default().data("[DONE]"))
+        }));
+
+    let mut response = Sse::new(events).into_response();
+    // Disable proxy buffering (nginx and other reverse proxies) so chunks are
+    // flushed to the client as they are produced instead of being held back —
+    // without this the whole streaming effort is invisible behind nginx.
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
 /// Pull the self-reported `X-SecurePrompt-Device-MAC` header off an

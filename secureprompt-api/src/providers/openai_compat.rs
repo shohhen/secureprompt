@@ -19,9 +19,13 @@
 
 use crate::{
     http::model_router::ModelTarget,
-    providers::{ProviderAdapter, ProviderFailure, ProviderInvocation, ProviderOutput},
+    providers::{
+        ProviderAdapter, ProviderEvent, ProviderEventStream, ProviderFailure, ProviderInvocation,
+        ProviderOutput,
+    },
 };
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use secureprompt_common::types::TokenUsage;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -95,11 +99,211 @@ impl ProviderAdapter for OpenAiCompatAdapter {
         target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure> {
-        // Phase 1: fetch the full response as a single chunk; the pipeline's
-        // `placeholder_safe_chunks` wrapper handles single-chunk streaming
-        // correctly. Real SSE chunk-by-chunk parsing is a follow-up.
+        // Buffered fallback: fetch the full response in one shot. Retained for
+        // callers that still want a complete `ProviderOutput` (and as the
+        // default `stream_events` adapter's source). True incremental
+        // streaming lives in `stream_events` below.
         invoke(self.provider_type, self.base_url, target, invocation, true).await
     }
+
+    async fn stream_events(
+        &self,
+        target: &ModelTarget,
+        invocation: &ProviderInvocation,
+    ) -> Result<ProviderEventStream, ProviderFailure> {
+        invoke_stream(self.provider_type, self.base_url, target, invocation).await
+    }
+}
+
+/// Real upstream SSE streaming. Asks the provider for `stream: true`, then
+/// parses the `text/event-stream` body into `ProviderEvent`s as bytes arrive,
+/// so the first token can reach the client as soon as the model emits it
+/// instead of after the whole answer is generated.
+async fn invoke_stream(
+    provider_type: &'static str,
+    base_url: &'static str,
+    _target: &ModelTarget,
+    invocation: &ProviderInvocation,
+) -> Result<ProviderEventStream, ProviderFailure> {
+    let api_key = invocation
+        .decrypted_credential
+        .as_deref()
+        .ok_or_else(|| ProviderFailure {
+            message: format!("{provider_type}: no credential configured"),
+            retryable: false,
+        })?
+        .to_owned();
+
+    let client = shared_http_client();
+
+    let extra_map = match &invocation.extra_params {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+
+    let body = ChatRequest {
+        model: &invocation.model,
+        messages: invocation
+            .messages
+            .iter()
+            .map(|m| ChatMessageBody {
+                role: m.role.as_str(),
+                content: m.content.as_str(),
+            })
+            .collect(),
+        stream: Some(true), // genuine incremental SSE from upstream
+        extra: extra_map,
+    };
+
+    let url = format!("{base_url}/chat/completions");
+    let send_started = Instant::now();
+    let response = client
+        .post(&url)
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ProviderFailure {
+            message: format!("{provider_type}: HTTP request failed: {e}"),
+            retryable: true,
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(ProviderFailure {
+            message: format!(
+                "{provider_type}: HTTP {status}: {}",
+                body_text.chars().take(500).collect::<String>()
+            ),
+            retryable: status.is_server_error(),
+        });
+    }
+
+    // Parse the SSE body incrementally. We accumulate raw bytes (a single SSE
+    // event, or even one UTF-8 codepoint, can straddle TCP chunk boundaries)
+    // and split on the `\n\n` event delimiter. Each event's `data:` payload is
+    // either an OpenAI `chat.completion.chunk` JSON object or the `[DONE]`
+    // sentinel.
+    let stream = async_stream::stream! {
+        let mut byte_stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<TokenUsage> = None;
+        let mut model: Option<String> = None;
+        let mut ttft_ms: Option<u32> = None;
+        let mut saw_done = false;
+
+        'outer: while let Some(item) = byte_stream.next().await {
+            let bytes = match item {
+                Ok(b) => b,
+                Err(e) => {
+                    yield Err(ProviderFailure {
+                        message: format!("{provider_type}: stream read error: {e}"),
+                        retryable: true,
+                    });
+                    return;
+                }
+            };
+            buf.extend_from_slice(&bytes);
+
+            // Drain every complete `\n\n`-delimited event currently in `buf`.
+            while let Some(pos) = find_subslice(&buf, b"\n\n") {
+                let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+                let block = String::from_utf8_lossy(&event_bytes);
+                for line in block.lines() {
+                    let line = line.trim_start();
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue; // ignore comments / `event:` / `id:` lines
+                    };
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if payload == "[DONE]" {
+                        saw_done = true;
+                        break 'outer;
+                    }
+                    let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) else {
+                        continue; // tolerate keep-alive / non-JSON frames
+                    };
+                    if model.is_none() {
+                        model = chunk.model.clone();
+                    }
+                    if let Some(u) = chunk.usage {
+                        usage = Some(TokenUsage {
+                            input_tokens: u.prompt_tokens,
+                            output_tokens: u.completion_tokens,
+                            reasoning_tokens: None,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                        });
+                    }
+                    if let Some(choice) = chunk.choices.into_iter().next() {
+                        if choice.finish_reason.is_some() {
+                            finish_reason = choice.finish_reason;
+                        }
+                        if let Some(content) = choice.delta.content {
+                            if !content.is_empty() {
+                                if ttft_ms.is_none() {
+                                    ttft_ms = Some(
+                                        u32::try_from(send_started.elapsed().as_millis())
+                                            .unwrap_or(u32::MAX),
+                                    );
+                                }
+                                yield Ok(ProviderEvent::Token(content));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = saw_done;
+        yield Ok(ProviderEvent::Done {
+            usage,
+            finish_reason,
+            model,
+            ttft_ms,
+        });
+    };
+
+    Ok(Box::pin(stream))
+}
+
+/// Byte-slice substring search (no extra deps). Returns the start index of the
+/// first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<UsageBody>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Serialize)]
