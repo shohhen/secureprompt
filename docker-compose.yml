@@ -45,6 +45,9 @@ services:
     environment:
       ML_LANGUAGE: en
       ML_USE_ONNX: "false"
+      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v3_no_ssn_xlmr.
+      # Comma-separated for several, or "all" to load every shipped checkpoint.
+      ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v3_no_ssn_xlmr}
       QDRANT_URL: http://qdrant:6333
     # No ports: mapping — api already binds host 8080; gateway calls via Docker DNS only.
     healthcheck:

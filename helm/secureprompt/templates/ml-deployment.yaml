@@ -1,0 +1,67 @@
+{{- if .Values.ml.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-ml
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ml.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-ml
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-ml
+    spec:
+      containers:
+        - name: ml
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.ml.image.repository }}:{{ .Values.ml.image.tag }}"
+          imagePullPolicy: {{ .Values.ml.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ML_LANGUAGE
+              value: {{ .Values.ml.env.language | quote }}
+            - name: ML_USE_ONNX
+              value: {{ .Values.ml.env.useOnnx | quote }}
+            {{- if .Values.ml.env.activeNerModels }}
+            - name: ACTIVE_NER_MODELS
+              value: {{ .Values.ml.env.activeNerModels | quote }}
+            {{- end }}
+            - name: QDRANT_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-qdrant:6333"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.ml.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-ml
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app: {{ include "secureprompt.fullname" . }}-ml
+{{- end }}

@@ -1,15 +1,41 @@
 global:
-  imageRegistry: ""  # Air-gap: set to "registry.internal/" (trailing slash required)
+  imageRegistry: ""  # e.g. "us-central1-docker.pkg.dev/secure-prompt-496204/secureprompt/"
 
 nameOverride: ""
 fullnameOverride: ""
 
+# ----------------------------------------------------------------------------
+# Domain / Ingress (GKE)
+# ----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  # Hostnames -> services. Cert is provisioned via Google-managed cert.
+  domain: "secureprompt.tech"
+  hosts:
+    marketing: "secureprompt.tech"
+    web: "app.secureprompt.tech"
+    api: "api.secureprompt.tech"
+  staticIpName: ""  # optional reserved global IP name. Leave empty for ephemeral.
+  managedCertificate:
+    enabled: true
+
+# ----------------------------------------------------------------------------
+# Application services
+# ----------------------------------------------------------------------------
 api:
   image:
     repository: secureprompt/api
     tag: "0.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 1
+  resources:
+    requests: { cpu: "100m", memory: "192Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+  env:
+    logLevel: "info"
+    publicSignupEnabled: "true"
+    chatDebugMode: "false"
+    corsOrigins: "https://app.secureprompt.tech,https://secureprompt.tech"
 
 worker:
   image:
@@ -17,17 +43,100 @@ worker:
     tag: "0.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 1
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "300m", memory: "384Mi" }
 
+web:
+  image:
+    repository: secureprompt/web
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    requests: { cpu: "50m",  memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+  env:
+    apiUrl: "http://secureprompt-api:8080"
+    nextauthUrl: "https://app.secureprompt.tech"
+    nextPublicApiUrl: "https://api.secureprompt.tech"
+
+marketing:
+  enabled: true
+  image:
+    repository: secureprompt/marketing
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    requests: { cpu: "25m",  memory: "96Mi" }
+    limits:   { cpu: "200m", memory: "192Mi" }
+  env:
+    contactFormEndpoint: ""
+
+ml:
+  enabled: true
+  image:
+    repository: secureprompt/ml
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    requests: { cpu: "200m",  memory: "1536Mi" }
+    limits:   { cpu: "1000m", memory: "2560Mi" }
+  env:
+    language: "en"
+    useOnnx: "false"
+    # Active NER checkpoint(s) under app/resources/. Empty → image default
+    # (multilingual_ner_v3_no_ssn_xlmr). Comma-separated to run several, or
+    # "all" to register every shipped checkpoint. See scripts/compare_v3_models.py.
+    activeNerModels: ""
+
+# ----------------------------------------------------------------------------
+# Data stores
+# ----------------------------------------------------------------------------
 postgres:
+  enabled: true
   image:
     repository: postgres
     tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    user: "secureprompt"
+    database: "secureprompt"
+  persistence:
+    enabled: true
+    size: "5Gi"
+    storageClass: "standard-rwo"
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+clickhouse:
+  enabled: true
+  image:
+    repository: clickhouse/clickhouse-server
+    tag: "24.8"
+    pullPolicy: IfNotPresent
+  auth:
+    user: "default"
+    database: "secureprompt"
+  persistence:
+    enabled: true
+    size: "10Gi"
+    storageClass: "standard-rwo"
+  resources:
+    requests: { cpu: "200m",  memory: "1Gi" }
+    limits:   { cpu: "1000m", memory: "2Gi" }
 
 valkey:
   image:
     repository: valkey/valkey
     tag: "8.1.6-alpine"
     pullPolicy: IfNotPresent
+  resources:
+    requests: { cpu: "25m",  memory: "64Mi" }
+    limits:   { cpu: "100m", memory: "128Mi" }
 
 qdrant:
   image:
@@ -37,7 +146,32 @@ qdrant:
   persistence:
     enabled: true
     size: 5Gi
+    storageClass: "standard-rwo"
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "1Gi" }
 
+grafana:
+  enabled: true
+  image:
+    repository: grafana/grafana
+    tag: "11.4.0"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: "2Gi"
+    storageClass: "standard-rwo"
+  resources:
+    requests: { cpu: "25m",  memory: "128Mi" }
+    limits:   { cpu: "200m", memory: "256Mi" }
+  admin:
+    user: "admin"
+    # password is generated into the secret if blank
+    password: ""
+
+# ----------------------------------------------------------------------------
+# Misc
+# ----------------------------------------------------------------------------
 kms:
   backend: "file"
 
@@ -45,25 +179,8 @@ serviceMesh:
   enabled: false
   provider: "linkerd"
 
-web:
-  image:
-    repository: secureprompt/web
-    tag: "0.1.0"
-    pullPolicy: IfNotPresent
-  replicaCount: 1
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "200m"
-    limits:
-      memory: "1Gi"
-      cpu: "1"
-  env:
-    apiUrl: "http://secureprompt-api:8080"
-    nextauthUrl: "http://localhost:3000"
-
 otel:
-  enabled: true
+  enabled: false
 
 prometheus:
-  enabled: true
+  enabled: false
