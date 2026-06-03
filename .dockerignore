@@ -14,3 +14,10 @@ target/
 **/.venv/
 **/venv/
 **/node_modules/
+
+# NER training artifacts: optimizer/scheduler/checkpoint state (~6 GB per
+# model, ~18 GB total). Produced by scripts/train_*_ner.py and never read at
+# runtime — the sidecar only loads `<model_dir>/model/`. Shipping these into
+# the build context exhausts the Docker VM disk (ResourceExhausted on build).
+secureprompt-ml/app/resources/*/trainer
+**/checkpoint-*
