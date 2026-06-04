@@ -37,9 +37,16 @@ interface RefreshTokenResponse {
 }
 
 function apiBaseUrl(): string {
-  const url = process.env.NEXT_PUBLIC_API_URL;
+  // `refreshAccessTokenIfNeeded` runs inside the NextAuth `jwt` callback, which
+  // executes SERVER-SIDE (in the web container). It must reach the API over the
+  // internal compose network (`API_URL`, e.g. http://api:8080) — NOT
+  // `NEXT_PUBLIC_API_URL` (http://localhost:8080), which inside the container
+  // points at the web service itself, so the refresh fetch fails and the user
+  // is signed out on the next request after the access token nears expiry.
+  // Mirrors `auth.ts:apiBaseUrl()`; the public URL stays as a local-dev fallback.
+  const url = process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!url) {
-    throw new Error("NEXT_PUBLIC_API_URL is not set");
+    throw new Error("API_URL / NEXT_PUBLIC_API_URL is not set");
   }
   return url.replace(/\/+$/, "");
 }
