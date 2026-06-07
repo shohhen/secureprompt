@@ -150,6 +150,16 @@ impl UserRepository {
         })
     }
 
+    /// Deployment-wide user count (users has no RLS — global count is intended,
+    /// for license seat enforcement).
+    pub async fn count_total_users(&self) -> Result<i64, ApiError> {
+        let row = sqlx::query("SELECT count(*) AS n FROM users")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
     /// Look up a user by email including the `role` column. Used by
     /// `/v1/auth/token`.
     ///

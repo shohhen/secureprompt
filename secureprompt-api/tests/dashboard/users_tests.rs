@@ -69,6 +69,24 @@ fn build_app(pool: PgPool) -> axum::Router {
     ))
 }
 
+fn build_app_with_seat_limit(pool: PgPool, seats: u32) -> axum::Router {
+    use secureprompt_api::license::{LicenseSnapshot, LicenseState, LicenseStatus};
+    let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    let license = LicenseState::new(LicenseSnapshot {
+        status: LicenseStatus::Valid,
+        max_seats: Some(seats),
+        features: vec![],
+        customer_name: Some("Test Customer".into()),
+        expires_at: Some("2030-01-01T00:00:00Z".into()),
+    });
+    build_router(AppState::new(
+        pool,
+        test_config(),
+        ml,
+        Arc::new(license),
+    ))
+}
+
 fn make_jwt(workspace_id: Uuid, user_id: Uuid, role: &str) -> String {
     let claims = Claims {
         sub: user_id,
@@ -302,4 +320,32 @@ async fn create_user_rejects_invalid_role(pool: PgPool) {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// With a Valid license of seats = 1 and 1 user already present,
+/// `POST /v1/users` must return 403 Forbidden (seat limit enforced).
+#[sqlx::test]
+async fn create_user_blocked_when_seat_limit_reached(pool: PgPool) {
+    // seed_workspace_with_admin inserts exactly 1 user (the admin itself).
+    let (_ws_id, _user_id, token) = seed_workspace_with_admin(&pool).await;
+    // Build app with seat limit = 1 (already reached).
+    let app = build_app_with_seat_limit(pool, 1);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/users")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email":"new@example.com","password":"pass123","role":"viewer"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

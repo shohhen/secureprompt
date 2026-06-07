@@ -102,6 +102,17 @@ async fn create_user(
     }
 
     let repo = UserRepository::new(state.db.clone());
+
+    // Enforce license seat limit (fail-open: only a Valid license enforces).
+    if let Some(max) = state.license.max_seats() {
+        let count = repo.count_total_users().await.map_err(api_error_response)?;
+        if count >= i64::from(max) {
+            return Err(api_error_response(ApiError::Forbidden(
+                format!("license seat limit ({max}) reached"),
+            )));
+        }
+    }
+
     let row = repo
         .create_user(ctx.workspace_id, &body.email, &body.password, &body.role)
         .await
