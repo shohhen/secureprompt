@@ -52,7 +52,7 @@ pub async fn get_attestation(
     }
 
     // --- Unwrap attestation signing key from the current valid license ---
-    let kek = match crate::license::parse_kek(&state.config.license.model_kek_b64) {
+    let kek = match crate::license::parse_kek(&crate::license::effective_kek(&state.config.license.model_kek_b64)) {
         Some(k) => k,
         None => {
             tracing::warn!("attestation: KEK not configured or invalid");
@@ -92,8 +92,12 @@ pub async fn get_attestation(
 
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
+    // --- Tamper flags from image digest check ---
+    let actual_digest = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
+    let tamper_flags = state.license.tamper_flags("api", &actual_digest);
+
     // --- Build + sign ---
-    let bundle = crate::license::attestation::build_bundle(
+    let mut bundle = crate::license::attestation::build_bundle(
         &lic_id,
         &deployment_fp,
         active_seats,
@@ -102,6 +106,7 @@ pub async fn get_attestation(
         &now,
         &now,
     );
+    bundle.tamper_flags = tamper_flags;
 
     match crate::license::attestation::sign_bundle(&bundle, &sk) {
         Ok(signed) => (StatusCode::OK, Json(signed)).into_response(),

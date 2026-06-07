@@ -23,11 +23,23 @@ pub struct LicenseSnapshot {
     pub lic_id: Option<String>,
     /// The per-deployment attestation signing key wrapped under the KEK — Valid license only.
     pub wrapped_attestation_key: Option<String>,
+    /// Image digests from the license's integrity section — Valid license only; empty otherwise.
+    pub image_digests: std::collections::BTreeMap<String, String>,
 }
 
 impl LicenseSnapshot {
     fn unlicensed() -> Self {
-        Self { status: LicenseStatus::Unlicensed, max_seats: None, features: vec![], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None }
+        Self {
+            status: LicenseStatus::Unlicensed,
+            max_seats: None,
+            features: vec![],
+            customer_name: None,
+            expires_at: None,
+            wrapped_model_key: None,
+            lic_id: None,
+            wrapped_attestation_key: None,
+            image_digests: std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -42,6 +54,7 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         wrapped_model_key: if valid { Some(lic.model.wrapped_key.clone()) } else { None },
         lic_id: if valid { Some(lic.lic_id.clone()) } else { None },
         wrapped_attestation_key: if valid { Some(lic.deployment.wrapped_attestation_key.clone()) } else { None },
+        image_digests: if valid { lic.integrity.image_digests.clone() } else { std::collections::BTreeMap::new() },
     }
 }
 
@@ -80,6 +93,14 @@ impl LicenseState {
         bytes.try_into().ok()
     }
 
+    /// Returns tamper flags if the running image digest mismatches the license's pinned digest.
+    /// Fail-open: returns empty vec when no pin or no actual digest.
+    pub fn tamper_flags(&self, component: &str, actual: &str) -> Vec<String> {
+        tamper_check(&self.snapshot().image_digests, component, actual)
+            .into_iter()
+            .collect()
+    }
+
     /// The per-deployment attestation signing key — Valid license only.
     pub fn unwrap_attestation_key(&self, kek: &[u8; 32]) -> Option<ed25519_dalek::SigningKey> {
         let s = self.snapshot();
@@ -103,6 +124,36 @@ pub fn parse_vendor_key(b64: &str) -> Option<VerifyingKey> {
 pub fn parse_kek(b64: &str) -> Option<[u8; 32]> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     B64.decode(b64.trim()).ok()?.try_into().ok()
+}
+
+/// Prefer a compile-time-pinned vendor public key (base64) baked in via the
+/// SECUREPROMPT_PINNED_VENDOR_PUBKEY build-time env; fall back to the runtime value.
+pub fn effective_vendor_pubkey(runtime_b64: &str) -> String {
+    option_env!("SECUREPROMPT_PINNED_VENDOR_PUBKEY")
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime_b64.to_string())
+}
+
+/// Same for the symmetric KEK.
+pub fn effective_kek(runtime_b64: &str) -> String {
+    option_env!("SECUREPROMPT_PINNED_MODEL_KEK")
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime_b64.to_string())
+}
+
+/// Tamper flag if the running image digest mismatches the license's pinned digest for `component`.
+/// Empty actual or empty/absent pin → None (fail-open).
+pub fn tamper_check(
+    pins: &std::collections::BTreeMap<String, String>,
+    component: &str,
+    actual_digest: &str,
+) -> Option<String> {
+    if actual_digest.is_empty() { return None; }
+    match pins.get(component) {
+        Some(expected) if !expected.is_empty() && expected != actual_digest =>
+            Some(format!("image digest mismatch for {component}: licensed {expected}, running {actual_digest}")),
+        _ => None,
+    }
 }
 
 /// Load + verify a license file. NEVER returns Err — failures map to a snapshot
@@ -212,7 +263,7 @@ mod tests {
     #[test]
     fn feature_and_seat_gates_fail_open() {
         // Valid: enforces
-        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None });
+        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None, image_digests: Default::default() });
         assert_eq!(valid.max_seats(), Some(5));
         assert!(valid.is_feature_enabled("a"));
         assert!(!valid.is_feature_enabled("b"));
@@ -319,5 +370,97 @@ mod tests {
         assert_eq!(parse_kek(&B64.encode([4u8; 32])), Some([4u8; 32]));
         assert_eq!(parse_kek("nope!!"), None);
         assert_eq!(parse_kek(&B64.encode([4u8; 16])), None); // wrong length
+    }
+
+    #[test]
+    fn effective_vendor_pubkey_falls_back_to_runtime() {
+        // Build env is unset in tests → must return the runtime value.
+        assert_eq!(effective_vendor_pubkey("RT"), "RT");
+    }
+
+    #[test]
+    fn effective_kek_falls_back_to_runtime() {
+        // Build env is unset in tests → must return the runtime value.
+        assert_eq!(effective_kek("RT"), "RT");
+    }
+
+    #[test]
+    fn tamper_check_cases() {
+        let mut pins = BTreeMap::new();
+        pins.insert("api".to_string(), "sha256:expected".to_string());
+
+        // Matching digest → None (no flag).
+        assert_eq!(tamper_check(&pins, "api", "sha256:expected"), None);
+
+        // Mismatch → Some with a descriptive message.
+        let flag = tamper_check(&pins, "api", "sha256:different");
+        assert!(flag.is_some());
+        let msg = flag.unwrap();
+        assert!(msg.contains("api"));
+        assert!(msg.contains("sha256:expected"));
+        assert!(msg.contains("sha256:different"));
+
+        // Empty actual → None (fail-open).
+        assert_eq!(tamper_check(&pins, "api", ""), None);
+
+        // Absent pin → None (fail-open).
+        assert_eq!(tamper_check(&pins, "ml", "sha256:something"), None);
+
+        // Empty pin value → None (fail-open).
+        let mut empty_pin = BTreeMap::new();
+        empty_pin.insert("api".to_string(), String::new());
+        assert_eq!(tamper_check(&empty_pin, "api", "sha256:something"), None);
+    }
+
+    #[test]
+    fn tamper_flags_on_license_state() {
+        let mut digests = BTreeMap::new();
+        digests.insert("api".to_string(), "sha256:pinned".to_string());
+        let snap = LicenseSnapshot {
+            status: LicenseStatus::Valid,
+            max_seats: None,
+            features: vec![],
+            customer_name: None,
+            expires_at: None,
+            wrapped_model_key: None,
+            lic_id: None,
+            wrapped_attestation_key: None,
+            image_digests: digests,
+        };
+        let state = LicenseState::new(snap);
+
+        // Matching → empty vec.
+        assert!(state.tamper_flags("api", "sha256:pinned").is_empty());
+
+        // Mismatch → one flag.
+        let flags = state.tamper_flags("api", "sha256:other");
+        assert_eq!(flags.len(), 1);
+
+        // No actual digest → empty (fail-open).
+        assert!(state.tamper_flags("api", "").is_empty());
+    }
+
+    #[test]
+    fn image_digests_only_in_valid_snapshot() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut env = mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 10, &[]);
+        // Inject a digest into the license before signing.
+        env.license.integrity.image_digests.insert("api".into(), "sha256:abc".into());
+        // Re-sign with the digest.
+        let env = sp_license::sign::sign_license(&env.license, &sk).unwrap();
+        let path = write("sp_lic_digest_valid.json", &env);
+        let s = load_and_verify(&path, &sk.verifying_key(), now());
+        assert_eq!(s.status, LicenseStatus::Valid);
+        assert_eq!(s.image_digests.get("api").map(String::as_str), Some("sha256:abc"));
+
+        // Grace → image_digests must be empty.
+        let mut exp_lic = env.license.clone();
+        exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
+        exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
+        let env2 = sp_license::sign::sign_license(&exp_lic, &sk).unwrap();
+        let p2 = write("sp_lic_digest_grace.json", &env2);
+        let s2 = load_and_verify(&p2, &sk.verifying_key(), now());
+        assert_eq!(s2.status, LicenseStatus::Grace);
+        assert!(s2.image_digests.is_empty());
     }
 }

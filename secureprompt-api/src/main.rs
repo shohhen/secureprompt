@@ -146,10 +146,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(5000);
     let ml_sidecar = Arc::new(MlSidecarClient::new(ml_sidecar_url, ml_sidecar_timeout_ms));
 
+    // Log whether keys are pinned at build time (boolean only — never log the key value).
+    tracing::info!(
+        "vendor key pinned at build: {}",
+        option_env!("SECUREPROMPT_PINNED_VENDOR_PUBKEY").is_some()
+    );
+
     // Plan 3 — startup license verification. Fail-open: never fatal.
     let license = {
         let now = chrono::Utc::now().timestamp();
-        match secureprompt_api::license::parse_vendor_key(&config.license.pubkey_b64) {
+        let effective_pubkey = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
+        match secureprompt_api::license::parse_vendor_key(&effective_pubkey) {
             Some(vk) => std::sync::Arc::new(secureprompt_api::license::LicenseState::new(
                 secureprompt_api::license::load_and_verify(
                     &config.license.license_path,
@@ -167,19 +174,31 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Plan 4 — parse the KEK. Non-empty but invalid → warn; empty → weight-encryption off.
-    let model_kek = if config.license.model_kek_b64.is_empty() {
-        None
-    } else {
-        let kek = secureprompt_api::license::parse_kek(&config.license.model_kek_b64);
-        if kek.is_none() {
-            tracing::warn!(
-                "SECUREPROMPT_MODEL_KEK is set but not a valid 32-byte base64 key"
-            );
+    let model_kek = {
+        let effective_kek_b64 = secureprompt_api::license::effective_kek(&config.license.model_kek_b64);
+        if effective_kek_b64.is_empty() {
+            None
+        } else {
+            let kek = secureprompt_api::license::parse_kek(&effective_kek_b64);
+            if kek.is_none() {
+                tracing::warn!(
+                    "SECUREPROMPT_MODEL_KEK is set but not a valid 32-byte base64 key"
+                );
+            }
+            kek
         }
-        kek
     };
 
     let state = AppState::new(db, config.clone(), ml_sidecar, license);
+
+    // Tamper-evidence: check running image digest against the license's pinned digest.
+    // Fail-open — NEVER crash, just warn.
+    {
+        let actual = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
+        for flag in state.license.tamper_flags("api", &actual) {
+            tracing::warn!(flag, "tamper evidence detected at startup");
+        }
+    }
 
     // Plan 4 — best-effort push of the unwrapped model key to the ML sidecar at startup.
     // Retries up to 10 times (sidecar may still be starting). NEVER aborts the gateway.
@@ -212,7 +231,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Plan 3 — periodic license re-verify (only when a vendor key is configured).
-    if let Some(vk) = secureprompt_api::license::parse_vendor_key(&config.license.pubkey_b64) {
+    let effective_pubkey_for_recheck = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
+    if let Some(vk) = secureprompt_api::license::parse_vendor_key(&effective_pubkey_for_recheck) {
         let st = std::sync::Arc::clone(&state.license);
         let path = config.license.license_path.clone();
         let secs = config.license.recheck_secs;
