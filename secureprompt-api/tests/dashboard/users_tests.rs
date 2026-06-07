@@ -78,6 +78,8 @@ fn build_app_with_seat_limit(pool: PgPool, seats: u32) -> axum::Router {
         features: vec![],
         customer_name: Some("Test Customer".into()),
         expires_at: Some("2030-01-01T00:00:00Z".into()),
+        wrapped_model_key: None,
+        lic_id: None,
     });
     build_router(AppState::new(
         pool,

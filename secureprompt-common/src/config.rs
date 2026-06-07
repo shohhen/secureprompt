@@ -13,6 +13,9 @@ pub struct LicenseConfig {
     /// permits substitution and is a development convenience only.
     pub pubkey_b64: String,
     pub recheck_secs: u64,
+    /// base64 32-byte key-encryption key for the model decryption key.
+    /// TODO(plan6): pin the KEK as a compile-time const alongside the vendor public key.
+    pub model_kek_b64: String,
 }
 
 impl LicenseConfig {
@@ -25,6 +28,7 @@ impl LicenseConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            model_kek_b64: std::env::var("SECUREPROMPT_MODEL_KEK").unwrap_or_default(),
         }
     }
 }

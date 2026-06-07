@@ -16,11 +16,13 @@ pub struct LicenseSnapshot {
     pub features: Vec<String>,
     pub customer_name: Option<String>,
     pub expires_at: Option<String>,
+    pub wrapped_model_key: Option<String>,
+    pub lic_id: Option<String>,
 }
 
 impl LicenseSnapshot {
     fn unlicensed() -> Self {
-        Self { status: LicenseStatus::Unlicensed, max_seats: None, features: vec![], customer_name: None, expires_at: None }
+        Self { status: LicenseStatus::Unlicensed, max_seats: None, features: vec![], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None }
     }
 }
 
@@ -31,6 +33,8 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         features: lic.entitlements.features.clone(),
         customer_name: Some(lic.customer.name.clone()),
         expires_at: Some(lic.entitlements.expires_at.clone()),
+        wrapped_model_key: Some(lic.model.wrapped_key.clone()),
+        lic_id: Some(lic.lic_id.clone()),
     }
 }
 
@@ -57,6 +61,17 @@ impl LicenseState {
             LicenseStatus::Grace | LicenseStatus::Unlicensed => true,
         }
     }
+
+    /// The 32-byte model decryption key — ONLY when the license is Valid.
+    pub fn unwrap_model_key(&self, kek: &[u8; 32]) -> Option<[u8; 32]> {
+        let s = self.snapshot();
+        if s.status != LicenseStatus::Valid { return None; }
+        let wrapped = s.wrapped_model_key.as_ref()?;
+        let lic_id = s.lic_id.as_ref()?;
+        let aad = format!("{lic_id}:model");
+        let bytes = sp_license::unwrap_key_with_aad(kek, wrapped, aad.as_bytes()).ok()?;
+        bytes.try_into().ok()
+    }
 }
 
 /// Parse a base64 Ed25519 vendor public key. None on bad input.
@@ -64,6 +79,12 @@ pub fn parse_vendor_key(b64: &str) -> Option<VerifyingKey> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     let bytes: [u8; 32] = B64.decode(b64.trim()).ok()?.try_into().ok()?;
     VerifyingKey::from_bytes(&bytes).ok()
+}
+
+/// Parse a base64-encoded 32-byte key-encryption key. Returns `None` on bad input or wrong length.
+pub fn parse_kek(b64: &str) -> Option<[u8; 32]> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    B64.decode(b64.trim()).ok()?.try_into().ok()
 }
 
 /// Load + verify a license file. NEVER returns Err — failures map to a snapshot
@@ -173,7 +194,7 @@ mod tests {
     #[test]
     fn feature_and_seat_gates_fail_open() {
         // Valid: enforces
-        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None });
+        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None });
         assert_eq!(valid.max_seats(), Some(5));
         assert!(valid.is_feature_enabled("a"));
         assert!(!valid.is_feature_enabled("b"));
@@ -190,5 +211,49 @@ mod tests {
         let b64 = B64.encode(sk.verifying_key().to_bytes());
         assert!(parse_vendor_key(&b64).is_some());
         assert!(parse_vendor_key("not-base64!!").is_none());
+    }
+
+    #[test]
+    fn unwrap_model_key_only_when_valid() {
+        use sp_license::seal_key_with_aad;
+        let sk = SigningKey::generate(&mut OsRng);
+        let kek = [3u8; 32];
+        let model_key = [7u8; 32];
+        let lic_id = "mk-test";
+        let wrapped = seal_key_with_aad(&kek, &model_key, format!("{lic_id}:model").as_bytes()).unwrap();
+        let base = License {
+            v: 1, lic_id: lic_id.into(),
+            customer: Customer { id: "c".into(), name: "Acme".into() },
+            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into() },
+            entitlements: Entitlements { not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(), seats: 5, features: vec![], components: vec![] },
+            model: ModelGrant { wrapped_key: wrapped, models: vec![] },
+            integrity: Integrity { image_digests: BTreeMap::new() },
+            iss: "sp-admin".into(), iat: "2026-01-01T00:00:00Z".into(),
+        };
+        // Valid → unwraps to the original key
+        let env = sign_license(&base, &sk).unwrap();
+        let path = write("sp_lic_mk.json", &env);
+        let st = LicenseState::new(load_and_verify(&path, &sk.verifying_key(), now()));
+        assert_eq!(st.status(), LicenseStatus::Valid);
+        assert_eq!(st.unwrap_model_key(&kek), Some(model_key));
+        assert_eq!(st.unwrap_model_key(&[9u8; 32]), None); // wrong KEK
+
+        // Expired (Grace) → None even with the right KEK (only Valid yields the key)
+        let mut exp_lic = base.clone();
+        exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
+        exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
+        let env2 = sign_license(&exp_lic, &sk).unwrap();
+        let p2 = write("sp_lic_mk_exp.json", &env2);
+        let st2 = LicenseState::new(load_and_verify(&p2, &sk.verifying_key(), now()));
+        assert_eq!(st2.status(), LicenseStatus::Grace);
+        assert_eq!(st2.unwrap_model_key(&kek), None);
+    }
+
+    #[test]
+    fn parse_kek_roundtrip() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        assert_eq!(parse_kek(&B64.encode([4u8; 32])), Some([4u8; 32]));
+        assert_eq!(parse_kek("nope!!"), None);
+        assert_eq!(parse_kek(&B64.encode([4u8; 16])), None); // wrong length
     }
 }
