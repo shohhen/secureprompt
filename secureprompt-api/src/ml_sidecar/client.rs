@@ -257,6 +257,41 @@ impl MlSidecarClient {
         }
     }
 
+    /// Push the model decryption key to the sidecar. Best-effort, fail-open.
+    ///
+    /// Independent of the circuit breaker — this is a one-shot internal call
+    /// that MUST NOT affect the breaker state (it's not a user-facing request).
+    /// A short-lived `reqwest::Client` is used so it has its own timeout and
+    /// never interferes with the circuit-guarded `http` field.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` when the HTTP call fails or the sidecar returns
+    /// a non-2xx status. The caller is responsible for logging and ignoring
+    /// the error (fail-open).
+    pub async fn push_model_key(&self, key: &[u8; 32], token: &str) -> Result<(), String> {
+        let url = format!("{}/internal/model-key", self.base_url);
+        let body = serde_json::json!({ "key_hex": hex::encode(key) });
+        // Construct a short-lived client with a generous but bounded timeout.
+        // We do not reuse `self.http` so this call never trips the circuit breaker.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .use_rustls_tls()
+            .build()
+            .map_err(|e| format!("failed to build push client: {e}"))?;
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("sidecar returned {}", resp.status()))
+        }
+    }
+
     /// Prometheus metrics for the ML sidecar client.
     /// Append to the main metrics output in the /metrics HTTP handler.
     #[must_use]

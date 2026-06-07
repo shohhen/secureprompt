@@ -166,22 +166,80 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Plan 4 — parse the KEK. Non-empty but invalid → warn; empty → weight-encryption off.
+    let model_kek = if config.license.model_kek_b64.is_empty() {
+        None
+    } else {
+        let kek = secureprompt_api::license::parse_kek(&config.license.model_kek_b64);
+        if kek.is_none() {
+            tracing::warn!(
+                "SECUREPROMPT_MODEL_KEK is set but not a valid 32-byte base64 key"
+            );
+        }
+        kek
+    };
+
     let state = AppState::new(db, config.clone(), ml_sidecar, license);
+
+    // Plan 4 — best-effort push of the unwrapped model key to the ML sidecar at startup.
+    // Retries up to 10 times (sidecar may still be starting). NEVER aborts the gateway.
+    let token = config.license.internal_token.clone();
+    if let (Some(kek), false) = (model_kek, token.is_empty()) {
+        let st = std::sync::Arc::clone(&state.license);
+        let client = std::sync::Arc::clone(&state.ml_sidecar);
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            for attempt in 0..10u32 {
+                if let Some(key) = st.unwrap_model_key(&kek) {
+                    match client.push_model_key(&key, &token_clone).await {
+                        Ok(()) => {
+                            tracing::info!("pushed model key to ML sidecar");
+                            return;
+                        }
+                        Err(e) => tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "model-key push failed; retrying"
+                        ),
+                    }
+                } else {
+                    tracing::warn!("no valid license model key to push");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
+
     // Plan 3 — periodic license re-verify (only when a vendor key is configured).
     if let Some(vk) = secureprompt_api::license::parse_vendor_key(&config.license.pubkey_b64) {
         let st = std::sync::Arc::clone(&state.license);
         let path = config.license.license_path.clone();
         let secs = config.license.recheck_secs;
+        // Plan 4 — capture kek/token/client for re-push on re-verify.
+        let recheck_kek = model_kek;
+        let recheck_token = token.clone();
+        let recheck_client = std::sync::Arc::clone(&state.ml_sidecar);
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
             t.tick().await; // skip immediate first tick (startup already verified)
             loop {
                 t.tick().await;
-                st.set(secureprompt_api::license::load_and_verify(
+                let new_snapshot = secureprompt_api::license::load_and_verify(
                     &path,
                     &vk,
                     chrono::Utc::now().timestamp(),
-                ));
+                );
+                st.set(new_snapshot);
+                // Plan 4 — re-push the model key after a license refresh (single attempt, best-effort).
+                if let (Some(kek), false) = (recheck_kek, recheck_token.is_empty()) {
+                    if let Some(key) = st.unwrap_model_key(&kek) {
+                        match recheck_client.push_model_key(&key, &recheck_token).await {
+                            Ok(()) => tracing::info!("re-pushed model key to ML sidecar after license re-verify"),
+                            Err(e) => tracing::warn!(error = %e, "model-key re-push failed after license re-verify (ignored)"),
+                        }
+                    }
+                }
             }
         });
     }

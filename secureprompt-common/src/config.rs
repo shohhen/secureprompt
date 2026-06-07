@@ -16,6 +16,10 @@ pub struct LicenseConfig {
     /// base64 32-byte key-encryption key for the model decryption key.
     /// TODO(plan6): pin the KEK as a compile-time const alongside the vendor public key.
     pub model_kek_b64: String,
+    /// Shared secret used when pushing the unwrapped model key to the ML sidecar's
+    /// `POST /internal/model-key` endpoint. Empty string disables the push.
+    /// Loaded from `ML_SIDECAR_INTERNAL_TOKEN`; empty default.
+    pub internal_token: String,
 }
 
 impl std::fmt::Debug for LicenseConfig {
@@ -25,6 +29,7 @@ impl std::fmt::Debug for LicenseConfig {
             .field("pubkey_b64", &self.pubkey_b64)
             .field("model_kek_b64", &"<redacted>")
             .field("recheck_secs", &self.recheck_secs)
+            .field("internal_token", &"<redacted>")
             .finish()
     }
 }
@@ -40,6 +45,7 @@ impl LicenseConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
             model_kek_b64: std::env::var("SECUREPROMPT_MODEL_KEK").unwrap_or_default(),
+            internal_token: std::env::var("ML_SIDECAR_INTERNAL_TOKEN").unwrap_or_default(),
         }
     }
 }
