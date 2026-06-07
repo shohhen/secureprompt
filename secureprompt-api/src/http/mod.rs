@@ -123,6 +123,10 @@ pub fn build_router(state: AppState) -> Router {
                     middleware::jwt_auth::require,
                 )),
         )
+        .route(
+            "/internal/attestation",
+            get(routes::internal::get_attestation),
+        )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
         .with_state(state)
         .layer(cors_layer())

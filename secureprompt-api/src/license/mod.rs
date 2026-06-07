@@ -1,6 +1,9 @@
 //! Gateway-side license verification (Plan 3). Fail-open: a bad/missing/expired
 //! license degrades to Unlicensed/Grace and is logged — it never blocks the
 //! request pipeline (mirrors the ml_sidecar circuit-breaker contract).
+
+pub mod attestation;
+
 use std::sync::RwLock;
 use ed25519_dalek::VerifyingKey;
 use sp_license::sign::{verify_license, LicenseEnvelope};
@@ -18,11 +21,13 @@ pub struct LicenseSnapshot {
     pub expires_at: Option<String>,
     pub wrapped_model_key: Option<String>,
     pub lic_id: Option<String>,
+    /// The per-deployment attestation signing key wrapped under the KEK — Valid license only.
+    pub wrapped_attestation_key: Option<String>,
 }
 
 impl LicenseSnapshot {
     fn unlicensed() -> Self {
-        Self { status: LicenseStatus::Unlicensed, max_seats: None, features: vec![], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None }
+        Self { status: LicenseStatus::Unlicensed, max_seats: None, features: vec![], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None }
     }
 }
 
@@ -36,6 +41,7 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         expires_at: Some(lic.entitlements.expires_at.clone()),
         wrapped_model_key: if valid { Some(lic.model.wrapped_key.clone()) } else { None },
         lic_id: if valid { Some(lic.lic_id.clone()) } else { None },
+        wrapped_attestation_key: if valid { Some(lic.deployment.wrapped_attestation_key.clone()) } else { None },
     }
 }
 
@@ -72,6 +78,17 @@ impl LicenseState {
         let aad = format!("{lic_id}:model");
         let bytes = sp_license::unwrap_key_with_aad(kek, wrapped, aad.as_bytes()).ok()?;
         bytes.try_into().ok()
+    }
+
+    /// The per-deployment attestation signing key — Valid license only.
+    pub fn unwrap_attestation_key(&self, kek: &[u8; 32]) -> Option<ed25519_dalek::SigningKey> {
+        let s = self.snapshot();
+        if s.status != LicenseStatus::Valid { return None; }
+        let wrapped = s.wrapped_attestation_key.as_ref()?;
+        let lic_id = s.lic_id.as_ref()?;
+        let bytes = sp_license::unwrap_key_with_aad(kek, wrapped, format!("{lic_id}:attest").as_bytes()).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        Some(ed25519_dalek::SigningKey::from_bytes(&arr))
     }
 }
 
@@ -124,7 +141,7 @@ mod tests {
         let lic = License {
             v: 1, lic_id: "test-lic".into(),
             customer: Customer { id: "c".into(), name: "Acme".into() },
-            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into() },
+            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(), wrapped_attestation_key: String::new() },
             entitlements: Entitlements {
                 not_before: not_before.into(), expires_at: expires.into(),
                 seats, features: features.iter().map(|s| s.to_string()).collect(), components: vec![],
@@ -195,7 +212,7 @@ mod tests {
     #[test]
     fn feature_and_seat_gates_fail_open() {
         // Valid: enforces
-        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None });
+        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None });
         assert_eq!(valid.max_seats(), Some(5));
         assert!(valid.is_feature_enabled("a"));
         assert!(!valid.is_feature_enabled("b"));
@@ -225,7 +242,7 @@ mod tests {
         let base = License {
             v: 1, lic_id: lic_id.into(),
             customer: Customer { id: "c".into(), name: "Acme".into() },
-            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into() },
+            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(), wrapped_attestation_key: String::new() },
             entitlements: Entitlements { not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(), seats: 5, features: vec![], components: vec![] },
             model: ModelGrant { wrapped_key: wrapped, models: vec![] },
             integrity: Integrity { image_digests: BTreeMap::new() },
@@ -248,6 +265,52 @@ mod tests {
         let st2 = LicenseState::new(load_and_verify(&p2, &sk.verifying_key(), now()));
         assert_eq!(st2.status(), LicenseStatus::Grace);
         assert_eq!(st2.unwrap_model_key(&kek), None);
+    }
+
+    #[test]
+    fn unwrap_attestation_key_only_when_valid() {
+        use sp_license::seal_key_with_aad;
+        let vendor_sk = SigningKey::generate(&mut OsRng);
+        let kek = [5u8; 32];
+        // Generate a known attestation keypair
+        let att_sk = SigningKey::generate(&mut OsRng);
+        let att_vk = att_sk.verifying_key();
+        let lic_id = "attest-test-lic";
+        let wrapped = seal_key_with_aad(&kek, att_sk.as_bytes(), format!("{lic_id}:attest").as_bytes()).unwrap();
+        let base = License {
+            v: 1, lic_id: lic_id.into(),
+            customer: Customer { id: "c".into(), name: "Acme".into() },
+            deployment: Deployment {
+                scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(),
+                wrapped_attestation_key: wrapped,
+            },
+            entitlements: Entitlements {
+                not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(),
+                seats: 5, features: vec![], components: vec![],
+            },
+            model: ModelGrant { wrapped_key: "w".into(), models: vec![] },
+            integrity: Integrity { image_digests: BTreeMap::new() },
+            iss: "sp-admin".into(), iat: "2026-01-01T00:00:00Z".into(),
+        };
+        // Valid → unwraps to the original attestation key
+        let env = sign_license(&base, &vendor_sk).unwrap();
+        let path = write("sp_lic_att.json", &env);
+        let st = LicenseState::new(load_and_verify(&path, &vendor_sk.verifying_key(), now()));
+        assert_eq!(st.status(), LicenseStatus::Valid);
+        let recovered = st.unwrap_attestation_key(&kek).expect("should unwrap");
+        assert_eq!(recovered.verifying_key(), att_vk);
+        // Wrong KEK → None
+        assert!(st.unwrap_attestation_key(&[9u8; 32]).is_none());
+
+        // Expired (Grace) → None even with correct KEK
+        let mut exp_lic = base.clone();
+        exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
+        exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
+        let env2 = sign_license(&exp_lic, &vendor_sk).unwrap();
+        let p2 = write("sp_lic_att_exp.json", &env2);
+        let st2 = LicenseState::new(load_and_verify(&p2, &vendor_sk.verifying_key(), now()));
+        assert_eq!(st2.status(), LicenseStatus::Grace);
+        assert!(st2.unwrap_attestation_key(&kek).is_none());
     }
 
     #[test]
