@@ -10,6 +10,14 @@ use axum::{
     Json,
 };
 
+/// Constant-time byte-slice equality to prevent timing oracles.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    diff == 0
+}
+
 /// Verify the request carries a valid internal bearer token.
 /// Returns `Err((status, message))` on failure.
 fn check_internal_token(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, &'static str)> {
@@ -22,7 +30,7 @@ fn check_internal_token(headers: &HeaderMap, expected: &str) -> Result<(), (Stat
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let provided = auth.strip_prefix("Bearer ").unwrap_or("");
-    if provided == expected {
+    if ct_eq(provided.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "invalid internal token"))
@@ -96,7 +104,7 @@ pub async fn get_attestation(
     );
 
     match crate::license::attestation::sign_bundle(&bundle, &sk) {
-        Ok(signed) => (StatusCode::OK, Json(serde_json::to_value(signed).unwrap_or_default())).into_response(),
+        Ok(signed) => (StatusCode::OK, Json(signed)).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "attestation: failed to sign bundle");
             (
