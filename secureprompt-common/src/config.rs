@@ -1,5 +1,42 @@
 use serde::{Deserialize, Serialize};
 
+/// Plan 3 — license verification configuration.
+///
+/// Fields are loaded from environment variables; see `LicenseConfig::from_env`.
+/// `LicenseConfig` is intentionally NOT deserialized from a config file
+/// (the public key must come from the environment at runtime only).
+#[derive(Debug, Clone)]
+pub struct LicenseConfig {
+    pub license_path: String,
+    /// base64 Ed25519 vendor public key; empty => unlicensed/grace.
+    /// TODO(plan6): pin this as a compile-time const (include_bytes) — env-loading
+    /// permits substitution and is a development convenience only.
+    pub pubkey_b64: String,
+    pub recheck_secs: u64,
+}
+
+impl LicenseConfig {
+    pub fn from_env() -> Self {
+        Self {
+            license_path: std::env::var("SECUREPROMPT_LICENSE_PATH")
+                .unwrap_or_else(|_| "/etc/secureprompt/license.json".into()),
+            pubkey_b64: std::env::var("SECUREPROMPT_LICENSE_PUBKEY").unwrap_or_default(),
+            recheck_secs: std::env::var("SECUREPROMPT_LICENSE_RECHECK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
+        }
+    }
+}
+
+/// `Default` delegates to `from_env()` so that `#[serde(skip)]` on
+/// `AppConfig::license` works (serde needs `Default` for skipped fields).
+impl Default for LicenseConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
@@ -37,6 +74,11 @@ pub struct AppConfig {
     /// `true` — the safe behavior.
     #[serde(default = "default_redact_when_no_rules")]
     pub redact_when_no_rules: bool,
+    /// Plan 3 — gateway license verification (fail-open). Loaded from env;
+    /// not serde-deserialized because the public key must not come from a
+    /// config file.
+    #[serde(skip)]
+    pub license: LicenseConfig,
 }
 
 fn default_redact_when_no_rules() -> bool {

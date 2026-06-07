@@ -25,8 +25,8 @@ use secureprompt_api::{
     ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-    TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+    ServerConfig, TelemetryConfig,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -92,9 +92,15 @@ fn build_state(pool: PgPool) -> AppState {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        license: LicenseConfig::default(),
     };
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));
-    AppState::new(pool, config, ml_sidecar)
+    AppState::new(
+        pool,
+        config,
+        ml_sidecar,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    )
 }
 
 fn router(state: AppState) -> Router {

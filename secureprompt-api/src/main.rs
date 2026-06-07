@@ -1,8 +1,8 @@
 use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::{
     config::{
-        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-        TelemetryConfig,
+        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+        ServerConfig, TelemetryConfig,
     },
     telemetry::init_telemetry,
 };
@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
         chat_debug_mode: AppConfig::chat_debug_mode_from_env(),
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
+        license: LicenseConfig::from_env(),
     };
 
     init_telemetry(&config.telemetry);
@@ -145,7 +146,46 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(5000);
     let ml_sidecar = Arc::new(MlSidecarClient::new(ml_sidecar_url, ml_sidecar_timeout_ms));
 
-    let state = AppState::new(db, config.clone(), ml_sidecar);
+    // Plan 3 — startup license verification. Fail-open: never fatal.
+    let license = {
+        let now = chrono::Utc::now().timestamp();
+        match secureprompt_api::license::parse_vendor_key(&config.license.pubkey_b64) {
+            Some(vk) => std::sync::Arc::new(secureprompt_api::license::LicenseState::new(
+                secureprompt_api::license::load_and_verify(
+                    &config.license.license_path,
+                    &vk,
+                    now,
+                ),
+            )),
+            None => {
+                tracing::warn!(
+                    "SECUREPROMPT_LICENSE_PUBKEY unset/invalid — running unlicensed (grace)"
+                );
+                std::sync::Arc::new(secureprompt_api::license::LicenseState::unlicensed())
+            }
+        }
+    };
+
+    let state = AppState::new(db, config.clone(), ml_sidecar, license);
+    // Plan 3 — periodic license re-verify (only when a vendor key is configured).
+    if let Some(vk) = secureprompt_api::license::parse_vendor_key(&config.license.pubkey_b64) {
+        let st = std::sync::Arc::clone(&state.license);
+        let path = config.license.license_path.clone();
+        let secs = config.license.recheck_secs;
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
+            t.tick().await; // skip immediate first tick (startup already verified)
+            loop {
+                t.tick().await;
+                st.set(secureprompt_api::license::load_and_verify(
+                    &path,
+                    &vk,
+                    chrono::Utc::now().timestamp(),
+                ));
+            }
+        });
+    }
+
     let app = build_router(state);
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&address).await?;

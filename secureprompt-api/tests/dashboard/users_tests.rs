@@ -12,8 +12,8 @@ use secureprompt_api::{
 };
 use secureprompt_api::http::middleware::jwt_auth::Claims;
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-    TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+    ServerConfig, TelemetryConfig,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -55,12 +55,18 @@ fn test_config() -> AppConfig {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        license: LicenseConfig::default(),
     }
 }
 
 fn build_app(pool: PgPool) -> axum::Router {
     let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
-    build_router(AppState::new(pool, test_config(), ml))
+    build_router(AppState::new(
+        pool,
+        test_config(),
+        ml,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    ))
 }
 
 fn make_jwt(workspace_id: Uuid, user_id: Uuid, role: &str) -> String {

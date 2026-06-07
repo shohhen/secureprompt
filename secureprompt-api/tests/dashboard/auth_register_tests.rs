@@ -9,8 +9,8 @@ use secureprompt_api::{
     app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-    TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+    ServerConfig, TelemetryConfig,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -51,6 +51,7 @@ fn test_config(public_signup_enabled: bool) -> AppConfig {
         public_signup_enabled,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        license: LicenseConfig::default(),
     }
 }
 
@@ -60,6 +61,7 @@ fn build_app(pool: PgPool, public_signup_enabled: bool) -> axum::Router {
         pool,
         test_config(public_signup_enabled),
         ml,
+        std::sync::Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
     ))
 }
 

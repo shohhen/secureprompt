@@ -7,8 +7,8 @@ use axum::{
 use http_body_util::BodyExt;
 use secureprompt_api::{app_state::AppState, db::api_key_repo::hash_api_key, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-    TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+    ServerConfig, TelemetryConfig,
 };
 use std::sync::Arc;
 use serde_json::Value;
@@ -46,12 +46,18 @@ pub fn test_config() -> AppConfig {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        license: LicenseConfig::default(),
     }
 }
 
 pub fn router(pool: PgPool) -> Router {
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 200));
-    build_router(AppState::new(pool, test_config(), ml_sidecar))
+    build_router(AppState::new(
+        pool,
+        test_config(),
+        ml_sidecar,
+        std::sync::Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    ))
 }
 
 pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) -> sqlx::Result<()> {

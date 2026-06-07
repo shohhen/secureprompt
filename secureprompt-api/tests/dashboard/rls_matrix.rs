@@ -16,8 +16,8 @@ use axum::{
 use deadpool_redis::{Config as RedisConfig, Runtime};
 use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::config::{
-    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig as AppRedisConfig,
-    ServerConfig, TelemetryConfig,
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig,
+    RedisConfig as AppRedisConfig, ServerConfig, TelemetryConfig,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -66,13 +66,19 @@ fn test_config() -> AppConfig {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        license: LicenseConfig::default(),
     }
 }
 
 fn build_app(pool: PgPool) -> (AppState, Router) {
     let config = test_config();
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));
-    let state = AppState::new(pool, config, ml_sidecar);
+    let state = AppState::new(
+        pool,
+        config,
+        ml_sidecar,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    );
     let router = build_router(state.clone());
     (state, router)
 }

@@ -56,6 +56,10 @@ pub struct AppState {
     /// Defaults to `FileKms` (AES-256-GCM). Switch to `VaultKms` via
     /// `KMS_BACKEND=vault` for regulated on-prem deployments.
     pub kms: Arc<dyn KmsBackend>,
+    /// Plan 3 — gateway license state. Fail-open: a missing/invalid/expired
+    /// license never blocks requests. Re-verified periodically by the
+    /// background task spawned in main.rs.
+    pub license: std::sync::Arc<crate::license::LicenseState>,
 }
 
 impl AppState {
@@ -68,6 +72,7 @@ impl AppState {
         db: PgPool,
         config: AppConfig,
         ml_sidecar: Arc<MlSidecarClient>,
+        license: std::sync::Arc<crate::license::LicenseState>,
     ) -> Result<Self, ApiError> {
         let metrics = Arc::new(MetricsRegistry::default());
         let ch_url = config.clickhouse.url.clone();
@@ -101,6 +106,7 @@ impl AppState {
             dashboard_reader,
             auth_cache: Arc::new(DashMap::new()),
             kms,
+            license,
         })
     }
 
@@ -112,7 +118,12 @@ impl AppState {
     /// Panics if `try_new` fails. Callers that need graceful handling should
     /// use `try_new` directly.
     #[must_use]
-    pub fn new(db: PgPool, config: AppConfig, ml_sidecar: Arc<MlSidecarClient>) -> Self {
-        Self::try_new(db, config, ml_sidecar).expect("AppState::new must succeed")
+    pub fn new(
+        db: PgPool,
+        config: AppConfig,
+        ml_sidecar: Arc<MlSidecarClient>,
+        license: std::sync::Arc<crate::license::LicenseState>,
+    ) -> Self {
+        Self::try_new(db, config, ml_sidecar, license).expect("AppState::new must succeed")
     }
 }
