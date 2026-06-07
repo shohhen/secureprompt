@@ -47,9 +47,12 @@ rand = { workspace = true }
 dashmap = { workspace = true }
 oauth2 = { workspace = true }
 sp-license = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 sqlx = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"

@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod db;
 pub mod detection;
 pub mod http;
+pub mod license;
 pub mod ml_sidecar;
 pub mod observability;
 pub mod pipeline;
