@@ -126,7 +126,17 @@ async def set_model_key(req: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
     body = await req.json()
-    _model_key = bytes.fromhex(body["key_hex"])
+    key_hex = body.get("key_hex") if isinstance(body, dict) else None
+    if not isinstance(key_hex, str):
+        raise HTTPException(status_code=400, detail="missing or non-string key_hex")
+    try:
+        key = bytes.fromhex(key_hex)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="key_hex must be valid hex")
+    if len(key) != 32:
+        raise HTTPException(status_code=400, detail="model key must be 32 bytes")
+    global _model_key
+    _model_key = key
     _key_event.set()
     return {"status": "accepted"}
 
