@@ -1,6 +1,7 @@
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from app.models import (
     NerRequest, NerResponse, NerEntity,
     InjectionRequest, InjectionResponse,
@@ -8,7 +9,7 @@ from app.models import (
     RagCheckRequest, RagCheckResponse, RagCheckMatch,
     ScanFileEntity, ScanFileResponse,
 )
-from app.detection.ner import _load_analyzer, detect
+from app.detection.ner import _load_analyzer as _load_analyzer_base, detect
 from app.detection.injection import _load_injection_pipeline, classify_injection
 from app.detection.batching import drain_worker
 from app.detection.secrets import scan_secrets
@@ -20,30 +21,114 @@ _ready = asyncio.Event()
 _models: dict = {}
 _ner_queue: asyncio.Queue | None = None
 
+# Module-level state for the deferred key delivery flow.
+_model_key: bytes | None = None
+_key_event = asyncio.Event()
+
+
+def _load_analyzer(model_key: bytes | None = None):
+    """Wrapper around the base _load_analyzer that passes the model_key
+    through to maybe_register inside xlmr_ner.
+
+    When model_key is None the behavior is identical to calling _load_analyzer_base()
+    directly (backward-compatible default path).
+    """
+    from app.detection import xlmr_ner as _xlmr_mod
+
+    # Monkey-patch maybe_register call inside _load_analyzer_base so we
+    # can inject the key without touching ner.py.  We do this via a
+    # temporary patch of xlmr_ner.maybe_register.
+    original_maybe_register = _xlmr_mod.maybe_register
+
+    if model_key is not None:
+        def _patched_maybe_register(analyzer, resources_dir=None, **kwargs):
+            return original_maybe_register(
+                analyzer, resources_dir=resources_dir, model_key=model_key,
+            )
+        _xlmr_mod.maybe_register = _patched_maybe_register
+
+    try:
+        return _load_analyzer_base()
+    finally:
+        _xlmr_mod.maybe_register = original_maybe_register
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _ner_queue
-    _models["analyzer"] = await asyncio.to_thread(_load_analyzer)
+    from app import config
+
+    # Always load these synchronous, non-encrypted models first.
     _models["injection"] = await asyncio.to_thread(_load_injection_pipeline)
     _models["embedder"] = await asyncio.to_thread(_load_embedder)
     _models["qdrant"] = await asyncio.to_thread(get_qdrant_client)
     await asyncio.to_thread(ensure_collections, _models["qdrant"])
+
     _ner_queue = asyncio.Queue(maxsize=100)
 
     async def _process_batch(texts: list[str]) -> list[list[dict]]:
         return [detect(_models["analyzer"], t) for t in texts]
 
-    asyncio.create_task(
-        drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
-    )
-    _ready.set()
-    yield
+    if not config.MODEL_KEY_REQUIRED:
+        # Default / backward-compatible path: load XLM-R immediately,
+        # set _ready, and yield to serve requests.
+        _models["analyzer"] = await asyncio.to_thread(_load_analyzer)
+        asyncio.create_task(
+            drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+        _ready.set()
+        yield
+    else:
+        # Encrypted-weights path: spawn a background task that waits for
+        # the key to arrive via POST /internal/model-key, then loads XLM-R.
+        # The lifespan yields immediately so the HTTP server can serve
+        # /internal/model-key and /health before the model is loaded.
+        # Inference routes gate on _ready (503 until it is set).
+        asyncio.create_task(
+            drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+
+        async def _wait_for_key_then_load():
+            await _key_event.wait()
+            _models["analyzer"] = await asyncio.to_thread(
+                _load_analyzer, _model_key
+            )
+            _ready.set()
+
+        asyncio.create_task(_wait_for_key_then_load())
+        yield
+
     _models.clear()
     _ready.clear()
 
 
 app = FastAPI(title="SecurePrompt ML Sidecar", lifespan=lifespan)
+
+
+@app.post("/internal/model-key")
+async def set_model_key(req: Request):
+    """Receive the AES-256 model key from the gateway.
+
+    Authentication: ``Authorization: Bearer <ML_SIDECAR_INTERNAL_TOKEN>``.
+    The token must be non-empty; an empty token always rejects.
+    Uses ``hmac.compare_digest`` to avoid timing-based token leaks.
+
+    This endpoint is intentionally NOT gated by ``_ready`` so the gateway
+    can POST the key before the model has loaded (the whole point of the
+    concurrent-load design).
+    """
+    from app import config
+    global _model_key
+
+    auth = req.headers.get("authorization", "")
+    expected = f"Bearer {config.INTERNAL_TOKEN}"
+    if not config.INTERNAL_TOKEN or not hmac.compare_digest(auth, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    body = await req.json()
+    _model_key = bytes.fromhex(body["key_hex"])
+    _key_event.set()
+    return {"status": "accepted"}
 
 
 @app.get("/health")

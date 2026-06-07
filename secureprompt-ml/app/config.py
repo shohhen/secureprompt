@@ -3,6 +3,8 @@ import os
 ML_LANGUAGE: str = os.getenv("ML_LANGUAGE", "en")
 ML_USE_ONNX: bool = os.getenv("ML_USE_ONNX", "false").lower() == "true"
 ML_SIDECAR_PORT: int = int(os.getenv("ML_SIDECAR_PORT", "8080"))
+INTERNAL_TOKEN: str = os.getenv("ML_SIDECAR_INTERNAL_TOKEN", "")
+MODEL_KEY_REQUIRED: bool = os.getenv("SECUREPROMPT_MODEL_KEY_REQUIRED", "false").lower() in ("1", "true", "yes")
 
 # Which fine-tuned NER checkpoint(s) under app/resources/*_ner*/ to load.
 #
