@@ -138,6 +138,10 @@ mod tests {
         let s = load_and_verify(&path, &sk.verifying_key(), now()); // now (2026) is after expiry
         assert_eq!(s.status, LicenseStatus::Grace);
         assert_eq!(s.max_seats, Some(10)); // entitlements still readable in grace
+        // Grace fail-opens: no seat ceiling, all features permitted
+        let st = LicenseState::new(s);
+        assert_eq!(st.max_seats(), None);
+        assert!(st.is_feature_enabled("any-feature"));
     }
 
     #[test]
