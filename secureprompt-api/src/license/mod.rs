@@ -27,14 +27,15 @@ impl LicenseSnapshot {
 }
 
 fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
+    let valid = status == LicenseStatus::Valid;
     LicenseSnapshot {
         status,
         max_seats: Some(lic.entitlements.seats),
         features: lic.entitlements.features.clone(),
         customer_name: Some(lic.customer.name.clone()),
         expires_at: Some(lic.entitlements.expires_at.clone()),
-        wrapped_model_key: Some(lic.model.wrapped_key.clone()),
-        lic_id: Some(lic.lic_id.clone()),
+        wrapped_model_key: if valid { Some(lic.model.wrapped_key.clone()) } else { None },
+        lic_id: if valid { Some(lic.lic_id.clone()) } else { None },
     }
 }
 

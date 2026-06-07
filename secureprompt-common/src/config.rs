@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Fields are loaded from environment variables; see `LicenseConfig::from_env`.
 /// `LicenseConfig` is intentionally NOT deserialized from a config file
 /// (the public key must come from the environment at runtime only).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LicenseConfig {
     pub license_path: String,
     /// base64 Ed25519 vendor public key; empty => unlicensed/grace.
@@ -16,6 +16,17 @@ pub struct LicenseConfig {
     /// base64 32-byte key-encryption key for the model decryption key.
     /// TODO(plan6): pin the KEK as a compile-time const alongside the vendor public key.
     pub model_kek_b64: String,
+}
+
+impl std::fmt::Debug for LicenseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LicenseConfig")
+            .field("license_path", &self.license_path)
+            .field("pubkey_b64", &self.pubkey_b64)
+            .field("model_kek_b64", &"<redacted>")
+            .field("recheck_secs", &self.recheck_secs)
+            .finish()
+    }
 }
 
 impl LicenseConfig {
