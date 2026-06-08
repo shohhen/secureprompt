@@ -66,10 +66,10 @@ rmcp = { version = "1.5", features = ["server", "macros", "transport-io", "schem
 # need the derive macro from the crate itself. MUST be 1.0, NOT 0.8 (Pitfall 6).
 schemars = "1.0"
 
-# DEV: path dep so it builds locally. PRODUCTION: replace with a git dep on the
-# sp-admin repo + an `sp-license-v0.1.0` tag (see Plan 3 doc). This crate provides
-# license verify/window (and AAD key-unwrap, used later in Plan 4).
-sp-license = { path = "../sp-admin/crates/sp-license" }
+# PRODUCTION git dep — sp-license is pinned to the sp-license-v0.1.0 tag on the
+# sp-admin repo. Same code as the former local path dep; reproducible source.
+# (and AAD key-unwrap, used later in Plan 4).
+sp-license = { git = "ssh://git@gitlab.com/secureprompt/admin.git", tag = "sp-license-v0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

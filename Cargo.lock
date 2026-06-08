@@ -3466,6 +3466,7 @@ dependencies = [
 [[package]]
 name = "sp-license"
 version = "0.1.0"
+source = "git+ssh://git@gitlab.com/secureprompt/admin.git?tag=sp-license-v0.1.0#5ef79b458bbbac106d7fac8ea87eb8e9b70464f0"
 dependencies = [
  "aes-gcm",
  "base64",
