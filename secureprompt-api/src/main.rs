@@ -151,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
         "vendor key pinned at build: {}",
         option_env!("SECUREPROMPT_PINNED_VENDOR_PUBKEY").is_some()
     );
+    tracing::info!(
+        "model KEK pinned at build: {}",
+        option_env!("SECUREPROMPT_PINNED_MODEL_KEK").is_some()
+    );
 
     // Plan 3 — startup license verification. Fail-open: never fatal.
     let license = {
@@ -240,6 +244,9 @@ async fn main() -> anyhow::Result<()> {
         let recheck_kek = model_kek;
         let recheck_token = token.clone();
         let recheck_client = std::sync::Arc::clone(&state.ml_sidecar);
+        // Capture digest once before the loop — reading the env var inside the
+        // loop on every tick would work too, but a single capture is cheaper.
+        let recheck_digest = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
             t.tick().await; // skip immediate first tick (startup already verified)
@@ -251,6 +258,11 @@ async fn main() -> anyhow::Result<()> {
                     chrono::Utc::now().timestamp(),
                 );
                 st.set(new_snapshot);
+                // Re-emit tamper-evidence flags after each periodic re-verify.
+                // Fail-open — never panic, just warn.
+                for flag in st.tamper_flags("api", &recheck_digest) {
+                    tracing::warn!(flag, "tamper evidence detected on re-verify");
+                }
                 // Plan 4 — re-push the model key after a license refresh (single attempt, best-effort).
                 if let (Some(kek), false) = (recheck_kek, recheck_token.is_empty()) {
                     if let Some(key) = st.unwrap_model_key(&kek) {
