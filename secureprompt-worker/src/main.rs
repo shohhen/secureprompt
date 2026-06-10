@@ -4,8 +4,8 @@ use anyhow::Context;
 use deadpool_redis::redis::cmd;
 use secureprompt_common::{
     config::{
-        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, RedisConfig, ServerConfig,
-        TelemetryConfig,
+        AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+        ServerConfig, TelemetryConfig,
     },
     tasks::{TaskEnvelope, ALL_QUEUES},
     telemetry::init_telemetry,
@@ -57,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
         // gateway request path, but AppConfig is shared so the field has
         // to be set. Defer to the env var so worker + API agree.
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
+        // The worker never verifies licenses (no gateway request path), so the
+        // empty/disabled default is correct here — no pubkey/keys.json reads.
+        license: LicenseConfig::default(),
     };
 
     init_telemetry(&config.telemetry);
