@@ -27,6 +27,10 @@ pub struct LicenseConfig {
     /// How often (seconds) to poll sp-admin for revocation. Default 300 (5 min).
     /// Loaded from `SECUREPROMPT_REVOCATION_CHECK_SECS`.
     pub revocation_check_secs: u64,
+    /// How often (seconds) to upload a signed attestation heartbeat to sp-admin
+    /// (`POST {license_server_url}/v1/attestations`). Default 3600 (1h). Only runs
+    /// when `license_server_url` is set. From `SECUREPROMPT_ATTESTATION_INTERVAL_SECS`.
+    pub attestation_interval_secs: u64,
 }
 
 impl std::fmt::Debug for LicenseConfig {
@@ -39,6 +43,7 @@ impl std::fmt::Debug for LicenseConfig {
             .field("internal_token", &"<redacted>")
             .field("license_server_url", &self.license_server_url)
             .field("revocation_check_secs", &self.revocation_check_secs)
+            .field("attestation_interval_secs", &self.attestation_interval_secs)
             .finish()
     }
 }
@@ -118,6 +123,10 @@ impl LicenseConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            attestation_interval_secs: std::env::var("SECUREPROMPT_ATTESTATION_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
         }
     }
 }

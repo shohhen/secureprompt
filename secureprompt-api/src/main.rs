@@ -314,6 +314,45 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Attestation heartbeat uploader (best-effort). Only runs when a license
+    // server URL is configured (reuses SECUREPROMPT_LICENSE_SERVER_URL). Builds
+    // + signs the same bundle as GET /internal/attestation and POSTs it to
+    // sp-admin's public, signature-authenticated /v1/attestations every
+    // SECUREPROMPT_ATTESTATION_INTERVAL_SECS. Never blocks, never panics; a
+    // revoked/invalid license simply produces no bundle and the beat is skipped.
+    if let Some(server_url) = config.license.license_server_url.clone() {
+        let att_state = state.clone();
+        let secs = config.license.attestation_interval_secs;
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!("{}/v1/attestations", server_url.trim_end_matches('/'));
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
+            tracing::info!(url, interval_secs = secs, "attestation heartbeat enabled");
+            loop {
+                t.tick().await;
+                let Some(signed) =
+                    secureprompt_api::http::routes::internal::build_signed_attestation(&att_state)
+                        .await
+                else {
+                    continue; // no valid license/key right now — skip this beat
+                };
+                match client
+                    .post(&url)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .json(&signed)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        tracing::debug!("attestation heartbeat uploaded")
+                    }
+                    Ok(r) => tracing::warn!(status = %r.status(), "attestation upload rejected"),
+                    Err(e) => tracing::warn!(error = %e, "attestation upload failed (ignored)"),
+                }
+            }
+        });
+    }
+
     let app = build_router(state);
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&address).await?;

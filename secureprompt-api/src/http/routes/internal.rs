@@ -51,35 +51,35 @@ pub async fn get_attestation(
         return (status, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
-    // --- Unwrap attestation signing key from the current valid license ---
-    let kek = match crate::license::parse_kek(&crate::license::effective_kek(&state.config.license.model_kek_b64)) {
-        Some(k) => k,
-        None => {
-            tracing::warn!("attestation: KEK not configured or invalid");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "no valid license attestation key" })),
-            ).into_response();
-        }
-    };
-    let sk = match state.license.unwrap_attestation_key(&kek) {
-        Some(k) => k,
-        None => {
-            tracing::warn!("attestation: license not Valid or attestation key absent");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "no valid license attestation key" })),
-            ).into_response();
-        }
-    };
+    match build_signed_attestation(&state).await {
+        Some(signed) => (StatusCode::OK, Json(signed)).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no valid license attestation key" })),
+        )
+            .into_response(),
+    }
+}
 
-    // --- Metrics ---
-    let lic_id = state.license.snapshot().lic_id.unwrap_or_else(|| "unknown".into());
+/// Build + sign an attestation bundle for the current deployment. Returns `None`
+/// when there is no valid license / attestation key (the license isn't `Valid`,
+/// is revoked, or the KEK is missing) — the caller decides 503 vs skip. Shared
+/// by `GET /internal/attestation` and the periodic heartbeat uploader so both
+/// produce byte-identical bundles. Best-effort; never panics.
+pub async fn build_signed_attestation(
+    state: &AppState,
+) -> Option<sp_license::SignedAttestation> {
+    let kek = crate::license::parse_kek(&crate::license::effective_kek(
+        &state.config.license.model_kek_b64,
+    ))?;
+    // Only yields a key when the license is Valid and not revoked.
+    let sk = state.license.unwrap_attestation_key(&kek)?;
+    let lic_id = state.license.snapshot().lic_id?;
 
-    let deployment_fp = std::env::var("SECUREPROMPT_DEPLOYMENT_ID")
-        .unwrap_or_else(|_| hostname_or_unknown());
+    let deployment_fp =
+        std::env::var("SECUREPROMPT_DEPLOYMENT_ID").unwrap_or_else(|_| hostname_or_unknown());
 
-    // Active seats: count users in the DB.  Best-effort — 0 on any error.
+    // Active seats: count users in the DB. Best-effort — 0 on any error.
     let active_seats: u32 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
         .await
@@ -91,33 +91,23 @@ pub async fn get_attestation(
     let requests: u64 = 0;
 
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    // --- Tamper flags from image digest check ---
     let actual_digest = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
     let tamper_flags = state.license.tamper_flags("api", &actual_digest);
 
-    // --- Build + sign ---
     let mut bundle = crate::license::attestation::build_bundle(
         &lic_id,
         &deployment_fp,
         active_seats,
         requests,
-        &now,   // period_from = point sample (same as now)
+        &now, // period_from = point sample (same as now)
         &now,
         &now,
     );
     bundle.tamper_flags = tamper_flags;
 
-    match crate::license::attestation::sign_bundle(&bundle, &sk) {
-        Ok(signed) => (StatusCode::OK, Json(signed)).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "attestation: failed to sign bundle");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "failed to sign attestation bundle" })),
-            ).into_response()
-        }
-    }
+    crate::license::attestation::sign_bundle(&bundle, &sk)
+        .map_err(|e| tracing::error!(error = %e, "attestation: failed to sign bundle"))
+        .ok()
 }
 
 fn hostname_or_unknown() -> String {
