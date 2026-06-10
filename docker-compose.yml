@@ -49,12 +49,23 @@ services:
       # Comma-separated for several, or "all" to load every shipped checkpoint.
       ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v3_no_ssn_xlmr}
       QDRANT_URL: http://qdrant:6333
+      # Shared secret the gateway uses to push the unwrapped model key to
+      # POST /internal/model-key. MUST match the api service's value below.
+      # The image sets SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the sidecar
+      # stays 503 until the gateway delivers the key with this token.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
     # No ports: mapping — api already binds host 8080; gateway calls via Docker DNS only.
+    # Healthcheck probes /health (liveness), NOT /ready. /ready only returns 200
+    # AFTER the gateway pushes the model key — but the api `depends_on` this
+    # service being healthy, so gating health on /ready would deadlock (api waits
+    # for ml ready ← ml waits for api's key push). The gateway's circuit breaker
+    # handles readiness: it gets 503 from /detect until the model loads and falls
+    # back to regex-only in the meantime (fail-open).
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')\" || exit 1",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1",
         ]
       start_period: 30s
       interval: 10s
@@ -85,6 +96,9 @@ services:
     build:
       context: .
       dockerfile: secureprompt-api/Dockerfile
+      # Forward the host ssh agent so cargo can fetch the private sp-license dep.
+      ssh:
+        - default
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
@@ -101,6 +115,17 @@ services:
       # assistant message instead. Override per-deployment in `.env`.
       SECUREPROMPT_CHAT_DEBUG_MODE: ${SECUREPROMPT_CHAT_DEBUG_MODE:-false}
       KMS_FILE_KEY: ${KMS_FILE_KEY:-c2VjdXJlcHJvbXB0LWRldi1rbXMta2V5LTMyYnl0ZXM=}
+      # License chain: the gateway reads license.json + keys.json (vendor pubkey
+      # + KEK) from this dir, unwraps the sealed model key, and pushes it to the
+      # ML sidecar using the shared token below (same value as the ml service).
+      SECUREPROMPT_LICENSE_PATH: /etc/secureprompt/license.json
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
+      # Optional: point at sp-admin to enable online revocation (fail-closed).
+      # SECUREPROMPT_LICENSE_SERVER_URL: http://host.docker.internal:8090
+    volumes:
+      # license.json must be UTF-8 (the gateway reads it as UTF-8). keys.json
+      # carries the vendor pubkey + KEK. Both are gitignored secrets.
+      - ./etc/secureprompt:/etc/secureprompt:ro
     ports:
       - "8080:8080"
     depends_on:
@@ -117,6 +142,9 @@ services:
     build:
       context: .
       dockerfile: secureprompt-worker/Dockerfile
+      # Forward the host ssh agent so cargo can fetch the private sp-license dep.
+      ssh:
+        - default
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
