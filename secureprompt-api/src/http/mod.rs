@@ -128,6 +128,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::internal::get_attestation),
         )
         .merge(middleware::rate_limit::test_probe_router(state.clone()))
+        // Fail-closed license gate: blocks the data plane + dashboard with 403
+        // once the revocation poller confirms the license is revoked. Wraps every
+        // route above; an allowlist (health/auth/internal) stays open so a revoked
+        // deployment can still authenticate and be re-licensed.
+        .layer(from_fn_with_state(
+            state.clone(),
+            middleware::license_gate::enforce,
+        ))
         .with_state(state)
         .layer(cors_layer())
 }

@@ -20,6 +20,13 @@ pub struct LicenseConfig {
     /// `POST /internal/model-key` endpoint. Empty string disables the push.
     /// Loaded from `ML_SIDECAR_INTERNAL_TOKEN`; empty default.
     pub internal_token: String,
+    /// sp-admin base URL for online revocation checks (OCSP-style). `None` =>
+    /// fully offline (today's behavior): the gateway only trusts the local file
+    /// and never blocks on revocation. Loaded from `SECUREPROMPT_LICENSE_SERVER_URL`.
+    pub license_server_url: Option<String>,
+    /// How often (seconds) to poll sp-admin for revocation. Default 300 (5 min).
+    /// Loaded from `SECUREPROMPT_REVOCATION_CHECK_SECS`.
+    pub revocation_check_secs: u64,
 }
 
 impl std::fmt::Debug for LicenseConfig {
@@ -30,6 +37,8 @@ impl std::fmt::Debug for LicenseConfig {
             .field("model_kek_b64", &"<redacted>")
             .field("recheck_secs", &self.recheck_secs)
             .field("internal_token", &"<redacted>")
+            .field("license_server_url", &self.license_server_url)
+            .field("revocation_check_secs", &self.revocation_check_secs)
             .finish()
     }
 }
@@ -102,6 +111,13 @@ impl LicenseConfig {
                 .unwrap_or(3600),
             model_kek_b64,
             internal_token: std::env::var("ML_SIDECAR_INTERNAL_TOKEN").unwrap_or_default(),
+            license_server_url: std::env::var("SECUREPROMPT_LICENSE_SERVER_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            revocation_check_secs: std::env::var("SECUREPROMPT_REVOCATION_CHECK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         }
     }
 }

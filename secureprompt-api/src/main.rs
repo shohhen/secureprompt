@@ -276,6 +276,44 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Online revocation poller (fail-closed). Only runs when a license server URL
+    // is configured; otherwise the gateway stays fully offline as before. Polls
+    // sp-admin's public status endpoint and, on a confirmed `revoked` verdict,
+    // flips the license to a sticky Revoked state that the request-pipeline gate
+    // turns into 403s. Soft-fail: an unreachable vendor keeps the last-known state.
+    if let Some(server_url) = config.license.license_server_url.clone() {
+        let st = std::sync::Arc::clone(&state.license);
+        let secs = config.license.revocation_check_secs;
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
+            tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
+            loop {
+                t.tick().await; // first tick is immediate — check promptly at startup
+                if st.is_revoked() {
+                    return; // terminal: vendor never un-revokes, stop polling
+                }
+                // lic_id is only present while the local file verifies (Valid).
+                let lic_id = match st.snapshot().lic_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                match secureprompt_api::license::revocation::check(&client, &server_url, &lic_id).await {
+                    secureprompt_api::license::revocation::RevocationVerdict::Revoked => {
+                        st.mark_revoked();
+                        tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403)");
+                        return;
+                    }
+                    secureprompt_api::license::revocation::RevocationVerdict::Active => {
+                        tracing::debug!(lic_id, "revocation check: license active");
+                    }
+                    // Unknown already logged inside check() — keep last-known state.
+                    secureprompt_api::license::revocation::RevocationVerdict::Unknown => {}
+                }
+            }
+        });
+    }
+
     let app = build_router(state);
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = TcpListener::bind(&address).await?;

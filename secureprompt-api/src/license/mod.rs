@@ -3,14 +3,21 @@
 //! request pipeline (mirrors the ml_sidecar circuit-breaker contract).
 
 pub mod attestation;
+pub mod revocation;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use ed25519_dalek::VerifyingKey;
 use sp_license::sign::{verify_license, LicenseEnvelope};
 use sp_license::token::License;
 
+/// `Revoked` is set out-of-band by the online revocation poller (see `revocation`)
+/// and is **fail-closed**: it overrides whatever the locally-signed file says, so a
+/// revoked license blocks traffic even though its on-disk token is still valid and
+/// in-window. The other three states come from local signature/window checks and
+/// remain fail-open. Revocation is terminal — once observed it sticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LicenseStatus { Valid, Grace, Unlicensed }
+pub enum LicenseStatus { Valid, Grace, Unlicensed, Revoked }
 
 #[derive(Debug, Clone)]
 pub struct LicenseSnapshot {
@@ -59,31 +66,47 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
 }
 
 /// Lives in AppState as `Arc<LicenseState>`. Interior RwLock lets the periodic
-/// re-verify task atomically swap the snapshot.
-pub struct LicenseState { inner: RwLock<LicenseSnapshot> }
+/// re-verify task atomically swap the snapshot. `revoked` is a separate sticky
+/// flag set by the online revocation poller — kept out of the snapshot so the
+/// hourly local re-verify (which replaces the snapshot) can't clear it.
+pub struct LicenseState { inner: RwLock<LicenseSnapshot>, revoked: AtomicBool }
 
 impl LicenseState {
-    pub fn new(s: LicenseSnapshot) -> Self { Self { inner: RwLock::new(s) } }
+    pub fn new(s: LicenseSnapshot) -> Self { Self { inner: RwLock::new(s), revoked: AtomicBool::new(false) } }
     pub fn unlicensed() -> Self { Self::new(LicenseSnapshot::unlicensed()) }
     pub fn snapshot(&self) -> LicenseSnapshot { self.inner.read().expect("license lock poisoned").clone() }
     pub fn set(&self, s: LicenseSnapshot) { *self.inner.write().expect("license lock poisoned") = s; }
-    pub fn status(&self) -> LicenseStatus { self.snapshot().status }
+    /// Mark the license revoked (fail-closed). Sticky: the vendor never un-revokes,
+    /// so once observed it stays set for the life of the process.
+    pub fn mark_revoked(&self) { self.revoked.store(true, Ordering::SeqCst); }
+    /// True once the online poller has confirmed a `revoked` verdict from sp-admin.
+    pub fn is_revoked(&self) -> bool { self.revoked.load(Ordering::SeqCst) }
+    /// Effective status — `Revoked` overrides the locally-derived snapshot status.
+    pub fn status(&self) -> LicenseStatus {
+        if self.is_revoked() { return LicenseStatus::Revoked; }
+        self.snapshot().status
+    }
     /// Seat ceiling to enforce. `None` under Unlicensed/Grace (fail-open: no enforcement on a license hiccup).
     pub fn max_seats(&self) -> Option<u32> {
+        if self.is_revoked() { return None; }
         let s = self.snapshot();
         match s.status { LicenseStatus::Valid => s.max_seats, _ => None }
     }
     /// Feature gate. Fail-open: Unlicensed/Grace permits everything (don't hard-block on a hiccup).
+    /// Revoked is fail-CLOSED (no features) — though the request-pipeline gate blocks first.
     pub fn is_feature_enabled(&self, f: &str) -> bool {
+        if self.is_revoked() { return false; }
         let s = self.snapshot();
         match s.status {
             LicenseStatus::Valid => s.features.iter().any(|x| x == f),
             LicenseStatus::Grace | LicenseStatus::Unlicensed => true,
+            LicenseStatus::Revoked => false,
         }
     }
 
-    /// The 32-byte model decryption key — ONLY when the license is Valid.
+    /// The 32-byte model decryption key — ONLY when the license is Valid and not revoked.
     pub fn unwrap_model_key(&self, kek: &[u8; 32]) -> Option<[u8; 32]> {
+        if self.is_revoked() { return None; }
         let s = self.snapshot();
         if s.status != LicenseStatus::Valid { return None; }
         let wrapped = s.wrapped_model_key.as_ref()?;
@@ -101,8 +124,9 @@ impl LicenseState {
             .collect()
     }
 
-    /// The per-deployment attestation signing key — Valid license only.
+    /// The per-deployment attestation signing key — Valid license only, never when revoked.
     pub fn unwrap_attestation_key(&self, kek: &[u8; 32]) -> Option<ed25519_dalek::SigningKey> {
+        if self.is_revoked() { return None; }
         let s = self.snapshot();
         if s.status != LicenseStatus::Valid { return None; }
         let wrapped = s.wrapped_attestation_key.as_ref()?;
@@ -271,6 +295,49 @@ mod tests {
         let un = LicenseState::unlicensed();
         assert_eq!(un.max_seats(), None);
         assert!(un.is_feature_enabled("anything"));
+    }
+
+    #[test]
+    fn revoked_is_sticky_and_fail_closed() {
+        // Start from a fully Valid snapshot with seats + a feature.
+        let st = LicenseState::new(LicenseSnapshot {
+            status: LicenseStatus::Valid,
+            max_seats: Some(5),
+            features: vec!["pii.uz".into()],
+            customer_name: None,
+            expires_at: None,
+            wrapped_model_key: None,
+            lic_id: Some("lic-1".into()),
+            wrapped_attestation_key: None,
+            image_digests: Default::default(),
+        });
+        assert!(!st.is_revoked());
+        assert_eq!(st.status(), LicenseStatus::Valid);
+        assert!(st.is_feature_enabled("pii.uz"));
+
+        // Revoke out-of-band (as the poller would).
+        st.mark_revoked();
+        assert!(st.is_revoked());
+        assert_eq!(st.status(), LicenseStatus::Revoked); // overrides snapshot
+        assert!(!st.is_feature_enabled("pii.uz")); // fail-closed
+        assert_eq!(st.max_seats(), None);
+        assert_eq!(st.unwrap_model_key(&[0u8; 32]), None);
+        assert!(st.unwrap_attestation_key(&[0u8; 32]).is_none());
+
+        // Sticky: a fresh local re-verify (snapshot swap to Valid) must NOT clear it.
+        st.set(LicenseSnapshot {
+            status: LicenseStatus::Valid,
+            max_seats: Some(5),
+            features: vec!["pii.uz".into()],
+            customer_name: None,
+            expires_at: None,
+            wrapped_model_key: None,
+            lic_id: Some("lic-1".into()),
+            wrapped_attestation_key: None,
+            image_digests: Default::default(),
+        });
+        assert!(st.is_revoked());
+        assert_eq!(st.status(), LicenseStatus::Revoked);
     }
 
     #[test]
