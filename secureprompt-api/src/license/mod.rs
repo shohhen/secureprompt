@@ -8,7 +8,7 @@ pub mod revocation;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use ed25519_dalek::VerifyingKey;
-use sp_license::sign::{verify_license, LicenseEnvelope};
+use sp_license::sign::{decode_verified_token, parse_rfc3339};
 use sp_license::token::License;
 
 /// `Revoked` is set out-of-band by the online revocation poller (see `revocation`)
@@ -182,24 +182,30 @@ pub fn tamper_check(
 
 /// Load + verify a license file. NEVER returns Err — failures map to a snapshot
 /// (fail-open). `now_epoch` injected for testing/clock control.
+///
+/// The file holds a single-line **token** (`base64url(payload).base64url(sig)`).
+/// We verify the signature over the transmitted payload bytes (no
+/// re-serialization), then classify by the validity window: in-window → Valid;
+/// signed but outside the window → Grace; anything else (bad signature,
+/// malformed, wrong key, legacy JSON envelope) → Unlicensed.
 pub fn load_and_verify(path: &str, vk: &VerifyingKey, now_epoch: i64) -> LicenseSnapshot {
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
-        Err(e) => { tracing::warn!(error = %e, path, "license file unreadable — unlicensed (grace)"); return LicenseSnapshot::unlicensed(); }
+        Err(e) => { tracing::warn!(error = %e, path, "license file unreadable — unlicensed"); return LicenseSnapshot::unlicensed(); }
     };
-    let env: LicenseEnvelope = match serde_json::from_str(&raw) {
-        Ok(e) => e,
-        Err(e) => { tracing::warn!(error = %e, "license not valid JSON — unlicensed"); return LicenseSnapshot::unlicensed(); }
+    // Signature check first → Unlicensed on bad sig / malformed / wrong key.
+    let lic = match decode_verified_token(raw.trim(), vk) {
+        Ok(l) => l,
+        Err(e) => { tracing::warn!(error = %e, "license token invalid — unlicensed"); return LicenseSnapshot::unlicensed(); }
     };
-    match verify_license(&env, vk, now_epoch) {
-        Ok(lic) => snapshot_from(&lic, LicenseStatus::Valid),
-        // sp-license verifies signature BEFORE the window, so Expired/NotYetValid
-        // means the signature was valid → safe to read entitlements in Grace.
-        Err(sp_license::LicenseError::Expired) | Err(sp_license::LicenseError::NotYetValid) => {
-            tracing::warn!(customer = ?env.license.customer.name, "license outside validity window — GRACE");
-            snapshot_from(&env.license, LicenseStatus::Grace)
+    // Signature is valid → classify by the validity window.
+    match (parse_rfc3339(&lic.entitlements.not_before), parse_rfc3339(&lic.entitlements.expires_at)) {
+        (Ok(nb), Ok(exp)) if now_epoch >= nb && now_epoch <= exp => snapshot_from(&lic, LicenseStatus::Valid),
+        (Ok(_), Ok(_)) => {
+            tracing::warn!(customer = ?lic.customer.name, "license outside validity window — GRACE");
+            snapshot_from(&lic, LicenseStatus::Grace)
         }
-        Err(e) => { tracing::warn!(error = %e, "license verification failed — unlicensed"); LicenseSnapshot::unlicensed() }
+        _ => { tracing::warn!("license has unparseable validity timestamps — unlicensed"); LicenseSnapshot::unlicensed() }
     }
 }
 
@@ -208,7 +214,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
-    use sp_license::sign::{sign_license, parse_rfc3339};
+    use sp_license::sign::{sign_license, LicenseEnvelope};
+    use sp_license::envelope_to_token;
     use sp_license::token::*;
     use std::collections::BTreeMap;
 
@@ -227,9 +234,12 @@ mod tests {
         };
         sign_license(&lic, sk).unwrap()
     }
+    // Write the license file the way the gateway now reads it: a single-line
+    // token. Re-encoding the envelope reuses its signature, so a tampered
+    // envelope (signature stale vs payload) still fails verification.
     fn write(name: &str, env: &LicenseEnvelope) -> String {
         let p = std::env::temp_dir().join(name);
-        std::fs::write(&p, serde_json::to_string(env).unwrap()).unwrap();
+        std::fs::write(&p, envelope_to_token(env).unwrap()).unwrap();
         p.to_string_lossy().into_owned()
     }
     fn now() -> i64 { parse_rfc3339("2026-06-01T00:00:00Z").unwrap() }
