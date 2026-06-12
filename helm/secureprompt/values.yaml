@@ -16,8 +16,15 @@ ingress:
     web: "app.secureprompt.tech"
     api: "api.secureprompt.tech"
   staticIpName: ""  # optional reserved global IP name. Leave empty for ephemeral.
+  # TLS: pick ONE.
+  #  - managedCertificate.enabled=true  → GCP-managed cert (needs DNS-only/grey-cloud
+  #    so Google can validate; cannot provision behind a Cloudflare proxy).
+  #  - tlsSecret="<name>" → use a self-managed kubernetes.io/tls secret on the LB
+  #    (e.g. a Cloudflare Origin Certificate). Required when fronting with the
+  #    Cloudflare proxy (orange cloud) in Full (strict) mode. Disable managedCertificate.
   managedCertificate:
     enabled: true
+  tlsSecret: ""
 
 # ----------------------------------------------------------------------------
 # Application services
@@ -57,7 +64,7 @@ web:
     requests: { cpu: "50m",  memory: "256Mi" }
     limits:   { cpu: "500m", memory: "512Mi" }
   env:
-    apiUrl: "http://secureprompt-api:8080"
+    apiUrl: "http://secureprompt-api"
     nextauthUrl: "https://app.secureprompt.tech"
     nextPublicApiUrl: "https://api.secureprompt.tech"
 
@@ -81,9 +88,13 @@ ml:
     tag: "0.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 1
+  # The sidecar loads four models into memory: GLiNER multi-PII, the DeBERTa
+  # injection classifier, the MiniLM embedder, and the decrypted XLM-R NER
+  # checkpoint (~1GB weights). Peak RSS during load is ~4-5GB, so the limit must
+  # be generous or the container is OOMKilled mid-load (exit 137).
   resources:
-    requests: { cpu: "200m",  memory: "1536Mi" }
-    limits:   { cpu: "1000m", memory: "2560Mi" }
+    requests: { cpu: "500m",  memory: "2Gi" }
+    limits:   { cpu: "2000m", memory: "6Gi" }
   env:
     language: "en"
     useOnnx: "false"
@@ -91,6 +102,36 @@ ml:
     # (multilingual_ner_v3_no_ssn_xlmr). Comma-separated to run several, or
     # "all" to register every shipped checkpoint. See scripts/compare_v3_models.py.
     activeNerModels: ""
+
+# ----------------------------------------------------------------------------
+# LibreChat (browser chat UI, SP-modified fork) + its MongoDB
+# ----------------------------------------------------------------------------
+librechat:
+  enabled: false
+  host: "chat.secureprompt.tech"
+  image:
+    repository: secureprompt/librechat
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  allowRegistration: "false"
+  scanFilesEnabled: "true"
+  # Login-form min password length (runtime startupConfig). 1 = effectively off,
+  # so short SP creds (admin/admin demo) are accepted; SP enforces real policy.
+  minPasswordLength: "1"
+  resources:
+    requests: { cpu: "100m", memory: "512Mi" }
+    limits:   { cpu: "1000m", memory: "1Gi" }
+  mongo:
+    image:
+      repository: mongo
+      tag: "7.0"
+    persistence:
+      size: "5Gi"
+      storageClass: "standard-rwo"
+    resources:
+      requests: { cpu: "50m",  memory: "256Mi" }
+      limits:   { cpu: "500m", memory: "512Mi" }
 
 # ----------------------------------------------------------------------------
 # Data stores
@@ -168,6 +209,25 @@ grafana:
     user: "admin"
     # password is generated into the secret if blank
     password: ""
+
+# ----------------------------------------------------------------------------
+# License / model-key chain
+# ----------------------------------------------------------------------------
+# When enabled, the API mounts a secret holding license.json + keys.json,
+# verifies the license, unwraps the sealed model decryption key, and pushes it
+# to the ML sidecar (which ships encrypted weights and runs with
+# SECUREPROMPT_MODEL_KEY_REQUIRED=true). Without this, the sidecar never loads
+# the XLM-R NER checkpoint and stays unready. The shared internal token comes
+# from the generated `<release>-secrets` (key: ml-sidecar-internal-token).
+#
+# Create the files secret out-of-band (scripts/gcp/deploy.sh does this):
+#   kubectl create secret generic secureprompt-license \
+#     --from-file=license.json=etc/secureprompt/license.json \
+#     --from-file=keys.json=etc/secureprompt/keys.json -n <namespace>
+license:
+  enabled: false
+  filesSecret: "secureprompt-license"
+  mountPath: "/etc/secureprompt"
 
 # ----------------------------------------------------------------------------
 # Misc

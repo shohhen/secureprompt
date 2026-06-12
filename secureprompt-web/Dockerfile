@@ -18,6 +18,12 @@ RUN pnpm install --frozen-lockfile
 COPY secureprompt-schemas /secureprompt-schemas
 COPY secureprompt-web/. ./
 
+# NEXT_PUBLIC_* vars are inlined into the browser bundle at BUILD time, so the
+# public API origin must be supplied here (not just at runtime) or the client
+# falls back to http://localhost:8080 and every browser API call fails.
+ARG NEXT_PUBLIC_API_URL=http://localhost:8080
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
 # Run codegen (openapi-typescript) + build (produces .next/standalone)
 RUN pnpm codegen && pnpm build
 

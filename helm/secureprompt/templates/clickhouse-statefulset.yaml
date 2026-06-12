@@ -1,0 +1,81 @@
+{{- if .Values.clickhouse.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-clickhouse
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "secureprompt.fullname" . }}-clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-clickhouse
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
+          imagePullPolicy: {{ .Values.clickhouse.image.pullPolicy }}
+          ports:
+            - containerPort: 8123
+              name: http
+            - containerPort: 9000
+              name: tcp
+          env:
+            - name: CLICKHOUSE_DB
+              value: {{ .Values.clickhouse.auth.database | quote }}
+            - name: CLICKHOUSE_USER
+              value: {{ .Values.clickhouse.auth.user | quote }}
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.clickhouse.persistence.storageClass }}
+        storageClassName: {{ .Values.clickhouse.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-clickhouse
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8123
+      targetPort: 8123
+      name: http
+    - port: 9000
+      targetPort: 9000
+      name: tcp
+  selector:
+    app: {{ include "secureprompt.fullname" . }}-clickhouse
+{{- end }}

@@ -18,23 +18,6 @@ spec:
         linkerd.io/inject: enabled
       {{- end }}
     spec:
-      initContainers:
-        - name: license-check
-          image: "{{ .Values.global.imageRegistry | default "" }}busybox:1.36"
-          command:
-            - sh
-            - -c
-            - |
-              set -e
-              if grep -r "bitnami/" /rendered-values 2>/dev/null; then
-                echo "ERROR: Bitnami image reference detected in values override. Use upstream images."
-                exit 1
-              fi
-              echo "OK: no bitnami/ references found."
-          volumeMounts:
-            - name: rendered-values
-              mountPath: /rendered-values
-              readOnly: true
       containers:
         - name: api
           image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
@@ -42,21 +25,93 @@ spec:
           ports:
             - containerPort: 8080
               protocol: TCP
+              name: http
           env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: {{ .Values.api.env.logLevel | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: database-url
-                  optional: true
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: redis-url
-                  optional: true
+            - name: CLICKHOUSE_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-clickhouse:8123"
+            - name: CLICKHOUSE_DATABASE
+              value: {{ .Values.clickhouse.auth.database | quote }}
+            - name: QDRANT_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-qdrant:6333"
+            - name: ML_SIDECAR_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-ml:8080"
+            - name: SECUREPROMPT_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: jwt-secret
+            - name: SECUREPROMPT_PROVIDER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: provider-key
+            - name: KMS_FILE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: kms-file-key
+            - name: SECUREPROMPT_PUBLIC_SIGNUP_ENABLED
+              value: {{ .Values.api.env.publicSignupEnabled | quote }}
+            - name: SECUREPROMPT_CHAT_DEBUG_MODE
+              value: {{ .Values.api.env.chatDebugMode | quote }}
+            - name: SECUREPROMPT_CORS_ORIGINS
+              value: {{ .Values.api.env.corsOrigins | quote }}
+            {{- if .Values.license.enabled }}
+            # License chain: read license.json + keys.json (vendor pubkey + KEK)
+            # from the mounted dir, unwrap the sealed model key, and push it to
+            # the ML sidecar using the shared internal token below.
+            - name: SECUREPROMPT_LICENSE_PATH
+              value: "{{ .Values.license.mountPath }}/license.json"
+            - name: ML_SIDECAR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: ml-sidecar-internal-token
+            {{- end }}
+          {{- if .Values.license.enabled }}
+          volumeMounts:
+            - name: license
+              mountPath: {{ .Values.license.mountPath | quote }}
+              readOnly: true
+          {{- end }}
+          # The API exposes no dedicated /health route; /metrics is unauthenticated,
+          # stays open past the license gate, and returns 200 whenever the server
+          # is up — so it doubles as the liveness/readiness target.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- if .Values.license.enabled }}
       volumes:
-        - name: rendered-values
-          configMap:
-            name: {{ include "secureprompt.fullname" . }}-values-check
-            optional: true
+        - name: license
+          secret:
+            secretName: {{ .Values.license.filesSecret | quote }}
+      {{- end }}

@@ -33,6 +33,23 @@ spec:
             {{- end }}
             - name: QDRANT_URL
               value: "http://{{ include "secureprompt.fullname" . }}-qdrant:6333"
+            {{- if .Values.license.enabled }}
+            # Shared secret authenticating the gateway's POST /internal/model-key.
+            # The image bakes SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the sidecar
+            # only becomes ready after the gateway pushes the unwrapped key.
+            - name: ML_SIDECAR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: ml-sidecar-internal-token
+            {{- else }}
+            # No license wired: there is no key to decrypt the XLM-R weights, so
+            # disable the requirement and let the sidecar serve GLiNER/Presidio
+            # only. Without this the image default (=true) would keep /ready at
+            # 503 forever and the pod would crash-loop on the liveness probe.
+            - name: SECUREPROMPT_MODEL_KEY_REQUIRED
+              value: "false"
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /ready
@@ -58,6 +75,11 @@ metadata:
     {{- include "secureprompt.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
+  # The gateway must POST the model-decryption key to /internal/model-key BEFORE
+  # the sidecar can pass its readiness probe (it loads the XLM-R weights only
+  # after receiving the key). Without this, the Service would drop the not-ready
+  # pod from its endpoints and the key push could never reach it — a deadlock.
+  publishNotReadyAddresses: true
   ports:
     - port: 8080
       targetPort: 8080

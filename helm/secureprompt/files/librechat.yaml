@@ -1,0 +1,102 @@
+# =============================================================================
+# librechat.yaml — SecurePrompt-fork custom config
+# =============================================================================
+#
+# This file declares the `endpoints.custom` array that LibreChat's BACKEND
+# chat dispatch reads at request time (`getCustomEndpointConfig`). Without
+# at least one entry here, the dispatcher throws
+# `Provider <name> not supported` even when the FRONTEND picker shows the
+# endpoint (the picker is populated dynamically via SP `/v1/providers`,
+# but the dispatcher reads only from this static YAML).
+#
+# THE APIKEY IS A PLACEHOLDER. The fork's
+# `packages/api/src/endpoints/custom/initialize.ts` overrides it at runtime
+# with `req.user._sp_api_key` (the per-user plaintext SP key fetched from
+# `/v1/me/api-key`). The real auth used in upstream calls is therefore
+# *never* what's in this file.
+#
+# THE BASEURL POINTS AT THE SP GATEWAY. Every chat request from LibreChat
+# goes to `${SECUREPROMPT_API_URL}/v1/chat/completions`, which is SP's
+# OpenAI-compatible reverse-proxy entry point. With
+# `SECUREPROMPT_CHAT_DEBUG_MODE=true` set on the SP `api` container, that
+# endpoint short-circuits before any cloud dispatch and returns the
+# tokenized prompt + redaction map as the assistant message.
+#
+# Phase 2 cleanup: replace this YAML with a dynamic config generator that
+# consults SP `/v1/providers` at boot OR patch
+# `getCustomEndpointConfig` to consult `discoverEndpoints` so the YAML
+# becomes unnecessary. Until then, every SP provider must have a
+# corresponding entry below.
+# =============================================================================
+
+version: 1.2.1
+cache: true
+
+# SP: Strip the LibreChat features that aren't part of our product story.
+# These flags propagate through `loadDefaultInterface` →
+# `updateInterfacePermissions` to both the frontend UI (the panels are
+# hidden) and the backend role permissions (PermissionTypes.AGENTS.USE=false
+# causes /api/agents/* to refuse with 403, no fork code change needed).
+#
+# `parameters: false` removes the per-conversation parameters panel
+# (temperature, top_p, etc). With SecurePrompt as the gateway, model
+# parameters are managed centrally via SP policy, not per-conversation.
+#
+# `agents: { use|create|share|public: false }` removes the agent builder
+# entirely — both the side-panel agents tab and the backend mutation
+# routes. SP's MCP integration is the agent surface for this product.
+#
+# Prompts: kept enabled — pure frontend templates, no backend coupling
+# to endpoint type. Users select a prompt, it fills variables client-side,
+# and the final user message is sent through the normal SP chat flow.
+#
+# Memories: DISABLED. Both the read-and-inject path
+# (AgentClient.useMemory at api/server/controllers/agents/client.js:343)
+# and the write path (set_memory tool at packages/api/src/agents/memory.ts)
+# are wired exclusively through the agents endpoint. Since we disable
+# agents above, memories cannot be written on custom-endpoint chats and
+# manually-added entries would never inject into requests — the feature
+# would be a dangling UI that silently does nothing. Hide it instead.
+interface:
+  parameters: false
+  agents:
+    use: false
+    create: false
+    share: false
+    public: false
+  prompts:
+    use: true
+    create: true
+    share: false
+    public: false
+  memories: false
+
+endpoints:
+  custom:
+    # SP: One entry per SecurePrompt provider. The `name` here MUST match
+    # SP: the provider name in the SP dashboard EXACTLY (case-sensitive,
+    # SP: spaces preserved) — that's the same string the picker sends as
+    # SP: the `endpoint` field on chat requests.
+    - name: "Google"
+      apiKey: "sp_placeholder_overridden_at_runtime"
+      baseURL: "${SECUREPROMPT_API_URL}/v1"
+      models:
+        # SP: Empty static list — the model picker is populated by SP
+        # discovery (`secureprompt-discovery.js` calls SP `/v1/providers`,
+        # which returns the per-provider `models[]` array auto-imported
+        # from the upstream `/models` endpoint at credential save time).
+        # The values here would be IGNORED for the picker (discovery
+        # overrides the merge in `ModelController.loadModels`); we just
+        # include a single sentinel so LibreChat's YAML schema validator
+        # doesn't reject the entry.
+        default:
+          - "auto-discovered"
+        fetch: false
+      titleConvo: true
+      titleModel: "current_model"
+      modelDisplayLabel: "Google"
+      # SP: Disable streaming for the debug-mode round-trip. SP's debug
+      # SP: response is a single markdown blob; LibreChat's SSE handler
+      # SP: would wait forever for chunks that never come. Re-enable once
+      # SP: cloud adapters are wired and SP returns real streaming chunks.
+      forcePrompt: false

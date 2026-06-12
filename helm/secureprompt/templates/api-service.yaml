@@ -4,10 +4,12 @@ metadata:
   name: {{ include "secureprompt.fullname" . }}-api
   labels:
     {{- include "secureprompt.labels" . | nindent 4 }}
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
 spec:
-  type: ClusterIP
+  type: NodePort
   ports:
-    - port: 8080
+    - port: 80
       targetPort: 8080
       protocol: TCP
       name: http

@@ -21,3 +21,5 @@ target/
 # the build context exhausts the Docker VM disk (ResourceExhausted on build).
 secureprompt-ml/app/resources/*/trainer
 **/checkpoint-*
+# Plaintext fine-tuned weights — ship only the .enc (encrypted on the host).
+  secureprompt-ml/app/resources/*/model/model.safetensors

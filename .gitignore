@@ -72,3 +72,10 @@ Desktop.ini
 *.swo
 *~
 .gstack/
+
+# Local secret material (license keys, Cloudflare origin cert, model key)
+secrets/
+
+# License material + generated TLS certs (secrets — never commit)
+etc/secureprompt/
+monitoring/nginx/certs/

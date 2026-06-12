@@ -1,0 +1,98 @@
+{{- if .Values.grafana.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ include "secureprompt.fullname" . }}-grafana
+  template:
+    metadata:
+      labels:
+        app: {{ include "secureprompt.fullname" . }}-grafana
+    spec:
+      # Grafana runs as uid/gid 472; fsGroup makes the mounted PVC group-writable
+      # so it can create /var/lib/grafana/plugins on a fresh (root-owned) volume.
+      securityContext:
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.grafana.image.repository }}:{{ .Values.grafana.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.image.pullPolicy }}
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: GF_INSTALL_PLUGINS
+              value: "grafana-clickhouse-datasource"
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.admin.user | quote }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: grafana-admin-password
+            - name: CLICKHOUSE_HOST
+              value: "{{ include "secureprompt.fullname" . }}-clickhouse"
+            - name: CLICKHOUSE_PORT
+              value: "8123"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.grafana.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "secureprompt.fullname" . }}-grafana
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.grafana.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.grafana.persistence.storageClass }}
+  storageClassName: {{ .Values.grafana.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.grafana.persistence.size }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3000
+      targetPort: 3000
+      name: http
+  selector:
+    app: {{ include "secureprompt.fullname" . }}-grafana
+{{- end }}

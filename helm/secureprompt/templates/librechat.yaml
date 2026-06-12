@@ -1,0 +1,201 @@
+{{- if .Values.librechat.enabled }}
+{{- $fullName := include "secureprompt.fullname" . -}}
+# ----------------------------------------------------------------------------
+# LibreChat (SP-modified fork) — browser chat UI that reverse-proxies every
+# completion through the SecurePrompt gateway. Ships with its own MongoDB.
+# Config (endpoints.custom -> SP gateway) is bundled from files/librechat.yaml.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-librechat-config
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+  librechat.yaml: |
+{{ .Files.Get "files/librechat.yaml" | indent 4 }}
+---
+# ----- MongoDB (no-auth, in-cluster only) -----------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullName }}-librechat-mongo
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $fullName }}-librechat-mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $fullName }}-librechat-mongo
+  template:
+    metadata:
+      labels:
+        app: {{ $fullName }}-librechat-mongo
+    spec:
+      containers:
+        - name: mongo
+          image: "{{ .Values.librechat.mongo.image.repository }}:{{ .Values.librechat.mongo.image.tag }}"
+          args: ["--quiet"]
+          ports:
+            - containerPort: 27017
+              name: mongo
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          # TCP probe, not `mongosh` exec: the mongosh client has a multi-second
+          # cold start that blows past any sane exec timeout and leaves a
+          # healthy mongod stuck NotReady (so its Service has no endpoints and
+          # LibreChat can't connect). A listening port is a sufficient signal.
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.librechat.mongo.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.librechat.mongo.persistence.storageClass }}
+        storageClassName: {{ .Values.librechat.mongo.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.librechat.mongo.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-librechat-mongo
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 27017
+      targetPort: 27017
+      name: mongo
+  selector:
+    app: {{ $fullName }}-librechat-mongo
+---
+# ----- LibreChat UI ---------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-librechat
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.librechat.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ $fullName }}-librechat
+  template:
+    metadata:
+      labels:
+        app: {{ $fullName }}-librechat
+    spec:
+      containers:
+        - name: librechat
+          image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.librechat.image.repository }}:{{ .Values.librechat.image.tag }}"
+          imagePullPolicy: {{ .Values.librechat.image.pullPolicy }}
+          ports:
+            - containerPort: 3080
+              name: http
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3080"
+            - name: MONGO_URI
+              value: "mongodb://{{ $fullName }}-librechat-mongo:27017/LibreChat"
+            - name: DOMAIN_CLIENT
+              value: "https://{{ .Values.librechat.host }}"
+            - name: DOMAIN_SERVER
+              value: "https://{{ .Values.librechat.host }}"
+            # SecurePrompt gateway integration — in-cluster service names.
+            # api Service is on port 80 (-> targetPort 8080); :8080 reaches nothing.
+            - name: SECUREPROMPT_API_URL
+              value: "http://{{ $fullName }}-api"
+            - name: SECUREPROMPT_ML_URL
+              value: "http://{{ $fullName }}-ml:8080"
+            - name: SECUREPROMPT_SCAN_FILES_ENABLED
+              value: {{ .Values.librechat.scanFilesEnabled | quote }}
+            - name: ALLOW_REGISTRATION
+              value: {{ .Values.librechat.allowRegistration | quote }}
+            - name: ALLOW_EMAIL_LOGIN
+              value: "true"
+            - name: ALLOW_SOCIAL_LOGIN
+              value: "false"
+            # Login form's min-password check reads this at runtime
+            # (startupConfig.minPasswordLength). Lowered so SP creds like the
+            # admin/admin demo account are accepted (login auth is delegated to
+            # the SP gateway, which enforces its own policy).
+            - name: MIN_PASSWORD_LENGTH
+              value: {{ .Values.librechat.minPasswordLength | quote }}
+            - name: CONFIG_PATH
+              value: "/app/librechat.yaml"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-librechat-secrets
+                  key: jwt-secret
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-librechat-secrets
+                  key: jwt-refresh-secret
+            - name: CREDS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-librechat-secrets
+                  key: creds-key
+            - name: CREDS_IV
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-librechat-secrets
+                  key: creds-iv
+          volumeMounts:
+            - name: config
+              mountPath: /app/librechat.yaml
+              subPath: librechat.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3080
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.librechat.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullName }}-librechat-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-librechat
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 3080
+      name: http
+  selector:
+    app: {{ $fullName }}-librechat
+{{- end }}

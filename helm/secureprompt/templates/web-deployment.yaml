@@ -25,39 +25,37 @@ spec:
           ports:
             - containerPort: 3000
               protocol: TCP
+              name: http
           env:
             - name: NEXTAUTH_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: nextauth-secret
-                  optional: true
             - name: NEXTAUTH_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "secureprompt.fullname" . }}-web-config
-                  key: NEXTAUTH_URL
-                  optional: true
+              value: {{ .Values.web.env.nextauthUrl | quote }}
             - name: NEXT_PUBLIC_API_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "secureprompt.fullname" . }}-web-config
-                  key: NEXT_PUBLIC_API_URL
-                  optional: true
+              value: {{ .Values.web.env.nextPublicApiUrl | quote }}
+            # api Service listens on port 80 (-> targetPort 8080); addressing
+            # :8080 here reaches nothing and NextAuth's authorize() fetch times out.
+            - name: API_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-api"
+            - name: ML_SIDECAR_URL
+              value: "http://{{ include "secureprompt.fullname" . }}-ml:8080"
           readinessProbe:
             httpGet:
               path: /api/health
               port: 3000
             initialDelaySeconds: 10
             periodSeconds: 10
-            failureThreshold: 3
+            failureThreshold: 5
           livenessProbe:
             httpGet:
               path: /api/health
               port: 3000
-            initialDelaySeconds: 20
+            initialDelaySeconds: 30
             periodSeconds: 30
-            failureThreshold: 3
+            failureThreshold: 5
           resources:
             requests:
               memory: {{ .Values.web.resources.requests.memory }}

@@ -1,0 +1,88 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "secureprompt.fullname" . -}}
+{{- if .Values.ingress.managedCertificate.enabled }}
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: {{ $fullName }}-cert
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  domains:
+    - {{ .Values.ingress.hosts.marketing | quote }}
+    - {{ .Values.ingress.hosts.web | quote }}
+    - {{ .Values.ingress.hosts.api | quote }}
+    {{- if .Values.librechat.enabled }}
+    - {{ .Values.librechat.host | quote }}
+    {{- end }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    {{- if .Values.ingress.staticIpName }}
+    kubernetes.io/ingress.global-static-ip-name: {{ .Values.ingress.staticIpName | quote }}
+    {{- end }}
+    {{- if .Values.ingress.managedCertificate.enabled }}
+    networking.gke.io/managed-certificates: {{ $fullName }}-cert
+    {{- end }}
+spec:
+  {{- if .Values.ingress.tlsSecret }}
+  tls:
+    - secretName: {{ .Values.ingress.tlsSecret | quote }}
+      hosts:
+        - {{ .Values.ingress.hosts.web | quote }}
+        - {{ .Values.ingress.hosts.api | quote }}
+        {{- if .Values.librechat.enabled }}
+        - {{ .Values.librechat.host | quote }}
+        {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.hosts.marketing | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-marketing
+                port:
+                  number: 80
+    - host: {{ .Values.ingress.hosts.web | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-web
+                port:
+                  number: 80
+    - host: {{ .Values.ingress.hosts.api | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-api
+                port:
+                  number: 80
+    {{- if .Values.librechat.enabled }}
+    - host: {{ .Values.librechat.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-librechat
+                port:
+                  number: 80
+    {{- end }}
+{{- end }}
