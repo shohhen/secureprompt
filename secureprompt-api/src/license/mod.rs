@@ -1,6 +1,7 @@
 //! Gateway-side license verification (Plan 3). Fail-open: a bad/missing/expired
 //! license degrades to Unlicensed/Grace and is logged — it never blocks the
-//! request pipeline (mirrors the ml_sidecar circuit-breaker contract).
+//! request pipeline (mirrors the ml_sidecar circuit-breaker contract). The
+//! license token is supplied as a single-line env var (no on-disk fallback).
 
 pub mod attestation;
 pub mod revocation;
@@ -180,21 +181,22 @@ pub fn tamper_check(
     }
 }
 
-/// Load + verify a license file. NEVER returns Err — failures map to a snapshot
-/// (fail-open). `now_epoch` injected for testing/clock control.
+/// Verify a license **token** against the vendor key. NEVER returns Err — failures
+/// map to a snapshot (fail-open). `now_epoch` injected for testing/clock control.
 ///
-/// The file holds a single-line **token** (`base64url(payload).base64url(sig)`).
+/// The token is the single-line compact form `base64url(payload).base64url(sig)`.
 /// We verify the signature over the transmitted payload bytes (no
 /// re-serialization), then classify by the validity window: in-window → Valid;
-/// signed but outside the window → Grace; anything else (bad signature,
-/// malformed, wrong key, legacy JSON envelope) → Unlicensed.
-pub fn load_and_verify(path: &str, vk: &VerifyingKey, now_epoch: i64) -> LicenseSnapshot {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(e) => { tracing::warn!(error = %e, path, "license file unreadable — unlicensed"); return LicenseSnapshot::unlicensed(); }
-    };
+/// signed but outside the window → Grace; anything else (empty, bad signature,
+/// malformed, wrong key) → Unlicensed.
+pub fn load_and_verify_token(token: &str, vk: &VerifyingKey, now_epoch: i64) -> LicenseSnapshot {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        tracing::warn!("SECUREPROMPT_LICENSE_TOKEN unset/empty — unlicensed");
+        return LicenseSnapshot::unlicensed();
+    }
     // Signature check first → Unlicensed on bad sig / malformed / wrong key.
-    let lic = match decode_verified_token(raw.trim(), vk) {
+    let lic = match decode_verified_token(trimmed, vk) {
         Ok(l) => l,
         Err(e) => { tracing::warn!(error = %e, "license token invalid — unlicensed"); return LicenseSnapshot::unlicensed(); }
     };
@@ -234,21 +236,19 @@ mod tests {
         };
         sign_license(&lic, sk).unwrap()
     }
-    // Write the license file the way the gateway now reads it: a single-line
-    // token. Re-encoding the envelope reuses its signature, so a tampered
-    // envelope (signature stale vs payload) still fails verification.
-    fn write(name: &str, env: &LicenseEnvelope) -> String {
-        let p = std::env::temp_dir().join(name);
-        std::fs::write(&p, envelope_to_token(env).unwrap()).unwrap();
-        p.to_string_lossy().into_owned()
+    // Encode an envelope as the single-line compact token the gateway now consumes.
+    // Re-encoding reuses the signature, so a tampered envelope (signature stale
+    // vs payload) still fails verification.
+    fn tok(env: &LicenseEnvelope) -> String {
+        envelope_to_token(env).unwrap()
     }
     fn now() -> i64 { parse_rfc3339("2026-06-01T00:00:00Z").unwrap() }
 
     #[test]
     fn valid_license_is_valid_with_entitlements() {
         let sk = SigningKey::generate(&mut OsRng);
-        let path = write("sp_lic_valid.json", &mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 50, &["pii.uz"]));
-        let s = load_and_verify(&path, &sk.verifying_key(), now());
+        let token = tok(&mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 50, &["pii.uz"]));
+        let s = load_and_verify_token(&token, &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Valid);
         assert_eq!(s.max_seats, Some(50));
         assert_eq!(s.customer_name.as_deref(), Some("Acme"));
@@ -258,11 +258,10 @@ mod tests {
     #[test]
     fn expired_license_is_grace() {
         let sk = SigningKey::generate(&mut OsRng);
-        let path = write("sp_lic_expired.json", &mint(&sk, "2025-01-01T00:00:00Z", "2025-02-01T00:00:00Z", 10, &[]));
-        let s = load_and_verify(&path, &sk.verifying_key(), now()); // now (2026) is after expiry
+        let token = tok(&mint(&sk, "2025-01-01T00:00:00Z", "2025-02-01T00:00:00Z", 10, &[]));
+        let s = load_and_verify_token(&token, &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Grace);
-        assert_eq!(s.max_seats, Some(10)); // entitlements still readable in grace
-        // Grace fail-opens: no seat ceiling, all features permitted
+        assert_eq!(s.max_seats, Some(10));
         let st = LicenseState::new(s);
         assert_eq!(st.max_seats(), None);
         assert!(st.is_feature_enabled("any-feature"));
@@ -272,8 +271,8 @@ mod tests {
     fn wrong_key_is_unlicensed() {
         let sk = SigningKey::generate(&mut OsRng);
         let other = SigningKey::generate(&mut OsRng);
-        let path = write("sp_lic_wrongkey.json", &mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 10, &[]));
-        let s = load_and_verify(&path, &other.verifying_key(), now());
+        let token = tok(&mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 10, &[]));
+        let s = load_and_verify_token(&token, &other.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Unlicensed);
     }
 
@@ -282,15 +281,18 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let mut env = mint(&sk, "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z", 10, &[]);
         env.license.entitlements.seats = 9999; // tamper after signing
-        let path = write("sp_lic_tampered.json", &env);
-        let s = load_and_verify(&path, &sk.verifying_key(), now());
+        let token = tok(&env);
+        let s = load_and_verify_token(&token, &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Unlicensed);
     }
 
     #[test]
-    fn missing_file_is_unlicensed_no_panic() {
+    fn empty_token_is_unlicensed_no_panic() {
         let sk = SigningKey::generate(&mut OsRng);
-        let s = load_and_verify("/nonexistent/sp_lic_nope.json", &sk.verifying_key(), now());
+        let s = load_and_verify_token("", &sk.verifying_key(), now());
+        assert_eq!(s.status, LicenseStatus::Unlicensed);
+        // Whitespace-only is also treated as empty.
+        let s = load_and_verify_token("   \n", &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Unlicensed);
     }
 
@@ -378,19 +380,19 @@ mod tests {
         };
         // Valid → unwraps to the original key
         let env = sign_license(&base, &sk).unwrap();
-        let path = write("sp_lic_mk.json", &env);
-        let st = LicenseState::new(load_and_verify(&path, &sk.verifying_key(), now()));
+        let token = tok(&env);
+        let st = LicenseState::new(load_and_verify_token(&token, &sk.verifying_key(), now()));
         assert_eq!(st.status(), LicenseStatus::Valid);
         assert_eq!(st.unwrap_model_key(&kek), Some(model_key));
-        assert_eq!(st.unwrap_model_key(&[9u8; 32]), None); // wrong KEK
+        assert_eq!(st.unwrap_model_key(&[9u8; 32]), None);
 
-        // Expired (Grace) → None even with the right KEK (only Valid yields the key)
+        // Expired (Grace) → None even with the right KEK
         let mut exp_lic = base.clone();
         exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
         exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
         let env2 = sign_license(&exp_lic, &sk).unwrap();
-        let p2 = write("sp_lic_mk_exp.json", &env2);
-        let st2 = LicenseState::new(load_and_verify(&p2, &sk.verifying_key(), now()));
+        let token2 = tok(&env2);
+        let st2 = LicenseState::new(load_and_verify_token(&token2, &sk.verifying_key(), now()));
         assert_eq!(st2.status(), LicenseStatus::Grace);
         assert_eq!(st2.unwrap_model_key(&kek), None);
     }
@@ -422,8 +424,8 @@ mod tests {
         };
         // Valid → unwraps to the original attestation key
         let env = sign_license(&base, &vendor_sk).unwrap();
-        let path = write("sp_lic_att.json", &env);
-        let st = LicenseState::new(load_and_verify(&path, &vendor_sk.verifying_key(), now()));
+        let token = tok(&env);
+        let st = LicenseState::new(load_and_verify_token(&token, &vendor_sk.verifying_key(), now()));
         assert_eq!(st.status(), LicenseStatus::Valid);
         let recovered = st.unwrap_attestation_key(&kek).expect("should unwrap");
         assert_eq!(recovered.verifying_key(), att_vk);
@@ -435,8 +437,8 @@ mod tests {
         exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
         exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
         let env2 = sign_license(&exp_lic, &vendor_sk).unwrap();
-        let p2 = write("sp_lic_att_exp.json", &env2);
-        let st2 = LicenseState::new(load_and_verify(&p2, &vendor_sk.verifying_key(), now()));
+        let token2 = tok(&env2);
+        let st2 = LicenseState::new(load_and_verify_token(&token2, &vendor_sk.verifying_key(), now()));
         assert_eq!(st2.status(), LicenseStatus::Grace);
         assert!(st2.unwrap_attestation_key(&kek).is_none());
     }
@@ -525,8 +527,8 @@ mod tests {
         env.license.integrity.image_digests.insert("api".into(), "sha256:abc".into());
         // Re-sign with the digest.
         let env = sp_license::sign::sign_license(&env.license, &sk).unwrap();
-        let path = write("sp_lic_digest_valid.json", &env);
-        let s = load_and_verify(&path, &sk.verifying_key(), now());
+        let token = tok(&env);
+        let s = load_and_verify_token(&token, &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Valid);
         assert_eq!(s.image_digests.get("api").map(String::as_str), Some("sha256:abc"));
 
@@ -535,8 +537,8 @@ mod tests {
         exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
         exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
         let env2 = sp_license::sign::sign_license(&exp_lic, &sk).unwrap();
-        let p2 = write("sp_lic_digest_grace.json", &env2);
-        let s2 = load_and_verify(&p2, &sk.verifying_key(), now());
+        let token2 = tok(&env2);
+        let s2 = load_and_verify_token(&token2, &sk.verifying_key(), now());
         assert_eq!(s2.status, LicenseStatus::Grace);
         assert!(s2.image_digests.is_empty());
     }

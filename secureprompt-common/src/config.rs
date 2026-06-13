@@ -2,12 +2,20 @@ use serde::{Deserialize, Serialize};
 
 /// Plan 3 — license verification configuration.
 ///
-/// Fields are loaded from environment variables; see `LicenseConfig::from_env`.
-/// `LicenseConfig` is intentionally NOT deserialized from a config file
-/// (the public key must come from the environment at runtime only).
+/// **All key material is environment-sourced.** There is no file fallback.
+/// The three env vars are:
+///   - `SECUREPROMPT_LICENSE_PUBKEY` — base64 Ed25519 vendor public key (32 bytes).
+///   - `SECUREPROMPT_MODEL_KEK`      — base64 32-byte key-encryption key for the
+///                                     wrapped model + attestation keys.
+///   - `SECUREPROMPT_LICENSE_TOKEN`  — the compact `base64url(payload).base64url(sig)`
+///                                     license token (sp-license 0.2.0).
+///
+/// Any of them being unset / empty is non-fatal: the gateway runs Unlicensed
+/// (fail-open, today's behavior on a missing license file).
 #[derive(Clone)]
 pub struct LicenseConfig {
-    pub license_path: String,
+    /// The full license token (compact single-line form). Empty => unlicensed.
+    pub license_token: String,
     /// base64 Ed25519 vendor public key; empty => unlicensed/grace.
     /// TODO(plan6): pin this as a compile-time const (include_bytes) — env-loading
     /// permits substitution and is a development convenience only.
@@ -21,8 +29,8 @@ pub struct LicenseConfig {
     /// Loaded from `ML_SIDECAR_INTERNAL_TOKEN`; empty default.
     pub internal_token: String,
     /// sp-admin base URL for online revocation checks (OCSP-style). `None` =>
-    /// fully offline (today's behavior): the gateway only trusts the local file
-    /// and never blocks on revocation. Loaded from `SECUREPROMPT_LICENSE_SERVER_URL`.
+    /// fully offline: the gateway only trusts the local token and never blocks
+    /// on revocation. Loaded from `SECUREPROMPT_LICENSE_SERVER_URL`.
     pub license_server_url: Option<String>,
     /// How often (seconds) to poll sp-admin for revocation. Default 300 (5 min).
     /// Loaded from `SECUREPROMPT_REVOCATION_CHECK_SECS`.
@@ -36,7 +44,7 @@ pub struct LicenseConfig {
 impl std::fmt::Debug for LicenseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LicenseConfig")
-            .field("license_path", &self.license_path)
+            .field("license_token", &"<redacted>")
             .field("pubkey_b64", &self.pubkey_b64)
             .field("model_kek_b64", &"<redacted>")
             .field("recheck_secs", &self.recheck_secs)
@@ -48,73 +56,25 @@ impl std::fmt::Debug for LicenseConfig {
     }
 }
 
-/// On-disk companion to `license.json`: holds the base64 vendor public key
-/// and (optionally) the base64 model key-encryption key. Dropped next to the
-/// license so operators can provision `/etc/secureprompt/{license,keys}.json`
-/// without exporting env vars. Env vars still take precedence when set.
-#[derive(Deserialize)]
-struct KeysFile {
-    /// base64 Ed25519 vendor public key.
-    vendor_pubkey: String,
-    /// base64 32-byte model key-encryption key (optional).
-    #[serde(default)]
-    kek: String,
-}
-
 impl LicenseConfig {
     pub fn from_env() -> Self {
-        let license_path = std::env::var("SECUREPROMPT_LICENSE_PATH")
-            .unwrap_or_else(|_| "/etc/secureprompt/license.json".into());
-
-        // Resolve the keys.json path: explicit override, else the license's
-        // directory joined with `keys.json`.
-        let keys_path = match std::env::var("SECUREPROMPT_KEYS_PATH") {
-            Ok(p) if !p.is_empty() => p,
-            _ => std::path::Path::new(&license_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new(""))
-                .join("keys.json")
-                .to_string_lossy()
-                .into_owned(),
+        // Empty env var (set but blank) is treated as unset — keeps docker-compose
+        // `${VAR:-}` defaults working as "no value" rather than "value of empty".
+        let from_env = |name: &str| -> String {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_default()
         };
 
-        // Best-effort: a missing or invalid keys file just means "no file
-        // source" — the gateway must still boot (env vars may supply the keys,
-        // or it runs unlicensed/grace).
-        let keys_file: Option<KeysFile> = std::fs::read_to_string(&keys_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<KeysFile>(&s).ok());
-
-        // Env > file > empty.
-        let env_pubkey = std::env::var("SECUREPROMPT_LICENSE_PUBKEY")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let env_kek = std::env::var("SECUREPROMPT_MODEL_KEK")
-            .ok()
-            .filter(|v| !v.is_empty());
-
-        let file_supplied = env_pubkey.is_none() && keys_file.is_some();
-
-        let pubkey_b64 = env_pubkey
-            .or_else(|| keys_file.as_ref().map(|k| k.vendor_pubkey.clone()))
-            .unwrap_or_default();
-        let model_kek_b64 = env_kek
-            .or_else(|| keys_file.as_ref().map(|k| k.kek.clone()))
-            .unwrap_or_default();
-
-        if file_supplied {
-            // Never log the KEK.
-            eprintln!("loaded vendor key + KEK from {keys_path}");
-        }
-
         Self {
-            license_path,
-            pubkey_b64,
+            license_token: from_env("SECUREPROMPT_LICENSE_TOKEN"),
+            pubkey_b64: from_env("SECUREPROMPT_LICENSE_PUBKEY"),
+            model_kek_b64: from_env("SECUREPROMPT_MODEL_KEK"),
             recheck_secs: std::env::var("SECUREPROMPT_LICENSE_RECHECK_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
-            model_kek_b64,
             internal_token: std::env::var("ML_SIDECAR_INTERNAL_TOKEN").unwrap_or_default(),
             license_server_url: std::env::var("SECUREPROMPT_LICENSE_SERVER_URL")
                 .ok()
@@ -434,71 +394,41 @@ mod tests {
     }
 
     fn clear_license_env() {
-        std::env::remove_var("SECUREPROMPT_LICENSE_PATH");
         std::env::remove_var("SECUREPROMPT_LICENSE_PUBKEY");
         std::env::remove_var("SECUREPROMPT_MODEL_KEK");
-        std::env::remove_var("SECUREPROMPT_KEYS_PATH");
+        std::env::remove_var("SECUREPROMPT_LICENSE_TOKEN");
     }
 
-    /// Create a unique temp dir and write `keys.json` into it; return the
-    /// keys.json path. Uses the process id + a nanosecond clock so parallel
-    /// runs never collide (avoids pulling in a tempfile dependency).
-    fn write_keys_json(body: &str) -> std::path::PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sp-keys-test-{}-{}", std::process::id(), nanos));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("keys.json");
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    // All keys-file behavior in one #[test] (env vars are process-global; the
-    // shared `env_lock` keeps us from racing other env-reading tests, and a
-    // single fn means we sequence set/clear deterministically).
     #[test]
-    fn license_config_keys_file_sources_and_precedence() {
+    fn license_config_loads_three_env_vars() {
         let _g = env_lock();
         clear_license_env();
 
-        // --- 1. Keys come from keys.json when env vars are absent. ---
-        let keys_path = write_keys_json(r#"{"vendor_pubkey":"AAAA","kek":"BBBB"}"#);
-        std::env::set_var("SECUREPROMPT_KEYS_PATH", &keys_path);
+        // --- 1. All three set → all three populated. ---
+        std::env::set_var("SECUREPROMPT_LICENSE_PUBKEY", "PUB");
+        std::env::set_var("SECUREPROMPT_MODEL_KEK", "KEK");
+        std::env::set_var("SECUREPROMPT_LICENSE_TOKEN", "TOKEN");
         let cfg = super::LicenseConfig::from_env();
-        assert_eq!(cfg.pubkey_b64, "AAAA", "pubkey should load from file");
-        assert_eq!(cfg.model_kek_b64, "BBBB", "kek should load from file");
+        assert_eq!(cfg.pubkey_b64, "PUB");
+        assert_eq!(cfg.model_kek_b64, "KEK");
+        assert_eq!(cfg.license_token, "TOKEN");
 
-        // --- 2. Env vars override the file. ---
-        std::env::set_var("SECUREPROMPT_LICENSE_PUBKEY", "ENVPUB");
-        std::env::set_var("SECUREPROMPT_MODEL_KEK", "ENVKEK");
-        let cfg = super::LicenseConfig::from_env();
-        assert_eq!(cfg.pubkey_b64, "ENVPUB", "env pubkey wins over file");
-        assert_eq!(cfg.model_kek_b64, "ENVKEK", "env kek wins over file");
-        std::env::remove_var("SECUREPROMPT_LICENSE_PUBKEY");
-        std::env::remove_var("SECUREPROMPT_MODEL_KEK");
-
-        // --- 3. Missing keys file → empty, no panic. ---
-        std::env::set_var(
-            "SECUREPROMPT_KEYS_PATH",
-            keys_path.with_file_name("does-not-exist.json"),
-        );
-        let cfg = super::LicenseConfig::from_env();
-        assert_eq!(cfg.pubkey_b64, "");
-        assert_eq!(cfg.model_kek_b64, "");
-
-        // --- 4. Invalid (non-JSON) keys file → empty, no panic. ---
-        let bad_path = write_keys_json("not valid json {{{");
-        std::env::set_var("SECUREPROMPT_KEYS_PATH", &bad_path);
-        let cfg = super::LicenseConfig::from_env();
-        assert_eq!(cfg.pubkey_b64, "");
-        assert_eq!(cfg.model_kek_b64, "");
-
-        // Cleanup: env + temp dirs.
+        // --- 2. All unset → empty strings, no panic, no file-system reads. ---
         clear_license_env();
-        let _ = std::fs::remove_dir_all(keys_path.parent().unwrap());
-        let _ = std::fs::remove_dir_all(bad_path.parent().unwrap());
+        let cfg = super::LicenseConfig::from_env();
+        assert_eq!(cfg.pubkey_b64, "");
+        assert_eq!(cfg.model_kek_b64, "");
+        assert_eq!(cfg.license_token, "");
+
+        // --- 3. Empty string is treated as unset. ---
+        std::env::set_var("SECUREPROMPT_LICENSE_PUBKEY", "");
+        std::env::set_var("SECUREPROMPT_MODEL_KEK", "");
+        std::env::set_var("SECUREPROMPT_LICENSE_TOKEN", "");
+        let cfg = super::LicenseConfig::from_env();
+        assert_eq!(cfg.pubkey_b64, "");
+        assert_eq!(cfg.model_kek_b64, "");
+        assert_eq!(cfg.license_token, "");
+
+        clear_license_env();
     }
 }

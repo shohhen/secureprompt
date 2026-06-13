@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         // to be set. Defer to the env var so worker + API agree.
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
         // The worker never verifies licenses (no gateway request path), so the
-        // empty/disabled default is correct here — no pubkey/keys.json reads.
+        // empty/disabled default is correct here — no pubkey/token reads matter.
         license: LicenseConfig::default(),
     };
 

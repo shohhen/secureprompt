@@ -162,8 +162,8 @@ async fn main() -> anyhow::Result<()> {
         let effective_pubkey = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
         match secureprompt_api::license::parse_vendor_key(&effective_pubkey) {
             Some(vk) => std::sync::Arc::new(secureprompt_api::license::LicenseState::new(
-                secureprompt_api::license::load_and_verify(
-                    &config.license.license_path,
+                secureprompt_api::license::load_and_verify_token(
+                    &config.license.license_token,
                     &vk,
                     now,
                 ),
@@ -238,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
     let effective_pubkey_for_recheck = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
     if let Some(vk) = secureprompt_api::license::parse_vendor_key(&effective_pubkey_for_recheck) {
         let st = std::sync::Arc::clone(&state.license);
-        let path = config.license.license_path.clone();
+        let license_token = config.license.license_token.clone();
         let secs = config.license.recheck_secs;
         // Plan 4 — capture kek/token/client for re-push on re-verify.
         let recheck_kek = model_kek;
@@ -252,8 +252,8 @@ async fn main() -> anyhow::Result<()> {
             t.tick().await; // skip immediate first tick (startup already verified)
             loop {
                 t.tick().await;
-                let new_snapshot = secureprompt_api::license::load_and_verify(
-                    &path,
+                let new_snapshot = secureprompt_api::license::load_and_verify_token(
+                    &license_token,
                     &vk,
                     chrono::Utc::now().timestamp(),
                 );
