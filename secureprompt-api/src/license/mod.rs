@@ -192,7 +192,7 @@ pub fn tamper_check(
 pub fn load_and_verify_token(token: &str, vk: &VerifyingKey, now_epoch: i64) -> LicenseSnapshot {
     let trimmed = token.trim();
     if trimmed.is_empty() {
-        tracing::warn!("SECUREPROMPT_LICENSE_TOKEN unset/empty — unlicensed");
+        tracing::warn!("license token unset/empty — unlicensed");
         return LicenseSnapshot::unlicensed();
     }
     // Signature check first → Unlicensed on bad sig / malformed / wrong key.
@@ -294,6 +294,18 @@ mod tests {
         // Whitespace-only is also treated as empty.
         let s = load_and_verify_token("   \n", &sk.verifying_key(), now());
         assert_eq!(s.status, LicenseStatus::Unlicensed);
+    }
+
+    #[test]
+    fn malformed_token_is_unlicensed_no_panic() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        // No dot separator at all.
+        assert_eq!(load_and_verify_token("not-a-token", &vk, now()).status, LicenseStatus::Unlicensed);
+        // Has a dot but neither half is valid base64url.
+        assert_eq!(load_and_verify_token("!!!.!!!", &vk, now()).status, LicenseStatus::Unlicensed);
+        // Valid base64url shape but the payload doesn't deserialize.
+        assert_eq!(load_and_verify_token("YWJj.ZGVm", &vk, now()).status, LicenseStatus::Unlicensed);
     }
 
     #[test]

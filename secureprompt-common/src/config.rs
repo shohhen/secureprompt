@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 ///                                     license token (sp-license 0.2.0).
 ///
 /// Any of them being unset / empty is non-fatal: the gateway runs Unlicensed
-/// (fail-open, today's behavior on a missing license file).
+/// (fail-open, mirroring the previous behavior on a missing license file).
 #[derive(Clone)]
 pub struct LicenseConfig {
     /// The full license token (compact single-line form). Empty => unlicensed.
