@@ -115,17 +115,16 @@ services:
       # assistant message instead. Override per-deployment in `.env`.
       SECUREPROMPT_CHAT_DEBUG_MODE: ${SECUREPROMPT_CHAT_DEBUG_MODE:-false}
       KMS_FILE_KEY: ${KMS_FILE_KEY:-c2VjdXJlcHJvbXB0LWRldi1rbXMta2V5LTMyYnl0ZXM=}
-      # License chain: the gateway reads license.json + keys.json (vendor pubkey
-      # + KEK) from this dir, unwraps the sealed model key, and pushes it to the
-      # ML sidecar using the shared token below (same value as the ml service).
-      SECUREPROMPT_LICENSE_PATH: /etc/secureprompt/license.json
+      # License chain: the gateway reads the vendor Ed25519 public key, the
+      # 32-byte KEK, and the compact license token entirely from env vars.
+      # Populate via .env / Docker secrets / your CI. Empty defaults below
+      # let the stack boot unlicensed (fail-open) for local dev.
+      SECUREPROMPT_LICENSE_PUBKEY: ${SECUREPROMPT_LICENSE_PUBKEY:-}
+      SECUREPROMPT_MODEL_KEK: ${SECUREPROMPT_MODEL_KEK:-}
+      SECUREPROMPT_LICENSE_TOKEN: ${SECUREPROMPT_LICENSE_TOKEN:-}
       ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
       # Optional: point at sp-admin to enable online revocation (fail-closed).
       # SECUREPROMPT_LICENSE_SERVER_URL: http://host.docker.internal:8090
-    volumes:
-      # license.json must be UTF-8 (the gateway reads it as UTF-8). keys.json
-      # carries the vendor pubkey + KEK. Both are gitignored secrets.
-      - ./etc/secureprompt:/etc/secureprompt:ro
     ports:
       - "8080:8080"
     depends_on:
