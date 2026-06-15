@@ -60,7 +60,8 @@ default:
     - if [ -f ~/.ssh/id_ed25519 ]; then ssh-add ~/.ssh/id_ed25519; fi
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker run --privileged --rm tonistiigi/binfmt --install all
-    - docker buildx create --use --name sp-builder --driver docker-container --bootstrap
+    - docker context create tls-env --docker "host=tcp://docker:2376,ca=/certs/client/ca.pem,cert=/certs/client/cert.pem,key=/certs/client/key.pem"
+    - docker buildx create --use --name sp-builder --driver docker-container --bootstrap tls-env
 
 build:
   stage: build
