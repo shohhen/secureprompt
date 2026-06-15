@@ -67,11 +67,13 @@ build:
   stage: build
   parallel:
     matrix:
+      # secureprompt-ml is intentionally excluded — its build needs the raw
+      # model DEK + plaintext weights, which aren't wired up yet. Build/push
+      # that image manually until weights distribution is decided.
       - SERVICE:
           - secureprompt-api
           - secureprompt-worker
           - secureprompt-mcp
-          - secureprompt-ml
           - secureprompt-web
           - secureprompt-marketing
           - secureprompt-chat
@@ -123,7 +125,6 @@ manifest:
           - secureprompt-api
           - secureprompt-worker
           - secureprompt-mcp
-          - secureprompt-ml
           - secureprompt-web
           - secureprompt-marketing
           - secureprompt-chat

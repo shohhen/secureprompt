@@ -10,7 +10,7 @@ FROM rust:1.89-slim-bookworm AS builder
 # Install the git CLI + ssh client, trust gitlab.com's host key, and let cargo
 # use the git CLI so it honours the forwarded ssh agent (--mount=type=ssh).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git openssh-client ca-certificates \
+    pkg-config libssl-dev git openssh-client ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
