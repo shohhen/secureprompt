@@ -1,10 +1,13 @@
 # SecurePrompt — build & push container images to the GitLab Container Registry.
 #
 # Trigger: manual only ("Run pipeline" in the GitLab UI or scheduled).
-# Parallelism: each (service, arch) is its own job, so 7 services × 2 arches +
-# sp-agent (amd64 only) = 15 build jobs that run concurrently across runners.
-# A small manifest stage then stitches the per-arch tags into one multi-arch
-# manifest per service.
+# Parallelism: one job per service, all running concurrently across runners
+# (7 jobs total). Each image is tagged with the short commit SHA and `latest`.
+#
+# Platform: linux/amd64 only. arm64 was dropped because QEMU emulation on the
+# shared amd64 runners blew past the 1h job timeout while compiling the Rust
+# workspace. Reintroduce arm64 once native arm64 runners are available, or by
+# adding Rust cross-compilation (e.g. `cargo zigbuild`) inside each Dockerfile.
 #
 # Required CI/CD variables (Settings → CI/CD → Variables):
 #   SP_LICENSE_DEPLOY_KEY  base64-encoded SSH private key with read access to
@@ -20,12 +23,9 @@
 #   - Network egress to gitlab.com (for the sp-license git+ssh fetch).
 #
 # Known caveats:
-#   - sp-agent is hardcoded to x86_64-unknown-linux-musl in its Dockerfile, so
-#     only an amd64 image is produced. Add arm64-musl to the Dockerfile to
-#     enable multi-arch for that service.
-#   - secureprompt-ml requires `secureprompt-ml/model/model.safetensors.enc`
-#     in the build context. Provide it via a pre-build step, LFS, or skip the
-#     ml matrix entry until weights are wired up.
+#   - secureprompt-ml is intentionally excluded — its build needs the raw
+#     model DEK + plaintext weights, which aren't wired up yet. Build/push
+#     that image manually until weights distribution is decided.
 
 workflow:
   rules:
@@ -34,7 +34,6 @@ workflow:
 
 stages:
   - build
-  - manifest
 
 variables:
   DOCKER_TLS_CERTDIR: "/certs"
@@ -59,7 +58,6 @@ default:
     - eval "$(ssh-agent -s)"
     - if [ -f ~/.ssh/id_ed25519 ]; then ssh-add ~/.ssh/id_ed25519; fi
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    - docker run --privileged --rm tonistiigi/binfmt --install all
     - docker context create tls-env --docker "host=tcp://docker:2376,ca=/certs/client/ca.pem,cert=/certs/client/cert.pem,key=/certs/client/key.pem"
     - docker buildx create --use --name sp-builder --driver docker-container --bootstrap tls-env
 
@@ -67,9 +65,6 @@ build:
   stage: build
   parallel:
     matrix:
-      # secureprompt-ml is intentionally excluded — its build needs the raw
-      # model DEK + plaintext weights, which aren't wired up yet. Build/push
-      # that image manually until weights distribution is decided.
       - SERVICE:
           - secureprompt-api
           - secureprompt-worker
@@ -77,13 +72,10 @@ build:
           - secureprompt-web
           - secureprompt-marketing
           - secureprompt-chat
-        PLATFORM: [linux/amd64, linux/arm64]
-      - SERVICE: [sp-agent]
-        PLATFORM: [linux/amd64]
+          - sp-agent
   script:
     - |
       set -euo pipefail
-      ARCH="${PLATFORM##*/}"
       IMAGE="${CI_REGISTRY_IMAGE}/${SERVICE}"
 
       case "$SERVICE" in
@@ -104,44 +96,15 @@ build:
         BUILD_ARGS="--build-arg NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}"
       fi
 
-      echo "Building ${IMAGE}:${CI_COMMIT_SHORT_SHA}-${ARCH} for ${PLATFORM}"
+      echo "Building ${IMAGE}:${CI_COMMIT_SHORT_SHA} for linux/amd64"
       docker buildx build \
-        --platform "$PLATFORM" \
+        --platform linux/amd64 \
         --file "$DOCKERFILE" \
-        --tag "${IMAGE}:${CI_COMMIT_SHORT_SHA}-${ARCH}" \
-        --cache-from "type=registry,ref=${IMAGE}:buildcache-${ARCH}" \
-        --cache-to "type=registry,ref=${IMAGE}:buildcache-${ARCH},mode=max" \
+        --tag "${IMAGE}:${CI_COMMIT_SHORT_SHA}" \
+        --tag "${IMAGE}:latest" \
+        --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+        --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
         --provenance=false \
         $BUILD_ARGS $SSH_FLAG \
         --push \
         "$CONTEXT"
-
-manifest:
-  stage: manifest
-  needs: [build]
-  parallel:
-    matrix:
-      - SERVICE:
-          - secureprompt-api
-          - secureprompt-worker
-          - secureprompt-mcp
-          - secureprompt-web
-          - secureprompt-marketing
-          - secureprompt-chat
-          - sp-agent
-  script:
-    - |
-      set -euo pipefail
-      IMAGE="${CI_REGISTRY_IMAGE}/${SERVICE}"
-
-      if [ "$SERVICE" = "sp-agent" ]; then
-        SOURCES="${IMAGE}:${CI_COMMIT_SHORT_SHA}-amd64"
-      else
-        SOURCES="${IMAGE}:${CI_COMMIT_SHORT_SHA}-amd64 ${IMAGE}:${CI_COMMIT_SHORT_SHA}-arm64"
-      fi
-
-      echo "Publishing multi-arch manifest for ${IMAGE}"
-      docker buildx imagetools create \
-        --tag "${IMAGE}:${CI_COMMIT_SHORT_SHA}" \
-        --tag "${IMAGE}:latest" \
-        $SOURCES
