@@ -3,11 +3,11 @@
 import { useEffect, useRef } from "react";
 
 const links: { href: string; num: string; label: string }[] = [
-  { href: "#problem", num: "01", label: "problem" },
-  { href: "#platform", num: "02", label: "platform" },
-  { href: "#mechanics", num: "03", label: "mechanics" },
-  { href: "#onprem", num: "04", label: "on-prem" },
-  { href: "#audience", num: "05", label: "who" },
+  { href: "#leak", num: "01", label: "leak" },
+  { href: "#gateway", num: "02", label: "gateway" },
+  { href: "#inside", num: "03", label: "inside" },
+  { href: "#proof", num: "04", label: "proof" },
+  { href: "#onprem", num: "05", label: "on-prem" },
 ];
 
 export function SideNav() {

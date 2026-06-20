@@ -3,7 +3,6 @@ import { TalkToUsButton } from "../TalkToUsButton";
 export function FinalCTA() {
   return (
     <section className="final-cta" id="talk">
-      <div className="label">[ 06 ]&nbsp;&nbsp;// the next step</div>
       <h2 className="editorial">
         <span className="row">
           <span className="word">you&apos;d</span>{" "}
@@ -20,7 +19,7 @@ export function FinalCTA() {
         </span>
       </h2>
       <div className="ctas">
-        <TalkToUsButton label="talk to us →" variant="primary" />
+        <TalkToUsButton label="talk to us →" variant="outline" className="pill" />
       </div>
     </section>
   );

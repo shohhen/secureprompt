@@ -7,6 +7,7 @@ import {
   Silkscreen,
 } from "next/font/google";
 import "./globals.css";
+import "./scenes.css";
 
 const inter = Inter({
   subsets: ["latin"],

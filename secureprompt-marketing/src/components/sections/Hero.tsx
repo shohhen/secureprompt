@@ -4,49 +4,35 @@ export function Hero() {
   return (
     <section className="hero" id="top">
       <div className="hero-eyebrow">
-        <span className="tag">[ 00 ]&nbsp;&nbsp;intro</span>
         <span>v 1.0 · 2026</span>
       </div>
       <h1 className="hero-title" id="hero-title">
         <span className="row">
-          <span className="word">the</span> <span className="word">security</span>{" "}
-          <span className="word">gateway</span>
+          <span className="word">see</span> <span className="word">every</span>{" "}
+          <span className="word">prompt</span>
         </span>
         <span className="row">
-          <span className="word">for</span>{" "}
-          <span className="word ital">the</span>{" "}
-          <span className="word accent">ai-native</span>
+          <span className="word">your</span> <span className="word">team</span>{" "}
+          <span className="word">sends</span> <span className="word">to</span>{" "}
+          <span className="word ital">ai</span>
         </span>
         <span className="row">
-          <span className="word underline">enterprise.</span>
+          <span className="word">before</span> <span className="word">it</span>{" "}
+          <span className="word underline">leaves.</span>
         </span>
       </h1>
-      <div className="hero-foot">
-        <div className="col">
-          <span className="k">// what it is</span>
-          <span className="v">
-            In-network gateway between every AI app, agent, copilot and the LLM
-            provider
-          </span>
+      <div className="hero-actions">
+        <div className="hero-pills">
+          <span className="hero-pill">in-network gateway</span>
+          <span className="hero-pill">redact · block · enforce · log</span>
+          <span className="hero-pill">your vpc · air-gapped</span>
         </div>
-        <div className="col">
-          <span className="k">// what it does</span>
-          <span className="v">
-            Redacts PII · blocks injection · enforces policy · ships an audit row
-          </span>
-        </div>
-        <div className="col">
-          <span className="k">// where it runs</span>
-          <span className="v">
-            Your VPC. Your hardware. Air-gap capable. No outbound telemetry.
-          </span>
-        </div>
-        <div className="col cta">
-          <span className="k">// next</span>
-          <TalkToUsButton label="Talk to us" variant="link" />
-        </div>
+        <TalkToUsButton label="talk to us ↗" variant="outline" />
       </div>
-      <div className="scroll-discover">scroll to discover</div>
+      <div className="scroll-cue">
+        <span className="arrow">↓</span>
+        scroll to follow one request
+      </div>
     </section>
   );
 }

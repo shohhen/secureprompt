@@ -12,9 +12,10 @@ Every team in your company is now wiring LLMs into something. Each integration i
 
 The choices today are bad:
 
-- **Block LLMs entirely** and lose the productivity gains your competitors are getting.
+- **Block LLMs entirely** and lose the productivity gains your competitors are getting — and watch shadow IT route around you anyway.
 - **Trust each app to redact** and watch as marketing's chatbot, sales' note-taker, and engineering's copilot all reinvent the same broken regex.
-- **Use a SaaS guardrail** and add another vendor to your data flow, your audit scope, and your incident response.
+- **Use a SaaS guardrail** and add another vendor to your data flow, your audit scope, and your incident-response playbook.
+- **Tell the auditor "we don't really know"** and watch them ask again next quarter, and the quarter after that.
 
 SecurePrompt is the fourth option: a single in-network gateway that every AI integration in your company funnels through, owned by you, deployed on your infrastructure, observable to your security team.
 
@@ -167,4 +168,4 @@ If your company has more than a handful of LLM integrations and your security te
 
 **Talk to us** — for licensed deployments, integration support, custom provider adapters, or air-gapped install consulting.
 
-SecurePrompt is the security gateway you'd build yourself if you had the time. Now you don't have to.
+SecurePrompt is the security gateway you'd build yourself — if you had a quarter to spend on it. Now you don't have to.

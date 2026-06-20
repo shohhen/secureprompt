@@ -1,0 +1,197 @@
+/* ============================================================
+   REDESIGN SCENES — the "follow one request" narrative.
+   Layered on the base design system in globals.css; reuses the
+   --color-* / --font-* tokens, .section, .section-head, .editorial
+   word-reveal, .marquee, .sidenav, .audit-demo, etc.
+   ============================================================ */
+
+/* Skew-preserving reveal for pixel (.ital) words inside headlines —
+   keeps the -10deg skew while the word rises into place. */
+.editorial .word.ital,
+.hero-title .word.ital {
+  transform: translateY(110%) skewX(-10deg);
+}
+.editorial.in .word.ital,
+.hero-title.in .word.ital {
+  transform: translateY(0) skewX(-10deg);
+}
+
+@keyframes sp-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.7; } }
+@keyframes sp-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ---------- outline CTA button (hero + final) ---------- */
+.talk-btn-outline {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 14px 22px;
+  border: 1.5px solid var(--color-accent);
+  background: transparent; color: var(--color-accent);
+  font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  cursor: pointer; white-space: nowrap;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.talk-btn-outline:hover {
+  background: var(--color-accent); color: var(--color-ink-on-accent);
+  border-color: var(--color-accent);
+}
+.talk-btn-outline.pill { border-radius: 999px; padding: 18px 28px; font-size: 12px; letter-spacing: 0.1em; }
+
+/* ---------- hero actions + scroll cue ---------- */
+.hero-actions {
+  border-top: 1px solid var(--color-line);
+  padding: 22px 28px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 20px; flex-wrap: wrap;
+}
+.hero-pills {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-fg);
+}
+.hero-pill { padding: 8px 13px; border: 1px solid var(--color-line-2); border-radius: 999px; }
+.scroll-cue {
+  text-align: center; padding: 40px 0 0;
+  font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--color-muted);
+}
+.scroll-cue .arrow { display: block; margin-bottom: 6px; color: var(--color-accent); animation: bob 2.2s ease-in-out infinite; }
+
+/* ---------- 01 · THE LEAK ---------- */
+.leak-card { background: var(--color-card); border: 1px solid var(--color-line-2); padding: 28px 24px; }
+.leak-meta {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+.leak-meta .muted { color: var(--color-muted); }
+.leak-meta .acc { color: var(--color-accent); }
+.leak-msg { font-size: clamp(15px, 1.7vw, 18px); line-height: 1.75; color: var(--color-fg); margin: 18px 0 0; }
+.leak-pii { background: rgba(227, 6, 19, 0.1); color: var(--color-accent-deep); border-radius: 3px; padding: 1px 5px; font-weight: 500; }
+.leak-stage { position: relative; margin-top: 46px; height: 84px; }
+.leak-rail {
+  position: absolute; left: 2px; right: 2px; top: 50%; transform: translateY(-50%);
+  height: 2px; background: repeating-linear-gradient(90deg, var(--color-line-2) 0 7px, transparent 7px 14px);
+}
+.leak-boundary { position: absolute; left: 42%; top: 12px; bottom: 12px; width: 2px; background: var(--color-line-2); transition: background 0.3s, box-shadow 0.3s; }
+.leak-edge {
+  position: absolute; left: 42%; top: -6px; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--color-muted); white-space: nowrap;
+}
+.leak-node {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  font-family: var(--font-mono); font-size: 11px; padding: 7px 11px;
+  border: 1px solid var(--color-line-2); border-radius: 5px; background: var(--color-card);
+}
+.leak-node.laptop { left: 0; color: var(--color-fg); }
+.leak-node.vendor { right: 0; color: var(--color-muted); transition: all 0.3s; }
+.leak-packet {
+  position: absolute; top: 50%; left: 96px; transform: translateY(-50%);
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  color: var(--color-accent-deep); background: var(--color-card);
+  border: 1px solid var(--color-accent); border-radius: 5px; padding: 4px 9px;
+  white-space: nowrap; box-shadow: 0 1px 7px rgba(227, 6, 19, 0.28);
+  transition: left 1600ms cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s;
+}
+.leak-foot {
+  margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--color-line);
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+  font-family: var(--font-mono); font-size: 12px;
+}
+.leak-foot .muted { color: var(--color-muted); }
+.leak-trail { color: var(--color-accent); opacity: 0; transition: opacity 0.4s; }
+
+/* ---------- 02 · THE GATEWAY (scroll-scrubbed pipeline) ---------- */
+.gw-scene { position: relative; height: 600vh; }
+.gw-sticky { position: sticky; top: 0; border-top: 1px solid var(--color-line); padding: 48px 28px 64px; background: var(--color-bg); }
+.pipeline { background: var(--color-card); border: 1px solid var(--color-line-2); padding: 34px 28px 30px; margin-top: 40px; }
+.pl-meta { font-family: var(--font-mono); font-size: 12px; color: var(--color-muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pl-meta .acc { color: var(--color-accent); }
+.pl-payload-wrap { margin-top: 30px; display: flex; justify-content: center; }
+.pl-payload {
+  font-family: var(--font-mono); font-size: clamp(13px, 1.7vw, 17px); font-weight: 500;
+  padding: 11px 18px; border-radius: 6px; border: 1px solid rgba(227, 6, 19, 0.45);
+  background: rgba(227, 6, 19, 0.12); color: var(--color-accent-deep);
+  transition: opacity 0.25s, background 0.3s, border-color 0.3s, color 0.3s;
+  white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+.pl-track { position: relative; margin-top: 36px; }
+.pl-rail { position: absolute; left: 18px; right: 18px; top: 18px; height: 2px; background: var(--color-line); }
+.pl-fill { position: absolute; left: 18px; top: 18px; height: 2px; width: 0; background: var(--color-accent); transition: width 700ms cubic-bezier(0.4, 0, 0.2, 1); }
+.pl-nodes { position: relative; display: flex; justify-content: space-between; }
+.pl-node { display: flex; flex-direction: column; align-items: center; gap: 9px; }
+.pl-dot {
+  width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--color-line-2);
+  background: var(--color-card); display: grid; place-items: center;
+  font-family: var(--font-mono); font-size: 12px; color: var(--color-muted); transition: all 0.3s;
+}
+.pl-lbl { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-muted); transition: color 0.3s; white-space: nowrap; }
+.pl-packet {
+  position: absolute; top: 3px; left: 0; width: 30px; height: 30px; border-radius: 50%;
+  background: var(--color-accent); border: 3px solid var(--color-card);
+  box-shadow: 0 0 0 1px var(--color-accent), 0 2px 10px rgba(227, 6, 19, 0.5);
+  transition: transform 700ms cubic-bezier(0.4, 0, 0.2, 1); z-index: 2;
+}
+.pl-caption {
+  text-align: center; margin-top: 30px; font-size: clamp(16px, 2vw, 22px); font-weight: 600;
+  letter-spacing: -0.015em; text-transform: lowercase; color: var(--color-fg);
+  min-height: 1.5em; transition: opacity 0.25s;
+}
+
+/* ---------- 03 · INSIDE (live cards) ---------- */
+.scene-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; align-items: stretch; }
+.icard { background: var(--color-card); border: 1px solid var(--color-line-2); padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+.icard-label { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; color: var(--color-accent); }
+.redact-msg { font-size: 15px; line-height: 1.85; color: var(--color-fg); margin: 0; }
+.pii { transition: background 0.3s, color 0.3s; background: rgba(227, 6, 19, 0.1); color: var(--color-accent-deep); font-weight: 500; border-radius: 3px; padding: 1px 4px; }
+.icard-foot { margin-top: auto; padding-top: 14px; border-top: 1px dashed var(--color-line); font-size: 13px; color: var(--color-muted); line-height: 1.55; }
+.icard-foot strong { color: var(--color-fg); font-weight: 500; }
+.inj-prompt { font-size: 15px; line-height: 1.7; color: var(--color-fg); margin: 0; min-height: 3.4em; font-family: var(--font-mono); }
+.meter { position: relative; height: 10px; background: var(--color-bg-2); border-radius: 999px; overflow: hidden; }
+.meter-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: var(--color-accent); border-radius: 999px; transition: background 0.3s; }
+.meter-threshold { position: absolute; top: -3px; bottom: -3px; left: 99%; width: 2px; background: var(--color-fg); }
+.meter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.meter-read-wrap { display: flex; align-items: baseline; gap: 8px; }
+.meter-read { font-family: var(--font-sans); font-weight: 800; font-size: 40px; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; color: var(--color-fg); }
+.meter-unit { font-family: var(--font-mono); font-size: 11px; color: var(--color-muted); }
+.verdict {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 6px 12px; border: 1px solid var(--color-line-2); border-radius: 999px;
+  color: var(--color-muted); transition: all 0.24s;
+}
+
+/* ---------- 05 · ON-PREM (perimeter) ---------- */
+.perim { position: relative; border: 1px solid var(--color-line-2); border-radius: 10px; padding: 30px 26px 26px; background: var(--color-card); }
+.perim-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 30px; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-muted); }
+.perim-flow { position: relative; display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; }
+.perim-box { position: relative; flex: 1 1 300px; min-width: 0; border: 1.5px dashed var(--color-accent); border-radius: 10px; background: #FBF4F4; padding: 20px 18px; overflow: hidden; }
+.perim-glow { position: absolute; inset: 0; box-shadow: inset 0 0 70px rgba(227, 6, 19, 0.1); animation: sp-pulse 3.4s ease-in-out infinite; pointer-events: none; }
+.perim-box-label { position: relative; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--color-accent); margin-bottom: 18px; }
+.perim-row { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.perim-rail { position: absolute; left: 12%; right: 12%; top: 50%; height: 2px; background: #E7CCCF; }
+.perim-node { position: relative; z-index: 1; font-family: var(--font-mono); font-size: 12px; padding: 10px 14px; border: 1px solid var(--color-line-2); border-radius: 6px; background: var(--color-card); color: var(--color-fg); }
+.perim-node.sp { color: var(--color-accent-deep); font-weight: 600; border-color: var(--color-accent); }
+.perim-arrow { flex: none; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0 16px; gap: 6px; }
+.perim-arrow .glyph { font-family: var(--font-mono); color: var(--color-accent); font-size: 20px; }
+.perim-arrow .note { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-muted); text-align: center; line-height: 1.35; }
+.perim-cloud-wrap { flex: none; display: flex; align-items: center; }
+.perim-cloud { font-family: var(--font-mono); font-size: 12px; color: var(--color-fg); padding: 12px 16px; border: 1px dashed var(--color-line-2); border-radius: 8px; background: var(--color-bg); text-align: center; line-height: 1.5; }
+.perim-cloud .muted { color: var(--color-muted); font-size: 10px; }
+.perim-packet { position: absolute; top: 0; left: 0; width: 16px; height: 16px; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 3px var(--color-card), 0 0 10px rgba(227, 6, 19, 0.6); transition: transform 1100ms cubic-bezier(0.4, 0, 0.2, 1); z-index: 5; }
+.perim-tag { position: absolute; top: 0; left: 0; opacity: 0; transition: opacity 0.3s; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-ink-on-accent); background: var(--color-fg); padding: 5px 9px; border-radius: 5px; white-space: nowrap; pointer-events: none; z-index: 6; }
+.perim-bullets { position: relative; margin-top: 36px; padding-top: 24px; border-top: 1px dashed var(--color-line); display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.perim-bullet { display: flex; align-items: center; gap: 12px; font-size: 14px; line-height: 1.5; color: var(--color-fg); }
+.perim-bullet .glyph { font-family: var(--font-mono); color: var(--color-accent); font-size: 17px; }
+.perim-bullet .glyph.blink { animation: sp-blink 1.8s ease-in-out infinite; }
+.perim-bullet .acc { color: var(--color-accent); font-weight: 600; }
+.perim-bullet .muted { color: var(--color-muted); }
+.perim-tags { position: relative; margin-top: 24px; display: flex; gap: 16px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-muted); }
+.perim-tags .dot { color: var(--color-line-2); }
+
+@media (max-width: 700px) {
+  .leak-card, .pipeline, .perim { padding-left: 18px; padding-right: 18px; }
+  .gw-sticky { padding-left: 18px; padding-right: 18px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-cue .arrow, .perim-glow, .perim-bullet .glyph.blink { animation: none; }
+}

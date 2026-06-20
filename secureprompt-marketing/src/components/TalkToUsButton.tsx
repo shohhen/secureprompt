@@ -10,7 +10,7 @@ export function TalkToUsButton({
 }: {
   label: string;
   className?: string;
-  variant?: "link" | "primary";
+  variant?: "link" | "primary" | "outline";
 }) {
   const [open, setOpen] = useState(false);
 
