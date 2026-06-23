@@ -4,6 +4,7 @@
 //! license token is supplied as a single-line env var (no on-disk fallback).
 
 pub mod attestation;
+pub mod freshness;
 pub mod revocation;
 
 use std::sync::atomic::{AtomicBool, Ordering};
