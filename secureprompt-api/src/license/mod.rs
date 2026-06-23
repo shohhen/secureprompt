@@ -5,6 +5,7 @@
 
 pub mod attestation;
 pub mod freshness;
+pub mod freshness_store;
 pub mod revocation;
 
 use std::sync::atomic::{AtomicBool, Ordering};
