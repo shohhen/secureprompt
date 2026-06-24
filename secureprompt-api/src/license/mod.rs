@@ -151,7 +151,10 @@ impl LicenseState {
             && matches!(self.offline_verdict(&s), freshness::OfflineVerdict::HardStale)
     }
 
-    /// Effective status — `Revoked` overrides the locally-derived snapshot status.
+    /// Raw status with only the sticky `Revoked` override — does NOT apply the
+    /// offline-staleness overlay. Prefer [`effective_status`](Self::effective_status)
+    /// for any gating decision; this remains for callers that only need the
+    /// locally-signed status.
     pub fn status(&self) -> LicenseStatus {
         if self.is_revoked() { return LicenseStatus::Revoked; }
         self.snapshot().status
@@ -163,9 +166,8 @@ impl LicenseState {
     /// Feature gate. Fail-open: Unlicensed/Grace permits everything (don't hard-block on a hiccup).
     /// Revoked is fail-CLOSED (no features) — though the request-pipeline gate blocks first.
     pub fn is_feature_enabled(&self, f: &str) -> bool {
-        let s = self.snapshot();
         match self.effective_status() {
-            LicenseStatus::Valid => s.features.iter().any(|x| x == f),
+            LicenseStatus::Valid => self.snapshot().features.iter().any(|x| x == f),
             LicenseStatus::Grace | LicenseStatus::Unlicensed => true,
             LicenseStatus::Revoked => false,
         }
