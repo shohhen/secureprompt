@@ -24,6 +24,9 @@ pub fn classify_offline(
         (Some(s), Some(h)) => (s, h),
         _ => return OfflineVerdict::Fresh, // no policy → never stale
     };
+    // Issuance enforces hard >= soft; assert in dev so a malformed token surfaces
+    // (an inverted window would let `> hard` shadow the recoverable soft band).
+    debug_assert!(hard >= soft, "revalidate_hard_secs ({hard}) must be >= soft ({soft})");
     // Perceived time cannot move backwards (defeats clock rollback).
     let perceived_now = now.max(highwater);
     // Last good check is the newest of (verified assertion, signed not_before anchor).
@@ -62,5 +65,10 @@ mod tests {
     #[test] fn newer_assertion_resets_offline() {
         // last assertion at 1350, now 1400 → offline 50 → Fresh despite old not_before.
         assert_eq!(c(1400, 1400, 1350), OfflineVerdict::Fresh);
+    }
+    #[test] fn one_sided_budget_is_fresh() {
+        // Only one budget set ⇒ no enforceable policy ⇒ always Fresh, even when very stale.
+        assert_eq!(classify_offline(99_999, 99_999, 0, 1000, Some(100), None), OfflineVerdict::Fresh);
+        assert_eq!(classify_offline(99_999, 99_999, 0, 1000, None, Some(300)), OfflineVerdict::Fresh);
     }
 }
