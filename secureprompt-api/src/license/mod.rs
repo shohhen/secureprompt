@@ -75,8 +75,8 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         image_digests: if valid { lic.integrity.image_digests.clone() } else { std::collections::BTreeMap::new() },
         // Offline-revalidation budgets from the signed token.  Read regardless of
         // Valid/Grace so the overlay has an anchor even while the license is expired.
-        // `perceived_now` stays 0 until the poller calls `set_freshness` (Task 7),
-        // so the overlay remains inert in production until that poller runs.
+        // The offline countdown advances from the live system clock — see observe_clock
+        // and observe_freshness in LicenseState.
         revalidate_soft_secs: lic.entitlements.revalidate_soft_secs.map(|v| v as i64),
         revalidate_hard_secs: lic.entitlements.revalidate_hard_secs.map(|v| v as i64),
         not_before_epoch: parse_rfc3339(&lic.entitlements.not_before).ok(),
@@ -92,7 +92,6 @@ pub struct LicenseState {
     revoked: AtomicBool,
     last_assertion_at: AtomicI64, // epoch secs; 0 = never
     highwater_at: AtomicI64,      // epoch secs; 0 = unseen
-    perceived_now: AtomicI64,     // last observed system clock, monotone via max
 }
 
 impl LicenseState {
@@ -102,7 +101,6 @@ impl LicenseState {
             revoked: AtomicBool::new(false),
             last_assertion_at: AtomicI64::new(0),
             highwater_at: AtomicI64::new(0),
-            perceived_now: AtomicI64::new(0),
         }
     }
     pub fn unlicensed() -> Self { Self::new(LicenseSnapshot::unlicensed()) }
@@ -114,21 +112,31 @@ impl LicenseState {
     /// True once the online poller has confirmed a `revoked` verdict from sp-admin.
     pub fn is_revoked(&self) -> bool { self.revoked.load(Ordering::SeqCst) }
 
-    /// Record the latest freshness observation. `last_assertion_at` is the verified
-    /// issued_at (or carry the previous value if this tick earned no credit). `now`
-    /// is the current system clock. All three advance monotonically.
-    pub fn set_freshness(&self, last_assertion_at: i64, highwater_at: i64, now: i64) {
+    /// Record a freshness observation from a persisted or poller-delivered row.
+    /// Both `last_assertion_at` and `highwater_at` advance monotonically.
+    pub fn observe_freshness(&self, last_assertion_at: i64, highwater_at: i64) {
         bump_max(&self.last_assertion_at, last_assertion_at);
-        bump_max(&self.highwater_at, highwater_at.max(now));
-        bump_max(&self.perceived_now, now);
+        bump_max(&self.highwater_at, highwater_at);
     }
 
-    fn offline_verdict(&self, s: &LicenseSnapshot) -> freshness::OfflineVerdict {
-        let now  = self.perceived_now.load(Ordering::SeqCst);
+    /// Advance the in-memory high-water mark to at least `now` (live system clock).
+    /// Called on every re-verify tick so the countdown advances even when the
+    /// license-server URL is absent.
+    pub fn observe_clock(&self, now: i64) {
+        bump_max(&self.highwater_at, now);
+    }
+
+    /// Classify offline staleness using an injected clock value (deterministic in tests).
+    fn offline_verdict_at(&self, s: &LicenseSnapshot, now: i64) -> freshness::OfflineVerdict {
         let hw   = self.highwater_at.load(Ordering::SeqCst);
         let last = self.last_assertion_at.load(Ordering::SeqCst);
         let nb   = s.not_before_epoch.unwrap_or(0);
         freshness::classify_offline(now, hw, last, nb, s.revalidate_soft_secs, s.revalidate_hard_secs)
+    }
+
+    /// Classify offline staleness using the live system clock.
+    fn offline_verdict(&self, s: &LicenseSnapshot) -> freshness::OfflineVerdict {
+        self.offline_verdict_at(s, chrono::Utc::now().timestamp())
     }
 
     /// Effective status folding the offline overlay over the base. Revoked wins; then
@@ -144,12 +152,33 @@ impl LicenseState {
         }
     }
 
+    /// Effective status using an injected clock — for tests or callers that need
+    /// a deterministic "what would the verdict be at time T?" query.
+    pub(crate) fn effective_status_at(&self, now: i64) -> LicenseStatus {
+        if self.is_revoked() { return LicenseStatus::Revoked; }
+        let s = self.snapshot();
+        if s.status != LicenseStatus::Valid { return s.status; }
+        match self.offline_verdict_at(&s, now) {
+            freshness::OfflineVerdict::Fresh     => LicenseStatus::Valid,
+            freshness::OfflineVerdict::SoftStale => LicenseStatus::Unlicensed,
+            freshness::OfflineVerdict::HardStale => LicenseStatus::Revoked,
+        }
+    }
+
     /// Hard-stale = offline budget blown. Recoverable (NOT the sticky revoked flag).
     pub fn is_hard_stale(&self) -> bool {
         if self.is_revoked() { return false; } // sticky revoke handled separately by the gate
         let s = self.snapshot();
         s.status == LicenseStatus::Valid
             && matches!(self.offline_verdict(&s), freshness::OfflineVerdict::HardStale)
+    }
+
+    /// Hard-stale with an injected clock — for tests.
+    pub(crate) fn is_hard_stale_at(&self, now: i64) -> bool {
+        if self.is_revoked() { return false; }
+        let s = self.snapshot();
+        s.status == LicenseStatus::Valid
+            && matches!(self.offline_verdict_at(&s, now), freshness::OfflineVerdict::HardStale)
     }
 
     /// Raw status with only the sticky `Revoked` override — does NOT apply the
@@ -748,42 +777,76 @@ mod tests {
     #[test]
     fn fresh_stays_valid() {
         let st = LicenseState::new(valid_snap_with_policy());
-        st.set_freshness(1000, 1080, 1080); // offline 80 ≤ soft
-        assert_eq!(st.effective_status(), LicenseStatus::Valid);
-        assert!(!st.is_hard_stale());
+        // observe_freshness(last_assertion_at=1000, highwater_at=1080); now=1080 → offline 80 ≤ soft(100)
+        st.observe_freshness(1000, 1080);
+        assert_eq!(st.effective_status_at(1080), LicenseStatus::Valid);
+        assert!(!st.is_hard_stale_at(1080));
     }
 
     #[test]
     fn soft_stale_degrades_to_unlicensed_not_revoked() {
         let st = LicenseState::new(valid_snap_with_policy());
-        st.set_freshness(1000, 1200, 1200); // offline 200
-        assert_eq!(st.effective_status(), LicenseStatus::Unlicensed);
-        assert!(!st.is_hard_stale());
+        // offline 200 > soft(100) but ≤ hard(300)
+        st.observe_freshness(1000, 1200);
+        assert_eq!(st.effective_status_at(1200), LicenseStatus::Unlicensed);
+        assert!(!st.is_hard_stale_at(1200));
         assert!(!st.is_revoked()); // staleness must NOT trip the sticky flag
     }
 
     #[test]
     fn hard_stale_reports_hard_stale() {
         let st = LicenseState::new(valid_snap_with_policy());
-        st.set_freshness(1000, 1400, 1400); // offline 400 > hard
-        assert!(st.is_hard_stale());
+        // offline 400 > hard(300)
+        st.observe_freshness(1000, 1400);
+        assert!(st.is_hard_stale_at(1400));
     }
 
     #[test]
     fn recovers_when_fresh_assertion_arrives() {
         let st = LicenseState::new(valid_snap_with_policy());
-        st.set_freshness(1000, 1400, 1400);
-        assert!(st.is_hard_stale());
-        st.set_freshness(1390, 1400, 1400); // new assertion at 1390 → offline 10
-        assert_eq!(st.effective_status(), LicenseStatus::Valid);
-        assert!(!st.is_hard_stale());
+        st.observe_freshness(1000, 1400);
+        assert!(st.is_hard_stale_at(1400));
+        // new assertion at 1390 → offline now = 1400 - 1390 = 10 → Fresh
+        st.observe_freshness(1390, 1400);
+        assert_eq!(st.effective_status_at(1400), LicenseStatus::Valid);
+        assert!(!st.is_hard_stale_at(1400));
     }
 
     #[test]
     fn revoked_still_overrides_everything() {
         let st = LicenseState::new(valid_snap_with_policy());
-        st.set_freshness(1000, 1010, 1010); // fresh
+        st.observe_freshness(1000, 1010); // fresh
         st.mark_revoked();
-        assert_eq!(st.effective_status(), LicenseStatus::Revoked);
+        assert_eq!(st.effective_status_at(1010), LicenseStatus::Revoked);
+    }
+
+    // ── URL-independence test ────────────────────────────────────────────────
+    // Proves the countdown advances from the live (injected) clock alone,
+    // with no poller or observe_clock call ever made.
+
+    #[test]
+    fn url_independence_countdown_advances_from_clock_alone() {
+        // No server URL, no poller, no observe_clock.  The only "freshness"
+        // seed is observe_freshness(0, 0) — as if the process just started
+        // and the DB had no row yet.
+        let st = LicenseState::new(valid_snap_with_policy());
+        // Atoms start at 0 (never been set).  Explicitly confirm with observe_freshness(0,0).
+        st.observe_freshness(0, 0);
+
+        // now=1080: offline = max(1080, 0) - max(0, 1000) = 1080 - 1000 = 80 ≤ soft(100) → Fresh
+        assert_eq!(st.effective_status_at(1080), LicenseStatus::Valid,
+            "should be fresh near not_before with no prior assertion");
+
+        // now far in the future: offline budget blown purely from clock — proves URL-independence.
+        let far_future = 1000 + 400; // not_before + 400 > hard(300)
+        assert!(st.is_hard_stale_at(far_future),
+            "hard stale must be reached by clock alone — no poller/observe_clock needed");
+        assert_eq!(st.effective_status_at(far_future), LicenseStatus::Revoked,
+            "hard stale maps to Revoked in effective_status");
+
+        // Recovery: an assertion arrives → countdown resets.
+        st.observe_freshness(far_future - 10, far_future);
+        assert_eq!(st.effective_status_at(far_future), LicenseStatus::Valid,
+            "fresh assertion should recover from hard stale");
     }
 }

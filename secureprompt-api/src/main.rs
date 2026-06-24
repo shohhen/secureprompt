@@ -195,6 +195,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db, config.clone(), ml_sidecar, license);
 
+    // Part B — boot seed: load persisted high-water from Postgres immediately
+    // so a freshly-booted (or URL-less) gateway doesn't emit a spurious hard-stale.
+    // Runs synchronously before any background task is spawned.
+    if let Some(lic_id) = state.license.snapshot().lic_id {
+        if let Ok(Some(row)) = secureprompt_api::license::freshness_store::load(&state.db, &lic_id).await {
+            state.license.observe_freshness(row.last_assertion_at, row.highwater_at);
+        }
+    }
+
     // Tamper-evidence: check running image digest against the license's pinned digest.
     // Fail-open — NEVER crash, just warn.
     {
@@ -247,9 +256,11 @@ async fn main() -> anyhow::Result<()> {
         // Capture digest once before the loop — reading the env var inside the
         // loop on every tick would work too, but a single capture is cheaper.
         let recheck_digest = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
+        // Part C — capture db for freshness high-water persistence (URL-independent).
+        let recheck_db = state.db.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
-            t.tick().await; // skip immediate first tick (startup already verified)
+            t.tick().await; // skip immediate first tick (startup already verified / boot-seeded)
             loop {
                 t.tick().await;
                 let new_snapshot = secureprompt_api::license::load_and_verify_token(
@@ -258,6 +269,17 @@ async fn main() -> anyhow::Result<()> {
                     chrono::Utc::now().timestamp(),
                 );
                 st.set(new_snapshot);
+                // Part C — advance + persist the high-water on every tick regardless of
+                // whether the license-server URL is configured.  This is what makes the
+                // offline countdown URL-independent: the clock advances here.
+                let now = chrono::Utc::now().timestamp();
+                if let Some(lic_id) = st.snapshot().lic_id {
+                    let _ = secureprompt_api::license::freshness_store::record(&recheck_db, &lic_id, None, now).await;
+                    if let Ok(Some(row)) = secureprompt_api::license::freshness_store::load(&recheck_db, &lic_id).await {
+                        st.observe_freshness(row.last_assertion_at, row.highwater_at);
+                    }
+                }
+                st.observe_clock(now); // advance in-memory high-water even if the DB write failed
                 // Re-emit tamper-evidence flags after each periodic re-verify.
                 // Fail-open — never panic, just warn.
                 for flag in st.tamper_flags("api", &recheck_digest) {
@@ -288,8 +310,12 @@ async fn main() -> anyhow::Result<()> {
         // the poller cannot verify signed assertions so we skip polling entirely.
         let poller_pubkey = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
         let poller_vk = secureprompt_api::license::parse_vendor_key(&poller_pubkey);
+        // Part D — capture db for freshness persistence of verified assertions.
+        let poller_db = state.db.clone();
         if let Some(vk) = poller_vk {
             tokio::spawn(async move {
+                use secureprompt_api::license::freshness_store;
+                use secureprompt_api::license::revocation::RevocationVerdict;
                 let client = reqwest::Client::new();
                 let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
                 tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
@@ -303,21 +329,32 @@ async fn main() -> anyhow::Result<()> {
                         Some(id) => id,
                         None => continue,
                     };
-                    let (verdict, _issued_at) = secureprompt_api::license::revocation::check(
+                    let (verdict, issued_at) = secureprompt_api::license::revocation::check(
                         &client, &server_url, &lic_id, &vk,
                     ).await;
-                    // _issued_at intentionally unused here — freshness persistence is Task 7.
+                    // Part D — record the assertion in Postgres and advance in-memory atoms.
+                    let now = chrono::Utc::now().timestamp();
                     match verdict {
-                        secureprompt_api::license::revocation::RevocationVerdict::Revoked => {
+                        RevocationVerdict::Revoked => {
                             st.mark_revoked();
                             tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403)");
                             return;
                         }
-                        secureprompt_api::license::revocation::RevocationVerdict::Active => {
+                        RevocationVerdict::Active => {
+                            // issued_at: Some(_) only when the server returned a sig-verified assertion.
+                            let _ = freshness_store::record(&poller_db, &lic_id, issued_at, now).await;
+                            if let Ok(Some(row)) = freshness_store::load(&poller_db, &lic_id).await {
+                                st.observe_freshness(row.last_assertion_at, row.highwater_at);
+                            }
                             tracing::debug!(lic_id, "revocation check: license active");
                         }
-                        // Unknown already logged inside check() — keep last-known state.
-                        secureprompt_api::license::revocation::RevocationVerdict::Unknown => {}
+                        // Unknown already logged inside check() — bump highwater only (no assertion credit).
+                        RevocationVerdict::Unknown => {
+                            let _ = freshness_store::record(&poller_db, &lic_id, None, now).await;
+                            if let Ok(Some(row)) = freshness_store::load(&poller_db, &lic_id).await {
+                                st.observe_freshness(row.last_assertion_at, row.highwater_at);
+                            }
+                        }
                     }
                 }
             });
