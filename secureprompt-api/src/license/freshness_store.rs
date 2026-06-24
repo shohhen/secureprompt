@@ -29,10 +29,13 @@ pub async fn load(pool: &PgPool, lic_id: &str) -> sqlx::Result<Option<FreshnessR
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| FreshnessRow {
-        last_assertion_at: r.get("last_assertion_at"),
-        highwater_at: r.get("highwater_at"),
-    }))
+    match row {
+        Some(r) => Ok(Some(FreshnessRow {
+            last_assertion_at: r.try_get("last_assertion_at")?,
+            highwater_at: r.try_get("highwater_at")?,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// Upsert with monotone max-merge.
@@ -72,6 +75,7 @@ pub async fn record(
         "#,
     )
     .bind(id)
+    // to_timestamp() takes f64; i64 epoch seconds are exact well below 2^53.
     .bind(assertion as f64)
     .bind(hw_seed as f64)
     .execute(pool)
@@ -107,6 +111,7 @@ mod tests {
         record(&pool, lic, None, 1200).await?;
         let r = load(&pool, lic).await?.unwrap();
         assert_eq!(r.highwater_at, 1500); // stays at the max
+        assert_eq!(r.last_assertion_at, 1000); // unchanged by a no-credit rollback tick
 
         Ok(())
     }
