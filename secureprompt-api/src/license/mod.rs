@@ -8,7 +8,7 @@ pub mod freshness;
 pub mod freshness_store;
 pub mod revocation;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 use ed25519_dalek::VerifyingKey;
 use sp_license::sign::{decode_verified_token, parse_rfc3339};
@@ -35,6 +35,11 @@ pub struct LicenseSnapshot {
     pub wrapped_attestation_key: Option<String>,
     /// Image digests from the license's integrity section — Valid license only; empty otherwise.
     pub image_digests: std::collections::BTreeMap<String, String>,
+    /// Offline-revalidation budgets from the signed token (secs). `None` ⇒ no policy.
+    pub revalidate_soft_secs: Option<i64>,
+    pub revalidate_hard_secs: Option<i64>,
+    /// not_before as epoch secs — the bootstrap anchor for the offline overlay.
+    pub not_before_epoch: Option<i64>,
 }
 
 impl LicenseSnapshot {
@@ -49,6 +54,9 @@ impl LicenseSnapshot {
             lic_id: None,
             wrapped_attestation_key: None,
             image_digests: std::collections::BTreeMap::new(),
+            revalidate_soft_secs: None,
+            revalidate_hard_secs: None,
+            not_before_epoch: None,
         }
     }
 }
@@ -65,6 +73,12 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         lic_id: if valid { Some(lic.lic_id.clone()) } else { None },
         wrapped_attestation_key: if valid { Some(lic.deployment.wrapped_attestation_key.clone()) } else { None },
         image_digests: if valid { lic.integrity.image_digests.clone() } else { std::collections::BTreeMap::new() },
+        // Task 6 will populate these from lic.entitlements.revalidate_* once the
+        // sp-license crate tag that adds those fields is available.  For now the
+        // overlay stays inert (None budgets ⇒ always Fresh).
+        revalidate_soft_secs: None,
+        revalidate_hard_secs: None,
+        not_before_epoch: None,
     }
 }
 
@@ -72,10 +86,24 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
 /// re-verify task atomically swap the snapshot. `revoked` is a separate sticky
 /// flag set by the online revocation poller — kept out of the snapshot so the
 /// hourly local re-verify (which replaces the snapshot) can't clear it.
-pub struct LicenseState { inner: RwLock<LicenseSnapshot>, revoked: AtomicBool }
+pub struct LicenseState {
+    inner: RwLock<LicenseSnapshot>,
+    revoked: AtomicBool,
+    last_assertion_at: AtomicI64, // epoch secs; 0 = never
+    highwater_at: AtomicI64,      // epoch secs; 0 = unseen
+    perceived_now: AtomicI64,     // last observed system clock, monotone via max
+}
 
 impl LicenseState {
-    pub fn new(s: LicenseSnapshot) -> Self { Self { inner: RwLock::new(s), revoked: AtomicBool::new(false) } }
+    pub fn new(s: LicenseSnapshot) -> Self {
+        Self {
+            inner: RwLock::new(s),
+            revoked: AtomicBool::new(false),
+            last_assertion_at: AtomicI64::new(0),
+            highwater_at: AtomicI64::new(0),
+            perceived_now: AtomicI64::new(0),
+        }
+    }
     pub fn unlicensed() -> Self { Self::new(LicenseSnapshot::unlicensed()) }
     pub fn snapshot(&self) -> LicenseSnapshot { self.inner.read().expect("license lock poisoned").clone() }
     pub fn set(&self, s: LicenseSnapshot) { *self.inner.write().expect("license lock poisoned") = s; }
@@ -84,6 +112,45 @@ impl LicenseState {
     pub fn mark_revoked(&self) { self.revoked.store(true, Ordering::SeqCst); }
     /// True once the online poller has confirmed a `revoked` verdict from sp-admin.
     pub fn is_revoked(&self) -> bool { self.revoked.load(Ordering::SeqCst) }
+
+    /// Record the latest freshness observation. `last_assertion_at` is the verified
+    /// issued_at (or carry the previous value if this tick earned no credit). `now`
+    /// is the current system clock. All three advance monotonically.
+    pub fn set_freshness(&self, last_assertion_at: i64, highwater_at: i64, now: i64) {
+        bump_max(&self.last_assertion_at, last_assertion_at);
+        bump_max(&self.highwater_at, highwater_at.max(now));
+        bump_max(&self.perceived_now, now);
+    }
+
+    fn offline_verdict(&self, s: &LicenseSnapshot) -> freshness::OfflineVerdict {
+        let now  = self.perceived_now.load(Ordering::SeqCst);
+        let hw   = self.highwater_at.load(Ordering::SeqCst);
+        let last = self.last_assertion_at.load(Ordering::SeqCst);
+        let nb   = s.not_before_epoch.unwrap_or(0);
+        freshness::classify_offline(now, hw, last, nb, s.revalidate_soft_secs, s.revalidate_hard_secs)
+    }
+
+    /// Effective status folding the offline overlay over the base. Revoked wins; then
+    /// hard-stale → Revoked-equivalent (recoverable); soft-stale → Unlicensed.
+    pub fn effective_status(&self) -> LicenseStatus {
+        if self.is_revoked() { return LicenseStatus::Revoked; }
+        let s = self.snapshot();
+        if s.status != LicenseStatus::Valid { return s.status; }
+        match self.offline_verdict(&s) {
+            freshness::OfflineVerdict::Fresh     => LicenseStatus::Valid,
+            freshness::OfflineVerdict::SoftStale => LicenseStatus::Unlicensed,
+            freshness::OfflineVerdict::HardStale => LicenseStatus::Revoked,
+        }
+    }
+
+    /// Hard-stale = offline budget blown. Recoverable (NOT the sticky revoked flag).
+    pub fn is_hard_stale(&self) -> bool {
+        if self.is_revoked() { return false; } // sticky revoke handled separately by the gate
+        let s = self.snapshot();
+        s.status == LicenseStatus::Valid
+            && matches!(self.offline_verdict(&s), freshness::OfflineVerdict::HardStale)
+    }
+
     /// Effective status — `Revoked` overrides the locally-derived snapshot status.
     pub fn status(&self) -> LicenseStatus {
         if self.is_revoked() { return LicenseStatus::Revoked; }
@@ -91,16 +158,13 @@ impl LicenseState {
     }
     /// Seat ceiling to enforce. `None` under Unlicensed/Grace (fail-open: no enforcement on a license hiccup).
     pub fn max_seats(&self) -> Option<u32> {
-        if self.is_revoked() { return None; }
-        let s = self.snapshot();
-        match s.status { LicenseStatus::Valid => s.max_seats, _ => None }
+        match self.effective_status() { LicenseStatus::Valid => self.snapshot().max_seats, _ => None }
     }
     /// Feature gate. Fail-open: Unlicensed/Grace permits everything (don't hard-block on a hiccup).
     /// Revoked is fail-CLOSED (no features) — though the request-pipeline gate blocks first.
     pub fn is_feature_enabled(&self, f: &str) -> bool {
-        if self.is_revoked() { return false; }
         let s = self.snapshot();
-        match s.status {
+        match self.effective_status() {
             LicenseStatus::Valid => s.features.iter().any(|x| x == f),
             LicenseStatus::Grace | LicenseStatus::Unlicensed => true,
             LicenseStatus::Revoked => false,
@@ -109,9 +173,8 @@ impl LicenseState {
 
     /// The 32-byte model decryption key — ONLY when the license is Valid and not revoked.
     pub fn unwrap_model_key(&self, kek: &[u8; 32]) -> Option<[u8; 32]> {
-        if self.is_revoked() { return None; }
+        if self.effective_status() != LicenseStatus::Valid { return None; }
         let s = self.snapshot();
-        if s.status != LicenseStatus::Valid { return None; }
         let wrapped = s.wrapped_model_key.as_ref()?;
         let lic_id = s.lic_id.as_ref()?;
         let aad = format!("{lic_id}:model");
@@ -129,14 +192,24 @@ impl LicenseState {
 
     /// The per-deployment attestation signing key — Valid license only, never when revoked.
     pub fn unwrap_attestation_key(&self, kek: &[u8; 32]) -> Option<ed25519_dalek::SigningKey> {
-        if self.is_revoked() { return None; }
+        if self.effective_status() != LicenseStatus::Valid { return None; }
         let s = self.snapshot();
-        if s.status != LicenseStatus::Valid { return None; }
         let wrapped = s.wrapped_attestation_key.as_ref()?;
         let lic_id = s.lic_id.as_ref()?;
         let bytes = sp_license::unwrap_key_with_aad(kek, wrapped, format!("{lic_id}:attest").as_bytes()).ok()?;
         let arr: [u8; 32] = bytes.try_into().ok()?;
         Some(ed25519_dalek::SigningKey::from_bytes(&arr))
+    }
+}
+
+/// Advance an `AtomicI64` to at least `v`, monotonically (compare-exchange loop).
+fn bump_max(cell: &AtomicI64, v: i64) {
+    let mut cur = cell.load(Ordering::SeqCst);
+    while v > cur {
+        match cell.compare_exchange(cur, v, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
     }
 }
 
@@ -313,7 +386,7 @@ mod tests {
     #[test]
     fn feature_and_seat_gates_fail_open() {
         // Valid: enforces
-        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None, image_digests: Default::default() });
+        let valid = LicenseState::new(LicenseSnapshot { status: LicenseStatus::Valid, max_seats: Some(5), features: vec!["a".into()], customer_name: None, expires_at: None, wrapped_model_key: None, lic_id: None, wrapped_attestation_key: None, image_digests: Default::default(), revalidate_soft_secs: None, revalidate_hard_secs: None, not_before_epoch: None });
         assert_eq!(valid.max_seats(), Some(5));
         assert!(valid.is_feature_enabled("a"));
         assert!(!valid.is_feature_enabled("b"));
@@ -336,6 +409,9 @@ mod tests {
             lic_id: Some("lic-1".into()),
             wrapped_attestation_key: None,
             image_digests: Default::default(),
+            revalidate_soft_secs: None,
+            revalidate_hard_secs: None,
+            not_before_epoch: None,
         });
         assert!(!st.is_revoked());
         assert_eq!(st.status(), LicenseStatus::Valid);
@@ -361,6 +437,9 @@ mod tests {
             lic_id: Some("lic-1".into()),
             wrapped_attestation_key: None,
             image_digests: Default::default(),
+            revalidate_soft_secs: None,
+            revalidate_hard_secs: None,
+            not_before_epoch: None,
         });
         assert!(st.is_revoked());
         assert_eq!(st.status(), LicenseStatus::Revoked);
@@ -519,6 +598,9 @@ mod tests {
             lic_id: None,
             wrapped_attestation_key: None,
             image_digests: digests,
+            revalidate_soft_secs: None,
+            revalidate_hard_secs: None,
+            not_before_epoch: None,
         };
         let state = LicenseState::new(snap);
 
@@ -555,5 +637,59 @@ mod tests {
         let s2 = load_and_verify_token(&token2, &sk.verifying_key(), now());
         assert_eq!(s2.status, LicenseStatus::Grace);
         assert!(s2.image_digests.is_empty());
+    }
+
+    // ── Overlay tests ────────────────────────────────────────────────────────
+
+    fn valid_snap_with_policy() -> LicenseSnapshot {
+        let mut s = LicenseSnapshot::unlicensed();
+        s.status = LicenseStatus::Valid;
+        s.lic_id = Some("lic-1".into());
+        s.revalidate_soft_secs = Some(100);
+        s.revalidate_hard_secs = Some(300);
+        s.not_before_epoch = Some(1000);
+        s
+    }
+
+    #[test]
+    fn fresh_stays_valid() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        st.set_freshness(1000, 1080, 1080); // offline 80 ≤ soft
+        assert_eq!(st.effective_status(), LicenseStatus::Valid);
+        assert!(!st.is_hard_stale());
+    }
+
+    #[test]
+    fn soft_stale_degrades_to_unlicensed_not_revoked() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        st.set_freshness(1000, 1200, 1200); // offline 200
+        assert_eq!(st.effective_status(), LicenseStatus::Unlicensed);
+        assert!(!st.is_hard_stale());
+        assert!(!st.is_revoked()); // staleness must NOT trip the sticky flag
+    }
+
+    #[test]
+    fn hard_stale_reports_hard_stale() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        st.set_freshness(1000, 1400, 1400); // offline 400 > hard
+        assert!(st.is_hard_stale());
+    }
+
+    #[test]
+    fn recovers_when_fresh_assertion_arrives() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        st.set_freshness(1000, 1400, 1400);
+        assert!(st.is_hard_stale());
+        st.set_freshness(1390, 1400, 1400); // new assertion at 1390 → offline 10
+        assert_eq!(st.effective_status(), LicenseStatus::Valid);
+        assert!(!st.is_hard_stale());
+    }
+
+    #[test]
+    fn revoked_still_overrides_everything() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        st.set_freshness(1000, 1010, 1010); // fresh
+        st.mark_revoked();
+        assert_eq!(st.effective_status(), LicenseStatus::Revoked);
     }
 }

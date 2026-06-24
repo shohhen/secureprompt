@@ -82,6 +82,9 @@ fn build_app_with_seat_limit(pool: PgPool, seats: u32) -> axum::Router {
         lic_id: None,
         wrapped_attestation_key: None,
         image_digests: Default::default(),
+        revalidate_soft_secs: None,
+        revalidate_hard_secs: None,
+        not_before_epoch: None,
     });
     build_router(AppState::new(
         pool,
