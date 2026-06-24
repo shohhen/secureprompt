@@ -1,13 +1,15 @@
-//! Fail-closed license gate. When the online revocation poller has confirmed the
-//! license is revoked (`LicenseState::is_revoked()`), this middleware blocks the
-//! request pipeline with `403`.
+//! Fail-closed license gate. When the license is revoked
+//! (`LicenseState::is_revoked()`) OR hard-stale — the offline revalidation budget
+//! is exhausted (`LicenseState::is_hard_stale()`) — this middleware blocks the
+//! data plane with `403`. Soft-stale is fail-open: it only withholds the model
+//! key elsewhere and keeps serving (see `license`).
 //!
-//! Revocation is the ONE place the gateway is fail-closed — everywhere else a
-//! license problem degrades to regex-only and keeps serving (see `license`).
-//! A small allowlist stays open so a revoked deployment isn't bricked: the
-//! operator can still reach health/observability and the auth endpoints to log
-//! in, see the "revoked" state, and install a fresh license. Everything else —
-//! the entire data plane and dashboard API — returns 403.
+//! These are the gateway's fail-closed conditions — everywhere else a license
+//! problem degrades to regex-only and keeps serving. A small allowlist stays open
+//! so a blocked deployment isn't bricked: the operator can still reach
+//! health/observability and the auth endpoints to log in, see the state, and
+//! install / revalidate a license. Everything else — the entire data plane and
+//! dashboard API — returns 403.
 
 use axum::{
     extract::{Request, State},
@@ -47,7 +49,7 @@ pub async fn enforce(State(state): State<AppState>, req: Request, next: Next) ->
         } else {
             "license requires revalidation — gateway could not reach the license server"
         };
-        tracing::warn!(path = %path, revoked = state.license.is_revoked(), "request blocked by license gate");
+        tracing::warn!(path = %path, revoked = state.license.is_revoked(), hard_stale = state.license.is_hard_stale(), reason, "request blocked by license gate");
         return api_error_response(ApiError::Forbidden(reason.into()));
     }
     next.run(req).await
@@ -63,6 +65,7 @@ mod tests {
         assert!(should_block(/*revoked*/ true,  /*hard_stale*/ false, "/v1/redact"));
         assert!(!should_block(false, true, "/health"));          // allowlist still open
         assert!(!should_block(false, false, "/v1/chat/completions")); // healthy → pass
+        assert!(should_block(true, true, "/v1/chat/completions")); // both → blocked (revoked reason wins in enforce)
     }
 
     #[test]
