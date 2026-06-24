@@ -152,8 +152,10 @@ impl LicenseState {
         }
     }
 
-    /// Effective status using an injected clock — for tests or callers that need
-    /// a deterministic "what would the verdict be at time T?" query.
+    /// Effective status using an injected clock — for deterministic tests
+    /// ("what would the verdict be at time T?"). Test-only; prod uses the live-clock
+    /// `effective_status`.
+    #[cfg(test)]
     pub(crate) fn effective_status_at(&self, now: i64) -> LicenseStatus {
         if self.is_revoked() { return LicenseStatus::Revoked; }
         let s = self.snapshot();
@@ -173,7 +175,8 @@ impl LicenseState {
             && matches!(self.offline_verdict(&s), freshness::OfflineVerdict::HardStale)
     }
 
-    /// Hard-stale with an injected clock — for tests.
+    /// Hard-stale with an injected clock — test-only; prod uses `is_hard_stale`.
+    #[cfg(test)]
     pub(crate) fn is_hard_stale_at(&self, now: i64) -> bool {
         if self.is_revoked() { return false; }
         let s = self.snapshot();
