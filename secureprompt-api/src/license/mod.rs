@@ -73,12 +73,13 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
         lic_id: if valid { Some(lic.lic_id.clone()) } else { None },
         wrapped_attestation_key: if valid { Some(lic.deployment.wrapped_attestation_key.clone()) } else { None },
         image_digests: if valid { lic.integrity.image_digests.clone() } else { std::collections::BTreeMap::new() },
-        // Task 6 will populate these from lic.entitlements.revalidate_* once the
-        // sp-license crate tag that adds those fields is available.  For now the
-        // overlay stays inert (None budgets ⇒ always Fresh).
-        revalidate_soft_secs: None,
-        revalidate_hard_secs: None,
-        not_before_epoch: None,
+        // Offline-revalidation budgets from the signed token.  Read regardless of
+        // Valid/Grace so the overlay has an anchor even while the license is expired.
+        // `perceived_now` stays 0 until the poller calls `set_freshness` (Task 7),
+        // so the overlay remains inert in production until that poller runs.
+        revalidate_soft_secs: lic.entitlements.revalidate_soft_secs.map(|v| v as i64),
+        revalidate_hard_secs: lic.entitlements.revalidate_hard_secs.map(|v| v as i64),
+        not_before_epoch: parse_rfc3339(&lic.entitlements.not_before).ok(),
     }
 }
 
@@ -617,6 +618,95 @@ mod tests {
 
         // No actual digest → empty (fail-open).
         assert!(state.tamper_flags("api", "").is_empty());
+    }
+
+    // ── Task 6: snapshot_from carries revalidation budgets from the token ────
+
+    fn mint_with_budgets(
+        sk: &SigningKey,
+        not_before: &str,
+        expires: &str,
+        soft: Option<u64>,
+        hard: Option<u64>,
+    ) -> LicenseEnvelope {
+        let lic = License {
+            v: 1, lic_id: "test-lic-budget".into(),
+            customer: Customer { id: "c".into(), name: "Acme".into() },
+            deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(), wrapped_attestation_key: String::new() },
+            entitlements: Entitlements {
+                not_before: not_before.into(), expires_at: expires.into(),
+                seats: 10, features: vec![], components: vec![],
+                revalidate_soft_secs: soft,
+                revalidate_hard_secs: hard,
+            },
+            model: ModelGrant { wrapped_key: "w".into(), models: vec![] },
+            integrity: Integrity { image_digests: BTreeMap::new() },
+            iss: "sp-admin".into(), iat: not_before.into(),
+        };
+        sign_license(&lic, sk).unwrap()
+    }
+
+    #[test]
+    fn snapshot_from_carries_revalidation_budgets() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let not_before_str = "2026-06-01T00:00:00Z";
+        let expected_nb_epoch = parse_rfc3339(not_before_str).unwrap();
+
+        // Token with explicit 14d soft / 30d hard budgets and a known not_before.
+        let token = tok(&mint_with_budgets(
+            &sk,
+            not_before_str,
+            "2027-01-01T00:00:00Z",
+            Some(1_209_600), // 14 days
+            Some(2_592_000), // 30 days
+        ));
+        // Use a `now` that is within the validity window so status == Valid.
+        let snapshot_now = parse_rfc3339("2026-09-01T00:00:00Z").unwrap();
+        let s = load_and_verify_token(&token, &sk.verifying_key(), snapshot_now);
+        assert_eq!(s.status, LicenseStatus::Valid);
+        assert_eq!(s.revalidate_soft_secs, Some(1_209_600_i64),
+            "soft budget must be carried from entitlements");
+        assert_eq!(s.revalidate_hard_secs, Some(2_592_000_i64),
+            "hard budget must be carried from entitlements");
+        assert_eq!(s.not_before_epoch, Some(expected_nb_epoch),
+            "not_before_epoch must be parsed from entitlements.not_before");
+
+        // Token with no budgets → all three overlay fields must be None.
+        let token_no_budget = tok(&mint_with_budgets(
+            &sk,
+            not_before_str,
+            "2027-01-01T00:00:00Z",
+            None,
+            None,
+        ));
+        let s2 = load_and_verify_token(&token_no_budget, &sk.verifying_key(), snapshot_now);
+        assert_eq!(s2.status, LicenseStatus::Valid);
+        assert_eq!(s2.revalidate_soft_secs, None, "absent policy: soft must be None");
+        assert_eq!(s2.revalidate_hard_secs, None, "absent policy: hard must be None");
+        // not_before_epoch should still be populated (the anchor is always needed)
+        assert_eq!(s2.not_before_epoch, Some(expected_nb_epoch),
+            "not_before_epoch must be populated even when budgets are None");
+    }
+
+    #[test]
+    fn snapshot_from_carries_budgets_in_grace_too() {
+        // Budgets must be read even when the license is in Grace (expired window).
+        let sk = SigningKey::generate(&mut OsRng);
+        let not_before_str = "2025-01-01T00:00:00Z";
+        let expected_nb_epoch = parse_rfc3339(not_before_str).unwrap();
+        let token = tok(&mint_with_budgets(
+            &sk,
+            not_before_str,
+            "2025-06-01T00:00:00Z", // expired
+            Some(604_800),  // 7 days
+            Some(1_209_600), // 14 days
+        ));
+        // `now()` is 2026-06-01, which is past expiry → Grace
+        let s = load_and_verify_token(&token, &sk.verifying_key(), now());
+        assert_eq!(s.status, LicenseStatus::Grace);
+        assert_eq!(s.revalidate_soft_secs, Some(604_800_i64));
+        assert_eq!(s.revalidate_hard_secs, Some(1_209_600_i64));
+        assert_eq!(s.not_before_epoch, Some(expected_nb_epoch));
     }
 
     #[test]
