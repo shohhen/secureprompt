@@ -284,34 +284,46 @@ async fn main() -> anyhow::Result<()> {
     if let Some(server_url) = config.license.license_server_url.clone() {
         let st = std::sync::Arc::clone(&state.license);
         let secs = config.license.revocation_check_secs;
-        tokio::spawn(async move {
-            let client = reqwest::Client::new();
-            let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
-            tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
-            loop {
-                t.tick().await; // first tick is immediate — check promptly at startup
-                if st.is_revoked() {
-                    return; // terminal: vendor never un-revokes, stop polling
-                }
-                // lic_id is only present while the local file verifies (Valid).
-                let lic_id = match st.snapshot().lic_id {
-                    Some(id) => id,
-                    None => continue,
-                };
-                match secureprompt_api::license::revocation::check(&client, &server_url, &lic_id).await {
-                    secureprompt_api::license::revocation::RevocationVerdict::Revoked => {
-                        st.mark_revoked();
-                        tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403)");
-                        return;
+        // Derive the vendor verifying key once before the loop; if it's absent
+        // the poller cannot verify signed assertions so we skip polling entirely.
+        let poller_pubkey = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
+        let poller_vk = secureprompt_api::license::parse_vendor_key(&poller_pubkey);
+        if let Some(vk) = poller_vk {
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
+                tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
+                loop {
+                    t.tick().await; // first tick is immediate — check promptly at startup
+                    if st.is_revoked() {
+                        return; // terminal: vendor never un-revokes, stop polling
                     }
-                    secureprompt_api::license::revocation::RevocationVerdict::Active => {
-                        tracing::debug!(lic_id, "revocation check: license active");
+                    // lic_id is only present while the local file verifies (Valid).
+                    let lic_id = match st.snapshot().lic_id {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    let (verdict, _issued_at) = secureprompt_api::license::revocation::check(
+                        &client, &server_url, &lic_id, &vk,
+                    ).await;
+                    // _issued_at intentionally unused here — freshness persistence is Task 7.
+                    match verdict {
+                        secureprompt_api::license::revocation::RevocationVerdict::Revoked => {
+                            st.mark_revoked();
+                            tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403)");
+                            return;
+                        }
+                        secureprompt_api::license::revocation::RevocationVerdict::Active => {
+                            tracing::debug!(lic_id, "revocation check: license active");
+                        }
+                        // Unknown already logged inside check() — keep last-known state.
+                        secureprompt_api::license::revocation::RevocationVerdict::Unknown => {}
                     }
-                    // Unknown already logged inside check() — keep last-known state.
-                    secureprompt_api::license::revocation::RevocationVerdict::Unknown => {}
                 }
-            }
-        });
+            });
+        } else {
+            tracing::warn!("online revocation checks configured but vendor key is absent/invalid — poller disabled");
+        }
     }
 
     // Attestation heartbeat uploader (best-effort). Only runs when a license

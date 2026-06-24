@@ -306,6 +306,7 @@ mod tests {
             entitlements: Entitlements {
                 not_before: not_before.into(), expires_at: expires.into(),
                 seats, features: features.iter().map(|s| s.to_string()).collect(), components: vec![],
+                revalidate_soft_secs: None, revalidate_hard_secs: None,
             },
             model: ModelGrant { wrapped_key: "w".into(), models: vec![] },
             integrity: Integrity { image_digests: BTreeMap::new() },
@@ -468,7 +469,7 @@ mod tests {
             v: 1, lic_id: lic_id.into(),
             customer: Customer { id: "c".into(), name: "Acme".into() },
             deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(), wrapped_attestation_key: String::new() },
-            entitlements: Entitlements { not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(), seats: 5, features: vec![], components: vec![] },
+            entitlements: Entitlements { not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(), seats: 5, features: vec![], components: vec![], revalidate_soft_secs: None, revalidate_hard_secs: None },
             model: ModelGrant { wrapped_key: wrapped, models: vec![] },
             integrity: Integrity { image_digests: BTreeMap::new() },
             iss: "sp-admin".into(), iat: "2026-01-01T00:00:00Z".into(),
@@ -512,6 +513,7 @@ mod tests {
             entitlements: Entitlements {
                 not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(),
                 seats: 5, features: vec![], components: vec![],
+                revalidate_soft_secs: None, revalidate_hard_secs: None,
             },
             model: ModelGrant { wrapped_key: "w".into(), models: vec![] },
             integrity: Integrity { image_digests: BTreeMap::new() },
