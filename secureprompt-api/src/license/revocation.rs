@@ -77,6 +77,13 @@ pub async fn check(
     let assertion_val = body.get("assertion");
     let sig_val = body.get("sig").and_then(|s| s.as_str());
 
+    // Rollout/observability: an assertion present without a usable signature is a
+    // misconfigured signer. We treat it as unsigned (no freshness credit) below, but
+    // surface it so the §4.5 signed-assertion rollout gap is visible.
+    if assertion_val.is_some() && sig_val.is_none() {
+        tracing::warn!("revocation check: response has 'assertion' but no 'sig' — treating as unsigned (no freshness credit); verify admin signing config");
+    }
+
     if let (Some(av), Some(sig_str)) = (assertion_val, sig_val) {
         // Attempt to deserialise the assertion.
         let assertion: FreshnessAssertion = match serde_json::from_value(av.clone()) {
