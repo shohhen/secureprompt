@@ -9,7 +9,7 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, ApiError } from "@/lib/api-fetch";
 
 export type LicenseStatusValue = "Valid" | "Grace" | "Unlicensed" | "Revoked";
 export type LicenseSource = "db" | "env" | "none";
@@ -34,7 +34,7 @@ export function useLicense() {
 
 export function useActivateLicense() {
   const qc = useQueryClient();
-  return useMutation<LicenseStatus, Error, { token: string }>({
+  return useMutation<LicenseStatus, ApiError, { token: string }>({
     mutationFn: (body) =>
       apiFetch<LicenseStatus>("/v1/license", { method: "PUT", body }),
     onSuccess: () => qc.invalidateQueries({ queryKey: LICENSE_QUERY_KEY }),
@@ -43,7 +43,7 @@ export function useActivateLicense() {
 
 export function useRemoveLicense() {
   const qc = useQueryClient();
-  return useMutation<LicenseStatus, Error, void>({
+  return useMutation<LicenseStatus, ApiError, void>({
     mutationFn: () => apiFetch<LicenseStatus>("/v1/license", { method: "DELETE" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: LICENSE_QUERY_KEY }),
   });

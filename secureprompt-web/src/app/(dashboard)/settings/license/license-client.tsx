@@ -56,7 +56,7 @@ export function LicenseClient() {
   const { data: session } = useSession();
   const writable = canWrite(session?.role);
 
-  const { data: license, isLoading } = useLicense();
+  const { data: license, isLoading, error } = useLicense();
   const activate = useActivateLicense();
   const remove = useRemoveLicense();
 
@@ -106,6 +106,12 @@ export function LicenseClient() {
       <div className="rounded-lg border p-5 space-y-4">
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading license status…</p>
+        ) : error ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error instanceof ApiError && error.status === 403
+              ? "You need owner or admin access to view license status."
+              : "Could not load license status."}
+          </p>
         ) : license ? (
           <>
             <div className="flex items-center gap-3">
