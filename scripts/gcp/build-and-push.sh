@@ -17,8 +17,8 @@ fi
 docker buildx inspect --bootstrap >/dev/null
 
 build_push() {
-  local name="$1" dockerfile="$2" context="${3:-.}"
-  local image="${IMAGE_PREFIX}/${name}:${IMAGE_TAG}"
+  local name="$1" dockerfile="$2" context="${3:-.}" tag="${4:-${IMAGE_TAG}}"
+  local image="${IMAGE_PREFIX}/${name}:${tag}"
   echo
   echo "==> Building ${name} -> ${image}"
   docker buildx build \
@@ -33,7 +33,7 @@ build_push() {
 
 # Order matters only for caching speed; everything is independent.
 build_push "librechat"  "secureprompt-chat/Dockerfile" "secureprompt-chat"
-build_push "web"        "secureprompt-web/Dockerfile"
+build_push "web"        "secureprompt-web/Dockerfile" "."  "${WEB_IMAGE_TAG}"
 build_push "ml"         "secureprompt-ml/Dockerfile"
 build_push "api"        "secureprompt-api/Dockerfile"
 build_push "worker"     "secureprompt-worker/Dockerfile"
