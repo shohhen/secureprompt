@@ -58,6 +58,18 @@ RUN pip install --no-cache-dir "cython>=3.0,<3.1" "setuptools>=68"
 COPY secureprompt-ml/app ./app
 COPY secureprompt-ml/cython_build.py ./cython_build.py
 
+# Bake the MODEL-KEK into the compiled keyloader. This is the key-encryption-key
+# that unwraps each license's sealed model key (license model.wrapped_key) — it is
+# NOT the weight-encryption key model_key.hex from the header. No default: it must
+# be supplied via a protected CI variable and is never committed (the in-repo
+# app/crypto/_keyconst.py ships empty). The generated _keyconst.py below is
+# Cython-compiled to a .so and its source stripped by cython_build.py, so the KEK
+# exists only inside the compiled binary in the final image.
+ARG SECUREPROMPT_PINNED_MODEL_KEK
+RUN test -n "$SECUREPROMPT_PINNED_MODEL_KEK" \
+    || (echo "ERROR: SECUREPROMPT_PINNED_MODEL_KEK build-arg is required" && exit 1)
+RUN printf 'MODEL_KEK_B64 = "%s"\n' "$SECUREPROMPT_PINNED_MODEL_KEK" > app/crypto/_keyconst.py
+
 RUN python cython_build.py
 
 # ---- Stage 3: minimal runtime (no .py sources, no .pyc) ----
