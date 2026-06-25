@@ -206,17 +206,6 @@ impl LicenseState {
         }
     }
 
-    /// The 32-byte model decryption key — ONLY when the license is Valid and not revoked.
-    pub fn unwrap_model_key(&self, kek: &[u8; 32]) -> Option<[u8; 32]> {
-        if self.effective_status() != LicenseStatus::Valid { return None; }
-        let s = self.snapshot();
-        let wrapped = s.wrapped_model_key.as_ref()?;
-        let lic_id = s.lic_id.as_ref()?;
-        let aad = format!("{lic_id}:model");
-        let bytes = sp_license::unwrap_key_with_aad(kek, wrapped, aad.as_bytes()).ok()?;
-        bytes.try_into().ok()
-    }
-
     /// Returns tamper flags if the running image digest mismatches the license's pinned digest.
     /// Fail-open: returns empty vec when no pin or no actual digest.
     pub fn tamper_flags(&self, component: &str, actual: &str) -> Vec<String> {
@@ -283,9 +272,11 @@ pub fn effective_vendor_pubkey(runtime_b64: &str) -> String {
         .unwrap_or_else(|| runtime_b64.to_string())
 }
 
-/// Same for the symmetric KEK.
-pub fn effective_kek(runtime_b64: &str) -> String {
-    option_env!("SECUREPROMPT_PINNED_MODEL_KEK")
+/// Prefer a compile-time-pinned ATTEST-KEK (base64) baked in via the
+/// SECUREPROMPT_PINNED_ATTEST_KEK build-time env; fall back to the runtime value.
+/// The gateway holds ONLY the ATTEST-KEK; the MODEL-KEK lives in the ML sidecar.
+pub fn effective_attest_kek(runtime_b64: &str) -> String {
+    option_env!("SECUREPROMPT_PINNED_ATTEST_KEK")
         .map(str::to_string)
         .unwrap_or_else(|| runtime_b64.to_string())
 }
@@ -473,7 +464,6 @@ mod tests {
         assert_eq!(st.status(), LicenseStatus::Revoked); // overrides snapshot
         assert!(!st.is_feature_enabled("pii.uz")); // fail-closed
         assert_eq!(st.max_seats(), None);
-        assert_eq!(st.unwrap_model_key(&[0u8; 32]), None);
         assert!(st.unwrap_attestation_key(&[0u8; 32]).is_none());
 
         // Sticky: a fresh local re-verify (snapshot swap to Valid) must NOT clear it.
@@ -504,32 +494,33 @@ mod tests {
         assert!(parse_vendor_key("not-base64!!").is_none());
     }
 
+    /// Gateway now relays the wrapped blob rather than unwrapping it.
+    /// Valid license → snapshot carries `wrapped_model_key` and `lic_id`; Grace → both None.
     #[test]
-    fn unwrap_model_key_only_when_valid() {
-        use sp_license::seal_key_with_aad;
+    fn wrapped_model_key_present_only_when_valid() {
         let sk = SigningKey::generate(&mut OsRng);
-        let kek = [3u8; 32];
-        let model_key = [7u8; 32];
         let lic_id = "mk-test";
-        let wrapped = seal_key_with_aad(&kek, &model_key, format!("{lic_id}:model").as_bytes()).unwrap();
         let base = License {
             v: 1, lic_id: lic_id.into(),
             customer: Customer { id: "c".into(), name: "Acme".into() },
             deployment: Deployment { scope: "single-node".into(), max_nodes: 1, sign_pubkey: "p".into(), wrapped_attestation_key: String::new() },
             entitlements: Entitlements { not_before: "2026-01-01T00:00:00Z".into(), expires_at: "2027-01-01T00:00:00Z".into(), seats: 5, features: vec![], components: vec![], revalidate_soft_secs: None, revalidate_hard_secs: None },
-            model: ModelGrant { wrapped_key: wrapped, models: vec![] },
+            model: ModelGrant { wrapped_key: "opaque-wrapped-blob".into(), models: vec![] },
             integrity: Integrity { image_digests: BTreeMap::new() },
             iss: "sp-admin".into(), iat: "2026-01-01T00:00:00Z".into(),
         };
-        // Valid → unwraps to the original key
+        // Valid → snapshot carries wrapped_model_key and lic_id (for relay)
         let env = sign_license(&base, &sk).unwrap();
         let token = tok(&env);
         let st = LicenseState::new(load_and_verify_token(&token, &sk.verifying_key(), now()));
         assert_eq!(st.status(), LicenseStatus::Valid);
-        assert_eq!(st.unwrap_model_key(&kek), Some(model_key));
-        assert_eq!(st.unwrap_model_key(&[9u8; 32]), None);
+        let snap = st.snapshot();
+        assert_eq!(snap.wrapped_model_key.as_deref(), Some("opaque-wrapped-blob"),
+            "Valid license must carry wrapped blob for relay");
+        assert_eq!(snap.lic_id.as_deref(), Some(lic_id),
+            "Valid license must carry lic_id for relay");
 
-        // Expired (Grace) → None even with the right KEK
+        // Expired (Grace) → wrapped_model_key and lic_id are None (no relay)
         let mut exp_lic = base.clone();
         exp_lic.entitlements.not_before = "2025-01-01T00:00:00Z".into();
         exp_lic.entitlements.expires_at = "2025-02-01T00:00:00Z".into();
@@ -537,7 +528,9 @@ mod tests {
         let token2 = tok(&env2);
         let st2 = LicenseState::new(load_and_verify_token(&token2, &sk.verifying_key(), now()));
         assert_eq!(st2.status(), LicenseStatus::Grace);
-        assert_eq!(st2.unwrap_model_key(&kek), None);
+        let snap2 = st2.snapshot();
+        assert!(snap2.wrapped_model_key.is_none(), "Grace license must not carry wrapped blob");
+        assert!(snap2.lic_id.is_none(), "Grace license must not carry lic_id");
     }
 
     #[test]
@@ -602,9 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn effective_kek_falls_back_to_runtime() {
+    fn effective_attest_kek_falls_back_to_runtime() {
         // Build env is unset in tests → must return the runtime value.
-        assert_eq!(effective_kek("RT"), "RT");
+        assert_eq!(effective_attest_kek("RT"), "RT");
     }
 
     #[test]

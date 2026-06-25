@@ -80,7 +80,7 @@ fn build_app_with_keys(pool: PgPool, sk: &SigningKey) -> (AppState, Router) {
         license: LicenseConfig {
             pubkey_b64: vk_b64,
             license_token: String::new(),
-            model_kek_b64: String::new(),
+            attest_kek_b64: String::new(),
             internal_token: String::new(),
             recheck_secs: 3600,
             license_server_url: None,
@@ -89,6 +89,67 @@ fn build_app_with_keys(pool: PgPool, sk: &SigningKey) -> (AppState, Router) {
         },
     };
     let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    let state = AppState::new(
+        pool,
+        config,
+        ml,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    );
+    let router = build_router(state.clone());
+    (state, router)
+}
+
+/// Build a test app with a known vendor signing keypair, a real internal token,
+/// and a custom ML sidecar base URL (for mock-sidecar tests).
+fn build_app_with_sidecar(
+    pool: PgPool,
+    sk: &SigningKey,
+    ml_base_url: &str,
+    internal_token: &str,
+) -> (AppState, Router) {
+    let vk_b64 = B64.encode(sk.verifying_key().to_bytes());
+    let config = AppConfig {
+        database: DatabaseConfig {
+            url: "postgres://unused".into(),
+            max_connections: 1,
+        },
+        redis: AppRedisConfig {
+            url: redis_url(),
+            max_connections: 4,
+        },
+        telemetry: TelemetryConfig {
+            otel_enabled: false,
+            prometheus_enabled: false,
+            log_level: "info".into(),
+        },
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+        },
+        clickhouse: ClickhouseConfig {
+            url: "http://localhost:8123".into(),
+            database: "default".into(),
+        },
+        jwt: JwtConfig {
+            secret: TEST_JWT_SECRET.into(),
+            access_ttl_secs: 900,
+            refresh_ttl_secs: 3600,
+        },
+        public_signup_enabled: false,
+        chat_debug_mode: false,
+        redact_when_no_rules: false,
+        license: LicenseConfig {
+            pubkey_b64: vk_b64,
+            license_token: String::new(),
+            attest_kek_b64: String::new(),
+            internal_token: internal_token.to_owned(),
+            recheck_secs: 3600,
+            license_server_url: None,
+            revocation_check_secs: 3600,
+            attestation_interval_secs: 3600,
+        },
+    };
+    let ml = Arc::new(MlSidecarClient::new(ml_base_url.to_owned(), 5000));
     let state = AppState::new(
         pool,
         config,
@@ -474,4 +535,136 @@ async fn unauthenticated_401(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Mint a compact license token with a specific wrapped_key blob and lic_id.
+/// Returns `(compact_token, lic_id)`.
+fn mint_valid_token_with_wrapped_key(sk: &SigningKey, wrapped_key: &str) -> (String, String) {
+    let lic_id = Uuid::new_v4().to_string();
+    let lic = License {
+        v: 1,
+        lic_id: lic_id.clone(),
+        customer: Customer {
+            id: "test-customer".into(),
+            name: "Acme Corp".into(),
+        },
+        deployment: Deployment {
+            scope: "single-node".into(),
+            max_nodes: 1,
+            sign_pubkey: "p".into(),
+            wrapped_attestation_key: String::new(),
+        },
+        entitlements: Entitlements {
+            not_before: "2000-01-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            seats: 10,
+            features: vec![],
+            components: vec![],
+            revalidate_soft_secs: None,
+            revalidate_hard_secs: None,
+        },
+        model: ModelGrant {
+            wrapped_key: wrapped_key.to_owned(),
+            models: vec![],
+        },
+        integrity: Integrity {
+            image_digests: BTreeMap::new(),
+        },
+        iss: "sp-admin".into(),
+        iat: "2000-01-01T00:00:00Z".into(),
+    };
+    let env = sign_license(&lic, sk).expect("sign license");
+    let token = envelope_to_token(&env).expect("encode token");
+    (token, lic_id)
+}
+
+/// Task 4: activating a Valid license relays `{wrapped_key, lic_id}` to the
+/// sidecar — NOT plaintext and NOT `key_hex`. The gateway must never unwrap
+/// the model blob; it forwards the opaque ciphertext as-is.
+#[sqlx::test]
+async fn activation_relays_wrapped_blob_not_plaintext(pool: PgPool) {
+    use axum::{routing::post, Json as AxumJson};
+    use std::sync::Mutex;
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    // 1. Spawn a tiny mock sidecar that captures the POST body and returns 200.
+    let captured_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = Arc::clone(&captured_body);
+
+    let mock_app = axum::Router::new().route(
+        "/internal/model-key",
+        post(move |AxumJson(body): AxumJson<serde_json::Value>| {
+            let cap = Arc::clone(&captured_clone);
+            async move {
+                *cap.lock().unwrap() = Some(body);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+
+    let mock_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_base_url = format!("http://{mock_addr}");
+
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    // Give the mock a moment to start.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 2. Build the gateway app pointing its ML sidecar at the mock.
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await.unwrap();
+    let (_, router) = build_app_with_sidecar(pool.clone(), &sk, &mock_base_url, "test-token");
+    let jwt = mint_jwt(ws, user, "admin");
+
+    // 3. Mint a Valid token whose model.wrapped_key is a known opaque blob.
+    let expected_wrapped = "c2VjcmV0LXdyYXBwZWQtYmxvYi1vcGFxdWU="; // base64 of some bytes
+    let (compact_token, expected_lic_id) = mint_valid_token_with_wrapped_key(&sk, expected_wrapped);
+
+    // PUT /v1/license to activate and trigger the relay.
+    let resp = put_req(
+        &router,
+        "/v1/license",
+        json!({"token": compact_token}),
+        &jwt,
+    )
+    .await;
+    let (status, body) = read_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "PUT must succeed: {body}");
+
+    // Small sleep to allow the async best_effort_push to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 4. Assert the mock received the right payload.
+    let captured: serde_json::Value = captured_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock sidecar must have received a POST /internal/model-key");
+
+    // Must have a non-empty wrapped_key equal to the blob from the token.
+    assert!(
+        captured.get("wrapped_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some(),
+        "relayed body must have a non-empty 'wrapped_key': {captured}"
+    );
+    assert_eq!(
+        captured["wrapped_key"],
+        serde_json::json!(expected_wrapped),
+        "relayed wrapped_key must equal the token's model.wrapped_key: {captured}"
+    );
+
+    // Must have lic_id matching the token's lic_id.
+    assert_eq!(
+        captured["lic_id"],
+        serde_json::json!(expected_lic_id),
+        "relayed lic_id must match the token's lic_id: {captured}"
+    );
+
+    // Must NOT have key_hex — no plaintext key, no MODEL-KEK unwrap.
+    assert!(
+        captured.get("key_hex").is_none(),
+        "relayed body must NOT contain 'key_hex' (no plaintext key): {captured}"
+    );
 }

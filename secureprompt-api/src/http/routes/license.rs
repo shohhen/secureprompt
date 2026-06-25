@@ -26,7 +26,7 @@ use crate::{
         routes::dashboard::role::require_role,
     },
     license::{
-        effective_kek, effective_vendor_pubkey, load_and_verify_token, parse_kek, parse_vendor_key,
+        effective_vendor_pubkey, load_and_verify_token, parse_vendor_key,
         resolve_active_token, LicenseStatus,
     },
 };
@@ -105,24 +105,22 @@ fn vendor_key(state: &AppState) -> Result<VerifyingKey, axum::response::Response
     })
 }
 
-/// Best-effort model-key re-push after a license swap. Errors are
-/// logged at warn level — they never fail the caller's response.
+/// Best-effort relay of the wrapped model blob after a license swap.
+/// The gateway forwards the ciphertext as-is; the sidecar owns the MODEL-KEK.
+/// Errors are logged at warn level — they never fail the caller's response.
 async fn best_effort_push(state: &AppState) {
-    let kek_b64 = effective_kek(&state.config.license.model_kek_b64);
-    let Some(kek) = parse_kek(&kek_b64) else {
-        return;
-    };
     let internal_token = &state.config.license.internal_token;
     if internal_token.is_empty() {
         return;
     }
-    if let Some(key) = state.license.unwrap_model_key(&kek) {
+    let snap = state.license.snapshot();
+    if let (Some(w), Some(lic)) = (snap.wrapped_model_key.as_ref(), snap.lic_id.as_ref()) {
         let _ = state
             .ml_sidecar
-            .push_model_key(&key, internal_token)
+            .push_wrapped_model_key(w, lic, internal_token)
             .await
             .map_err(|e| {
-                tracing::warn!(error = %e, "best-effort model-key push failed (ignored)");
+                tracing::warn!(error = %e, "best-effort wrapped model-key push failed (ignored)");
             });
     }
 }

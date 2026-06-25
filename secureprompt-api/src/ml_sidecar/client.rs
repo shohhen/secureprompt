@@ -257,7 +257,11 @@ impl MlSidecarClient {
         }
     }
 
-    /// Push the model decryption key to the sidecar. Best-effort, fail-open.
+    /// Relay the still-wrapped model blob to the sidecar. Best-effort, fail-open.
+    ///
+    /// The gateway holds ONLY the ATTEST-KEK and never unwraps the model key —
+    /// it sends the ciphertext blob (`wrapped_b64`) and the license ID to the
+    /// sidecar, which owns the MODEL-KEK and performs the actual unwrap.
     ///
     /// Independent of the circuit breaker — this is a one-shot internal call
     /// that MUST NOT affect the breaker state (it's not a user-facing request).
@@ -268,9 +272,9 @@ impl MlSidecarClient {
     /// Returns `Err(String)` when the HTTP call fails or the sidecar returns
     /// a non-2xx status. The caller is responsible for logging and ignoring
     /// the error (fail-open).
-    pub async fn push_model_key(&self, key: &[u8; 32], token: &str) -> Result<(), String> {
+    pub async fn push_wrapped_model_key(&self, wrapped_b64: &str, lic_id: &str, token: &str) -> Result<(), String> {
         let url = format!("{}/internal/model-key", self.base_url);
-        let body = serde_json::json!({ "key_hex": hex::encode(key) });
+        let body = serde_json::json!({ "wrapped_key": wrapped_b64, "lic_id": lic_id });
         // Construct a short-lived client with a generous but bounded timeout.
         // We do not reuse `self.http` so this call never trips the circuit breaker.
         let client = reqwest::Client::builder()

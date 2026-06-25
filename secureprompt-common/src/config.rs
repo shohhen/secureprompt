@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 /// **All key material is environment-sourced.** There is no file fallback.
 /// The three env vars are:
 ///   - `SECUREPROMPT_LICENSE_PUBKEY` — base64 Ed25519 vendor public key (32 bytes).
-///   - `SECUREPROMPT_MODEL_KEK`      — base64 32-byte key-encryption key for the
-///                                     wrapped model + attestation keys.
+///   - `SECUREPROMPT_ATTEST_KEK`     — base64 32-byte key-encryption key for the
+///                                     attestation key (ATTEST-KEK only; the gateway
+///                                     never holds nor needs the MODEL-KEK).
 ///   - `SECUREPROMPT_LICENSE_TOKEN`  — the compact `base64url(payload).base64url(sig)`
 ///                                     license token (sp-license 0.2.0).
 ///
@@ -21,11 +22,13 @@ pub struct LicenseConfig {
     /// permits substitution and is a development convenience only.
     pub pubkey_b64: String,
     pub recheck_secs: u64,
-    /// base64 32-byte key-encryption key for the model decryption key.
+    /// base64 32-byte key-encryption key for the attestation key (ATTEST-KEK).
+    /// The gateway holds ONLY this KEK; the MODEL-KEK lives exclusively in the
+    /// ML sidecar. The wrapped model blob is relayed as-is to the sidecar.
     /// TODO(plan6): pin the KEK as a compile-time const alongside the vendor public key.
-    pub model_kek_b64: String,
-    /// Shared secret used when pushing the unwrapped model key to the ML sidecar's
-    /// `POST /internal/model-key` endpoint. Empty string disables the push.
+    pub attest_kek_b64: String,
+    /// Shared secret used when relaying the wrapped model blob to the ML sidecar's
+    /// `POST /internal/model-key` endpoint. Empty string disables the relay.
     /// Loaded from `ML_SIDECAR_INTERNAL_TOKEN`; empty default.
     pub internal_token: String,
     /// sp-admin base URL for online revocation checks (OCSP-style). `None` =>
@@ -46,7 +49,7 @@ impl std::fmt::Debug for LicenseConfig {
         f.debug_struct("LicenseConfig")
             .field("license_token", &"<redacted>")
             .field("pubkey_b64", &self.pubkey_b64)
-            .field("model_kek_b64", &"<redacted>")
+            .field("attest_kek_b64", &"<redacted>")
             .field("recheck_secs", &self.recheck_secs)
             .field("internal_token", &"<redacted>")
             .field("license_server_url", &self.license_server_url)
@@ -70,7 +73,7 @@ impl LicenseConfig {
         Self {
             license_token: from_env("SECUREPROMPT_LICENSE_TOKEN"),
             pubkey_b64: from_env("SECUREPROMPT_LICENSE_PUBKEY"),
-            model_kek_b64: from_env("SECUREPROMPT_MODEL_KEK"),
+            attest_kek_b64: from_env("SECUREPROMPT_ATTEST_KEK"),
             recheck_secs: std::env::var("SECUREPROMPT_LICENSE_RECHECK_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -395,7 +398,7 @@ mod tests {
 
     fn clear_license_env() {
         std::env::remove_var("SECUREPROMPT_LICENSE_PUBKEY");
-        std::env::remove_var("SECUREPROMPT_MODEL_KEK");
+        std::env::remove_var("SECUREPROMPT_ATTEST_KEK");
         std::env::remove_var("SECUREPROMPT_LICENSE_TOKEN");
     }
 
@@ -406,27 +409,27 @@ mod tests {
 
         // --- 1. All three set → all three populated. ---
         std::env::set_var("SECUREPROMPT_LICENSE_PUBKEY", "PUB");
-        std::env::set_var("SECUREPROMPT_MODEL_KEK", "KEK");
+        std::env::set_var("SECUREPROMPT_ATTEST_KEK", "KEK");
         std::env::set_var("SECUREPROMPT_LICENSE_TOKEN", "TOKEN");
         let cfg = super::LicenseConfig::from_env();
         assert_eq!(cfg.pubkey_b64, "PUB");
-        assert_eq!(cfg.model_kek_b64, "KEK");
+        assert_eq!(cfg.attest_kek_b64, "KEK");
         assert_eq!(cfg.license_token, "TOKEN");
 
         // --- 2. All unset → empty strings, no panic, no file-system reads. ---
         clear_license_env();
         let cfg = super::LicenseConfig::from_env();
         assert_eq!(cfg.pubkey_b64, "");
-        assert_eq!(cfg.model_kek_b64, "");
+        assert_eq!(cfg.attest_kek_b64, "");
         assert_eq!(cfg.license_token, "");
 
         // --- 3. Empty string is treated as unset. ---
         std::env::set_var("SECUREPROMPT_LICENSE_PUBKEY", "");
-        std::env::set_var("SECUREPROMPT_MODEL_KEK", "");
+        std::env::set_var("SECUREPROMPT_ATTEST_KEK", "");
         std::env::set_var("SECUREPROMPT_LICENSE_TOKEN", "");
         let cfg = super::LicenseConfig::from_env();
         assert_eq!(cfg.pubkey_b64, "");
-        assert_eq!(cfg.model_kek_b64, "");
+        assert_eq!(cfg.attest_kek_b64, "");
         assert_eq!(cfg.license_token, "");
 
         clear_license_env();
