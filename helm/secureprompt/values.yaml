@@ -12,7 +12,6 @@ ingress:
   # Hostnames -> services. Cert is provisioned via Google-managed cert.
   domain: "secureprompt.tech"
   hosts:
-    marketing: "secureprompt.tech"
     web: "app.secureprompt.tech"
     api: "api.secureprompt.tech"
   staticIpName: ""  # optional reserved global IP name. Leave empty for ephemeral.
@@ -67,19 +66,6 @@ web:
     apiUrl: "http://secureprompt-api"
     nextauthUrl: "https://app.secureprompt.tech"
     nextPublicApiUrl: "https://api.secureprompt.tech"
-
-marketing:
-  enabled: true
-  image:
-    repository: secureprompt/marketing
-    tag: "0.1.0"
-    pullPolicy: IfNotPresent
-  replicaCount: 1
-  resources:
-    requests: { cpu: "25m",  memory: "96Mi" }
-    limits:   { cpu: "200m", memory: "192Mi" }
-  env:
-    contactFormEndpoint: ""
 
 ml:
   enabled: true

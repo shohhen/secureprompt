@@ -9,7 +9,6 @@ metadata:
     {{- include "secureprompt.labels" . | nindent 4 }}
 spec:
   domains:
-    - {{ .Values.ingress.hosts.marketing | quote }}
     - {{ .Values.ingress.hosts.web | quote }}
     - {{ .Values.ingress.hosts.api | quote }}
     {{- if .Values.librechat.enabled }}
@@ -43,16 +42,6 @@ spec:
         {{- end }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.hosts.marketing | quote }}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ $fullName }}-marketing
-                port:
-                  number: 80
     - host: {{ .Values.ingress.hosts.web | quote }}
       http:
         paths:

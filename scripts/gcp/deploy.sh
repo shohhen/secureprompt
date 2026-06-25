@@ -70,7 +70,7 @@ if [[ "${LIBRECHAT_ENABLED}" == "true" ]]; then
 fi
 
 # Image wiring: every chart template renders `{{ global.imageRegistry }}{{ repo }}`.
-# We keep global.imageRegistry empty and point each of OUR 5 app images at its
+# We keep global.imageRegistry empty and point each of OUR 4 app images at its
 # full Artifact Registry path; the data-store images (postgres, valkey, etc.)
 # keep their public repos and pull from Docker Hub. (Setting global.imageRegistry
 # to the AR repo would both double-prefix the app repos and wrongly route the
@@ -83,7 +83,6 @@ helm upgrade --install "${RELEASE}" helm/secureprompt \
   --set api.image.repository="${IMAGE_PREFIX}/api"             --set api.image.tag="${IMAGE_TAG}" \
   --set worker.image.repository="${IMAGE_PREFIX}/worker"       --set worker.image.tag="${IMAGE_TAG}" \
   --set web.image.repository="${IMAGE_PREFIX}/web"             --set web.image.tag="${WEB_IMAGE_TAG:-${IMAGE_TAG}}" \
-  --set marketing.image.repository="${IMAGE_PREFIX}/marketing" --set marketing.image.tag="${IMAGE_TAG}" \
   --set ml.image.repository="${IMAGE_PREFIX}/ml"               --set ml.image.tag="${IMAGE_TAG}" \
   --set ingress.domain="${DOMAIN}" \
   "${HELM_LICENSE_ARGS[@]}" \

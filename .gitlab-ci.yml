@@ -70,7 +70,6 @@ build:
           - secureprompt-worker
           - secureprompt-mcp
           - secureprompt-web
-          - secureprompt-marketing
           - secureprompt-chat
           - sp-agent
   script:

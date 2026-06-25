@@ -33,7 +33,6 @@ build_push() {
 
 # Order matters only for caching speed; everything is independent.
 build_push "librechat"  "secureprompt-chat/Dockerfile" "secureprompt-chat"
-build_push "marketing"  "secureprompt-marketing/Dockerfile"
 build_push "web"        "secureprompt-web/Dockerfile"
 build_push "ml"         "secureprompt-ml/Dockerfile"
 build_push "api"        "secureprompt-api/Dockerfile"
