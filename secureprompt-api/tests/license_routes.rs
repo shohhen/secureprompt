@@ -299,12 +299,9 @@ async fn get_license_non_admin_403(pool: PgPool) -> sqlx::Result<()> {
     let viewer_id = Uuid::new_v4();
     let jwt = mint_jwt(ws, viewer_id, "viewer");
 
+    // GET is admin-gated too (same gate as PUT/DELETE) — a viewer must get 403.
     let resp = get_req(&router, "/v1/license", &jwt).await;
-    // GET does not require admin — only JWT. Viewer should still get 200.
-    // However, PUT and DELETE need admin. This test verifies the viewer
-    // cannot PUT.
-    let (get_status, _) = read_json(resp).await;
-    assert_eq!(get_status, StatusCode::OK, "GET should be 200 for any authenticated user");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "viewer GET must be 403");
 
     // PUT with viewer → 403
     let valid_token = mint_valid_token(&sk, "TestCo", &[]);

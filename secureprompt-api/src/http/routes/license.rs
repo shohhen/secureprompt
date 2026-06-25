@@ -129,11 +129,12 @@ async fn best_effort_push(state: &AppState) {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// `GET /v1/license` — current license status (any admin+).
+/// `GET /v1/license` — current license status. Admin only (same gate as PUT/DELETE).
 async fn get_license(
     State(state): State<AppState>,
-    Extension(_ctx): Extension<JwtAuthContext>,
+    Extension(ctx): Extension<JwtAuthContext>,
 ) -> Result<Json<LicenseStatusResponse>, axum::response::Response> {
+    require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
     Ok(Json(build_response(&state).await))
 }
 
