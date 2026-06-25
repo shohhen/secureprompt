@@ -126,16 +126,15 @@ async def set_model_key(req: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
     body = await req.json()
-    key_hex = body.get("key_hex") if isinstance(body, dict) else None
-    if not isinstance(key_hex, str):
-        raise HTTPException(status_code=400, detail="missing or non-string key_hex")
+    wrapped = body.get("wrapped_key") if isinstance(body, dict) else None
+    lic_id = body.get("lic_id") if isinstance(body, dict) else None
+    if not isinstance(wrapped, str) or not isinstance(lic_id, str) or not wrapped or not lic_id:
+        raise HTTPException(status_code=400, detail="missing wrapped_key or lic_id")
+    from app.crypto import keyloader
     try:
-        key = bytes.fromhex(key_hex)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="key_hex must be valid hex")
-    if len(key) != 32:
-        raise HTTPException(status_code=400, detail="model key must be 32 bytes")
-    global _model_key
+        key = keyloader.unwrap_model_key(wrapped, lic_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="model key unwrap failed")
     _model_key = key
     _key_event.set()
     return {"status": "accepted"}
