@@ -13,7 +13,7 @@ def _model_kek() -> bytes:
     b64 = _keyconst.MODEL_KEK_B64
     if not b64:
         raise RuntimeError("MODEL-KEK not baked into build")
-    kek = base64.b64decode(b64)
+    kek = base64.b64decode(b64, validate=True)
     if len(kek) != 32:
         raise RuntimeError("MODEL-KEK must be 32 bytes")
     return kek
@@ -21,7 +21,7 @@ def _model_kek() -> bytes:
 
 def unwrap_model_key(wrapped_b64: str, lic_id: str) -> bytes:
     """Recover the 32-byte model_key. Raises on wrong key / AAD / format (fail-closed)."""
-    blob = base64.b64decode(wrapped_b64)
+    blob = base64.b64decode(wrapped_b64, validate=True)
     if len(blob) < _NONCE_LEN + 16:
         raise ValueError("wrapped blob too short")
     nonce, ct = blob[:_NONCE_LEN], blob[_NONCE_LEN:]
