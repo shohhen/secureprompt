@@ -10,26 +10,36 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" --zone="${ZONE}" >/d
 
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
 
-# License chain: the ML image ships encrypted weights and runs with
-# SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the gateway must read license.json +
-# keys.json, unwrap the sealed model key, and push it to the sidecar. We carry
-# those two gitignored files into the cluster as a Secret and enable the chart's
-# license wiring. Set LICENSE_ENABLED=false to skip (GLiNER-only fallback).
+# License chain (env-only): the ML image ships encrypted weights and runs with
+# SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the gateway must verify the compact
+# license token, unwrap the sealed model key with the KEK, and push it to the
+# sidecar. We carry the token + KEK (from the gitignored .env, or the ambient
+# environment) into the cluster as a Secret and enable the chart's license
+# wiring. Set LICENSE_ENABLED=false to skip (GLiNER-only fallback).
 LICENSE_ENABLED="${LICENSE_ENABLED:-true}"
 LICENSE_SECRET="${LICENSE_SECRET:-secureprompt-license}"
-LICENSE_DIR="${LICENSE_DIR:-etc/secureprompt}"
+LICENSE_SERVER_URL="${LICENSE_SERVER_URL:-}"   # optional sp-admin /api base URL
 HELM_LICENSE_ARGS=(--set license.enabled=false)
 if [[ "${LICENSE_ENABLED}" == "true" ]]; then
-  if [[ -f "${LICENSE_DIR}/license.json" && -f "${LICENSE_DIR}/keys.json" ]]; then
-    echo "==> Creating/refreshing license secret '${LICENSE_SECRET}' from ${LICENSE_DIR}/"
+  # Prefer values already in the environment; otherwise pull them out of .env.
+  LIC_TOKEN="${SECUREPROMPT_LICENSE_TOKEN:-}"
+  LIC_KEK="${SECUREPROMPT_MODEL_KEK:-}"
+  if [[ -f .env ]]; then
+    [[ -z "${LIC_TOKEN}" ]] && LIC_TOKEN="$(grep -E '^SECUREPROMPT_LICENSE_TOKEN=' .env | head -1 | cut -d= -f2-)"
+    [[ -z "${LIC_KEK}"   ]] && LIC_KEK="$(grep -E '^SECUREPROMPT_MODEL_KEK=' .env | head -1 | cut -d= -f2-)"
+  fi
+  if [[ -n "${LIC_TOKEN}" && -n "${LIC_KEK}" ]]; then
+    echo "==> Creating/refreshing license secret '${LICENSE_SECRET}' (env-only token + KEK)"
     kubectl -n "${NAMESPACE}" create secret generic "${LICENSE_SECRET}" \
-      --from-file=license.json="${LICENSE_DIR}/license.json" \
-      --from-file=keys.json="${LICENSE_DIR}/keys.json" \
+      --from-literal=license-token="${LIC_TOKEN}" \
+      --from-literal=model-kek="${LIC_KEK}" \
       --dry-run=client -o yaml | kubectl -n "${NAMESPACE}" apply -f -
-    HELM_LICENSE_ARGS=(--set license.enabled=true --set "license.filesSecret=${LICENSE_SECRET}")
+    HELM_LICENSE_ARGS=(--set license.enabled=true --set "license.secretName=${LICENSE_SECRET}")
+    [[ -n "${LICENSE_SERVER_URL}" ]] && HELM_LICENSE_ARGS+=(--set "license.serverUrl=${LICENSE_SERVER_URL}")
   else
-    echo "!! LICENSE_ENABLED=true but ${LICENSE_DIR}/{license.json,keys.json} not found."
-    echo "   Provide them, or set LICENSE_ENABLED=false to deploy GLiNER-only."
+    echo "!! LICENSE_ENABLED=true but SECUREPROMPT_LICENSE_TOKEN / SECUREPROMPT_MODEL_KEK"
+    echo "   not found in the environment or .env. Provide them, or set"
+    echo "   LICENSE_ENABLED=false to deploy GLiNER-only."
     exit 1
   fi
 fi

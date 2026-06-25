@@ -197,23 +197,29 @@ grafana:
     password: ""
 
 # ----------------------------------------------------------------------------
-# License / model-key chain
+# License / model-key chain (env-only)
 # ----------------------------------------------------------------------------
-# When enabled, the API mounts a secret holding license.json + keys.json,
-# verifies the license, unwraps the sealed model decryption key, and pushes it
-# to the ML sidecar (which ships encrypted weights and runs with
-# SECUREPROMPT_MODEL_KEY_REQUIRED=true). Without this, the sidecar never loads
-# the XLM-R NER checkpoint and stays unready. The shared internal token comes
-# from the generated `<release>-secrets` (key: ml-sidecar-internal-token).
+# When enabled, the API reads the compact license token + base64 KEK from the
+# license secret (as env vars), verifies the license, unwraps the sealed model
+# decryption key, and pushes it to the ML sidecar (which ships encrypted weights
+# and runs with SECUREPROMPT_MODEL_KEY_REQUIRED=true). Without this the sidecar
+# never loads the XLM-R NER checkpoint and stays unready. The shared internal
+# token comes from the generated `<release>-secrets` (key: ml-sidecar-internal-token).
 #
-# Create the files secret out-of-band (scripts/gcp/deploy.sh does this):
+# Create the license secret out-of-band (scripts/gcp/deploy.sh does this from .env):
 #   kubectl create secret generic secureprompt-license \
-#     --from-file=license.json=etc/secureprompt/license.json \
-#     --from-file=keys.json=etc/secureprompt/keys.json -n <namespace>
+#     --from-literal=license-token="$SECUREPROMPT_LICENSE_TOKEN" \
+#     --from-literal=model-kek="$SECUREPROMPT_MODEL_KEK" -n <namespace>
 license:
   enabled: false
-  filesSecret: "secureprompt-license"
-  mountPath: "/etc/secureprompt"
+  # Secret (created out-of-band) holding the env-only license material.
+  # Keys: `license-token` (compact base64url token) and `model-kek` (base64
+  # 32-byte KEK that unwraps the sealed model key).
+  secretName: "secureprompt-license"
+  # Optional sp-admin base URL for online revalidation + revocation polling.
+  # Empty = offline (the token's carried freshness budgets still apply).
+  # e.g. https://manage.secureprompt.tech/api
+  serverUrl: ""
 
 # ----------------------------------------------------------------------------
 # Misc

@@ -73,23 +73,31 @@ spec:
             - name: SECUREPROMPT_CORS_ORIGINS
               value: {{ .Values.api.env.corsOrigins | quote }}
             {{- if .Values.license.enabled }}
-            # License chain: read license.json + keys.json (vendor pubkey + KEK)
-            # from the mounted dir, unwrap the sealed model key, and push it to
-            # the ML sidecar using the shared internal token below.
-            - name: SECUREPROMPT_LICENSE_PATH
-              value: "{{ .Values.license.mountPath }}/license.json"
+            # License chain (env-only): the gateway verifies the compact license
+            # token, unwraps the sealed model key with the KEK, and pushes it to
+            # the ML sidecar via the shared internal token. Token + KEK come from
+            # the out-of-band license secret (created by scripts/gcp/deploy.sh).
+            - name: SECUREPROMPT_LICENSE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.license.secretName | quote }}
+                  key: license-token
+            - name: SECUREPROMPT_MODEL_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.license.secretName | quote }}
+                  key: model-kek
+            {{- if .Values.license.serverUrl }}
+            # Optional sp-admin base URL for online revalidation/revocation.
+            - name: SECUREPROMPT_LICENSE_SERVER_URL
+              value: {{ .Values.license.serverUrl | quote }}
+            {{- end }}
             - name: ML_SIDECAR_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: ml-sidecar-internal-token
             {{- end }}
-          {{- if .Values.license.enabled }}
-          volumeMounts:
-            - name: license
-              mountPath: {{ .Values.license.mountPath | quote }}
-              readOnly: true
-          {{- end }}
           # The API exposes no dedicated /health route; /metrics is unauthenticated,
           # stays open past the license gate, and returns 200 whenever the server
           # is up — so it doubles as the liveness/readiness target.
@@ -109,9 +117,3 @@ spec:
             failureThreshold: 5
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
-      {{- if .Values.license.enabled }}
-      volumes:
-        - name: license
-          secret:
-            secretName: {{ .Values.license.filesSecret | quote }}
-      {{- end }}
