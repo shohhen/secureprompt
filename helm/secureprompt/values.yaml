@@ -74,7 +74,9 @@ ml:
   image:
     repository: secureprompt/ml
     tag: "0.1.0"
-    pullPolicy: IfNotPresent
+    # Always: 0.1.x tags are mutable (re-pushed per build); IfNotPresent would
+    # serve a stale node-cached layer after a rebuild (e.g. the lang-router fix).
+    pullPolicy: Always
   replicaCount: 1
   # The sidecar loads four models into memory: GLiNER multi-PII, the DeBERTa
   # injection classifier, the MiniLM embedder, and the decrypted XLM-R NER
