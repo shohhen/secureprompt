@@ -31,7 +31,7 @@ if [[ "${LICENSE_ENABLED}" == "true" ]]; then
   #   3. .env (local dev fallback)
   LICENSE_DIR="${LICENSE_DIR:-etc/secureprompt}"
   LIC_TOKEN="${SECUREPROMPT_LICENSE_TOKEN:-}"
-  LIC_KEK="${SECUREPROMPT_MODEL_KEK:-}"
+  LIC_KEK="${SECUREPROMPT_ATTEST_KEK:-}"
   LIC_PUBKEY="${SECUREPROMPT_LICENSE_PUBKEY:-}"
   if command -v python3 >/dev/null 2>&1 \
      && [[ -f "${LICENSE_DIR}/license.json" && -f "${LICENSE_DIR}/keys.json" ]]; then
@@ -46,7 +46,7 @@ raw = (d / "license.json").read_text()
 m = re.search(r'[A-Za-z0-9_\-]{40,}\.[A-Za-z0-9_\-]{40,}', raw)
 kj = json.load(open(d / "keys.json"))
 print(m.group(0) if m else "")
-print(kj.get("kek", ""))
+print(kj.get("attest_kek", ""))
 print(kj.get("vendor_pubkey", ""))
 PY
 )
@@ -56,20 +56,20 @@ PY
   fi
   if [[ -f .env ]]; then
     [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="$(grep -E '^SECUREPROMPT_LICENSE_TOKEN=' .env | head -1 | cut -d= -f2-)"
-    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="$(grep -E '^SECUREPROMPT_MODEL_KEK=' .env | head -1 | cut -d= -f2-)"
+    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="$(grep -E '^SECUREPROMPT_ATTEST_KEK=' .env | head -1 | cut -d= -f2-)"
     [[ -z "${LIC_PUBKEY}" ]] && LIC_PUBKEY="$(grep -E '^SECUREPROMPT_LICENSE_PUBKEY=' .env | head -1 | cut -d= -f2-)"
   fi
   if [[ -n "${LIC_TOKEN}" && -n "${LIC_KEK}" && -n "${LIC_PUBKEY}" ]]; then
     echo "==> Creating/refreshing license secret '${LICENSE_SECRET}' (env-only token + KEK + pubkey)"
     kubectl -n "${NAMESPACE}" create secret generic "${LICENSE_SECRET}" \
       --from-literal=license-token="${LIC_TOKEN}" \
-      --from-literal=model-kek="${LIC_KEK}" \
+      --from-literal=attest-kek="${LIC_KEK}" \
       --from-literal=license-pubkey="${LIC_PUBKEY}" \
       --dry-run=client -o yaml | kubectl -n "${NAMESPACE}" apply -f -
     HELM_LICENSE_ARGS=(--set license.enabled=true --set "license.secretName=${LICENSE_SECRET}")
     [[ -n "${LICENSE_SERVER_URL}" ]] && HELM_LICENSE_ARGS+=(--set "license.serverUrl=${LICENSE_SERVER_URL}")
   else
-    echo "!! LICENSE_ENABLED=true but SECUREPROMPT_LICENSE_TOKEN / SECUREPROMPT_MODEL_KEK /"
+    echo "!! LICENSE_ENABLED=true but SECUREPROMPT_LICENSE_TOKEN / SECUREPROMPT_ATTEST_KEK /"
     echo "   SECUREPROMPT_LICENSE_PUBKEY not all found in the environment or .env. Provide"
     echo "   them, or set LICENSE_ENABLED=false to deploy GLiNER-only."
     exit 1

@@ -41,6 +41,12 @@ services:
     build:
       context: .
       dockerfile: secureprompt-ml/Dockerfile
+      args:
+        # Bakes the MODEL-KEK into the compiled keyloader .so (see Dockerfile).
+        # REQUIRED to build this image (the Dockerfile guards non-empty). Supply
+        # via your shell/CI (protected var); never commit the value. Other compose
+        # commands still work with it unset — only the ML build fails without it.
+        SECUREPROMPT_PINNED_MODEL_KEK: ${SECUREPROMPT_PINNED_MODEL_KEK:-}
     restart: on-failure
     environment:
       ML_LANGUAGE: en
@@ -53,10 +59,11 @@ services:
       # detections. Tune via .env; experiment default below.
       XLMR_CONFIDENCE_FLOOR: ${XLMR_CONFIDENCE_FLOOR:-0.85}
       QDRANT_URL: http://qdrant:6333
-      # Shared secret the gateway uses to push the unwrapped model key to
-      # POST /internal/model-key. MUST match the api service's value below.
+      # Shared secret the gateway uses to relay the license's WRAPPED model key
+      # to POST /internal/model-key. The sidecar's compiled .so unwraps it.
+      # MUST match the api service's value below.
       # The image sets SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the sidecar
-      # stays 503 until the gateway delivers the key with this token.
+      # stays 503 until the gateway relays the wrapped key with this token.
       ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
     # No ports: mapping — api already binds host 8080; gateway calls via Docker DNS only.
     # Healthcheck probes /health (liveness), NOT /ready. /ready only returns 200
@@ -127,7 +134,7 @@ services:
       # Populate via .env / Docker secrets / your CI. Empty defaults below
       # let the stack boot unlicensed (fail-open) for local dev.
       SECUREPROMPT_LICENSE_PUBKEY: ${SECUREPROMPT_LICENSE_PUBKEY:-}
-      SECUREPROMPT_MODEL_KEK: ${SECUREPROMPT_MODEL_KEK:-}
+      SECUREPROMPT_ATTEST_KEK: ${SECUREPROMPT_ATTEST_KEK:-}
       SECUREPROMPT_LICENSE_TOKEN: ${SECUREPROMPT_LICENSE_TOKEN:-}
       ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
       # sp-admin license server. Enables the online revocation poller (fail-CLOSED
