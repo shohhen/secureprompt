@@ -43,7 +43,7 @@ pub struct LicenseSnapshot {
 }
 
 impl LicenseSnapshot {
-    fn unlicensed() -> Self {
+    pub fn unlicensed() -> Self {
         Self {
             status: LicenseStatus::Unlicensed,
             max_seats: None,
