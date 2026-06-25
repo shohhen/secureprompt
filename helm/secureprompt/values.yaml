@@ -209,12 +209,14 @@ grafana:
 # Create the license secret out-of-band (scripts/gcp/deploy.sh does this from .env):
 #   kubectl create secret generic secureprompt-license \
 #     --from-literal=license-token="$SECUREPROMPT_LICENSE_TOKEN" \
-#     --from-literal=model-kek="$SECUREPROMPT_MODEL_KEK" -n <namespace>
+#     --from-literal=model-kek="$SECUREPROMPT_MODEL_KEK" \
+#     --from-literal=license-pubkey="$SECUREPROMPT_LICENSE_PUBKEY" -n <namespace>
 license:
   enabled: false
-  # Secret (created out-of-band) holding the env-only license material.
-  # Keys: `license-token` (compact base64url token) and `model-kek` (base64
-  # 32-byte KEK that unwraps the sealed model key).
+  # Secret (created out-of-band) holding the env-only license material. Keys:
+  #   license-token   — compact base64url license token
+  #   model-kek       — base64 32-byte KEK that unwraps the sealed model key
+  #   license-pubkey  — base64 Ed25519 vendor public key that verifies the token
   secretName: "secureprompt-license"
   # Optional sp-admin base URL for online revalidation + revocation polling.
   # Empty = offline (the token's carried freshness budgets still apply).

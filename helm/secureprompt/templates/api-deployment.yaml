@@ -87,6 +87,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.license.secretName | quote }}
                   key: model-kek
+            # Ed25519 vendor public key that verifies the license token signature.
+            # Without it the gateway runs unlicensed (grace) and pushes no model key.
+            - name: SECUREPROMPT_LICENSE_PUBKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.license.secretName | quote }}
+                  key: license-pubkey
             {{- if .Values.license.serverUrl }}
             # Optional sp-admin base URL for online revalidation/revocation.
             - name: SECUREPROMPT_LICENSE_SERVER_URL

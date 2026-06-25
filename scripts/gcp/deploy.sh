@@ -21,25 +21,56 @@ LICENSE_SECRET="${LICENSE_SECRET:-secureprompt-license}"
 LICENSE_SERVER_URL="${LICENSE_SERVER_URL:-}"   # optional sp-admin /api base URL
 HELM_LICENSE_ARGS=(--set license.enabled=false)
 if [[ "${LICENSE_ENABLED}" == "true" ]]; then
-  # Prefer values already in the environment; otherwise pull them out of .env.
+  # Source the license material, in precedence order:
+  #   1. explicit environment variables (override everything)
+  #   2. the canonical files in etc/secureprompt/ — license.json holds the
+  #      compact token; keys.json holds { kek, vendor_pubkey } (base64). These
+  #      are the values whose unwrapped model key matches the encrypted weights
+  #      shipped in the ml image. (A mismatched token/KEK unwraps to the wrong
+  #      key and the sidecar fails to decrypt the XLM-R weights — GCM InvalidTag.)
+  #   3. .env (local dev fallback)
+  LICENSE_DIR="${LICENSE_DIR:-etc/secureprompt}"
   LIC_TOKEN="${SECUREPROMPT_LICENSE_TOKEN:-}"
   LIC_KEK="${SECUREPROMPT_MODEL_KEK:-}"
-  if [[ -f .env ]]; then
-    [[ -z "${LIC_TOKEN}" ]] && LIC_TOKEN="$(grep -E '^SECUREPROMPT_LICENSE_TOKEN=' .env | head -1 | cut -d= -f2-)"
-    [[ -z "${LIC_KEK}"   ]] && LIC_KEK="$(grep -E '^SECUREPROMPT_MODEL_KEK=' .env | head -1 | cut -d= -f2-)"
+  LIC_PUBKEY="${SECUREPROMPT_LICENSE_PUBKEY:-}"
+  if command -v python3 >/dev/null 2>&1 \
+     && [[ -f "${LICENSE_DIR}/license.json" && -f "${LICENSE_DIR}/keys.json" ]]; then
+    # license.json may be a raw token or JSON wrapping one; pull the compact
+    # `base64url.base64url` token out either way. kek/vendor_pubkey come from
+    # keys.json. Emitted one-per-line so values containing +/=/ stay intact.
+    mapfile -t _LIC < <(python3 - "${LICENSE_DIR}" <<'PY'
+import sys, re, json, pathlib
+d = pathlib.Path(sys.argv[1])
+raw = (d / "license.json").read_text()
+m = re.search(r'[A-Za-z0-9_\-]{40,}\.[A-Za-z0-9_\-]{40,}', raw)
+kj = json.load(open(d / "keys.json"))
+print(m.group(0) if m else "")
+print(kj.get("kek", ""))
+print(kj.get("vendor_pubkey", ""))
+PY
+)
+    [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="${_LIC[0]:-}"
+    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="${_LIC[1]:-}"
+    [[ -z "${LIC_PUBKEY}" ]] && LIC_PUBKEY="${_LIC[2]:-}"
   fi
-  if [[ -n "${LIC_TOKEN}" && -n "${LIC_KEK}" ]]; then
-    echo "==> Creating/refreshing license secret '${LICENSE_SECRET}' (env-only token + KEK)"
+  if [[ -f .env ]]; then
+    [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="$(grep -E '^SECUREPROMPT_LICENSE_TOKEN=' .env | head -1 | cut -d= -f2-)"
+    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="$(grep -E '^SECUREPROMPT_MODEL_KEK=' .env | head -1 | cut -d= -f2-)"
+    [[ -z "${LIC_PUBKEY}" ]] && LIC_PUBKEY="$(grep -E '^SECUREPROMPT_LICENSE_PUBKEY=' .env | head -1 | cut -d= -f2-)"
+  fi
+  if [[ -n "${LIC_TOKEN}" && -n "${LIC_KEK}" && -n "${LIC_PUBKEY}" ]]; then
+    echo "==> Creating/refreshing license secret '${LICENSE_SECRET}' (env-only token + KEK + pubkey)"
     kubectl -n "${NAMESPACE}" create secret generic "${LICENSE_SECRET}" \
       --from-literal=license-token="${LIC_TOKEN}" \
       --from-literal=model-kek="${LIC_KEK}" \
+      --from-literal=license-pubkey="${LIC_PUBKEY}" \
       --dry-run=client -o yaml | kubectl -n "${NAMESPACE}" apply -f -
     HELM_LICENSE_ARGS=(--set license.enabled=true --set "license.secretName=${LICENSE_SECRET}")
     [[ -n "${LICENSE_SERVER_URL}" ]] && HELM_LICENSE_ARGS+=(--set "license.serverUrl=${LICENSE_SERVER_URL}")
   else
-    echo "!! LICENSE_ENABLED=true but SECUREPROMPT_LICENSE_TOKEN / SECUREPROMPT_MODEL_KEK"
-    echo "   not found in the environment or .env. Provide them, or set"
-    echo "   LICENSE_ENABLED=false to deploy GLiNER-only."
+    echo "!! LICENSE_ENABLED=true but SECUREPROMPT_LICENSE_TOKEN / SECUREPROMPT_MODEL_KEK /"
+    echo "   SECUREPROMPT_LICENSE_PUBKEY not all found in the environment or .env. Provide"
+    echo "   them, or set LICENSE_ENABLED=false to deploy GLiNER-only."
     exit 1
   fi
 fi
