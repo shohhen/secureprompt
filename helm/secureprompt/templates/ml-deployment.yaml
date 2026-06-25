@@ -50,20 +50,31 @@ spec:
             - name: SECUREPROMPT_MODEL_KEY_REQUIRED
               value: "false"
             {{- end }}
+          # Readiness gates Service membership on the model being loaded (/ready
+          # is 503 until the gateway pushes the key). timeout 3s so a CPU-busy
+          # sidecar isn't spuriously evicted from the Service mid-inference.
           readinessProbe:
             httpGet:
               path: /ready
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 3
             failureThreshold: 30
+          # Liveness MUST target the ungated /health, NOT /ready. /ready stays 503
+          # until the gateway pushes the model key, so a liveness probe on /ready
+          # kills the pod before it can be (re-)keyed — an unrecoverable crash-loop
+          # whenever the pod restarts (the gateway pushes the key, not the sidecar).
+          # /health is always 200 once uvicorn is up, so the pod stays alive waiting
+          # for the gateway's periodic re-push (SECUREPROMPT_LICENSE_RECHECK_SECS).
           livenessProbe:
             httpGet:
-              path: /ready
+              path: /health
               port: 8080
-            initialDelaySeconds: 60
-            periodSeconds: 30
-            failureThreshold: 5
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             {{- toYaml .Values.ml.resources | nindent 12 }}
 ---

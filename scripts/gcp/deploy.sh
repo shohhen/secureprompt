@@ -38,7 +38,8 @@ if [[ "${LICENSE_ENABLED}" == "true" ]]; then
     # license.json may be a raw token or JSON wrapping one; pull the compact
     # `base64url.base64url` token out either way. kek/vendor_pubkey come from
     # keys.json. Emitted one-per-line so values containing +/=/ stay intact.
-    mapfile -t _LIC < <(python3 - "${LICENSE_DIR}" <<'PY'
+    # bash 3.2 (macOS default) has no `mapfile`; read the 3 lines individually.
+    { IFS= read -r _F_TOK; IFS= read -r _F_KEK; IFS= read -r _F_PUB; } < <(python3 - "${LICENSE_DIR}" <<'PY'
 import sys, re, json, pathlib
 d = pathlib.Path(sys.argv[1])
 raw = (d / "license.json").read_text()
@@ -49,9 +50,9 @@ print(kj.get("kek", ""))
 print(kj.get("vendor_pubkey", ""))
 PY
 )
-    [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="${_LIC[0]:-}"
-    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="${_LIC[1]:-}"
-    [[ -z "${LIC_PUBKEY}" ]] && LIC_PUBKEY="${_LIC[2]:-}"
+    [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="${_F_TOK:-}"
+    [[ -z "${LIC_KEK}"    ]] && LIC_KEK="${_F_KEK:-}"
+    [[ -z "${LIC_PUBKEY}" ]] && LIC_PUBKEY="${_F_PUB:-}"
   fi
   if [[ -f .env ]]; then
     [[ -z "${LIC_TOKEN}"  ]] && LIC_TOKEN="$(grep -E '^SECUREPROMPT_LICENSE_TOKEN=' .env | head -1 | cut -d= -f2-)"

@@ -99,6 +99,10 @@ spec:
             - name: SECUREPROMPT_LICENSE_SERVER_URL
               value: {{ .Values.license.serverUrl | quote }}
             {{- end }}
+            # Re-verify + re-push the model key on this interval so a restarted
+            # ML sidecar gets re-keyed promptly (default app value is 3600s).
+            - name: SECUREPROMPT_LICENSE_RECHECK_SECS
+              value: {{ .Values.license.recheckSecs | quote }}
             - name: ML_SIDECAR_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

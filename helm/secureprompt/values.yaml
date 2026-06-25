@@ -47,7 +47,9 @@ worker:
   image:
     repository: secureprompt/worker
     tag: "0.1.0"
-    pullPolicy: IfNotPresent
+    # Always: the 0.1.x tags are mutable (re-pushed per build), so IfNotPresent
+    # would serve a stale node-cached layer after a rebuild. Pull on every start.
+    pullPolicy: Always
   replicaCount: 1
   resources:
     requests: { cpu: "50m",  memory: "128Mi" }
@@ -222,6 +224,12 @@ license:
   # Empty = offline (the token's carried freshness budgets still apply).
   # e.g. https://manage.secureprompt.tech/api
   serverUrl: ""
+  # How often (seconds) the gateway re-verifies the license AND re-pushes the
+  # model key to the ML sidecar. The app default is 3600 (1h) — far too long for
+  # sidecar recovery: if the ml pod restarts it loses the in-memory key and stays
+  # unkeyed (503, GLiNER-only) until the next push. 60s re-keys a restarted
+  # sidecar promptly (its liveness is on /health so it survives the wait).
+  recheckSecs: "60"
 
 # ----------------------------------------------------------------------------
 # Misc
