@@ -203,23 +203,24 @@ grafana:
 # ----------------------------------------------------------------------------
 # License / model-key chain (env-only)
 # ----------------------------------------------------------------------------
-# When enabled, the API reads the compact license token + base64 KEK from the
-# license secret (as env vars), verifies the license, unwraps the sealed model
-# decryption key, and pushes it to the ML sidecar (which ships encrypted weights
-# and runs with SECUREPROMPT_MODEL_KEY_REQUIRED=true). Without this the sidecar
-# never loads the XLM-R NER checkpoint and stays unready. The shared internal
-# token comes from the generated `<release>-secrets` (key: ml-sidecar-internal-token).
+# When enabled, the API reads the compact license token + base64 ATTEST-KEK from
+# the license secret (as env vars), verifies the license with the ATTEST-KEK, and
+# relays the wrapped model key to the ML sidecar. The sidecar's baked .so unwraps
+# the model key (ML image ships encrypted weights; runs with
+# SECUREPROMPT_MODEL_KEY_REQUIRED=true). Without this the sidecar never loads
+# the XLM-R NER checkpoint and stays unready. The shared internal token comes from
+# the generated `<release>-secrets` (key: ml-sidecar-internal-token).
 #
 # Create the license secret out-of-band (scripts/gcp/deploy.sh does this from .env):
 #   kubectl create secret generic secureprompt-license \
 #     --from-literal=license-token="$SECUREPROMPT_LICENSE_TOKEN" \
-#     --from-literal=model-kek="$SECUREPROMPT_MODEL_KEK" \
+#     --from-literal=attest-kek="$SECUREPROMPT_ATTEST_KEK" \
 #     --from-literal=license-pubkey="$SECUREPROMPT_LICENSE_PUBKEY" -n <namespace>
 license:
   enabled: false
   # Secret (created out-of-band) holding the env-only license material. Keys:
   #   license-token   — compact base64url license token
-  #   model-kek       — base64 32-byte KEK that unwraps the sealed model key
+  #   attest-kek      — base64 32-byte KEK for gateway license attestation/verification
   #   license-pubkey  — base64 Ed25519 vendor public key that verifies the token
   secretName: "secureprompt-license"
   # Optional sp-admin base URL for online revalidation + revocation polling.

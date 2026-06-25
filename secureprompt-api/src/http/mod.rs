@@ -88,6 +88,14 @@ pub fn build_router(state: AppState) -> Router {
                 )),
         )
         .nest(
+            "/v1/license",
+            routes::license::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
             "/v1/policy-rules",
             routes::dashboard::policy_rules::routes()
                 .route_layer(from_fn_with_state(

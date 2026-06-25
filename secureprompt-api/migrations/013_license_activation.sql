@@ -2,6 +2,6 @@
 CREATE TABLE IF NOT EXISTS license_activation (
     id           smallint    PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     token        text        NOT NULL,
-    activated_by uuid        REFERENCES users(id),
+    activated_by uuid        REFERENCES users(id) ON DELETE SET NULL,
     updated_at   timestamptz NOT NULL DEFAULT now()
 );

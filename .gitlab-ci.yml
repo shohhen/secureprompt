@@ -26,6 +26,8 @@
 #   - secureprompt-ml is intentionally excluded — its build needs the raw
 #     model DEK + plaintext weights, which aren't wired up yet. Build/push
 #     that image manually until weights distribution is decided.
+#     Manual build MUST pass the MODEL-KEK build-arg (from a protected CI var):
+#       docker build --build-arg SECUREPROMPT_PINNED_MODEL_KEK=<value> ...
 
 workflow:
   rules:

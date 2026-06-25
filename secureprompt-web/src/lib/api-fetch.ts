@@ -85,7 +85,7 @@ async function parseError(
   const text = await res.text().catch(() => "");
   if (!text) return fallback;
   try {
-    const parsed = JSON.parse(text) as Partial<ApiErrorEnvelope>;
+    const parsed = JSON.parse(text) as { error?: Partial<ApiErrorEnvelope> };
     return {
       code: parsed.error?.code ?? fallback.code,
       message: parsed.error?.message ?? fallback.message,

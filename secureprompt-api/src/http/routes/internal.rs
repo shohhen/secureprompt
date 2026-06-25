@@ -69,8 +69,8 @@ pub async fn get_attestation(
 pub async fn build_signed_attestation(
     state: &AppState,
 ) -> Option<sp_license::SignedAttestation> {
-    let kek = crate::license::parse_kek(&crate::license::effective_kek(
-        &state.config.license.model_kek_b64,
+    let kek = crate::license::parse_kek(&crate::license::effective_attest_kek(
+        &state.config.license.attest_kek_b64,
     ))?;
     // Only yields a key when the license is Valid and not revoked.
     let sk = state.license.unwrap_attestation_key(&kek)?;

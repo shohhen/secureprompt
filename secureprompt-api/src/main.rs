@@ -152,8 +152,8 @@ async fn main() -> anyhow::Result<()> {
         option_env!("SECUREPROMPT_PINNED_VENDOR_PUBKEY").is_some()
     );
     tracing::info!(
-        "model KEK pinned at build: {}",
-        option_env!("SECUREPROMPT_PINNED_MODEL_KEK").is_some()
+        "attest KEK pinned at build: {}",
+        option_env!("SECUREPROMPT_PINNED_ATTEST_KEK").is_some()
     );
 
     // Plan 3 — startup license verification. Fail-open: never fatal.
@@ -179,22 +179,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Plan 4 — parse the KEK. Non-empty but invalid → warn; empty → weight-encryption off.
-    let model_kek = {
-        let effective_kek_b64 = secureprompt_api::license::effective_kek(&config.license.model_kek_b64);
-        if effective_kek_b64.is_empty() {
-            None
-        } else {
-            let kek = secureprompt_api::license::parse_kek(&effective_kek_b64);
-            if kek.is_none() {
-                tracing::warn!(
-                    "SECUREPROMPT_MODEL_KEK is set but not a valid 32-byte base64 key"
-                );
-            }
-            kek
-        }
-    };
-
     let state = AppState::new(db, config.clone(), ml_sidecar, license);
 
     // Part B — boot seed: load persisted high-water from Postgres immediately
@@ -215,29 +199,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Plan 4 — best-effort push of the unwrapped model key to the ML sidecar at startup.
+    // Task 4 — best-effort relay of the wrapped model blob to the ML sidecar at startup.
     // Retries up to 10 times (sidecar may still be starting). NEVER aborts the gateway.
+    // The gateway holds ONLY the ATTEST-KEK; the wrapped blob is forwarded as-is.
     let token = config.license.internal_token.clone();
-    if let (Some(kek), false) = (model_kek, token.is_empty()) {
+    if !token.is_empty() {
         let st = std::sync::Arc::clone(&state.license);
         let client = std::sync::Arc::clone(&state.ml_sidecar);
         let token_clone = token.clone();
         tokio::spawn(async move {
             for attempt in 0..10u32 {
-                if let Some(key) = st.unwrap_model_key(&kek) {
-                    match client.push_model_key(&key, &token_clone).await {
+                let snap = st.snapshot();
+                if let (Some(w), Some(lic)) = (snap.wrapped_model_key.as_ref(), snap.lic_id.as_ref()) {
+                    match client.push_wrapped_model_key(w, lic, &token_clone).await {
                         Ok(()) => {
-                            tracing::info!("pushed model key to ML sidecar");
+                            tracing::info!("relayed wrapped model blob to ML sidecar");
                             return;
                         }
                         Err(e) => tracing::warn!(
                             attempt,
                             error = %e,
-                            "model-key push failed; retrying"
+                            "wrapped model blob relay failed; retrying"
                         ),
                     }
                 } else {
-                    tracing::warn!("no valid license model key to push");
+                    tracing::warn!("no valid license wrapped model blob to relay");
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -252,8 +238,7 @@ async fn main() -> anyhow::Result<()> {
         // Task 2: capture the env token so we can re-resolve DB vs env each tick.
         let env_token_for_recheck = config.license.license_token.clone();
         let secs = config.license.recheck_secs;
-        // Plan 4 — capture kek/token/client for re-push on re-verify.
-        let recheck_kek = model_kek;
+        // Task 4 — capture token/client for re-relay on re-verify (wrapped blob, not plaintext).
         let recheck_token = token.clone();
         let recheck_client = std::sync::Arc::clone(&state.ml_sidecar);
         // Capture digest once before the loop — reading the env var inside the
@@ -292,12 +277,13 @@ async fn main() -> anyhow::Result<()> {
                 for flag in st.tamper_flags("api", &recheck_digest) {
                     tracing::warn!(flag, "tamper evidence detected on re-verify");
                 }
-                // Plan 4 — re-push the model key after a license refresh (single attempt, best-effort).
-                if let (Some(kek), false) = (recheck_kek, recheck_token.is_empty()) {
-                    if let Some(key) = st.unwrap_model_key(&kek) {
-                        match recheck_client.push_model_key(&key, &recheck_token).await {
-                            Ok(()) => tracing::info!("re-pushed model key to ML sidecar after license re-verify"),
-                            Err(e) => tracing::warn!(error = %e, "model-key re-push failed after license re-verify (ignored)"),
+                // Task 4 — re-relay the wrapped model blob after a license refresh (single attempt, best-effort).
+                if !recheck_token.is_empty() {
+                    let snap = st.snapshot();
+                    if let (Some(w), Some(lic)) = (snap.wrapped_model_key.as_ref(), snap.lic_id.as_ref()) {
+                        match recheck_client.push_wrapped_model_key(w, lic, &recheck_token).await {
+                            Ok(()) => tracing::info!("re-relayed wrapped model blob to ML sidecar after license re-verify"),
+                            Err(e) => tracing::warn!(error = %e, "wrapped model blob re-relay failed after license re-verify (ignored)"),
                         }
                     }
                 }
