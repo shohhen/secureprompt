@@ -99,8 +99,8 @@ ml:
     language: "en"
     useOnnx: "false"
     # Active NER checkpoint(s) under app/resources/. Empty → image default
-    # (multilingual_ner_v3_no_ssn_xlmr). Comma-separated to run several, or
-    # "all" to register every shipped checkpoint. See scripts/compare_v3_models.py.
+    # (multilingual_ner_v5_cold_xlmr). Comma-separated to run several, or
+    # "all" to register every shipped checkpoint.
     activeNerModels: ""
 
 # ----------------------------------------------------------------------------
