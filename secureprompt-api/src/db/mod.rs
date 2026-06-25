@@ -1,5 +1,6 @@
 pub mod api_key_repo;
 pub mod budget_repo;
+pub mod license_repo;
 pub mod policy_repo;
 pub mod provider_repo;
 pub mod refresh_token_repo;
