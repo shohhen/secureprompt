@@ -634,15 +634,18 @@ async fn activation_relays_wrapped_blob_not_plaintext(pool: PgPool) {
     let (status, body) = read_json(resp).await;
     assert_eq!(status, StatusCode::OK, "PUT must succeed: {body}");
 
-    // Small sleep to allow the async best_effort_push to complete.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // 4. Assert the mock received the right payload.
-    let captured: serde_json::Value = captured_body
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("mock sidecar must have received a POST /internal/model-key");
+    // Poll (bounded) for the async best_effort_push to reach the mock — a fixed
+    // sleep is flaky under CI scheduler contention; this is deterministic.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let captured: serde_json::Value = loop {
+        if let Some(body) = captured_body.lock().unwrap().clone() {
+            break body;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("mock sidecar never received a POST /internal/model-key");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
 
     // Must have a non-empty wrapped_key equal to the blob from the token.
     assert!(
