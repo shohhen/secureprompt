@@ -24,7 +24,7 @@ if [[ "${LICENSE_ENABLED}" == "true" ]]; then
   # Source the license material, in precedence order:
   #   1. explicit environment variables (override everything)
   #   2. the canonical files in etc/secureprompt/ — license.json holds the
-  #      compact token; keys.json holds { kek, vendor_pubkey } (base64). These
+  #      compact token; keys.json holds { attest_kek, vendor_pubkey } (base64). These
   #      are the values whose unwrapped model key matches the encrypted weights
   #      shipped in the ml image. (A mismatched token/KEK unwraps to the wrong
   #      key and the sidecar fails to decrypt the XLM-R weights — GCM InvalidTag.)

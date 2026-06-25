@@ -220,7 +220,7 @@ license:
   enabled: false
   # Secret (created out-of-band) holding the env-only license material. Keys:
   #   license-token   — compact base64url license token
-  #   attest-kek      — base64 32-byte KEK that unwraps the attestation key
+  #   attest-kek      — base64 32-byte KEK for gateway license attestation/verification
   #   license-pubkey  — base64 Ed25519 vendor public key that verifies the token
   secretName: "secureprompt-license"
   # Optional sp-admin base URL for online revalidation + revocation polling.
