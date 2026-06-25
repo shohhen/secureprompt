@@ -15,10 +15,13 @@ pub async fn get(pool: &PgPool) -> sqlx::Result<Option<ActivatedLicense>> {
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| ActivatedLicense {
-        token: r.try_get("token").expect("token column"),
-        updated_at: r.try_get("updated_at").expect("updated_at column"),
-    }))
+    match row {
+        Some(r) => Ok(Some(ActivatedLicense {
+            token: r.try_get("token")?,
+            updated_at: r.try_get("updated_at")?,
+        })),
+        None => Ok(None),
+    }
 }
 
 pub async fn upsert(pool: &PgPool, token: &str, activated_by: Option<Uuid>) -> sqlx::Result<()> {
