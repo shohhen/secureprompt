@@ -103,10 +103,17 @@ pub async fn check(
             return (RevocationVerdict::Revoked, None);
         }
         // Non-revoked signed assertion: parse issued_at for freshness credit.
-        match parse_rfc3339(&assertion.issued_at) {
-            Ok(epoch) => return (RevocationVerdict::Active, Some(epoch)),
-            Err(e) => {
-                tracing::warn!(error = %e, "revocation check: assertion issued_at unparseable — no freshness credit");
+        // Accept full RFC3339 (sub-second precision + numeric offset, e.g. the
+        // admin's chrono `to_rfc3339()` output like `...311864977+00:00`) via
+        // chrono, falling back to the crate's strict `YYYY-MM-DDTHH:MM:SSZ` parser.
+        let issued_epoch = chrono::DateTime::parse_from_rfc3339(&assertion.issued_at)
+            .ok()
+            .map(|dt| dt.timestamp())
+            .or_else(|| parse_rfc3339(&assertion.issued_at).ok());
+        match issued_epoch {
+            Some(epoch) => return (RevocationVerdict::Active, Some(epoch)),
+            None => {
+                tracing::warn!(issued_at = %assertion.issued_at, "revocation check: assertion issued_at unparseable — no freshness credit");
                 return (RevocationVerdict::Unknown, None);
             }
         }
@@ -211,6 +218,32 @@ mod tests {
         let epoch = issued_at.unwrap();
         // 2026-06-24T10:00:00Z should be > 0 and a reasonable epoch
         assert!(epoch > 0, "epoch must be positive");
+    }
+
+    #[tokio::test]
+    async fn signed_active_with_chrono_rfc3339_timestamp_parses() {
+        // Regression: the live admin emits issued_at via chrono `to_rfc3339()`
+        // (sub-second precision + numeric offset, e.g. ...311864977+00:00). The
+        // gateway must parse it and grant freshness credit, not reject it — else a
+        // budgeted license would falsely hard-stale against a healthy admin.
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let assertion = FreshnessAssertion {
+            lic_id: "test-lic".into(),
+            status: "active".into(),
+            issued_at: "2026-06-25T09:12:35.311864977+00:00".into(),
+            expires_at: "2026-06-25T09:22:35.311864977+00:00".into(),
+            nonce: "n".into(),
+        };
+        let sig = sp_license::sign_assertion(&assertion, &sk).unwrap();
+        let body = json!({ "lic_id":"test-lic","status":"active","revoked_at":null,"assertion":assertion,"sig":sig });
+        let base_url = start_mock(body).await;
+        let client = reqwest::Client::new();
+
+        let (verdict, issued_at) = check(&client, &base_url, "test-lic", &vk).await;
+
+        assert_eq!(verdict, RevocationVerdict::Active);
+        assert!(issued_at.is_some(), "chrono-format issued_at must parse and yield freshness credit");
     }
 
     #[tokio::test]
