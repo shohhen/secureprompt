@@ -45,9 +45,9 @@ services:
     environment:
       ML_LANGUAGE: en
       ML_USE_ONNX: "false"
-      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v3_no_ssn_xlmr.
+      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v5_cold_xlmr.
       # Comma-separated for several, or "all" to load every shipped checkpoint.
-      ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v3_no_ssn_xlmr}
+      ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v5_cold_xlmr}
       QDRANT_URL: http://qdrant:6333
       # Shared secret the gateway uses to push the unwrapped model key to
       # POST /internal/model-key. MUST match the api service's value below.
