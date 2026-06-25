@@ -17,9 +17,9 @@
 # ║       docker build -t secureprompt-ml -f secureprompt-ml/Dockerfile .     ║
 # ║                                                                            ║
 # ║  model_key.hex must contain exactly 64 hex chars (32-byte AES key).       ║
-# ║  The same key must be sealed into customer licenses by sp-admin so the     ║
-# ║  gateway can push it via ML_SIDECAR_INTERNAL_TOKEN + the license's         ║
-# ║  sealed model key at runtime.                                              ║
+# ║  The same key is sealed into each license by sp-admin. At runtime the     ║
+# ║  gateway relays the still-wrapped key + lic_id and the sidecar .so        ║
+# ║  (MODEL-KEK baked at build) unwraps it. Plaintext keys never transit.     ║
 # ║                                                                            ║
 # ║  Without a valid license the sidecar never receives the decryption key     ║
 # ║  and stays 503 — the gateway falls back to regex-only (fail-open) mode.   ║

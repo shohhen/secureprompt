@@ -107,11 +107,18 @@ app = FastAPI(title="SecurePrompt ML Sidecar", lifespan=lifespan)
 
 @app.post("/internal/model-key")
 async def set_model_key(req: Request):
-    """Receive the AES-256 model key from the gateway.
+    """Receive the license's WRAPPED model key from the gateway and unwrap it.
+
+    Body: ``{ "wrapped_key": "<base64>", "lic_id": "<uuid>" }``. The plaintext
+    model key never crosses the wire — the gateway relays the still-sealed blob
+    and the compiled keyloader (.so, MODEL-KEK baked at build) unwraps it here.
 
     Authentication: ``Authorization: Bearer <ML_SIDECAR_INTERNAL_TOKEN>``.
     The token must be non-empty; an empty token always rejects.
     Uses ``hmac.compare_digest`` to avoid timing-based token leaks.
+
+    Fail-closed: ``_model_key`` is set only after a successful unwrap; a bad blob
+    returns 400 and leaves any previously-loaded key untouched.
 
     This endpoint is intentionally NOT gated by ``_ready`` so the gateway
     can POST the key before the model has loaded (the whole point of the
