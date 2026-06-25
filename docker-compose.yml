@@ -48,6 +48,10 @@ services:
       # Active NER checkpoint(s); defaults in-image to multilingual_ner_v5_cold_xlmr.
       # Comma-separated for several, or "all" to load every shipped checkpoint.
       ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v5_cold_xlmr}
+      # XLM-R confidence floor. Recognizer is language-gated to ru/uz (never
+      # scores English), so the legacy 0.85 mostly drops legitimate lone-name
+      # detections. Tune via .env; experiment default below.
+      XLMR_CONFIDENCE_FLOOR: ${XLMR_CONFIDENCE_FLOOR:-0.85}
       QDRANT_URL: http://qdrant:6333
       # Shared secret the gateway uses to push the unwrapped model key to
       # POST /internal/model-key. MUST match the api service's value below.
@@ -108,6 +112,9 @@ services:
       CLICKHOUSE_DATABASE: secureprompt
       SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}
       SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:-dev-provider-key-changeme-in-prod}
+      # Browser-facing CORS allowlist. Dashboard runs on host port 3003; the
+      # API default is only localhost:3000, so the new origin must be listed.
+      SECUREPROMPT_CORS_ORIGINS: ${SECUREPROMPT_CORS_ORIGINS:-http://localhost:3003}
       SECUREPROMPT_PUBLIC_SIGNUP_ENABLED: ${SECUREPROMPT_PUBLIC_SIGNUP_ENABLED:-true}
       # Phase 1 chat-completions debug mode. When `true`, the gateway runs
       # the full redaction pipeline but does NOT call the cloud provider —
@@ -123,8 +130,12 @@ services:
       SECUREPROMPT_MODEL_KEK: ${SECUREPROMPT_MODEL_KEK:-}
       SECUREPROMPT_LICENSE_TOKEN: ${SECUREPROMPT_LICENSE_TOKEN:-}
       ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
-      # Optional: point at sp-admin to enable online revocation (fail-closed).
-      # SECUREPROMPT_LICENSE_SERVER_URL: http://host.docker.internal:8090
+      # sp-admin license server. Enables the online revocation poller (fail-CLOSED
+      # only on a confirmed `revoked`; soft-fail/last-known on any other outcome)
+      # and the attestation heartbeat uploader. Base URL must point at the JSON
+      # API (/api), NOT the dashboard root — the gateway appends /v1/licenses/...
+      # and /v1/attestations. Override via .env.
+      SECUREPROMPT_LICENSE_SERVER_URL: ${SECUREPROMPT_LICENSE_SERVER_URL:-https://manage.secureprompt.tech/api}
     ports:
       - "8080:8080"
     depends_on:
@@ -169,31 +180,19 @@ services:
       dockerfile: secureprompt-web/Dockerfile
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8080
-      NEXTAUTH_URL: http://localhost:3000
+      # Host port remapped to 3003 (sp-admin-web owns 3000).
+      # NEXTAUTH_URL must match the browser-facing URL or auth callbacks break.
+      NEXTAUTH_URL: http://localhost:3003
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme-dev-only}
       API_URL: http://api:8080
       ML_SIDECAR_URL: http://secureprompt-ml:8080
     ports:
-      - "3000:3000"
+      - "3003:3000"
     depends_on:
       api:
         condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  marketing:
-    build:
-      context: .
-      dockerfile: secureprompt-marketing/Dockerfile
-    ports:
-      - "3002:3001"
-    environment:
-      CONTACT_FORM_ENDPOINT: ${CONTACT_FORM_ENDPOINT:-}
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3001/"]
       interval: 30s
       timeout: 5s
       retries: 3
