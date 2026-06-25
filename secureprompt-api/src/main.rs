@@ -160,10 +160,12 @@ async fn main() -> anyhow::Result<()> {
     let license = {
         let now = chrono::Utc::now().timestamp();
         let effective_pubkey = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
+        // Task 2: prefer DB-stored token over env/config token; fall back on any error.
+        let token = secureprompt_api::license::resolve_active_token(&db, &config.license.license_token).await;
         match secureprompt_api::license::parse_vendor_key(&effective_pubkey) {
             Some(vk) => std::sync::Arc::new(secureprompt_api::license::LicenseState::new(
                 secureprompt_api::license::load_and_verify_token(
-                    &config.license.license_token,
+                    &token,
                     &vk,
                     now,
                 ),
@@ -247,7 +249,8 @@ async fn main() -> anyhow::Result<()> {
     let effective_pubkey_for_recheck = secureprompt_api::license::effective_vendor_pubkey(&config.license.pubkey_b64);
     if let Some(vk) = secureprompt_api::license::parse_vendor_key(&effective_pubkey_for_recheck) {
         let st = std::sync::Arc::clone(&state.license);
-        let license_token = config.license.license_token.clone();
+        // Task 2: capture the env token so we can re-resolve DB vs env each tick.
+        let env_token_for_recheck = config.license.license_token.clone();
         let secs = config.license.recheck_secs;
         // Plan 4 — capture kek/token/client for re-push on re-verify.
         let recheck_kek = model_kek;
@@ -257,14 +260,18 @@ async fn main() -> anyhow::Result<()> {
         // loop on every tick would work too, but a single capture is cheaper.
         let recheck_digest = std::env::var("SECUREPROMPT_IMAGE_DIGEST").unwrap_or_default();
         // Part C — capture db for freshness high-water persistence (URL-independent).
+        // Also used by Task 2 for re-resolving DB token each tick.
         let recheck_db = state.db.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
             t.tick().await; // skip immediate first tick (startup already verified / boot-seeded)
             loop {
                 t.tick().await;
+                // Task 2: re-resolve DB vs env on every tick so a token activated
+                // mid-run takes effect without a restart.
+                let token = secureprompt_api::license::resolve_active_token(&recheck_db, &env_token_for_recheck).await;
                 let new_snapshot = secureprompt_api::license::load_and_verify_token(
-                    &license_token,
+                    &token,
                     &vk,
                     chrono::Utc::now().timestamp(),
                 );

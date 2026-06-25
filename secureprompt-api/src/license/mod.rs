@@ -248,6 +248,20 @@ fn bump_max(cell: &AtomicI64, v: i64) {
     }
 }
 
+/// Resolve the active license token: prefer the DB-stored token (written by the
+/// console activation endpoint) over the environment/config token.  Falls back
+/// to `env_token` on any DB error or when no row exists — **never fails**.
+pub async fn resolve_active_token(db: &sqlx::PgPool, env_token: &str) -> String {
+    match crate::db::license_repo::get(db).await {
+        Ok(Some(row)) => row.token,
+        Ok(None) => env_token.to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, "license_repo::get failed — falling back to env token");
+            env_token.to_string()
+        }
+    }
+}
+
 /// Parse a base64 Ed25519 vendor public key. None on bad input.
 pub fn parse_vendor_key(b64: &str) -> Option<VerifyingKey> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -821,6 +835,22 @@ mod tests {
         st.observe_freshness(1000, 1010); // fresh
         st.mark_revoked();
         assert_eq!(st.effective_status_at(1010), LicenseStatus::Revoked);
+    }
+
+    // ── Task 2: resolve_active_token ─────────────────────────────────────────
+
+    #[sqlx::test]
+    async fn resolve_active_token_falls_back_to_env_when_no_row(pool: sqlx::PgPool) {
+        let result = super::resolve_active_token(&pool, "ENV").await;
+        assert_eq!(result, "ENV");
+    }
+
+    #[sqlx::test]
+    async fn resolve_active_token_returns_db_token_when_row_exists(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        crate::db::license_repo::upsert(&pool, "DB", None).await?;
+        let result = super::resolve_active_token(&pool, "ENV").await;
+        assert_eq!(result, "DB");
+        Ok(())
     }
 
     // ── URL-independence test ────────────────────────────────────────────────
