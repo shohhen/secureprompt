@@ -48,5 +48,6 @@ def test_generator_is_deterministic(tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     run(a); run(b)
     for lang in LANGS:
-        assert (a / f"aug_v6_{lang}.jsonl").read_text(encoding="utf-8") == \
-               (b / f"aug_v6_{lang}.jsonl").read_text(encoding="utf-8")
+        fn = f"aug_train_{A.FILE_LANG[lang]}.jsonl"
+        assert (a / fn).read_text(encoding="utf-8") == \
+               (b / fn).read_text(encoding="utf-8")

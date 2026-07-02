@@ -13,7 +13,10 @@ gaps the v5_cold model misses:
      (so `Ташкент`, `Eloquent ORM`, `Kafka` stop being tagged PERSON/ORG).
 
 Offsets are character offsets (Python `len`), matching the dataset. Output:
-`data/aug_v6_{ru,uz_latin,uz_cyrillic}.jsonl`. Deterministic (seeded).
+`data/aug_train_{ru,uz_latin,uz_cyrillic}.jsonl` — the trainer's file-lang naming,
+so prepare_v5_training.py converts them to `aug_train_{lang}_v4.jsonl` and
+train_v4_ner.py auto-loads them as the *train-split* augmentation (val/test stay
+clean for honest eval). Deterministic (seeded).
 
 Usage: python scripts/augment_v6.py --per-category 220 --out-dir data
 """
@@ -150,6 +153,10 @@ def gen_hardneg_tech(rng, lang):
 CATEGORIES = [gen_resume_header, gen_resume_bio, gen_standalone_name,
               gen_org_context, gen_hardneg_city, gen_hardneg_tech]
 
+# internal generation lang key -> the trainer's on-disk file language
+# (prepare_v5_training.py / train_v4_ner.py LANG_FILES both use these)
+FILE_LANG = {"ru": "ru", "uz_latn": "uz_latin", "uz_cyrl": "uz_cyrillic"}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -166,16 +173,15 @@ def main():
         rows = []
         for gen in CATEGORIES:
             for _ in range(args.per_category):
-                rec = gen(rng, lang)
-                rec["lang"] = "ru" if lang == "ru" else ("uz" if False else lang)
-                rows.append(rec)
+                rows.append(gen(rng, lang))
         rng.shuffle(rows)
-        out = args.out_dir / f"aug_v6_{lang}.jsonl"
+        flang = FILE_LANG[lang]  # uz_latn -> uz_latin (trainer's file naming)
+        out = args.out_dir / f"aug_train_{flang}.jsonl"
         with out.open("w", encoding="utf-8") as f:
             for r in rows:
-                f.write(json.dumps({"text": r["text"], "lang": r["lang"],
+                f.write(json.dumps({"text": r["text"], "lang": flang,
                                     "entities": r["entities"]}, ensure_ascii=False) + "\n")
-        totals[lang] = len(rows)
+        totals[flang] = len(rows)
         print(f"[aug] {out}  ({len(rows)} samples)")
     print("total:", sum(totals.values()))
 
