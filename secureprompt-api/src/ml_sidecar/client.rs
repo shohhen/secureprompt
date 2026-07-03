@@ -389,6 +389,12 @@ fn rebase_span(span: Option<(usize, usize)>, offset: usize) -> Option<(usize, us
 /// this, a long prompt got ZERO detections and the 422 poisoned the circuit
 /// breaker for all traffic (P0-4).
 pub(crate) fn split_for_ner(text: &str, max_chars: usize) -> Vec<(usize, String)> {
+    // Defensive clamp: max_chars == 0 would never advance `start` in the
+    // hard-cut branch below (infinite loop). The constructor already filters
+    // ML_NER_CHUNK_CHARS to > 0, but this function is pub(crate) on a
+    // security-critical path — guard here too, don't rely on one caller's
+    // invariant.
+    let max_chars = max_chars.max(1);
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     if chars.len() <= max_chars {
         return vec![(0, text.to_owned())];
@@ -528,6 +534,51 @@ mod tests {
         assert_eq!(rebuilt, text); // no panic on char boundaries, exact tiling
     }
 
+    /// Hard-cut branch: no whitespace anywhere in the window, so the split
+    /// must fall back to cutting at exactly max_chars — exact tiling, no
+    /// empty chunks, every chunk within the budget, loop terminates.
+    #[test]
+    fn split_for_ner_hard_cut_no_whitespace() {
+        let text = "a".repeat(5000);
+        let out = split_for_ner(&text, 1200);
+        assert!(out.len() > 1);
+        let mut expect_off = 0usize;
+        for (off, chunk) in &out {
+            assert_eq!(*off, expect_off, "chunks tile with no gaps/overlaps");
+            assert!(!chunk.is_empty(), "no empty chunks");
+            assert!(chunk.chars().count() <= 1200, "chunk within max_chars");
+            expect_off += chunk.len();
+        }
+        let rebuilt: String = out.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(rebuilt, text, "concatenation reproduces the input exactly");
+    }
+
+    /// Hard-cut branch with multibyte chars: no whitespace, 2-byte chars —
+    /// byte-boundary math must not panic or produce partial chars.
+    #[test]
+    fn split_for_ner_hard_cut_multibyte_no_whitespace() {
+        let text = "я".repeat(3000);
+        let out = split_for_ner(&text, 800);
+        assert!(out.len() > 1);
+        for (_, chunk) in &out {
+            assert!(!chunk.is_empty(), "no empty chunks");
+            assert!(chunk.chars().count() <= 800, "chunk within max_chars");
+        }
+        let rebuilt: String = out.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(rebuilt, text, "exact tiling, no panic on char boundaries");
+    }
+
+    /// max_chars == 0 is clamped to 1 instead of hanging (defensive guard —
+    /// the constructor filters ML_NER_CHUNK_CHARS to > 0, but the function
+    /// is pub(crate) and must not be able to infinite-loop).
+    #[test]
+    fn split_for_ner_zero_max_chars_terminates() {
+        let out = split_for_ner("abc def", 0);
+        assert!(!out.is_empty());
+        let rebuilt: String = out.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(rebuilt, "abc def");
+    }
+
     // --- P0-4: span rebase arithmetic (pure logic; no mock-server crate in
     // this workspace, so this is the feasible equivalent per the task brief) ---
 
@@ -587,6 +638,67 @@ mod tests {
             "4xx responses must not count as sidecar failures (P0-4)"
         );
         assert!(!client.circuit.as_ref().unwrap().is_open());
+
+        server.join().expect("mock server thread panicked");
+    }
+
+    // --- P0-4: end-to-end chunk + span-rebase through detect_if_available ---
+    //
+    // Same raw-TCP idiom as the 4xx test: the listener serves a valid
+    // one-entity NerResponse (chunk-local span (0,4)) per request. With
+    // ner_chunk_chars overridden to 50 (set directly — same module, avoids
+    // env races between parallel tests), a 120-char prompt tiles into 3
+    // chunks, so the client must issue 3 requests and return 3 detections
+    // whose spans are rebased by each chunk's byte offset.
+    #[tokio::test]
+    async fn test_detect_chunks_and_rebases_spans_end_to_end() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let prompt = "word ".repeat(24); // 120 chars, whitespace-separated
+        let expected_chunks = split_for_ner(&prompt, 50);
+        assert_eq!(expected_chunks.len(), 3, "test setup: prompt must tile into 3 chunks");
+        let n_chunks = expected_chunks.len();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..n_chunks {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // drain the request, best-effort
+                let body = b"{\"entities\":[{\"entity_type\":\"PERSON\",\"start\":0,\"end\":4,\"score\":0.99,\"text\":\"word\",\"compliance_categories\":[]}]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let mut client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        client.ner_chunk_chars = 50;
+
+        let dets = client.detect_if_available(&prompt).await;
+        assert_eq!(dets.len(), n_chunks, "one detection per chunk");
+        for (det, (off, _)) in dets.iter().zip(expected_chunks.iter()) {
+            assert_eq!(
+                det.span,
+                Some((*off, off + 4)),
+                "span must be rebased by the chunk's byte offset {off}"
+            );
+        }
+        assert_eq!(
+            client.calls_total.load(Ordering::Relaxed),
+            n_chunks as u64,
+            "each chunk is a successful sidecar call"
+        );
+        assert_eq!(client.failures_total.load(Ordering::Relaxed), 0);
 
         server.join().expect("mock server thread panicked");
     }
