@@ -281,8 +281,15 @@ async def scan_file_endpoint(file: UploadFile = File(...)):
 
     text = await asyncio.to_thread(_decode_best_effort, raw)
 
-    # NER (PII) detection — same analyzer as /detect/ner.
-    ner_raw = await asyncio.to_thread(detect, _models["analyzer"], text)
+    # NER (PII) detection — same analyzer as /detect/ner, run under the
+    # bulk scan profile so XLM-R's coverage caps open up for large documents.
+    def _detect_bulk(analyzer, txt):
+        # thread-locals don't cross to_thread — set the profile in-thread
+        from app.detection.scan_profile import scan_scope
+        with scan_scope("bulk"):
+            return detect(analyzer, txt)
+
+    ner_raw = await asyncio.to_thread(_detect_bulk, _models["analyzer"], text)
 
     # Prompt-injection on a bounded prefix (the model has a 2 KiB limit).
     injection_text = text[:2000]
