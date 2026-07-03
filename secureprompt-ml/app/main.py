@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import os
 import time as _time
 import uuid
 from contextlib import asynccontextmanager
@@ -374,15 +375,25 @@ async def scan_file_endpoint(file: UploadFile = File(...)):
 
 # In-memory task store for the async scan flow. No persistence, no locks —
 # a single asyncio event loop gives us atomic dict access between awaits, and
-# entries are TTL-pruned on each new task creation so this never grows
-# unbounded across a long-running sidecar process.
+# terminal entries are TTL-pruned on each new task creation so this never
+# grows unbounded across a long-running sidecar process.
 _scan_tasks: dict[str, dict] = {}
 _SCAN_TASK_TTL_S = 15 * 60
+# Cap on concurrently-running background scans — each one is a CPU-bound
+# NER pass in a worker thread, so unbounded enqueueing is a trivial DoS.
+_SCAN_ASYNC_MAX_RUNNING = int(os.getenv("ML_SCAN_ASYNC_MAX_RUNNING", "4"))
+# Strong refs to in-flight scan tasks: the event loop only keeps a WEAK
+# reference to tasks, so a create_task() result that nobody holds can be
+# garbage-collected mid-flight (poller then sees "running" forever).
+_scan_task_refs: set = set()
 
 
 def _prune_scan_tasks() -> None:
     cutoff = _time.monotonic() - _SCAN_TASK_TTL_S
-    for tid in [t for t, v in _scan_tasks.items() if v["created"] < cutoff]:
+    for tid in [
+        t for t, v in _scan_tasks.items()
+        if v["created"] < cutoff and v["status"] != "running"
+    ]:
         _scan_tasks.pop(tid, None)
 
 
@@ -394,19 +405,29 @@ async def scan_file_async(file: UploadFile = File(...)):
     if len(raw) > _SCAN_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
     _prune_scan_tasks()
+    running = sum(1 for v in _scan_tasks.values() if v["status"] == "running")
+    if running >= _SCAN_ASYNC_MAX_RUNNING:
+        raise HTTPException(status_code=429, detail="too many concurrent scans")
     tid = uuid.uuid4().hex
     _scan_tasks[tid] = {"status": "running", "result": None, "error": None,
                         "created": _time.monotonic()}
 
     async def _run():
         try:
-            _scan_tasks[tid]["result"] = await _scan_impl(raw)
-            _scan_tasks[tid]["status"] = "done"
+            result = await _scan_impl(raw)
+            entry = _scan_tasks.get(tid)
+            if entry is not None:
+                entry["result"] = result
+                entry["status"] = "done"
         except Exception as exc:  # fail visible, never silent
-            _scan_tasks[tid]["status"] = "error"
-            _scan_tasks[tid]["error"] = str(exc)
+            entry = _scan_tasks.get(tid)
+            if entry is not None:
+                entry["status"] = "error"
+                entry["error"] = str(exc)
 
-    asyncio.create_task(_run())
+    t = asyncio.create_task(_run())
+    _scan_task_refs.add(t)
+    t.add_done_callback(_scan_task_refs.discard)
     return ScanTaskCreated(task_id=tid)
 
 
