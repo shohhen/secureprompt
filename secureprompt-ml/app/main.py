@@ -246,9 +246,10 @@ async def rag_check_endpoint(req: RagCheckRequest):
 
 
 # Cap the amount of file content we decode before scanning — protects the
-# sidecar from OOM on large uploads. 2 MiB is enough for any reasonable text
-# prompt or config file; PDFs are handled best-effort.
-_SCAN_FILE_MAX_BYTES = 2 * 1024 * 1024
+# sidecar from OOM on large uploads. Env-tunable; default 15 MiB (covers
+# multi-page PDFs/DOCX). Chat side already allows more (nginx 25M, multer 20M),
+# so this sidecar cap is the binding limit.
+_SCAN_FILE_MAX_BYTES = int(os.getenv("ML_SCAN_FILE_MAX_BYTES", str(15 * 1024 * 1024)))
 _SCAN_FILE_TEXT_PREVIEW = 8 * 1024  # keep redacted_text small in the response
 
 
