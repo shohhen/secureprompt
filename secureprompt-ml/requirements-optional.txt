@@ -1,0 +1,6 @@
+# Optional heavy deps, gated behind env flags. NOT installed in the default
+# image until the transformers-5 validation gate passes (see findings doc).
+# ML_NER_BACKEND=gliner2:
+gliner2==1.3.2
+# ML_USE_ONNX=true for XLM-R (Task 8):
+optimum[onnxruntime]>=1.24
