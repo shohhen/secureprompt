@@ -65,12 +65,20 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Default char budget per NER chunk (well under the sidecar's 32,768-char
+/// Pydantic cap — margin kept for multi-byte expansion/JSON overhead).
+const DEFAULT_NER_CHUNK_CHARS: usize = 24_000;
+
 #[derive(Debug, Clone)]
 pub struct MlSidecarClient {
     pub base_url: String,
     pub enabled: bool,
     http: Option<Client>,
     circuit: Option<Arc<AtomicCircuit>>,
+    // P0-4: max chars per `/detect/ner` request. Prompts longer than this are
+    // tiled via `split_for_ner` so oversized prompts get full coverage
+    // instead of a single 422-rejected call.
+    ner_chunk_chars: usize,
     // Observable counters — always allocated, zero when disabled.
     calls_total: Arc<AtomicU64>,
     failures_total: Arc<AtomicU64>,
@@ -101,11 +109,18 @@ impl MlSidecarClient {
             (None, None)
         };
 
+        let ner_chunk_chars = std::env::var("ML_NER_CHUNK_CHARS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_NER_CHUNK_CHARS);
+
         Self {
             base_url,
             enabled,
             http,
             circuit,
+            ner_chunk_chars,
             calls_total: Arc::new(AtomicU64::new(0)),
             failures_total: Arc::new(AtomicU64::new(0)),
             circuit_open_count: Arc::new(AtomicU64::new(0)),
@@ -113,6 +128,15 @@ impl MlSidecarClient {
     }
 
     /// Returns ML detections. Returns empty Vec when circuit is OPEN or sidecar disabled (D-13).
+    ///
+    /// P0-4: the sidecar 422-rejects any single request whose `text` exceeds
+    /// 32,768 chars. Before this fix, a >32k prompt got a 4xx which was
+    /// treated as a generic failure — zero detections (unredacted
+    /// pass-through) AND a circuit-breaker failure, so repeated long prompts
+    /// could trip the breaker OPEN and fail-open ALL traffic, not just the
+    /// oversized ones. Now: the prompt is tiled into `ner_chunk_chars`-sized
+    /// chunks (full coverage) and a 4xx response is treated as "our request
+    /// was malformed", never as a sidecar-health signal (see `detect_chunk`).
     pub async fn detect_if_available(&self, prompt: &str) -> Vec<MlDetection> {
         let (http, circuit) = match (&self.http, &self.circuit) {
             (Some(h), Some(c)) if self.enabled => (h, c),
@@ -123,12 +147,47 @@ impl MlSidecarClient {
             return Vec::new();
         }
 
+        let mut all = Vec::new();
+        for (offset, chunk) in split_for_ner(prompt, self.ner_chunk_chars) {
+            // The breaker may have opened mid-loop from a prior chunk's
+            // transport/parse failure — stop issuing further chunk calls.
+            if circuit.is_open() {
+                break;
+            }
+            let mut dets = self.detect_chunk(http, circuit, &chunk).await;
+            for det in &mut dets {
+                det.span = rebase_span(det.span, offset);
+            }
+            all.extend(dets);
+        }
+        all
+    }
+
+    /// Query `/detect/ner` for a single chunk (already ≤ `ner_chunk_chars`
+    /// chars). Spans in the returned `MlDetection`s are relative to the
+    /// START of `chunk` — the caller (`detect_if_available`) rebases them to
+    /// whole-prompt byte offsets.
+    ///
+    /// Breaker semantics (unchanged from the pre-chunking single-request
+    /// code, for every arm EXCEPT the new 4xx one): success -> record_success
+    /// + calls_total++; parse failure or transport failure -> record_failure
+    /// + failures_total++ (+ circuit_open_count++ if that failure just
+    /// tripped the breaker OPEN).
+    async fn detect_chunk(&self, http: &Client, circuit: &AtomicCircuit, chunk: &str) -> Vec<MlDetection> {
         let url = format!("{}/detect/ner", self.base_url);
         let body = NerRequest {
-            text: prompt.to_owned(),
+            text: chunk.to_owned(),
         };
 
         match http.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_client_error() => {
+                // 4xx = OUR request was rejected (e.g. still oversized, or
+                // malformed). This is not a sidecar health signal — do NOT
+                // feed the circuit breaker, or long prompts fail-open ALL
+                // traffic (P0-4).
+                tracing::warn!(status = %resp.status(), "ml sidecar rejected NER request");
+                Vec::new()
+            }
             Ok(resp) => match resp.json::<NerResponse>().await {
                 Ok(ner) => {
                     circuit.record_success();
@@ -316,6 +375,47 @@ impl MlSidecarClient {
     }
 }
 
+/// Rebase a detection span from chunk-local byte offsets to whole-prompt
+/// byte offsets by adding the chunk's starting byte offset. Pure arithmetic,
+/// factored out of `detect_if_available` so it's unit-testable without a
+/// mock HTTP server (P0-4).
+fn rebase_span(span: Option<(usize, usize)>, offset: usize) -> Option<(usize, usize)> {
+    span.map(|(s, e)| (s + offset, e + offset))
+}
+
+/// Split text into (byte_offset, chunk) pairs of at most `max_chars`
+/// characters, cutting at whitespace when one exists in the window. The
+/// sidecar caps NER requests at 32,768 chars (Pydantic 422 beyond) — before
+/// this, a long prompt got ZERO detections and the 422 poisoned the circuit
+/// breaker for all traffic (P0-4).
+pub(crate) fn split_for_ner(text: &str, max_chars: usize) -> Vec<(usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.len() <= max_chars {
+        return vec![(0, text.to_owned())];
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize; // index into chars
+    while start < chars.len() {
+        let hard_end = (start + max_chars).min(chars.len());
+        let mut cut = hard_end;
+        if hard_end < chars.len() {
+            // walk back to just AFTER the last whitespace in the window
+            let mut j = hard_end;
+            while j > start && !chars[j - 1].1.is_whitespace() {
+                j -= 1;
+            }
+            if j > start {
+                cut = j;
+            }
+        }
+        let start_byte = chars[start].0;
+        let end_byte = if cut < chars.len() { chars[cut].0 } else { text.len() };
+        out.push((start_byte, text[start_byte..end_byte].to_owned()));
+        start = cut;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +490,104 @@ mod tests {
             open_count.fetch_add(1, Ordering::Relaxed);
         }
         assert_eq!(open_count.load(Ordering::Relaxed), 1);
+    }
+
+    // --- P0-4: split_for_ner ---
+
+    #[test]
+    fn split_for_ner_short_text_single_chunk() {
+        let out = split_for_ner("hello world", 100);
+        assert_eq!(out, vec![(0usize, "hello world".to_string())]);
+    }
+
+    #[test]
+    fn split_for_ner_tiles_text_at_whitespace() {
+        let text = "word ".repeat(1000); // 5000 chars
+        let out = split_for_ner(&text, 1200);
+        assert!(out.len() > 1);
+        // chunks tile the original text exactly
+        let mut rebuilt = String::new();
+        let mut expect_off = 0usize;
+        for (off, chunk) in &out {
+            assert_eq!(*off, expect_off);
+            rebuilt.push_str(chunk);
+            expect_off += chunk.len();
+        }
+        assert_eq!(rebuilt, text);
+        // split points fall between words, not inside them
+        for (_, chunk) in &out[..out.len() - 1] {
+            assert!(chunk.ends_with(' '), "chunk must end at whitespace");
+        }
+    }
+
+    #[test]
+    fn split_for_ner_multibyte_safe() {
+        let text = "Привет мир ".repeat(500);
+        let out = split_for_ner(&text, 800);
+        let rebuilt: String = out.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(rebuilt, text); // no panic on char boundaries, exact tiling
+    }
+
+    // --- P0-4: span rebase arithmetic (pure logic; no mock-server crate in
+    // this workspace, so this is the feasible equivalent per the task brief) ---
+
+    #[test]
+    fn rebase_span_adds_chunk_offset() {
+        assert_eq!(rebase_span(Some((3, 7)), 1000), Some((1003, 1007)));
+        assert_eq!(rebase_span(None, 1000), None);
+        assert_eq!(rebase_span(Some((0, 0)), 0), Some((0, 0)));
+    }
+
+    // --- P0-4: 4xx must not trip the circuit breaker ---
+    //
+    // No mock-HTTP crate (wiremock/mockito) is in this workspace's
+    // dev-dependencies, so this drives a real 4xx response off a raw
+    // loopback TCP listener (same pattern already used by
+    // `test_unreachable_sidecar_returns_empty` for real-socket testing).
+    #[tokio::test]
+    async fn test_4xx_does_not_trip_circuit_breaker() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..FAILURE_THRESHOLD {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf); // drain the request, best-effort
+                let body = b"{\"detail\":\"text exceeds 32768 chars\"}";
+                let resp = format!(
+                    "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        for _ in 0..FAILURE_THRESHOLD {
+            let result = client.detect_if_available("some prompt").await;
+            assert!(result.is_empty(), "4xx yields no detections");
+        }
+
+        assert_eq!(
+            client.circuit_open_count.load(Ordering::Relaxed),
+            0,
+            "4xx responses must never trip the circuit breaker (P0-4)"
+        );
+        assert_eq!(
+            client.failures_total.load(Ordering::Relaxed),
+            0,
+            "4xx responses must not count as sidecar failures (P0-4)"
+        );
+        assert!(!client.circuit.as_ref().unwrap().is_open());
+
+        server.join().expect("mock server thread panicked");
     }
 }
