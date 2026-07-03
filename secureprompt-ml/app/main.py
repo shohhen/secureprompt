@@ -2,6 +2,7 @@ import asyncio
 import hmac
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from app import config
 from app.models import (
     NerRequest, NerResponse, NerEntity,
     InjectionRequest, InjectionResponse,
@@ -20,10 +21,21 @@ from app.rag import rag_check
 _ready = asyncio.Event()
 _models: dict = {}
 _ner_queue: asyncio.Queue | None = None
+_ner_queue_bulk: asyncio.Queue | None = None
 
 # Module-level state for the deferred key delivery flow.
 _model_key: bytes | None = None
 _key_event = asyncio.Event()
+
+
+def _route_queue(text: str) -> asyncio.Queue:
+    """Inline lane for chat-sized texts; bulk lane for documents, so a big
+    scan can never head-of-line-block interactive traffic (two drain
+    workers → two independent worker threads)."""
+    from app import config
+    if len(text) > config.NER_BULK_THRESHOLD_CHARS and _ner_queue_bulk is not None:
+        return _ner_queue_bulk
+    return _ner_queue
 
 
 def _make_process_batch():
@@ -66,7 +78,7 @@ def _load_analyzer(model_key: bytes | None = None):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ner_queue
+    global _ner_queue, _ner_queue_bulk
     from app import config
 
     # Always load these synchronous, non-encrypted models first.
@@ -76,6 +88,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_collections, _models["qdrant"])
 
     _ner_queue = asyncio.Queue(maxsize=100)
+    _ner_queue_bulk = asyncio.Queue(maxsize=20)
     _process_batch = _make_process_batch()
 
     if not config.MODEL_KEY_REQUIRED:
@@ -84,6 +97,9 @@ async def lifespan(app: FastAPI):
         _models["analyzer"] = await asyncio.to_thread(_load_analyzer)
         asyncio.create_task(
             drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+        asyncio.create_task(
+            drain_worker(_ner_queue_bulk, _process_batch, deadline_ms=50, max_batch=2)
         )
         _ready.set()
         yield
@@ -95,6 +111,9 @@ async def lifespan(app: FastAPI):
         # Inference routes gate on _ready (503 until it is set).
         asyncio.create_task(
             drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+        asyncio.create_task(
+            drain_worker(_ner_queue_bulk, _process_batch, deadline_ms=50, max_batch=2)
         )
 
         async def _wait_for_key_then_load():
@@ -175,7 +194,7 @@ async def detect_ner(req: NerRequest):
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
     try:
-        _ner_queue.put_nowait((future, req.text))
+        _route_queue(req.text).put_nowait((future, req.text))
     except asyncio.QueueFull:
         raise HTTPException(status_code=429, detail="NER queue full")
     entities_raw = await future

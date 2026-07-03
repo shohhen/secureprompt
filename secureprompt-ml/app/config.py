@@ -24,3 +24,8 @@ MODEL_KEY_REQUIRED: bool = os.getenv("SECUREPROMPT_MODEL_KEY_REQUIRED", "false")
 # comma-separated list to run several, or `all`/`*` to register every
 # discovered checkpoint (legacy auto-discover-everything behaviour).
 ACTIVE_NER_MODELS: str = os.getenv("ACTIVE_NER_MODELS", "multilingual_ner_v5_cold_xlmr")
+
+# Texts longer than this (in characters) route to the bulk NER queue instead
+# of the inline one, so a single large document can't head-of-line-block
+# chat-sized requests behind it (P2-9, two-lane queue).
+NER_BULK_THRESHOLD_CHARS: int = int(os.getenv("NER_BULK_THRESHOLD_CHARS", "8192"))
