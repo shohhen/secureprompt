@@ -8,7 +8,7 @@ ML_USE_ONNX: bool = os.getenv("ML_USE_ONNX", "false").lower() == "true"
 # "gliner2" swaps in the GLiNER2-PII recognizer (app/detection/gliner2_ner.py,
 # P1-5) — requires the optional `gliner2` dependency
 # (requirements-optional.txt) plus transformers>=5 image validation.
-ML_NER_BACKEND: str = os.getenv("ML_NER_BACKEND", "gliner").lower()
+ML_NER_BACKEND: str = os.getenv("ML_NER_BACKEND", "gliner2").lower()
 ML_SIDECAR_PORT: int = int(os.getenv("ML_SIDECAR_PORT", "8080"))
 INTERNAL_TOKEN: str = os.getenv("ML_SIDECAR_INTERNAL_TOKEN", "")
 MODEL_KEY_REQUIRED: bool = os.getenv("SECUREPROMPT_MODEL_KEY_REQUIRED", "false").lower() in ("1", "true", "yes")
