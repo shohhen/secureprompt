@@ -29,3 +29,9 @@ ACTIVE_NER_MODELS: str = os.getenv("ACTIVE_NER_MODELS", "multilingual_ner_v5_col
 # of the inline one, so a single large document can't head-of-line-block
 # chat-sized requests behind it (P2-9, two-lane queue).
 NER_BULK_THRESHOLD_CHARS: int = int(os.getenv("NER_BULK_THRESHOLD_CHARS", "8192"))
+
+# GLiNER chunk size and overlap for Presidio. Default 250-char chunks were ~3x
+# slower than necessary: recall is flat up to ~2000 chars and collapses past the
+# model's 384-word cap (~2.3k chars EN). Findings 2026-07-03.
+ML_GLINER_CHUNK_SIZE: int = int(os.getenv("ML_GLINER_CHUNK_SIZE", "1000"))
+ML_GLINER_CHUNK_OVERLAP: int = int(os.getenv("ML_GLINER_CHUNK_OVERLAP", "100"))
