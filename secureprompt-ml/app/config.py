@@ -42,3 +42,14 @@ NER_BULK_THRESHOLD_CHARS: int = int(os.getenv("NER_BULK_THRESHOLD_CHARS", "8192"
 # model's 384-word cap (~2.3k chars EN). Findings 2026-07-03.
 ML_GLINER_CHUNK_SIZE: int = int(os.getenv("ML_GLINER_CHUNK_SIZE", "1000"))
 ML_GLINER_CHUNK_OVERLAP: int = int(os.getenv("ML_GLINER_CHUNK_OVERLAP", "100"))
+
+# Route each contiguous same-language line block through the analyzer with
+# that block's own language, instead of detecting one language for the whole
+# document. A single whole-doc language call gates entire model families
+# (XLM-R ru/uz, English-gated GLiNER) off minority-language content — an EN
+# doc with one RU paragraph scored 0.00 recall on that paragraph (findings
+# 2026-07-03, P1-6). Single-language documents still take the original
+# single-scope fast path (identical behaviour), so this only changes output
+# for genuinely mixed-language text. Disable to fall back to the legacy
+# whole-document language_scope path.
+ML_SEGMENT_LANG_ROUTING: bool = os.getenv("ML_SEGMENT_LANG_ROUTING", "true").lower() == "true"
