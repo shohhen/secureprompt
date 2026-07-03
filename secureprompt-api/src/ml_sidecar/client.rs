@@ -69,6 +69,12 @@ fn now_secs() -> u64 {
 /// Pydantic cap — margin kept for multi-byte expansion/JSON overhead).
 const DEFAULT_NER_CHUNK_CHARS: usize = 24_000;
 
+/// Default aggregate wall-clock budget (ms) for the whole `detect_if_available`
+/// chunk loop — mirrors the sidecar's log-and-truncate philosophy (XLM-R caps
+/// do the same) so a slow-but-not-failing sidecar can't block the interactive
+/// chat request path for minutes on an oversized prompt (Finding 2).
+const DEFAULT_NER_TOTAL_BUDGET_MS: u64 = 30_000;
+
 #[derive(Debug, Clone)]
 pub struct MlSidecarClient {
     pub base_url: String,
@@ -79,10 +85,21 @@ pub struct MlSidecarClient {
     // tiled via `split_for_ner` so oversized prompts get full coverage
     // instead of a single 422-rejected call.
     ner_chunk_chars: usize,
+    // Aggregate wall-clock budget for the whole `detect_if_available` chunk
+    // loop (Finding 2, whole-branch review): a slow-but-not-failing sidecar
+    // can otherwise block a ~2MB prompt's ~87 serial chunk calls for minutes
+    // on the interactive chat request path, before the upstream LLM call.
+    ner_total_budget: Duration,
     // Observable counters — always allocated, zero when disabled.
     calls_total: Arc<AtomicU64>,
     failures_total: Arc<AtomicU64>,
     circuit_open_count: Arc<AtomicU64>,
+    // Finding 1 (whole-branch review): 429 (NER-queue-full, sidecar
+    // saturation) is a distinct, transient signal from other 4xx (malformed/
+    // oversized request) — chunks skipped this way get ZERO PII coverage
+    // under load, which must be observable in production, not folded into
+    // the generic client-error path.
+    saturated_total: Arc<AtomicU64>,
 }
 
 impl MlSidecarClient {
@@ -115,15 +132,29 @@ impl MlSidecarClient {
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_NER_CHUNK_CHARS);
 
+        // Finding 2 (whole-branch review): aggregate wall-clock budget for
+        // the whole chunk loop, read from ML_NER_TOTAL_BUDGET_MS. Clamped to
+        // at least `timeout_ms` so the budget can never be shorter than a
+        // single chunk call (which would make the very first chunk break
+        // the loop before it even completes).
+        let ner_total_budget = std::env::var("ML_NER_TOTAL_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(DEFAULT_NER_TOTAL_BUDGET_MS))
+            .max(Duration::from_millis(timeout_ms));
+
         Self {
             base_url,
             enabled,
             http,
             circuit,
             ner_chunk_chars,
+            ner_total_budget,
             calls_total: Arc::new(AtomicU64::new(0)),
             failures_total: Arc::new(AtomicU64::new(0)),
             circuit_open_count: Arc::new(AtomicU64::new(0)),
+            saturated_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -148,10 +179,28 @@ impl MlSidecarClient {
         }
 
         let mut all = Vec::new();
-        for (offset, chunk) in split_for_ner(prompt, self.ner_chunk_chars) {
+        let chunks = split_for_ner(prompt, self.ner_chunk_chars);
+        let chunks_total = chunks.len();
+        let started = std::time::Instant::now();
+        for (chunks_done, (offset, chunk)) in chunks.into_iter().enumerate() {
             // The breaker may have opened mid-loop from a prior chunk's
             // transport/parse failure — stop issuing further chunk calls.
             if circuit.is_open() {
+                break;
+            }
+            // Finding 2: a slow-but-not-failing sidecar has no other
+            // deadline on this loop — each per-call timeout only bounds a
+            // single chunk, and a ~2MB prompt can tile into dozens of
+            // chunks on the interactive chat path (before the upstream LLM
+            // call). Stop issuing new chunk calls once the aggregate
+            // wall-clock budget is exhausted; already-collected detections
+            // are kept (partial PII coverage beats none).
+            if chunks_done > 0 && started.elapsed() >= self.ner_total_budget {
+                tracing::warn!(
+                    chunks_done,
+                    chunks_total,
+                    "NER chunking hit aggregate budget — remaining chunks skipped (partial PII coverage)"
+                );
                 break;
             }
             let mut dets = self.detect_chunk(http, circuit, &chunk).await;
@@ -180,11 +229,29 @@ impl MlSidecarClient {
         };
 
         match http.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                // Finding 1 (whole-branch review): 429 = the sidecar's NER
+                // queue is full (transient saturation under load), NOT a
+                // malformed/oversized request. Distinct from the general 4xx
+                // arm below: this chunk gets ZERO PII coverage, which must be
+                // observable in production (a PII gateway silently failing
+                // open under load is exactly the risk this counter guards
+                // against). Same fail-open contract as other 4xx — do NOT
+                // feed the circuit breaker, or a saturated sidecar would trip
+                // the breaker OPEN and fail-open ALL traffic, not just the
+                // saturated chunks (consistent with the 422 P0-4 rationale).
+                tracing::warn!(
+                    status = %resp.status(),
+                    "ml sidecar saturated (queue full) — chunk skipped, NO PII coverage"
+                );
+                self.saturated_total.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
             Ok(resp) if resp.status().is_client_error() => {
-                // 4xx = OUR request was rejected (e.g. still oversized, or
-                // malformed). This is not a sidecar health signal — do NOT
-                // feed the circuit breaker, or long prompts fail-open ALL
-                // traffic (P0-4).
+                // 4xx (excluding 429, handled above) = OUR request was
+                // rejected (e.g. still oversized, or malformed). This is not
+                // a sidecar health signal — do NOT feed the circuit breaker,
+                // or long prompts fail-open ALL traffic (P0-4).
                 tracing::warn!(status = %resp.status(), "ml sidecar rejected NER request");
                 Vec::new()
             }
@@ -367,10 +434,13 @@ impl MlSidecarClient {
                 "secureprompt_ml_sidecar_failures_total {}\n",
                 "# TYPE secureprompt_ml_sidecar_circuit_open_total counter\n",
                 "secureprompt_ml_sidecar_circuit_open_total {}\n",
+                "# TYPE secureprompt_ml_sidecar_saturated_total counter\n",
+                "secureprompt_ml_sidecar_saturated_total {}\n",
             ),
             self.calls_total.load(Ordering::Relaxed),
             self.failures_total.load(Ordering::Relaxed),
             self.circuit_open_count.load(Ordering::Relaxed),
+            self.saturated_total.load(Ordering::Relaxed),
         )
     }
 }
@@ -699,6 +769,129 @@ mod tests {
             "each chunk is a successful sidecar call"
         );
         assert_eq!(client.failures_total.load(Ordering::Relaxed), 0);
+
+        server.join().expect("mock server thread panicked");
+    }
+
+    // --- Finding 1 (whole-branch review): 429 is a distinct saturation
+    // signal, not a generic 4xx failure, and must never touch the breaker ---
+
+    #[tokio::test]
+    async fn test_429_marks_saturated_not_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf); // drain the request, best-effort
+            let body = b"{\"detail\":\"NER queue full\"}";
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        let result = client.detect_if_available("some prompt").await;
+
+        assert!(
+            result.is_empty(),
+            "429 yields no detections (fail-open — still zero PII coverage for this chunk)"
+        );
+        assert_eq!(
+            client.saturated_total.load(Ordering::Relaxed),
+            1,
+            "429 must be counted distinctly via saturated_total"
+        );
+        assert_eq!(
+            client.failures_total.load(Ordering::Relaxed),
+            0,
+            "429 must NOT count as a generic sidecar failure"
+        );
+        assert_eq!(
+            client.circuit_open_count.load(Ordering::Relaxed),
+            0,
+            "429 must never trip the circuit breaker (consistent with other 4xx, P0-4)"
+        );
+        assert!(!client.circuit.as_ref().unwrap().is_open());
+
+        server.join().expect("mock server thread panicked");
+    }
+
+    // --- Finding 2 (whole-branch review): aggregate wall-clock budget
+    // truncates the chunk loop ---
+    //
+    // Deterministic without any sleep: the budget is set to ZERO, so
+    // `started.elapsed() >= ner_total_budget` is true the instant the check
+    // runs (before chunk index 1 is issued, per the "skip check for the
+    // first chunk" rule). The mock server therefore only ever needs to
+    // serve ONE request — no timing race, no flakiness.
+    #[tokio::test]
+    async fn test_aggregate_budget_truncates_chunk_loop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let prompt = "word ".repeat(24); // 120 chars, whitespace-separated
+        let expected_chunks = split_for_ner(&prompt, 50);
+        assert_eq!(expected_chunks.len(), 3, "test setup: prompt must tile into 3 chunks");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = std::thread::spawn(move || {
+            // Only ONE request is expected — the budget check breaks the
+            // loop before a second chunk is ever issued.
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf); // drain the request, best-effort
+            let body = b"{\"entities\":[{\"entity_type\":\"PERSON\",\"start\":0,\"end\":4,\"score\":0.99,\"text\":\"word\",\"compliance_categories\":[]}]}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let mut client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        client.ner_chunk_chars = 50;
+        client.ner_total_budget = Duration::ZERO;
+
+        let dets = client.detect_if_available(&prompt).await;
+        assert_eq!(
+            dets.len(),
+            1,
+            "only the first chunk is processed before the exhausted budget breaks the loop"
+        );
+        assert_eq!(
+            client.calls_total.load(Ordering::Relaxed),
+            1,
+            "only one sidecar call is issued once the aggregate budget is exhausted"
+        );
+        // The mock server thread only ever serves ONE connection then exits
+        // (unlike test_detect_chunks_and_rebases_spans_end_to_end's `for _
+        // in 0..n_chunks` loop) — deliberately, so that if the budget check
+        // regresses, chunks 2/3 hit connection-refused (a transport
+        // failure) instead of a real response, which would show up here as
+        // a nonzero failures_total even though dets.len()/calls_total alone
+        // wouldn't catch it.
+        assert_eq!(
+            client.failures_total.load(Ordering::Relaxed),
+            0,
+            "no further chunk calls (successful OR failed) are attempted past the budget break"
+        );
 
         server.join().expect("mock server thread panicked");
     }
