@@ -35,7 +35,15 @@ _key_event = asyncio.Event()
 def _route_queue(text: str) -> asyncio.Queue:
     """Inline lane for chat-sized texts; bulk lane for documents, so a big
     scan can never head-of-line-block interactive traffic (two drain
-    workers → two independent worker threads)."""
+    workers → two independent worker threads).
+
+    NOTE (whole-branch review, do not conflate): routing by size here picks
+    a QUEUE for throughput isolation only — it does NOT change XLM-R/GLiNER
+    coverage caps (see detection/scan_profile.py's inline vs. bulk
+    `scan_profile`). `/detect/ner` always runs with INLINE caps regardless
+    of which queue lane it lands on; only `/v1/scan-file` opts into the
+    wider BULK caps.
+    """
     from app import config
     if len(text) > config.NER_BULK_THRESHOLD_CHARS and _ner_queue_bulk is not None:
         return _ner_queue_bulk
@@ -377,6 +385,14 @@ async def scan_file_endpoint(file: UploadFile = File(...)):
 # a single asyncio event loop gives us atomic dict access between awaits, and
 # terminal entries are TTL-pruned on each new task creation so this never
 # grows unbounded across a long-running sidecar process.
+#
+# SCALING NOTE (whole-branch review): this store is PROCESS-LOCAL. Async
+# scan-file endpoints (/v1/scan-file/async + its poll/status routes) require
+# `ml.replicaCount=1` (or sticky/session-affinity routing, or swapping this
+# for a shared store like Redis) before horizontally scaling the ML sidecar —
+# otherwise a poll request can land on a different replica than the one that
+# created the task and spuriously 404. See helm/secureprompt/values.yaml's
+# `ml.replicaCount`.
 _scan_tasks: dict[str, dict] = {}
 _SCAN_TASK_TTL_S = 15 * 60
 # Cap on concurrently-running background scans — each one is a CPU-bound
