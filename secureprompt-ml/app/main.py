@@ -1,5 +1,7 @@
 import asyncio
 import hmac
+import time as _time
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from app import config
@@ -9,6 +11,7 @@ from app.models import (
     EmbedRequest, EmbedResponse,
     RagCheckRequest, RagCheckResponse, RagCheckMatch,
     ScanFileEntity, ScanFileResponse,
+    ScanTaskCreated, ScanTaskStatus,
 )
 from app.detection.ner import _load_analyzer as _load_analyzer_base, detect
 from app.detection.injection import _load_injection_pipeline, classify_injection
@@ -295,18 +298,10 @@ def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:
     return b"".join(parts).decode("utf-8", errors="replace")
 
 
-@app.post("/v1/scan-file", response_model=ScanFileResponse)
-async def scan_file_endpoint(file: UploadFile = File(...)):
-    if not _ready.is_set():
-        raise HTTPException(status_code=503, detail="loading")
-
-    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
-    if len(raw) > _SCAN_FILE_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)",
-        )
-
+async def _scan_impl(raw: bytes) -> ScanFileResponse:
+    """Run the full scan pipeline (decode → NER → injection → secrets →
+    redact) on already-read file bytes. Shared by the sync and async
+    `/v1/scan-file` endpoints so their behavior stays byte-identical."""
     text = await asyncio.to_thread(_decode_best_effort, raw)
 
     # NER (PII) detection — same analyzer as /detect/ner, run under the
@@ -360,3 +355,64 @@ async def scan_file_endpoint(file: UploadFile = File(...)):
         file_size_bytes=len(raw),
         preview_truncated=preview_truncated,
     )
+
+
+@app.post("/v1/scan-file", response_model=ScanFileResponse)
+async def scan_file_endpoint(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)",
+        )
+
+    return await _scan_impl(raw)
+
+
+# In-memory task store for the async scan flow. No persistence, no locks —
+# a single asyncio event loop gives us atomic dict access between awaits, and
+# entries are TTL-pruned on each new task creation so this never grows
+# unbounded across a long-running sidecar process.
+_scan_tasks: dict[str, dict] = {}
+_SCAN_TASK_TTL_S = 15 * 60
+
+
+def _prune_scan_tasks() -> None:
+    cutoff = _time.monotonic() - _SCAN_TASK_TTL_S
+    for tid in [t for t, v in _scan_tasks.items() if v["created"] < cutoff]:
+        _scan_tasks.pop(tid, None)
+
+
+@app.post("/v1/scan-file/async", response_model=ScanTaskCreated, status_code=202)
+async def scan_file_async(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    _prune_scan_tasks()
+    tid = uuid.uuid4().hex
+    _scan_tasks[tid] = {"status": "running", "result": None, "error": None,
+                        "created": _time.monotonic()}
+
+    async def _run():
+        try:
+            _scan_tasks[tid]["result"] = await _scan_impl(raw)
+            _scan_tasks[tid]["status"] = "done"
+        except Exception as exc:  # fail visible, never silent
+            _scan_tasks[tid]["status"] = "error"
+            _scan_tasks[tid]["error"] = str(exc)
+
+    asyncio.create_task(_run())
+    return ScanTaskCreated(task_id=tid)
+
+
+@app.get("/v1/scan-file/tasks/{task_id}", response_model=ScanTaskStatus)
+async def scan_file_task_status(task_id: str):
+    t = _scan_tasks.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    return ScanTaskStatus(status=t["status"], result=t["result"], error=t["error"])

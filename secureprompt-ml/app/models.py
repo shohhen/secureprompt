@@ -68,3 +68,13 @@ class ScanFileResponse(BaseModel):
     redacted_text: str | None = None
     file_size_bytes: int
     preview_truncated: bool
+
+
+class ScanTaskCreated(BaseModel):
+    task_id: str
+
+
+class ScanTaskStatus(BaseModel):
+    status: str  # running | done | error
+    result: ScanFileResponse | None = None
+    error: str | None = None
