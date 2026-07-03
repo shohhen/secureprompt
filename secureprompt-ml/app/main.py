@@ -26,6 +26,17 @@ _model_key: bytes | None = None
 _key_event = asyncio.Event()
 
 
+def _make_process_batch():
+    async def _process_batch(texts: list[str]) -> list[list[dict]]:
+        # Run the whole batch in ONE worker thread: detect() is CPU-bound
+        # (torch inference) and previously starved the event loop — /health
+        # and every enqueued request stalled behind a big document.
+        def _run(ts: list[str]) -> list[list[dict]]:
+            return [detect(_models["analyzer"], t) for t in ts]
+        return await asyncio.to_thread(_run, texts)
+    return _process_batch
+
+
 def _load_analyzer(model_key: bytes | None = None):
     """Wrapper around the base _load_analyzer that passes the model_key
     through to maybe_register inside xlmr_ner.
@@ -65,9 +76,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_collections, _models["qdrant"])
 
     _ner_queue = asyncio.Queue(maxsize=100)
-
-    async def _process_batch(texts: list[str]) -> list[list[dict]]:
-        return [detect(_models["analyzer"], t) for t in texts]
+    _process_batch = _make_process_batch()
 
     if not config.MODEL_KEY_REQUIRED:
         # Default / backward-compatible path: load XLM-R immediately,
