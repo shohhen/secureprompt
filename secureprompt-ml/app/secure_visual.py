@@ -77,6 +77,11 @@ def _ordered(dets):
 def secure_pdf(data, detect_fn, dpi, langs, min_chars, font_path):
     pages = extract_boxes(data, True, dpi, langs, min_chars)
     per_page = [detect_fn(p.text) for p in pages]
+    # Detection runs per page, so a `N/M` page-number footer looks unique on its
+    # own page; pool across pages to drop pagination the model mis-tags (e.g.
+    # `1/16` as CREDIT_CARD_EXPIRATION_DATE) before it becomes a redaction box.
+    from app.detection.ner import _filter_pagination_per_page
+    per_page = _filter_pagination_per_page(per_page)
     # first-appearance numbering: page order, then byte offset within each page
     labels = build_labels([d for dets in per_page for d in _ordered(dets)])
     images = []
