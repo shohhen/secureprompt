@@ -9,11 +9,22 @@ from app.secure_labels import build_labels, redact_text
 
 
 def _set_paragraph_text(paragraph, text: str) -> None:
-    """Put `text` in the first run (keeps its formatting), blank the rest. PII
-    that spanned multiple runs is flattened to run[0]'s style (v1 limitation)."""
-    if paragraph.runs:
-        paragraph.runs[0].text = text
-        for r in paragraph.runs[1:]:
+    """Put `text` in the first direct run (keeps its formatting), blank the rest.
+
+    PII inside ``<w:hyperlink>`` runs is NOT part of ``paragraph.runs`` even
+    though it IS part of ``paragraph.text`` — so we must blank hyperlink-nested
+    runs too, else the original hyperlinked PII survives in the file (a security
+    hole for a redaction control). PII that spanned multiple runs is flattened to
+    run[0]'s style, and a redacted hyperlink loses its link formatting — both are
+    v1 limitations; text removal (the security property) is unaffected.
+    """
+    for hl in paragraph.hyperlinks:
+        for r in hl.runs:
+            r.text = ""
+    direct = paragraph.runs
+    if direct:
+        direct[0].text = text
+        for r in direct[1:]:
             r.text = ""
     elif text:
         paragraph.add_run(text)
@@ -36,6 +47,10 @@ def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     full = "\n".join(p.text for p in paras)
     dets = detect_fn(full)
     labels = build_labels(dets)
+    # Detection saw the joined document, but redaction is a per-paragraph substring
+    # replace — so a PII value straddling a paragraph/cell boundary won't match
+    # verbatim in any single paragraph. v1 assumes each PII value lies within one
+    # paragraph (true for names/emails/ids; multi-paragraph spans are out of scope).
     for p in paras:
         new = redact_text(p.text, labels)
         if new != p.text:
@@ -53,6 +68,9 @@ def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     full = "\n".join(c.value for c in cells)
     dets = detect_fn(full)
     labels = build_labels(dets)
+    # Detection saw the joined sheet, but redaction is a per-cell substring replace —
+    # so a PII value straddling a cell boundary won't match verbatim in any single
+    # cell. v1 assumes each PII value lies within one cell.
     for c in cells:
         c.value = redact_text(c.value, labels)
     out = io.BytesIO()
