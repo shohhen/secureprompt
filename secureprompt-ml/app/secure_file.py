@@ -85,42 +85,42 @@ def _summary(dets: list[dict], pages: int, ocr: bool, mime: str, filename: str) 
 
 
 def secure_file(data: bytes, filename: str, analyzer) -> SecuredFile:
+    from app.document_scan import scan_document, partition_by_page
+    from app.secure_labels import build_labels
     ext = os.path.splitext(filename or "")[1].lower()
     head = data[:4]
 
-    if head == b"%PDF":
-        out, dets, ocr, pages = secure_pdf(
-            data, lambda t: _detect(analyzer, t), _DPI, _LANGS, _MIN_CHARS, _font_path())
-        fn = f"{_stem(filename)}-secured.pdf"
-        return SecuredFile(out, "application/pdf", fn,
-                           _summary(dets, pages, ocr, "application/pdf", fn))
-
-    img_fmt = next((v for magic, v in _IMAGE_MAGIC.items() if data[:len(magic)] == magic), None)
-    if img_fmt:
-        out, dets, mime = secure_image(
-            data, lambda t: _detect(analyzer, t), _DPI, _LANGS, _font_path())
+    if head == b"%PDF" or next((v for m, v in _IMAGE_MAGIC.items() if data[:len(m)] == m), None):
+        doc = scan_document(data, filename, analyzer)
+        labels = build_labels(sorted(doc.detections, key=lambda d: d.get("start", 0)))
+        page_lens = [len(p.text.encode("utf-8")) for p in doc.pages]
+        per_page = partition_by_page(doc.detections, doc.page_byte_offsets, page_lens)
+        if head == b"%PDF":
+            out, dets, ocr, pages = secure_pdf(
+                doc.pages, per_page, labels, data, _DPI, _font_path())
+            fn = f"{_stem(filename)}-secured.pdf"
+            return SecuredFile(out, "application/pdf", fn,
+                               _summary(dets, pages, ocr, "application/pdf", fn))
+        img_fmt = next(v for m, v in _IMAGE_MAGIC.items() if data[:len(m)] == m)
+        out, mime = secure_image(doc.pages, per_page[0], labels, img_fmt, _DPI, _font_path())
         fn = f"{_stem(filename)}-secured.{img_fmt}"
-        return SecuredFile(out, mime, fn, _summary(dets, 1, True, mime, fn))
+        return SecuredFile(out, mime, fn, _summary(doc.detections, 1, doc.is_ocr, mime, fn))
 
+    detect_fn = lambda t: _detect(analyzer, t)  # noqa: E731
     if head[:2] == b"PK" and ext == ".docx":
-        out, dets = secure_docx(data, lambda t: _detect(analyzer, t))
+        out, dets = secure_docx(data, detect_fn)
         mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         fn = f"{_stem(filename)}-secured.docx"
         return SecuredFile(out, mime, fn, _summary(dets, 0, False, mime, fn))
-
     if head[:2] == b"PK" and ext == ".xlsx":
-        out, dets = secure_xlsx(data, lambda t: _detect(analyzer, t))
+        out, dets = secure_xlsx(data, detect_fn)
         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         fn = f"{_stem(filename)}-secured.xlsx"
         return SecuredFile(out, mime, fn, _summary(dets, 0, False, mime, fn))
-
-    # plain text: only if it decodes cleanly as utf-8
     if ext in (".txt", ".text", ".md", ".csv", ".log") or _looks_text(data):
-        out, dets = secure_text(data, lambda t: _detect(analyzer, t))
+        out, dets = secure_text(data, detect_fn)
         fn = f"{_stem(filename)}-secured.txt"
         return SecuredFile(out, "text/plain", fn, _summary(dets, 0, False, "text/plain", fn))
-
-    # Never embed raw file bytes in the message (leaks into logs / reused callers)
     raise UnsupportedFormat(f"unsupported file type: ext={ext!r}")
 
 
