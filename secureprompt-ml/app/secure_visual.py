@@ -74,16 +74,10 @@ def _ordered(dets):
     return sorted(dets, key=lambda d: d.get("start", 0))
 
 
-def secure_pdf(data, detect_fn, dpi, langs, min_chars, font_path):
-    pages = extract_boxes(data, True, dpi, langs, min_chars)
-    per_page = [detect_fn(p.text) for p in pages]
-    # Detection runs per page, so a `N/M` page-number footer looks unique on its
-    # own page; pool across pages to drop pagination the model mis-tags (e.g.
-    # `1/16` as CREDIT_CARD_EXPIRATION_DATE) before it becomes a redaction box.
-    from app.detection.ner import _filter_pagination_per_page
-    per_page = _filter_pagination_per_page(per_page)
-    # first-appearance numbering: page order, then byte offset within each page
-    labels = build_labels([d for dets in per_page for d in _ordered(dets)])
+def secure_pdf(pages, per_page, labels, data, dpi, font_path):
+    """Draw redaction boxes from PRE-COMPUTED per-page detections + labels.
+    `pages` are the geometry pages; `per_page[i]` are page-local detections for
+    page i; `data` is the original bytes (for re-rendering a page if needed)."""
     images = []
     for idx, page in enumerate(pages):
         img = page.image if page.image is not None else _render_pdf_page(data, idx, dpi)
@@ -94,17 +88,14 @@ def secure_pdf(data, detect_fn, dpi, langs, min_chars, font_path):
     return images_to_pdf(images, dpi), all_dets, any(p.is_ocr for p in pages), len(pages)
 
 
-def secure_image(data, detect_fn, dpi, langs, font_path):
-    from PIL import Image
-    pages = extract_boxes(data, False, dpi, langs, 0)
+def secure_image(pages, dets, labels, img_fmt, dpi, font_path):
+    """Draw boxes on a single-page image from pre-computed detections + labels.
+    `img_fmt` is the source format keyword ('jpeg'/'png'/…) — preserves the
+    output format + mime instead of forcing PNG."""
     page = pages[0]
-    dets = detect_fn(page.text)
-    labels = build_labels(_ordered(dets))
     rects = spans_to_rects(page, dets, labels, dpi)
     img = page.image
     draw_page(img, rects, font_path)
-    fmt = (Image.open(io.BytesIO(data)).format or "PNG")
     out = io.BytesIO()
-    img.save(out, format=fmt)
-    mime = f"image/{fmt.lower()}"
-    return out.getvalue(), dets, mime
+    img.save(out, format=img_fmt.upper())
+    return out.getvalue(), f"image/{img_fmt}"
