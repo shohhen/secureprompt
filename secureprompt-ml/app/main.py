@@ -1,10 +1,11 @@
 import asyncio
 import hmac
+import json
 import os
 import time as _time
 import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response
 from app import config
 from app.models import (
     NerRequest, NerResponse, NerEntity,
@@ -13,6 +14,7 @@ from app.models import (
     RagCheckRequest, RagCheckResponse, RagCheckMatch,
     ScanFileEntity, ScanFileResponse,
     ScanTaskCreated, ScanTaskStatus,
+    SecureTaskCreated, SecureSummary, SecureTaskStatus,
 )
 from app.detection.ner import _load_analyzer as _load_analyzer_base, detect
 from app.detection.injection import _load_injection_pipeline, classify_injection
@@ -21,6 +23,8 @@ from app.detection.secrets import scan_secrets
 from app.embeddings.embed import _load_embedder, embed
 from app.qdrant_init import get_qdrant_client, ensure_collections
 from app.rag import rag_check
+from app.async_tasks import TaskStore
+from app.secure_file import UnsupportedFormat, secure_file as _secure_file
 
 _ready = asyncio.Event()
 _models: dict = {}
@@ -432,3 +436,80 @@ async def scan_file_task_status(task_id: str):
     if t is None:
         raise HTTPException(status_code=404, detail="unknown task")
     return ScanTaskStatus(status=t["status"], result=t["result"], error=t["error"])
+
+
+# Reusable async task store for the secure-file flow (see app.async_tasks).
+# Same PROCESS-LOCAL scaling caveat as _scan_tasks above.
+_secure_store = TaskStore(max_running=int(os.getenv("ML_SECURE_ASYNC_MAX_RUNNING", "4")))
+
+
+async def _run_secure(raw: bytes, filename: str):
+    def _work():
+        return _secure_file(raw, filename, _models["analyzer"])
+    return await asyncio.to_thread(_work)
+
+
+def _file_response(secured) -> Response:
+    return Response(
+        content=secured.data,
+        media_type=secured.mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{secured.filename}"',
+            "X-Secure-Summary": json.dumps(secured.summary),
+        },
+    )
+
+
+@app.post("/v1/secure-file")
+async def secure_file_sync(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    try:
+        secured = await _run_secure(raw, file.filename or "file")
+    except UnsupportedFormat:
+        # Do NOT echo str(e) here — UnsupportedFormat's message embeds raw
+        # file bytes (`head={head!r}`); a fixed detail avoids reflecting
+        # uploaded content back into the HTTP response.
+        raise HTTPException(status_code=415, detail="unsupported file type")
+    return _file_response(secured)
+
+
+@app.post("/v1/secure-file/async", response_model=SecureTaskCreated, status_code=202)
+async def secure_file_async(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    if _secure_store.at_capacity():
+        raise HTTPException(status_code=429, detail="too many concurrent secure-file jobs")
+    fname = file.filename or "file"
+    tid = _secure_store.start(lambda: _run_secure(raw, fname))
+    return SecureTaskCreated(task_id=tid)
+
+
+@app.get("/v1/secure-file/tasks/{task_id}", response_model=SecureTaskStatus)
+async def secure_file_status(task_id: str):
+    t = _secure_store.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    if t["status"] == "done":
+        return SecureTaskStatus(status="done", summary=SecureSummary(**t["result"].summary))
+    if t["status"] == "error":
+        return SecureTaskStatus(status="error", error=t["error"])
+    return SecureTaskStatus(status="running")
+
+
+@app.get("/v1/secure-file/tasks/{task_id}/download")
+async def secure_file_download(task_id: str):
+    t = _secure_store.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t["error"])
+    if t["status"] != "done":
+        raise HTTPException(status_code=409, detail="not ready")
+    return _file_response(t["result"])
