@@ -49,6 +49,28 @@ def redact_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
     return text
 
 
+def value_repeat_spans(text: str, by_value: dict[str, str]) -> list[tuple[int, int, str]]:
+    """``(char_start, char_end, label)`` for every exact occurrence of each
+    detected value in ``text``.
+
+    Detection returns one span per occurrence it *found*, but the whole-document
+    NER pass often reports a value once even when it repeats (e.g. a name in both
+    the body and a header). Span-only redaction would then miss the repeat, so we
+    additionally cover every clean occurrence of each already-detected value.
+    Combined with the exact detection spans (which cover noisy forms a plain
+    string match can't), overlaps are resolved by ``redact_spans``.
+    """
+    out: list[tuple[int, int, str]] = []
+    for value, label in by_value.items():
+        if not value:
+            continue
+        start = 0
+        while (i := text.find(value, start)) >= 0:
+            out.append((i, i + len(value), label))
+            start = i + len(value)
+    return out
+
+
 def redact_text(text: str, labels: dict[tuple[str, str], str]) -> str:
     """Replace every occurrence of each value with its label in a SINGLE pass.
 

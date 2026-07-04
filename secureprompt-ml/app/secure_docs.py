@@ -6,7 +6,17 @@ import io
 from typing import Callable
 
 from app.secure_boxes import byte_to_char_map
-from app.secure_labels import build_labels, redact_spans
+from app.secure_labels import build_labels, redact_spans, value_repeat_spans
+
+
+def _by_value(labels: dict) -> dict[str, str]:
+    return {val: lbl for (_typ, val), lbl in labels.items() if val}
+
+
+def _redact_container(text: str, spans: list, by_value: dict) -> str:
+    """Splice detected spans (noise-tolerant) plus any remaining exact repeats of
+    detected values; redact_spans de-overlaps so each region is labeled once."""
+    return redact_spans(text, spans + value_repeat_spans(text, by_value))
 
 
 def _container_spans(texts: list[str], dets: list[dict], labels: dict):
@@ -150,12 +160,15 @@ def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     texts = [p.text for p in paras]
     dets = detect_fn("\n".join(texts))
     labels = _ordered_labels(dets)
+    by_value = _by_value(labels)
     # Redact by span (see _container_spans) so noisy PII is removed even when the
-    # cleaned detection value differs from the document text. A value straddling a
-    # paragraph/cell boundary is a v1 limitation (skipped by _container_spans).
+    # cleaned detection value differs from the document text, plus a repeat sweep
+    # so a detected value recurring in another paragraph (body vs header) is also
+    # covered. A value straddling a paragraph boundary is a v1 limitation.
     for p, t, spans in zip(paras, texts, _container_spans(texts, dets, labels)):
-        if spans:
-            _set_paragraph_text(p, redact_spans(t, spans))
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            _set_paragraph_text(p, new)
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue(), dets
@@ -173,14 +186,17 @@ def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     texts = [c.value for c in value_cells] + [c.comment.text for c in comment_cells]
     dets = detect_fn("\n".join(texts))
     labels = _ordered_labels(dets)
+    by_value = _by_value(labels)
     per = _container_spans(texts, dets, labels)
     n = len(value_cells)
     for c, t, spans in zip(value_cells, texts[:n], per[:n]):
-        if spans:
-            c.value = redact_spans(t, spans)
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            c.value = new
     for c, t, spans in zip(comment_cells, texts[n:], per[n:]):
-        if spans:
-            c.comment.text = redact_spans(t, spans)
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            c.comment.text = new
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue(), dets
@@ -191,4 +207,4 @@ def secure_text(data: bytes, detect_fn: Callable[[str], list[dict]]):
     dets = detect_fn(text)
     labels = _ordered_labels(dets)
     spans = _container_spans([text], dets, labels)[0]
-    return redact_spans(text, spans).encode("utf-8"), dets
+    return _redact_container(text, spans, _by_value(labels)).encode("utf-8"), dets
