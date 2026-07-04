@@ -7,7 +7,8 @@ returns BYTE offsets, so spans are mapped byte->char before indexing char_boxes.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
 
 @dataclass
@@ -51,13 +52,16 @@ def group_by_line(boxes: list[tuple]) -> list[list[tuple]]:
 
 def to_pixels(page: PageBoxes, x0, y0, x1, y1, dpi: int) -> tuple[int, int, int, int]:
     if page.is_ocr:
-        return (int(x0), int(y0), int(x1), int(y1))
+        # round outward so the box never under-covers the glyph by a sub-pixel
+        return (int(math.floor(x0)), int(math.floor(y0)),
+                int(math.ceil(x1)), int(math.ceil(y1)))
     s = dpi / 72.0
     px0 = x0 * s
     px1 = x1 * s
     py0 = (page.height - y1) * s  # top edge (y-flip)
     py1 = (page.height - y0) * s  # bottom edge
-    return (int(px0), int(py0), int(px1), int(py1))
+    return (int(math.floor(px0)), int(math.floor(py0)),
+            int(math.ceil(px1)), int(math.ceil(py1)))
 
 
 def spans_to_rects(page: PageBoxes, detections, labels, dpi: int):
@@ -96,11 +100,18 @@ def _pdf_text_boxes(page_layout):
                 continue
             for ch in line:
                 if isinstance(ch, LTChar):
-                    chars.append(ch.get_text())
-                    boxes.append((ch.x0, ch.y0, ch.x1, ch.y1))
+                    # LTChar.get_text() may return MORE THAN ONE character:
+                    # ligatures ("fi"/"ffi") and unmapped glyphs (rendered as the
+                    # literal "(cid:N)" marker). Emit one box per character so
+                    # char_boxes stays index-aligned to the text — otherwise every
+                    # box after such a glyph drifts and lands on the wrong words.
+                    t = ch.get_text()
+                    chars.append(t)
+                    boxes.extend([(ch.x0, ch.y0, ch.x1, ch.y1)] * len(t))
                 elif isinstance(ch, LTAnno):
-                    chars.append(ch.get_text())
-                    boxes.append(None)
+                    t = ch.get_text()
+                    chars.append(t)
+                    boxes.extend([None] * len(t))
     return "".join(chars), boxes
 
 

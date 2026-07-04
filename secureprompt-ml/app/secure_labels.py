@@ -26,6 +26,21 @@ def build_labels(detections: list[dict]) -> dict[tuple[str, str], str]:
     return labels
 
 
+def redact_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
+    """Splice each ``(char_start, char_end, label)`` range over ``text``.
+
+    Span-based (not value-match) so the ORIGINAL bytes are removed — including any
+    invisible noise inside the span (NBSP, zero-width, collapsed whitespace, soft
+    line breaks) that makes the cleaned detection value differ from the document
+    text. Applied right-to-left so earlier offsets stay valid; caller passes
+    non-overlapping detection spans.
+    """
+    for s, e, label in sorted(spans, key=lambda x: x[0], reverse=True):
+        if 0 <= s < e <= len(text):
+            text = text[:s] + label + text[e:]
+    return text
+
+
 def redact_text(text: str, labels: dict[tuple[str, str], str]) -> str:
     """Replace every occurrence of each value with its label in a SINGLE pass.
 

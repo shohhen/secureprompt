@@ -1,10 +1,12 @@
 import asyncio
 import hmac
 import json
+import logging
 import os
 import time as _time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response
 from app import config
 from app.models import (
@@ -441,6 +443,7 @@ async def scan_file_task_status(task_id: str):
 # Reusable async task store for the secure-file flow (see app.async_tasks).
 # Same PROCESS-LOCAL scaling caveat as _scan_tasks above.
 _secure_store = TaskStore(max_running=int(os.getenv("ML_SECURE_ASYNC_MAX_RUNNING", "4")))
+_secure_log = logging.getLogger("secureprompt.ml.secure_file")
 
 
 async def _run_secure(raw: bytes, filename: str):
@@ -448,14 +451,25 @@ async def _run_secure(raw: bytes, filename: str):
         try:
             return _secure_file(raw, filename, _models["analyzer"])
         except UnsupportedFormat:
-            # UnsupportedFormat's message embeds raw file bytes
-            # (`head={head!r}`). Re-raise with a fixed message so the async
-            # TaskStore never stores attacker-controlled bytes — otherwise
-            # both GET .../tasks/{id} (status error) and .../download (500
-            # detail) would echo them back. No-op for the sync path, which
-            # already discards str(e) for its 415.
+            # Re-raise with a fixed message so the async TaskStore never stores
+            # attacker-controlled bytes — otherwise both GET .../tasks/{id}
+            # (status error) and .../download (500 detail) would echo them back.
             raise UnsupportedFormat("unsupported file type") from None
+        except Exception:
+            # Parser errors (pdfminer/PIL/openpyxl) can embed input-derived
+            # fragments. Log the real detail server-side; surface a generic
+            # message so neither the status nor download surface leaks content.
+            _secure_log.exception("secure-file processing failed")
+            raise RuntimeError("secure-file processing failed") from None
     return await asyncio.to_thread(_work)
+
+
+def _content_disposition(filename: str) -> str:
+    """RFC 6266/5987 header: ASCII fallback + UTF-8 ``filename*`` so non-ASCII
+    (Cyrillic/Uzbek) names don't hit Starlette's latin-1 header encoding and 500."""
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace('"', "")
+    return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (
+        ascii_fallback, quote(filename, safe=""))
 
 
 def _file_response(secured) -> Response:
@@ -463,7 +477,7 @@ def _file_response(secured) -> Response:
         content=secured.data,
         media_type=secured.mime,
         headers={
-            "Content-Disposition": f'attachment; filename="{secured.filename}"',
+            "Content-Disposition": _content_disposition(secured.filename),
             "X-Secure-Summary": json.dumps(secured.summary),
         },
     )

@@ -4,10 +4,10 @@ profile (full coverage caps). One-way — no reverse mapping stored."""
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass
 
-from app import config
 from app.secure_docs import secure_docx, secure_text, secure_xlsx
 from app.secure_visual import _font_path, secure_image, secure_pdf
 
@@ -38,9 +38,15 @@ def _detect(analyzer, text: str) -> list[dict]:
         return detect(analyzer, text)
 
 
+_UNSAFE_STEM = re.compile(r'[\r\n"\\/\x00-\x1f\x7f]')
+
+
 def _stem(filename: str) -> str:
     base = os.path.basename(filename or "file")
-    return os.path.splitext(base)[0] or "file"
+    stem = os.path.splitext(base)[0]
+    # strip control/quote/backslash chars that would break Content-Disposition
+    stem = _UNSAFE_STEM.sub("", stem).strip()
+    return stem or "file"
 
 
 def _summary(dets: list[dict], pages: int, ocr: bool, mime: str, filename: str) -> dict:
@@ -87,7 +93,8 @@ def secure_file(data: bytes, filename: str, analyzer) -> SecuredFile:
         fn = f"{_stem(filename)}-secured.txt"
         return SecuredFile(out, "text/plain", fn, _summary(dets, 0, False, "text/plain", fn))
 
-    raise UnsupportedFormat(f"unsupported file type: ext={ext!r} head={head!r}")
+    # Never embed raw file bytes in the message (leaks into logs / reused callers)
+    raise UnsupportedFormat(f"unsupported file type: ext={ext!r}")
 
 
 def _looks_text(data: bytes) -> bool:

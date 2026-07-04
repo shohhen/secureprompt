@@ -24,11 +24,12 @@ pytesseract==0.3.13
 pdf2image==1.17.0
 python-docx==1.1.2
 python-multipart==0.0.12
-# Secure-file redaction: Pillow (draw boxes), img2pdf (image pages -> PDF),
-# openpyxl (XLSX cell redaction). All MIT/permissive. pdf2image/pdfminer/
-# pytesseract already present; poppler + tesseract + DejaVu fonts ship in the image.
-Pillow>=10.4
-img2pdf==0.5.1
+# Secure-file redaction: Pillow (draw boxes + assemble image pages into a PDF
+# via its native writer — no img2pdf, which is LGPL), openpyxl (XLSX cell
+# redaction). Pillow (HPND) and openpyxl (MIT) are permissive. pdf2image/
+# pdfminer/pytesseract already present; poppler + tesseract + DejaVu fonts ship
+# in the image.
+Pillow>=10.4,<12
 openpyxl==3.1.5
 # torch CPU-only installed separately in Dockerfile:
 # pip install torch==2.6.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu

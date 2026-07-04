@@ -5,7 +5,47 @@ from __future__ import annotations
 import io
 from typing import Callable
 
-from app.secure_labels import build_labels, redact_text
+from app.secure_boxes import byte_to_char_map
+from app.secure_labels import build_labels, redact_spans
+
+
+def _container_spans(texts: list[str], dets: list[dict], labels: dict):
+    """Map global byte-offset detections (into ``"\\n".join(texts)``) back to each
+    container as ``(char_start, char_end, label)`` spans.
+
+    Detection reports UTF-8 byte offsets into the joined text; we convert to char
+    offsets and locate the owning container. Redacting by span (not by matching
+    the cleaned display value) means noise inside the original span — NBSP,
+    zero-width chars, collapsed whitespace — is removed too, closing the
+    fail-open gap where a noisy value never matched its cleaned form. A span
+    straddling a container boundary is a v1 limitation and is skipped.
+    """
+    full = "\n".join(texts)
+    b2c = byte_to_char_map(full)
+    ranges = []
+    pos = 0
+    for t in texts:
+        ranges.append((pos, pos + len(t)))
+        pos += len(t) + 1  # trailing "\n" join char
+    per: list[list[tuple[int, int, str]]] = [[] for _ in texts]
+    for d in dets:
+        cs = b2c.get(d["start"])
+        ce = b2c.get(d["end"])
+        if cs is None or ce is None or cs >= ce:
+            continue
+        label = labels.get((d["entity_type"].upper(), d["text"]), "")
+        if not label:
+            continue
+        for i, (a, b) in enumerate(ranges):
+            if a <= cs and ce <= b:
+                per[i].append((cs - a, ce - a, label))
+                break
+    return per
+
+
+def _ordered_labels(dets: list[dict]) -> dict:
+    """build_labels in first-appearance (byte-offset) order."""
+    return build_labels(sorted(dets, key=lambda d: d.get("start", 0)))
 
 
 def _set_paragraph_text(paragraph, text: str) -> None:
@@ -30,31 +70,38 @@ def _set_paragraph_text(paragraph, text: str) -> None:
         paragraph.add_run(text)
 
 
+def _iter_cell_paragraphs(cell):
+    """Cell body paragraphs plus paragraphs in any NESTED tables (recursive)."""
+    for p in cell.paragraphs:
+        yield p
+    for table in cell.tables:
+        for row in table.rows:
+            for c in row.cells:
+                yield from _iter_cell_paragraphs(c)
+
+
 def _iter_paragraphs(doc):
     for p in doc.paragraphs:
         yield p
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for p in cell.paragraphs:
-                    yield p
+                yield from _iter_cell_paragraphs(cell)
 
 
 def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     import docx
     doc = docx.Document(io.BytesIO(data))
     paras = list(_iter_paragraphs(doc))
-    full = "\n".join(p.text for p in paras)
-    dets = detect_fn(full)
-    labels = build_labels(dets)
-    # Detection saw the joined document, but redaction is a per-paragraph substring
-    # replace — so a PII value straddling a paragraph/cell boundary won't match
-    # verbatim in any single paragraph. v1 assumes each PII value lies within one
-    # paragraph (true for names/emails/ids; multi-paragraph spans are out of scope).
-    for p in paras:
-        new = redact_text(p.text, labels)
-        if new != p.text:
-            _set_paragraph_text(p, new)
+    texts = [p.text for p in paras]
+    dets = detect_fn("\n".join(texts))
+    labels = _ordered_labels(dets)
+    # Redact by span (see _container_spans) so noisy PII is removed even when the
+    # cleaned detection value differs from the document text. A value straddling a
+    # paragraph/cell boundary is a v1 limitation (skipped by _container_spans).
+    for p, t, spans in zip(paras, texts, _container_spans(texts, dets, labels)):
+        if spans:
+            _set_paragraph_text(p, redact_spans(t, spans))
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue(), dets
@@ -65,14 +112,12 @@ def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     wb = openpyxl.load_workbook(io.BytesIO(data))
     cells = [c for ws in wb.worksheets for row in ws.iter_rows()
              for c in row if isinstance(c.value, str)]
-    full = "\n".join(c.value for c in cells)
-    dets = detect_fn(full)
-    labels = build_labels(dets)
-    # Detection saw the joined sheet, but redaction is a per-cell substring replace —
-    # so a PII value straddling a cell boundary won't match verbatim in any single
-    # cell. v1 assumes each PII value lies within one cell.
-    for c in cells:
-        c.value = redact_text(c.value, labels)
+    texts = [c.value for c in cells]
+    dets = detect_fn("\n".join(texts))
+    labels = _ordered_labels(dets)
+    for c, t, spans in zip(cells, texts, _container_spans(texts, dets, labels)):
+        if spans:
+            c.value = redact_spans(t, spans)
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue(), dets
@@ -81,5 +126,6 @@ def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
 def secure_text(data: bytes, detect_fn: Callable[[str], list[dict]]):
     text = data.decode("utf-8", "replace")
     dets = detect_fn(text)
-    labels = build_labels(dets)
-    return redact_text(text, labels).encode("utf-8"), dets
+    labels = _ordered_labels(dets)
+    spans = _container_spans([text], dets, labels)[0]
+    return redact_spans(text, spans).encode("utf-8"), dets

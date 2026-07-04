@@ -55,20 +55,30 @@ def draw_page(image, rects, font_path: str):
     return image
 
 
-def images_to_pdf(images) -> bytes:
-    import img2pdf
-    bufs = []
-    for im in images:
-        b = io.BytesIO()
-        im.convert("RGB").save(b, format="PNG")
-        bufs.append(b.getvalue())
-    return img2pdf.convert(bufs)
+def images_to_pdf(images, dpi: int) -> bytes:
+    """Assemble page images into a PDF using Pillow's native writer.
+
+    Pillow (permissive/HPND) replaces img2pdf (LGPL) — one fewer copyleft
+    dependency. Passing ``resolution=dpi`` stamps the correct physical page size
+    so a 200-DPI render isn't blown up to img2pdf's assumed 96 DPI.
+    """
+    rgb = [im.convert("RGB") for im in images]
+    out = io.BytesIO()
+    rgb[0].save(out, format="PDF", save_all=True, append_images=rgb[1:],
+                resolution=float(dpi))
+    return out.getvalue()
+
+
+def _ordered(dets):
+    """First-appearance (byte-offset) order within one page/image."""
+    return sorted(dets, key=lambda d: d.get("start", 0))
 
 
 def secure_pdf(data, detect_fn, dpi, langs, min_chars, font_path):
     pages = extract_boxes(data, True, dpi, langs, min_chars)
     per_page = [detect_fn(p.text) for p in pages]
-    labels = build_labels([d for dets in per_page for d in dets])
+    # first-appearance numbering: page order, then byte offset within each page
+    labels = build_labels([d for dets in per_page for d in _ordered(dets)])
     images = []
     for idx, page in enumerate(pages):
         img = page.image if page.image is not None else _render_pdf_page(data, idx, dpi)
@@ -76,7 +86,7 @@ def secure_pdf(data, detect_fn, dpi, langs, min_chars, font_path):
         draw_page(img, rects, font_path)
         images.append(img)
     all_dets = [d for dets in per_page for d in dets]
-    return images_to_pdf(images), all_dets, any(p.is_ocr for p in pages), len(pages)
+    return images_to_pdf(images, dpi), all_dets, any(p.is_ocr for p in pages), len(pages)
 
 
 def secure_image(data, detect_fn, dpi, langs, font_path):
@@ -84,7 +94,7 @@ def secure_image(data, detect_fn, dpi, langs, font_path):
     pages = extract_boxes(data, False, dpi, langs, 0)
     page = pages[0]
     dets = detect_fn(page.text)
-    labels = build_labels(dets)
+    labels = build_labels(_ordered(dets))
     rects = spans_to_rects(page, dets, labels, dpi)
     img = page.image
     draw_page(img, rects, font_path)
