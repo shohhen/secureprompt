@@ -1,6 +1,8 @@
 """Placeholder labels + text redaction for secure-file. Pure — no heavy deps."""
 from __future__ import annotations
 
+import re
+
 
 def title_case(entity_type: str) -> str:
     return "_".join(w.capitalize() for w in entity_type.split("_"))
@@ -14,6 +16,8 @@ def build_labels(detections: list[dict]) -> dict[tuple[str, str], str]:
     for d in detections:
         typ = d["entity_type"].upper()
         val = d["text"]
+        if not val:  # skip empty values so the visible sequence has no gaps
+            continue
         key = (typ, val)
         if key in labels:
             continue
@@ -23,9 +27,16 @@ def build_labels(detections: list[dict]) -> dict[tuple[str, str], str]:
 
 
 def redact_text(text: str, labels: dict[tuple[str, str], str]) -> str:
-    """Replace every occurrence of each value with its label. Longest values
-    first so a shorter value can't clobber a longer overlapping one."""
-    for (_typ, val), label in sorted(labels.items(), key=lambda kv: -len(kv[0][1])):
-        if val:
-            text = text.replace(val, label)
-    return text
+    """Replace every occurrence of each value with its label in a SINGLE pass.
+
+    A per-label loop of ``str.replace`` would let a short value processed later
+    match inside a placeholder already inserted (e.g. "1" corrupting "{{Ssn_1}}").
+    Building one longest-first regex alternation and substituting once avoids
+    that: matched spans are consumed, so inserted placeholders are never rescanned.
+    """
+    by_value = {val: label for (_typ, val), label in labels.items() if val}
+    if not by_value:
+        return text
+    values = sorted(by_value, key=len, reverse=True)  # longest first
+    pattern = re.compile("|".join(re.escape(v) for v in values))
+    return pattern.sub(lambda m: by_value[m.group(0)], text)
