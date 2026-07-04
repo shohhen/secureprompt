@@ -22,8 +22,24 @@ def _font_path() -> str:
     return _FONT_CANDIDATES[0]  # let PIL raise a clear error if truly missing
 
 
+def _load_font(font_path: str, size: int):
+    """Load the label font at `size`, falling back to PIL's bundled default.
+
+    The black box (which covers the PII) is the security-critical element; the
+    `{{Type_N}}` label is informational. If the configured TrueType font is
+    missing (e.g. running off-image where the DejaVu path doesn't exist), never
+    let that abort redaction — fall back to `load_default(size)` so the box is
+    still drawn with a readable label. Requires Pillow >= 10.1 for the sized
+    default (pinned floor is >= 10.4)."""
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype(font_path, size)
+    except OSError:
+        return ImageFont.load_default(size=size)
+
+
 def draw_page(image, rects, font_path: str):
-    from PIL import ImageDraw, ImageFont
+    from PIL import ImageDraw
     draw = ImageDraw.Draw(image)
     for (x0, y0, x1, y1, label) in rects:
         if x1 <= x0 or y1 <= y0:
@@ -31,10 +47,10 @@ def draw_page(image, rects, font_path: str):
         draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0))
         # fit the label to the box: shrink until it fits the width
         size = max(6, int((y1 - y0) * 0.8))
-        font = ImageFont.truetype(font_path, size)
+        font = _load_font(font_path, size)
         while size > 6 and draw.textlength(label, font=font) > (x1 - x0):
             size -= 1
-            font = ImageFont.truetype(font_path, size)
+            font = _load_font(font_path, size)
         draw.text((x0 + 1, y0), label, fill=(255, 255, 255), font=font)
     return image
 
