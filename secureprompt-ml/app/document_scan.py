@@ -38,8 +38,10 @@ def partition_by_page(detections: list[dict], page_byte_offsets: list[int],
                       page_byte_lengths: list[int]) -> list[list[dict]]:
     """Split whole-document detections (byte spans in the assembled text) into
     per-page lists with PAGE-LOCAL byte offsets. A detection is assigned to the
-    page where it STARTS; its end is clamped to that page's length (the value-repeat
-    pass in spans_to_rects covers any tail on later pages)."""
+    page where it STARTS; its end is clamped to that page's length. A span
+    crossing a page break is rare (the `\\n\\n` separator makes the model unlikely
+    to emit one, and regex secrets are single-line); its tail on the next page is
+    not separately boxed — an accepted v1 limitation."""
     per_page: list[list[dict]] = [[] for _ in page_byte_offsets]
     for d in detections:
         i = _page_of(d["start"], page_byte_offsets)
@@ -91,8 +93,11 @@ def detect_all(analyzer, text: str) -> list[dict]:
     if secrets:
         c2b = _char_to_byte(text)
         for s in secrets:
+            # `is_secret` lets scan-file report secrets_found vs pii_found without
+            # re-scanning (secrets are already folded in here, once).
             dets.append({"entity_type": s.kind.upper(), "text": s.text,
-                         "start": c2b[s.start], "end": c2b[s.end], "score": 1.0})
+                         "start": c2b[s.start], "end": c2b[s.end], "score": 1.0,
+                         "is_secret": True})
     return merge_overlapping_spans(dets)
 
 

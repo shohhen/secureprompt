@@ -310,9 +310,9 @@ async def _scan_impl(raw: bytes) -> ScanFileResponse:
         classify_injection, _models["injection"], injection_text
     )
 
-    # Secret regexes on the full decoded text.
-    secret_hits = scan_secrets(text)
-
+    # `scan_document` (detect_all) already folded regex secrets into `ner_raw`
+    # with byte offsets and an `is_secret` flag — do NOT re-scan (that duplicated
+    # every secret and let a char-offset copy shadow the correct byte-offset one).
     entities = [
         ScanFileEntity(
             text=e["text"],
@@ -321,24 +321,18 @@ async def _scan_impl(raw: bytes) -> ScanFileResponse:
         )
         for e in ner_raw
     ]
-    # Include secrets as entities too so the UI can list them.
-    for s in secret_hits:
-        entities.append(
-            ScanFileEntity(text=s.text, label=s.kind.upper(), score=1.0)
-        )
 
     spans: list[tuple[int, int, str]] = [
         (int(e["start"]), int(e["end"]), e["entity_type"].upper()) for e in ner_raw
     ]
-    spans.extend((s.start, s.end, s.kind.upper()) for s in secret_hits)
 
     redacted_full = _redact(text, spans)
     preview_truncated = len(redacted_full) > _SCAN_FILE_TEXT_PREVIEW
     redacted_preview = redacted_full[:_SCAN_FILE_TEXT_PREVIEW]
 
     return ScanFileResponse(
-        pii_found=bool(ner_raw),
-        secrets_found=bool(secret_hits),
+        pii_found=any(not e.get("is_secret") for e in ner_raw),
+        secrets_found=any(e.get("is_secret") for e in ner_raw),
         injection_detected=bool(injection.get("is_injection")),
         entities=entities,
         redacted_text=redacted_preview,

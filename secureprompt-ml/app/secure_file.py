@@ -96,11 +96,13 @@ def secure_file(data: bytes, filename: str, analyzer) -> SecuredFile:
         page_lens = [len(p.text.encode("utf-8")) for p in doc.pages]
         per_page = partition_by_page(doc.detections, doc.page_byte_offsets, page_lens)
         if head == b"%PDF":
-            out, dets, ocr, pages = secure_pdf(
+            out, _dets, ocr, pages = secure_pdf(
                 doc.pages, per_page, labels, data, _DPI, _font_path())
             fn = f"{_stem(filename)}-secured.pdf"
+            # summarize the whole-doc detections (not the post-partition list) so
+            # the summary matches scan-file + the image branch exactly.
             return SecuredFile(out, "application/pdf", fn,
-                               _summary(dets, pages, ocr, "application/pdf", fn))
+                               _summary(doc.detections, pages, ocr, "application/pdf", fn))
         img_fmt = next(v for m, v in _IMAGE_MAGIC.items() if data[:len(m)] == m)
         out, mime = secure_image(doc.pages, per_page[0], labels, img_fmt, _DPI, _font_path())
         fn = f"{_stem(filename)}-secured.{img_fmt}"
