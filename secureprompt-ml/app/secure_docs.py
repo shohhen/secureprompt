@@ -80,13 +80,67 @@ def _iter_cell_paragraphs(cell):
                 yield from _iter_cell_paragraphs(c)
 
 
+def _txbx_paragraphs(element, parent):
+    """Paragraphs inside text boxes (``<w:txbxContent>``) under ``element``.
+
+    Text-box text is NOT part of ``doc.paragraphs`` / header ``.paragraphs`` —
+    it lives in the drawing/VML tree — so a name in a letterhead text box would
+    survive without this. Best-effort: any structural surprise is swallowed so a
+    text box never aborts the whole redaction."""
+    try:
+        from docx.oxml.ns import qn
+        from docx.text.paragraph import Paragraph
+        for txbx in element.iter(qn("w:txbxContent")):
+            for p in txbx.iterfind(qn("w:p")):
+                yield Paragraph(p, parent)
+    except Exception:  # noqa: BLE001 — text boxes are a best-effort extra surface
+        return
+
+
 def _iter_paragraphs(doc):
+    """Every redactable paragraph: body, tables (incl. nested), headers/footers
+    (all first/even/default variants), and text boxes. Deduplicated by paragraph
+    XML element so linked-section headers (which share one part) aren't processed
+    twice — double-processing would splice a label into already-redacted runs."""
+    seen: set[int] = set()
+
+    def _fresh(p):
+        k = id(p._p)
+        if k in seen:
+            return False
+        seen.add(k)
+        return True
+
     for p in doc.paragraphs:
-        yield p
+        if _fresh(p):
+            yield p
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                yield from _iter_cell_paragraphs(cell)
+                for p in _iter_cell_paragraphs(cell):
+                    if _fresh(p):
+                        yield p
+    for section in doc.sections:
+        for hf in (section.header, section.footer,
+                   section.first_page_header, section.first_page_footer,
+                   section.even_page_header, section.even_page_footer):
+            if hf is None:
+                continue
+            for p in hf.paragraphs:
+                if _fresh(p):
+                    yield p
+            for table in hf.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for p in _iter_cell_paragraphs(cell):
+                            if _fresh(p):
+                                yield p
+            for p in _txbx_paragraphs(hf._element, hf):
+                if _fresh(p):
+                    yield p
+    for p in _txbx_paragraphs(doc.element.body, doc):
+        if _fresh(p):
+            yield p
 
 
 def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
@@ -110,14 +164,23 @@ def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
 def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(data))
-    cells = [c for ws in wb.worksheets for row in ws.iter_rows()
-             for c in row if isinstance(c.value, str)]
-    texts = [c.value for c in cells]
+    value_cells = [c for ws in wb.worksheets for row in ws.iter_rows()
+                   for c in row if isinstance(c.value, str)]
+    comment_cells = [c for ws in wb.worksheets for row in ws.iter_rows()
+                     for c in row if c.comment is not None and c.comment.text]
+    # cell string values first, then comment texts — both are redactable containers.
+    # (Sheet names are left intact: renaming them would break formula references.)
+    texts = [c.value for c in value_cells] + [c.comment.text for c in comment_cells]
     dets = detect_fn("\n".join(texts))
     labels = _ordered_labels(dets)
-    for c, t, spans in zip(cells, texts, _container_spans(texts, dets, labels)):
+    per = _container_spans(texts, dets, labels)
+    n = len(value_cells)
+    for c, t, spans in zip(value_cells, texts[:n], per[:n]):
         if spans:
             c.value = redact_spans(t, spans)
+    for c, t, spans in zip(comment_cells, texts[n:], per[n:]):
+        if spans:
+            c.comment.text = redact_spans(t, spans)
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue(), dets

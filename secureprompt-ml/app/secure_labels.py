@@ -32,12 +32,20 @@ def redact_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
     Span-based (not value-match) so the ORIGINAL bytes are removed — including any
     invisible noise inside the span (NBSP, zero-width, collapsed whitespace, soft
     line breaks) that makes the cleaned detection value differ from the document
-    text. Applied right-to-left so earlier offsets stay valid; caller passes
-    non-overlapping detection spans.
+    text. Overlapping spans (e.g. a secret nested inside an NER span) are
+    de-overlapped by greedily keeping the longest, non-overlapping set; the chosen
+    spans are then spliced right-to-left so earlier offsets stay valid.
     """
-    for s, e, label in sorted(spans, key=lambda x: x[0], reverse=True):
-        if 0 <= s < e <= len(text):
-            text = text[:s] + label + text[e:]
+    valid = [(s, e, lbl) for (s, e, lbl) in spans if 0 <= s < e <= len(text)]
+    valid.sort(key=lambda x: (x[0], -x[1]))  # start asc, longer first on ties
+    chosen: list[tuple[int, int, str]] = []
+    last_end = -1
+    for s, e, lbl in valid:
+        if s >= last_end:  # non-overlapping with the previously chosen span
+            chosen.append((s, e, lbl))
+            last_end = e
+    for s, e, lbl in sorted(chosen, key=lambda x: x[0], reverse=True):
+        text = text[:s] + lbl + text[e:]
     return text
 
 

@@ -30,12 +30,36 @@ class SecuredFile:
     summary: dict
 
 
+def _char_to_byte(text: str) -> list[int]:
+    """``lookup[i]`` = UTF-8 byte offset of char ``i``; ``lookup[len(text)]`` =
+    total byte length. ``scan_secrets`` reports CHAR offsets while NER reports
+    BYTE offsets; converting keeps the merged detection list uniformly
+    byte-indexed (secure_boxes / secure_docs both assume byte offsets)."""
+    out = []
+    b = 0
+    for ch in text:
+        out.append(b)
+        b += len(ch.encode("utf-8"))
+    out.append(b)
+    return out
+
+
 def _detect(analyzer, text: str) -> list[dict]:
-    """Detection under the bulk scan profile (indirection point for tests)."""
+    """NER PII + regex secrets under the bulk scan profile (indirection point for
+    tests). Secrets (API keys, tokens, private keys) are merged so they are
+    redacted in the secured file too — not just names/PII."""
     from app.detection.ner import detect
     from app.detection.scan_profile import scan_scope
+    from app.detection.secrets import scan_secrets
     with scan_scope("bulk"):
-        return detect(analyzer, text)
+        dets = detect(analyzer, text)
+    secrets = scan_secrets(text)
+    if secrets:
+        c2b = _char_to_byte(text)
+        for s in secrets:
+            dets.append({"entity_type": s.kind.upper(), "text": s.text,
+                         "start": c2b[s.start], "end": c2b[s.end], "score": 1.0})
+    return dets
 
 
 _UNSAFE_STEM = re.compile(r'[\r\n"\\/\x00-\x1f\x7f]')
