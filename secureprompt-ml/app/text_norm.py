@@ -15,7 +15,10 @@ excluded (not 1:1 char-mappable, and measured low-value).
 """
 from __future__ import annotations
 
+import re
 import unicodedata
+
+_WS_RE = re.compile(r"\s+")
 
 # Zero-width / joiner / BOM. Removed outright (they split tokens invisibly, e.g.
 # `jo​hn@x.com`). Soft hyphen (U+00AD) is category Cf, handled by the
@@ -82,6 +85,17 @@ def normalize_for_ner(text: str) -> tuple[str, list[int]]:
         cmap.append(i)
         i += 1
     return "".join(norm), cmap
+
+
+def clean_value(span_text: str) -> str:
+    """Cleaned DISPLAY / vault value for a detected span: the same invisible-noise
+    removal as `normalize_for_ner` (zero-width, soft/line-break hyphens, NBSP,
+    control/PUA), plus whitespace collapse + strip. Used for the returned `text`
+    field only — the span's byte offsets still point at the ORIGINAL text, which
+    is what redaction slices, so `Shoh​jahon` redacts the original bytes but
+    displays as `Shohjahon`."""
+    norm, _ = normalize_for_ner(span_text)
+    return _WS_RE.sub(" ", norm).strip()
 
 
 def remap_span(cmap: list[int], ns: int, ne: int, orig_len: int) -> tuple[int, int]:
