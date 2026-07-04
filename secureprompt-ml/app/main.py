@@ -445,7 +445,16 @@ _secure_store = TaskStore(max_running=int(os.getenv("ML_SECURE_ASYNC_MAX_RUNNING
 
 async def _run_secure(raw: bytes, filename: str):
     def _work():
-        return _secure_file(raw, filename, _models["analyzer"])
+        try:
+            return _secure_file(raw, filename, _models["analyzer"])
+        except UnsupportedFormat:
+            # UnsupportedFormat's message embeds raw file bytes
+            # (`head={head!r}`). Re-raise with a fixed message so the async
+            # TaskStore never stores attacker-controlled bytes — otherwise
+            # both GET .../tasks/{id} (status error) and .../download (500
+            # detail) would echo them back. No-op for the sync path, which
+            # already discards str(e) for its 415.
+            raise UnsupportedFormat("unsupported file type") from None
     return await asyncio.to_thread(_work)
 
 
