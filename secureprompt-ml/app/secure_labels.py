@@ -8,22 +8,103 @@ def title_case(entity_type: str) -> str:
     return "_".join(w.capitalize() for w in entity_type.split("_"))
 
 
+# Wrapping quotes removed anywhere in the value (orgs are quoted inconsistently:
+# `SECURETECH` vs `"SECURETECH"` vs `"SECURETECH" MCHJ`). Deliberately excludes
+# the single/curly apostrophes ‘ ’ ' that are INSIDE Uzbek words (`O‘G‘LI`).
+_WRAP_QUOTE_RE = re.compile(r'[“”"«»]')
+# Leading/trailing punctuation trimmed after quote removal.
+_EDGE_PUNCT = " .,;:()[]{}"
+# Legal-entity forms that trail an org name (`"SECURETECH" MCHJ`).
+_LEGAL_SUFFIX_RE = re.compile(r"\s+(?:mchj|mchz|ooo|ооо|aj|yoaj|xk|chp|qmj|qk)\b")
+# Uzbek agglutinative case suffixes — longest first for greedy stripping. The
+# same noun/name recurs with different endings (Jamiyat / Jamiyat*ga* /
+# Jamiyat*ning*), which must resolve to one placeholder.
+_UZ_SUFFIXES = (
+    "lardagi", "larning", "lardan", "larga", "larni", "gacha",
+    "ning", "dagi", "niki", "lari", "lar", "dan", "ga", "da", "ni", "si",
+)
+
+
+def _strip_uz_suffix(word: str) -> str:
+    """Strip a trailing Uzbek case suffix, but only when >=3 chars remain (so
+    short names like `Olga` keep their `-ga`)."""
+    for suf in _UZ_SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            return word[: -len(suf)]
+    return word
+
+
+def _canonical(entity_type: str, value: str) -> str:
+    """Collapse surface variants of one entity to a single key: lowercase, drop
+    edge quotes/punctuation, drop a trailing legal suffix (orgs), and strip a
+    case suffix from the final word. Used ONLY to assign the shared label —
+    redaction still targets each original surface form."""
+    v = _WRAP_QUOTE_RE.sub(" ", value.lower())
+    v = re.sub(r"\s+", " ", v).strip(_EDGE_PUNCT)
+    if entity_type == "ORGANIZATION":
+        v = _LEGAL_SUFFIX_RE.sub("", v).strip()
+    parts = [p for p in v.split(" ") if p]
+    if parts:
+        parts[-1] = _strip_uz_suffix(parts[-1])
+    return " ".join(parts).strip()
+
+
 def build_labels(detections: list[dict]) -> dict[tuple[str, str], str]:
-    """Assign `{{Type_N}}` per (TYPE, value); same pair -> same label; per-type
-    counter in first-appearance order. No mapping is persisted (one-way)."""
+    """Map each (TYPE, surface value) -> `{{Type_N}}`. The per-type counter is
+    keyed on the CANONICAL form so surface variants of one entity (quotes, legal
+    suffix, Uzbek case endings) share a label; first-appearance order. Each
+    original surface value is kept as a key so redaction still replaces every
+    variant. No mapping is persisted (one-way)."""
     labels: dict[tuple[str, str], str] = {}
+    canon_label: dict[tuple[str, str], str] = {}
     counters: dict[str, int] = {}
     for d in detections:
         typ = d["entity_type"].upper()
         val = d["text"]
         if not val:  # skip empty values so the visible sequence has no gaps
             continue
-        key = (typ, val)
-        if key in labels:
+        skey = (typ, val)
+        if skey in labels:
             continue
-        counters[typ] = counters.get(typ, 0) + 1
-        labels[key] = "{{%s_%d}}" % (title_case(typ), counters[typ])
+        ckey = (typ, _canonical(typ, val))
+        label = canon_label.get(ckey)
+        if label is None:
+            counters[typ] = counters.get(typ, 0) + 1
+            label = "{{%s_%d}}" % (title_case(typ), counters[typ])
+            canon_label[ckey] = label
+        labels[skey] = label
     return labels
+
+
+def merge_overlapping_spans(detections: list[dict]) -> list[dict]:
+    """Collapse overlapping SAME-TYPE detections to a single representative (the
+    largest span). Different recognizers emit the same entity with different
+    boundaries — `SECURETECH` vs `"SECURETECH"`, or a surname nested inside the
+    full name — which would otherwise get separate placeholders and boxes.
+    Cross-type overlaps (a secret inside a name) are left for redact_spans.
+    Returns detections sorted by start offset (first-appearance order)."""
+    by_type: dict[str, list[dict]] = {}
+    for d in detections:
+        by_type.setdefault(d["entity_type"].upper(), []).append(d)
+    out: list[dict] = []
+    for group in by_type.values():
+        group = sorted(group, key=lambda d: (d.get("start", 0), -(d.get("end", 0))))
+        rep = None
+        cluster_end = -1
+        for d in group:
+            s, e = d.get("start", 0), d.get("end", 0)
+            if rep is not None and s < cluster_end:  # overlaps the open cluster
+                cluster_end = max(cluster_end, e)
+                if (e - s) > (rep.get("end", 0) - rep.get("start", 0)):
+                    rep = d  # keep the widest span as the representative
+            else:
+                if rep is not None:
+                    out.append(rep)
+                rep, cluster_end = d, e
+        if rep is not None:
+            out.append(rep)
+    out.sort(key=lambda d: d.get("start", 0))
+    return out
 
 
 def redact_spans(text: str, spans: list[tuple[int, int, str]]) -> str:

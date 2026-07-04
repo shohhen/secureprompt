@@ -64,27 +64,57 @@ def to_pixels(page: PageBoxes, x0, y0, x1, y1, dpi: int) -> tuple[int, int, int,
             int(math.ceil(px1)), int(math.ceil(py1)))
 
 
+def _emit_rects(page: PageBoxes, cs: int, ce: int, label: str, dpi: int, n: int, rects: list):
+    boxes = [page.char_boxes[i] for i in range(cs, min(ce, n))
+             if page.char_boxes[i] is not None]
+    if not boxes:
+        return
+    for grp in group_by_line(boxes):
+        gx0 = min(b[0] for b in grp)
+        gy0 = min(b[1] for b in grp)
+        gx1 = max(b[2] for b in grp)
+        gy1 = max(b[3] for b in grp)
+        px0, py0, px1, py1 = to_pixels(page, gx0, gy0, gx1, gy1, dpi)
+        rects.append((px0, py0, px1, py1, label))
+
+
 def spans_to_rects(page: PageBoxes, detections, labels, dpi: int):
     b2c = byte_to_char_map(page.text)
     n = len(page.char_boxes)
-    rects = []
+    rects: list = []
+    covered: list[tuple[int, int]] = []
+
+    def _overlaps(cs: int, ce: int) -> bool:
+        return any(cs < e and ce > s for s, e in covered)
+
+    # 1) Exact detection spans first — these cover noisy/spaced forms a plain
+    #    string match can't, and pin the byte-accurate region.
     for d in detections:
         cs = b2c.get(d["start"])
         ce = b2c.get(d["end"])
         if cs is None or ce is None or cs >= ce:
             continue
         label = labels.get((d["entity_type"].upper(), d["text"]), "")
-        boxes = [page.char_boxes[i] for i in range(cs, min(ce, n))
-                 if page.char_boxes[i] is not None]
-        if not boxes:
-            continue
-        for grp in group_by_line(boxes):
-            gx0 = min(b[0] for b in grp)
-            gy0 = min(b[1] for b in grp)
-            gx1 = max(b[2] for b in grp)
-            gy1 = max(b[3] for b in grp)
-            px0, py0, px1, py1 = to_pixels(page, gx0, gy0, gx1, gy1, dpi)
-            rects.append((px0, py0, px1, py1, label))
+        _emit_rects(page, cs, ce, label, dpi, n, rects)
+        covered.append((cs, ce))
+
+    # 2) Value repeat: box EVERY occurrence of each labeled value on this page —
+    #    repeats the model reported only once, and values first detected on OTHER
+    #    pages (labels is the whole-document map). Longest first so a short value
+    #    can't pre-empt a longer one; skip anything already covered.
+    by_value: dict[str, str] = {}
+    for (_typ, value), label in labels.items():
+        if value:
+            by_value.setdefault(value, label)
+    for value in sorted(by_value, key=len, reverse=True):
+        label = by_value[value]
+        start = 0
+        while (i := page.text.find(value, start)) >= 0:
+            cs, ce = i, i + len(value)
+            start = ce
+            if not _overlaps(cs, ce):
+                _emit_rects(page, cs, ce, label, dpi, n, rects)
+                covered.append((cs, ce))
     return rects
 
 

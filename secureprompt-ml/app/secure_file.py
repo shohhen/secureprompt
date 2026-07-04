@@ -51,6 +51,7 @@ def _detect(analyzer, text: str) -> list[dict]:
     from app.detection.ner import detect
     from app.detection.scan_profile import scan_scope
     from app.detection.secrets import scan_secrets
+    from app.secure_labels import merge_overlapping_spans
     with scan_scope("bulk"):
         dets = detect(analyzer, text)
     secrets = scan_secrets(text)
@@ -59,7 +60,9 @@ def _detect(analyzer, text: str) -> list[dict]:
         for s in secrets:
             dets.append({"entity_type": s.kind.upper(), "text": s.text,
                          "start": c2b[s.start], "end": c2b[s.end], "score": 1.0})
-    return dets
+    # Collapse overlapping same-type spans (e.g. `SECURETECH` vs `"SECURETECH"`,
+    # surname nested in full name) so one entity yields one placeholder + box.
+    return merge_overlapping_spans(dets)
 
 
 _UNSAFE_STEM = re.compile(r'[\r\n"\\/\x00-\x1f\x7f]')
