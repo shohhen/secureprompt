@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 _CID_RE = re.compile(r"\(cid:\d+\)")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
+# A standalone page-number footer: `1/16`, `3 / 16`, `12/16`. These are the
+# per-page markers pdfminer emits on their own line; XLM-R tags them as
+# CREDIT_CARD_EXPIRATION_DATE (MM/YY shape), so we drop them before NER.
+_PAGE_NUMBER_RE = re.compile(r"^\d{1,4}\s*/\s*\d{1,4}$")
+# A line short enough to be a running header/footer/watermark.
+_BOILERPLATE_MAX_LEN = 40
+# Identical short line repeated on >= this many pages → boilerplate ("Maxfiy").
+_BOILERPLATE_MIN_REPEATS = 3
 # A leading icon symbol (single non-word, non-space char) followed by space(s),
 # e.g. pdfminer renders a FontAwesome icon as "# email@x.com" or "◦ bullet".
 _LEADING_ICON_RE = re.compile(r"^\s*[^\w\s][ \t]+")
@@ -64,6 +72,37 @@ def clean_extracted(text: str) -> str:
         ln = _MULTISPACE_RE.sub(" ", ln).strip()
         lines.append(ln)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def strip_boilerplate_lines(text: str) -> str:
+    """Drop per-page boilerplate: standalone page-number footers (`N/M`) and
+    short lines repeated across many pages (watermarks like `Maxfiy`).
+
+    Both are noise that survives `clean_extracted` and either produce false
+    positives (page numbers → CREDIT_CARD_EXPIRATION_DATE) or clutter the
+    redacted output. Content lines — including inline fractions inside prose —
+    are untouched because only *standalone* `N/M` lines match.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    counts: dict[str, int] = {}
+    for ln in lines:
+        s = ln.strip()
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+
+    def _is_boilerplate(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return False
+        if _PAGE_NUMBER_RE.match(s):
+            return True
+        if len(s) <= _BOILERPLATE_MAX_LEN and counts.get(s, 0) >= _BOILERPLATE_MIN_REPEATS:
+            return True
+        return False
+
+    return "\n".join(ln for ln in lines if not _is_boilerplate(ln))
 
 
 def _pdf_page_texts(data: bytes) -> list[str]:
@@ -116,7 +155,7 @@ def extract_pdf(data: bytes) -> str:
             pages = _ocr_sparse_pages(data, pages)
         except Exception as e:  # noqa: BLE001 — tesseract/poppler not installed
             logger.warning("OCR fallback unavailable (%s)", e)
-    return clean_extracted("\n".join(pages))
+    return strip_boilerplate_lines(clean_extracted("\n".join(pages)))
 
 
 def extract_docx(data: bytes) -> str:
