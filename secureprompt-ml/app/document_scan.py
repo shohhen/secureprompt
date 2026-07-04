@@ -21,3 +21,34 @@ def assemble_pages(page_texts: list[str], sep: str = "\n\n") -> tuple[str, list[
         parts.append(pt)
         running += len(pt.encode("utf-8"))
     return "".join(parts), offsets
+
+
+def _page_of(byte_pos: int, page_byte_offsets: list[int]) -> int | None:
+    """Largest page index i with page_byte_offsets[i] <= byte_pos, else None."""
+    found = None
+    for i, off in enumerate(page_byte_offsets):
+        if off <= byte_pos:
+            found = i
+        else:
+            break
+    return found
+
+
+def partition_by_page(detections: list[dict], page_byte_offsets: list[int],
+                      page_byte_lengths: list[int]) -> list[list[dict]]:
+    """Split whole-document detections (byte spans in the assembled text) into
+    per-page lists with PAGE-LOCAL byte offsets. A detection is assigned to the
+    page where it STARTS; its end is clamped to that page's length (the value-repeat
+    pass in spans_to_rects covers any tail on later pages)."""
+    per_page: list[list[dict]] = [[] for _ in page_byte_offsets]
+    for d in detections:
+        i = _page_of(d["start"], page_byte_offsets)
+        if i is None:
+            continue
+        base = page_byte_offsets[i]
+        local_start = d["start"] - base
+        local_end = min(d["end"] - base, page_byte_lengths[i])
+        if local_end <= local_start:
+            continue
+        per_page[i].append({**d, "start": local_start, "end": local_end})
+    return per_page
