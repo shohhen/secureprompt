@@ -254,32 +254,10 @@ _SCAN_FILE_TEXT_PREVIEW = 8 * 1024  # keep redacted_text small in the response
 
 
 def _decode_best_effort(data: bytes) -> str:
-    """Decode file bytes to text. PDFs/DOCX are extracted lazily when the
-    corresponding library is installed; otherwise fall back to latin-1 so we
-    can still run regex + NER on whatever printable ASCII is embedded."""
-    head = data[:4]
-    # PDF
-    if head == b"%PDF":
-        try:
-            from pypdf import PdfReader  # type: ignore
-            import io
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join((p.extract_text() or "") for p in reader.pages)
-        except Exception:
-            pass
-    # DOCX (zip + word/document.xml)
-    if head[:2] == b"PK":
-        try:
-            import docx  # type: ignore
-            import io
-            doc = docx.Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            pass
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="replace")
+    """Extract text from an uploaded file (PDF via pdfminer.six + Tesseract OCR
+    fallback, DOCX, or plaintext). See app.file_extract."""
+    from app.file_extract import decode_best_effort
+    return decode_best_effort(data)
 
 
 def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:

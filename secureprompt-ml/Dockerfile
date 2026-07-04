@@ -78,6 +78,14 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
+# OCR fallback for /v1/scan-file: pytesseract shells out to `tesseract`, and
+# pdf2image shells out to poppler's `pdftoppm`. Language packs: eng (base) + rus
+# + Uzbek (Latin & Cyrillic). Runtime binaries only — no build toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-uzb tesseract-ocr-uzb-cyrl \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /app/.cache/torch /app/.cache/huggingface
 
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
