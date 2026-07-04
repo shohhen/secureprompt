@@ -49,10 +49,15 @@ def clean_extracted(text: str) -> str:
     for ch in text:
         if ch in "\t\n":
             out.append(ch)
-        elif unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs", "Cn"):
-            out.append(" ")
-        else:
-            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue  # zero-width / format: REMOVE (spacing would split tokens
+            # like jo​hn@x.com — same rule as text_norm.normalize_for_ner)
+        if cat in ("Cc", "Co", "Cs", "Cn"):
+            out.append(" ")  # standalone control / private-use icon glyphs
+            continue
+        out.append(ch)
     lines: list[str] = []
     for ln in "".join(out).split("\n"):
         ln = _LEADING_ICON_RE.sub("", ln)

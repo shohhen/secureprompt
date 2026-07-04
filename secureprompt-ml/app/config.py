@@ -53,3 +53,8 @@ ML_GLINER_CHUNK_OVERLAP: int = int(os.getenv("ML_GLINER_CHUNK_OVERLAP", "100"))
 # for genuinely mixed-language text. Disable to fall back to the legacy
 # whole-document language_scope path.
 ML_SEGMENT_LANG_ROUTING: bool = os.getenv("ML_SEGMENT_LANG_ROUTING", "true").lower() == "true"
+
+# Normalize text before NER (remove zero-width/format chars, join line-break
+# hyphens, NBSP->space, control/PUA->space) with offset back-mapping so spans
+# still point into the original. Default on; disable to fall back to raw text.
+ML_NORMALIZE_NER: bool = os.getenv("ML_NORMALIZE_NER", "true").lower() == "true"
