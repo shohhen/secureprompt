@@ -21,7 +21,6 @@ from app.models import (
 from app.detection.ner import _load_analyzer as _load_analyzer_base, detect
 from app.detection.injection import _load_injection_pipeline, classify_injection
 from app.detection.batching import drain_worker
-from app.detection.secrets import scan_secrets
 from app.embeddings.embed import _load_embedder, embed
 from app.qdrant_init import get_qdrant_client, ensure_collections
 from app.rag import rag_check
@@ -257,13 +256,6 @@ async def rag_check_endpoint(req: RagCheckRequest):
 # so this sidecar cap is the binding limit.
 _SCAN_FILE_MAX_BYTES = int(os.getenv("ML_SCAN_FILE_MAX_BYTES", str(15 * 1024 * 1024)))
 _SCAN_FILE_TEXT_PREVIEW = 8 * 1024  # keep redacted_text small in the response
-
-
-def _decode_best_effort(data: bytes) -> str:
-    """Extract text from an uploaded file (PDF via pdfminer.six + Tesseract OCR
-    fallback, DOCX, or plaintext). See app.file_extract."""
-    from app.file_extract import decode_best_effort
-    return decode_best_effort(data)
 
 
 def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:

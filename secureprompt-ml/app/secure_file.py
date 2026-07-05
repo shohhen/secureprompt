@@ -12,8 +12,6 @@ from app.secure_docs import secure_docx, secure_text, secure_xlsx
 from app.secure_visual import _font_path, secure_image, secure_pdf
 
 _DPI = int(os.getenv("ML_SECURE_DPI", "200"))
-_LANGS = os.getenv("ML_OCR_LANGS", "eng+rus+uzb+uzb_cyrl")
-_MIN_CHARS = int(os.getenv("ML_OCR_PAGE_MIN_CHARS", "24"))
 _IMAGE_MAGIC = {b"\xff\xd8\xff": "jpeg", b"\x89PNG": "png", b"GIF8": "gif",
                 b"BM": "bmp", b"II*\x00": "tiff", b"MM\x00*": "tiff"}
 
@@ -30,39 +28,12 @@ class SecuredFile:
     summary: dict
 
 
-def _char_to_byte(text: str) -> list[int]:
-    """``lookup[i]`` = UTF-8 byte offset of char ``i``; ``lookup[len(text)]`` =
-    total byte length. ``scan_secrets`` reports CHAR offsets while NER reports
-    BYTE offsets; converting keeps the merged detection list uniformly
-    byte-indexed (secure_boxes / secure_docs both assume byte offsets)."""
-    out = []
-    b = 0
-    for ch in text:
-        out.append(b)
-        b += len(ch.encode("utf-8"))
-    out.append(b)
-    return out
-
-
 def _detect(analyzer, text: str) -> list[dict]:
-    """NER PII + regex secrets under the bulk scan profile (indirection point for
-    tests). Secrets (API keys, tokens, private keys) are merged so they are
-    redacted in the secured file too — not just names/PII."""
-    from app.detection.ner import detect
-    from app.detection.scan_profile import scan_scope
-    from app.detection.secrets import scan_secrets
-    from app.secure_labels import merge_overlapping_spans
-    with scan_scope("bulk"):
-        dets = detect(analyzer, text)
-    secrets = scan_secrets(text)
-    if secrets:
-        c2b = _char_to_byte(text)
-        for s in secrets:
-            dets.append({"entity_type": s.kind.upper(), "text": s.text,
-                         "start": c2b[s.start], "end": c2b[s.end], "score": 1.0})
-    # Collapse overlapping same-type spans (e.g. `SECURETECH` vs `"SECURETECH"`,
-    # surname nested in full name) so one entity yields one placeholder + box.
-    return merge_overlapping_spans(dets)
+    """Whole-text NER + regex secrets, overlap-merged (bulk profile). Delegates to
+    the shared core so the DOCX/XLSX/text redactors detect identically to
+    scan-file / secure-file's PDF path. Kept as an indirection point for tests."""
+    from app.document_scan import detect_all
+    return detect_all(analyzer, text)
 
 
 _UNSAFE_STEM = re.compile(r'[\r\n"\\/\x00-\x1f\x7f]')

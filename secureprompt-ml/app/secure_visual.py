@@ -6,8 +6,7 @@ from __future__ import annotations
 import io
 import os
 
-from app.secure_boxes import _render_pdf_page, extract_boxes, spans_to_rects
-from app.secure_labels import build_labels
+from app.secure_boxes import _render_pdf_page, spans_to_rects
 
 _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -67,11 +66,6 @@ def images_to_pdf(images, dpi: int) -> bytes:
     rgb[0].save(out, format="PDF", save_all=True, append_images=rgb[1:],
                 resolution=float(dpi))
     return out.getvalue()
-
-
-def _ordered(dets):
-    """First-appearance (byte-offset) order within one page/image."""
-    return sorted(dets, key=lambda d: d.get("start", 0))
 
 
 def secure_pdf(pages, per_page, labels, data, dpi, font_path):
