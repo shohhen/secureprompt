@@ -88,3 +88,6 @@ secrets/
 # License material + generated TLS certs (secrets — never commit)
 etc/secureprompt/
 monitoring/nginx/certs/
+
+# graphify tool cache (regenerable)
+graphify-out/cache/
