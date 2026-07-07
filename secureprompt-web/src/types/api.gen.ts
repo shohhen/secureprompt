@@ -851,6 +851,8 @@ export interface components {
             last_rotated_at: string;
             /** Format: date-time */
             created_at: string;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
         };
         CreateProviderRequest: {
             name: string;
@@ -858,12 +860,16 @@ export interface components {
             provider_type: string;
             /** @description Plaintext API key — encrypted before storage */
             credential?: string | null;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
         };
         UpdateProviderRequest: {
             name?: string | null;
             provider_type?: string | null;
             /** @description New plaintext key; omit to leave existing unchanged */
             credential?: string | null;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
         };
         /** @enum {string} */
         PolicyAction: "deny" | "allow" | "redact" | "transform" | "flag";

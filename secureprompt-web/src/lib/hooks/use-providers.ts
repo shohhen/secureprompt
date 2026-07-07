@@ -23,18 +23,22 @@ export interface ProviderResponse {
    *  the LibreChat fork's discovery client falls back to per-type defaults
    *  in that case. */
   models?: ModelSummary[];
+  /** Provider-specific config (e.g. Vertex AI's { region, project }). */
+  config?: Record<string, unknown>;
 }
 
 export interface CreateProviderBody {
   name: string;
   provider_type: string;
   credential?: string;
+  config?: Record<string, unknown>;
 }
 
 export interface UpdateProviderBody {
   name?: string;
   provider_type?: string;
   credential?: string;
+  config?: Record<string, unknown>;
 }
 
 export function useProviders() {
@@ -83,6 +87,7 @@ export interface TestUnsavedBody {
   provider_type: string;
   credential: string;
   base_url?: string;
+  config?: Record<string, unknown>;
 }
 
 /**
@@ -177,6 +182,30 @@ export function useSyncProviderModels(providerId: string) {
       apiFetch<SyncModelsResponse>(
         `/v1/providers/${providerId}/models/sync`,
         { method: "POST" },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["providerModels", providerId] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
+    },
+  });
+}
+
+export interface BulkDeleteModelsResponse {
+  deleted: number;
+}
+
+/**
+ * Soft-delete many models in one request (the "Delete selected" action).
+ * Removed models are excluded from re-sync, so the deletion sticks across
+ * credential rotations and "Sync from upstream".
+ */
+export function useBulkDeleteProviderModels(providerId: string) {
+  const qc = useQueryClient();
+  return useMutation<BulkDeleteModelsResponse, Error, string[]>({
+    mutationFn: (names) =>
+      apiFetch<BulkDeleteModelsResponse>(
+        `/v1/providers/${providerId}/models/bulk-delete`,
+        { method: "POST", body: { names } },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providerModels", providerId] });

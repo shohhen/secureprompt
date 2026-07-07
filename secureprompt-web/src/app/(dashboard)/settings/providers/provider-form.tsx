@@ -4,7 +4,7 @@
  * Phase 5 / Plan 05-04 — Provider create/edit form (dialog).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -12,6 +12,7 @@ import { toast } from "sonner";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   useAddProviderModel,
+  useBulkDeleteProviderModels,
   useCreateProvider,
   useDeleteProviderModel,
   useProviderModels,
@@ -25,12 +26,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-const PROVIDER_TYPES = ["openai", "anthropic", "google", "azure", "bedrock", "custom"];
+const PROVIDER_TYPES = ["openai", "anthropic", "google", "vertex", "azure", "bedrock", "custom"];
 
 const schema = z.object({
   name: z.string().min(1, "Name is required").max(120),
   provider_type: z.string().min(1, "Provider type is required"),
   credential: z.string().optional(),
+  region: z.string().optional(),
+  project: z.string().optional(),
 });
 type FormData = z.infer<typeof schema>;
 
@@ -54,8 +57,16 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
       name: provider?.name ?? "",
       provider_type: provider?.provider_type ?? "openai",
       credential: "",
+      region:
+        (provider?.config as { region?: string; project?: string } | undefined)?.region ??
+        "us-central1",
+      project:
+        (provider?.config as { region?: string; project?: string } | undefined)?.project ?? "",
     },
   });
+
+  const providerType = form.watch("provider_type");
+  const isVertex = providerType === "vertex";
 
   useEffect(() => {
     if (open) {
@@ -63,6 +74,11 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
         name: provider?.name ?? "",
         provider_type: provider?.provider_type ?? "openai",
         credential: "",
+        region:
+          (provider?.config as { region?: string; project?: string } | undefined)?.region ??
+          "us-central1",
+        project:
+          (provider?.config as { region?: string; project?: string } | undefined)?.project ?? "",
       });
       setTestResult(null);
     }
@@ -75,8 +91,19 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
       setTestResult({ success: false, error: "Enter an API key first." });
       return;
     }
+    const config =
+      provider_type === "vertex"
+        ? {
+            region: form.getValues("region") || "us-central1",
+            project: form.getValues("project") || undefined,
+          }
+        : undefined;
     try {
-      const result = await testConn.mutateAsync({ provider_type, credential });
+      const result = await testConn.mutateAsync({
+        provider_type,
+        credential,
+        ...(config ? { config } : {}),
+      });
       setTestResult(result);
     } catch (e) {
       setTestResult({
@@ -87,6 +114,10 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
   }
 
   async function onSubmit(data: FormData) {
+    const config =
+      data.provider_type === "vertex"
+        ? { region: data.region || "us-central1", ...(data.project ? { project: data.project } : {}) }
+        : undefined;
     try {
       if (isEdit && provider) {
         await update.mutateAsync({
@@ -94,6 +125,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
           name: data.name,
           provider_type: data.provider_type,
           ...(data.credential ? { credential: data.credential } : {}),
+          ...(config ? { config } : {}),
         });
         toast.success("Provider updated.");
       } else {
@@ -101,6 +133,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
           name: data.name,
           provider_type: data.provider_type,
           ...(data.credential ? { credential: data.credential } : {}),
+          ...(config ? { config } : {}),
         });
         toast.success("Provider created.");
       }
@@ -114,7 +147,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg bg-background border shadow-lg p-6 space-y-4">
+        <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 max-h-[85vh] overflow-y-auto rounded-lg bg-background border shadow-lg p-6 space-y-4">
           <Dialog.Title className="text-lg font-semibold">
             {isEdit ? "Edit Provider" : "Add Provider"}
           </Dialog.Title>
@@ -149,22 +182,61 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
               </select>
             </div>
 
+            {isVertex && (
+              <>
+                <div className="space-y-1.5">
+                  <Label htmlFor="prov-region">Region</Label>
+                  <Input id="prov-region" placeholder="us-central1" {...form.register("region")} />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="prov-project">Project (optional)</Label>
+                  <Input
+                    id="prov-project"
+                    placeholder="leave blank to use the SA key's project"
+                    {...form.register("project")}
+                  />
+                </div>
+              </>
+            )}
+
             <div className="space-y-1.5">
               <Label htmlFor="prov-cred">
-                {isEdit ? "API Key (leave blank to keep existing)" : "API Key"}
+                {isVertex
+                  ? "Service Account JSON"
+                  : isEdit
+                    ? "API Key (leave blank to keep existing)"
+                    : "API Key"}
               </Label>
-              <Input
-                id="prov-cred"
-                type="password"
-                placeholder={isEdit ? "••••••••" : "sk-..."}
-                {...form.register("credential")}
-                onChange={(e) => {
-                  // Reset test status when the user edits the key — the
-                  // previous result no longer reflects what's typed.
-                  form.setValue("credential", e.target.value);
-                  setTestResult(null);
-                }}
-              />
+              {isVertex ? (
+                <textarea
+                  id="prov-cred"
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono min-h-[120px]"
+                  placeholder={'{ "type": "service_account", ... }  — optional (ADC if blank)'}
+                  {...form.register("credential")}
+                  onChange={(e) => {
+                    form.setValue("credential", e.target.value);
+                    setTestResult(null);
+                  }}
+                />
+              ) : (
+                <Input
+                  id="prov-cred"
+                  type="password"
+                  placeholder={isEdit ? "••••••••" : "sk-..."}
+                  {...form.register("credential")}
+                  onChange={(e) => {
+                    // Reset test status when the user edits the key — the
+                    // previous result no longer reflects what's typed.
+                    form.setValue("credential", e.target.value);
+                    setTestResult(null);
+                  }}
+                />
+              )}
+              {isVertex && (
+                <p className="text-xs text-muted-foreground">
+                  Optional — uses Workload Identity / ADC if blank
+                </p>
+              )}
               <div className="flex items-center gap-2 pt-1">
                 <Button
                   type="button"
@@ -221,7 +293,36 @@ function ModelsPanel({ providerId }: { providerId: string }) {
   const add = useAddProviderModel(providerId);
   const remove = useDeleteProviderModel(providerId);
   const sync = useSyncProviderModels(providerId);
+  const bulkDelete = useBulkDeleteProviderModels(providerId);
   const [name, setName] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // `selected` may retain names that were just deleted; intersect with the
+  // current models at read time (derived) rather than syncing state in an
+  // effect, so stale selections never drive a delete or a wrong count.
+  const modelNames = useMemo(() => new Set(models.map((m) => m.name)), [models]);
+  const selectedNames = useMemo(
+    () => [...selected].filter((n) => modelNames.has(n)),
+    [selected, modelNames],
+  );
+  const selectedCount = selectedNames.length;
+  const allSelected = models.length > 0 && selectedCount === models.length;
+
+  function toggleOne(modelName: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(modelName)) {
+        next.delete(modelName);
+      } else {
+        next.add(modelName);
+      }
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? new Set() : new Set(modelNames));
+  }
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
@@ -234,6 +335,19 @@ function ModelsPanel({ providerId }: { providerId: string }) {
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to add model.",
+      );
+    }
+  }
+
+  async function handleBulkDelete() {
+    if (selectedNames.length === 0) return;
+    try {
+      const { deleted } = await bulkDelete.mutateAsync(selectedNames);
+      setSelected(new Set());
+      toast.success(`Removed ${deleted} model${deleted === 1 ? "" : "s"}`);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to delete models.",
       );
     }
   }
@@ -274,9 +388,9 @@ function ModelsPanel({ providerId }: { providerId: string }) {
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Auto-fetched from the provider&apos;s API key on save. Click Sync
-        to refresh after the upstream adds new models, or add one
-        manually below.
+        Auto-fetched from the provider&apos;s API key on save. Removed models
+        stay removed across syncs. Add one back manually below, or click Sync
+        to pull newly-released upstream models.
       </p>
       {isLoading ? (
         <p className="text-xs text-muted-foreground">Loading…</p>
@@ -285,29 +399,70 @@ function ModelsPanel({ providerId }: { providerId: string }) {
           No models registered yet.
         </p>
       ) : (
-        <ul className="space-y-1">
-          {models.map((m) => (
-            <li
-              key={m.id}
-              className="flex items-center justify-between rounded border px-2 py-1 text-xs"
-            >
-              <span className="font-mono">{m.name}</span>
-              <button
+        <>
+          <div className="flex items-center justify-between gap-2 px-1">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                ref={(el) => {
+                  if (el)
+                    el.indeterminate =
+                      selectedCount > 0 && selectedCount < models.length;
+                }}
+                onChange={toggleAll}
+                aria-label="Select all models"
+              />
+              {selectedCount > 0
+                ? `${selectedCount} selected`
+                : `Select all (${models.length})`}
+            </label>
+            {selectedCount > 0 && (
+              <Button
                 type="button"
-                onClick={() =>
-                  remove.mutate(m.name, {
-                    onSuccess: () => toast.success(`Removed ${m.name}`),
-                    onError: (e) => toast.error(e.message),
-                  })
-                }
-                className="text-destructive hover:underline"
-                disabled={remove.isPending}
+                size="sm"
+                variant="destructive"
+                onClick={handleBulkDelete}
+                disabled={bulkDelete.isPending}
               >
-                Remove
-              </button>
-            </li>
-          ))}
-        </ul>
+                {bulkDelete.isPending
+                  ? "Deleting…"
+                  : `Delete selected (${selectedCount})`}
+              </Button>
+            )}
+          </div>
+          <ul className="max-h-64 space-y-1 overflow-y-auto pr-1">
+            {models.map((m) => (
+              <li
+                key={m.id}
+                className="flex items-center justify-between gap-2 rounded border px-2 py-1 text-xs"
+              >
+                <label className="flex min-w-0 flex-1 items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(m.name)}
+                    onChange={() => toggleOne(m.name)}
+                    aria-label={`Select ${m.name}`}
+                  />
+                  <span className="truncate font-mono">{m.name}</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    remove.mutate(m.name, {
+                      onSuccess: () => toast.success(`Removed ${m.name}`),
+                      onError: (e) => toast.error(e.message),
+                    })
+                  }
+                  className="shrink-0 text-destructive hover:underline"
+                  disabled={remove.isPending}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       <form onSubmit={handleAdd} className="flex gap-2">
         <Input
