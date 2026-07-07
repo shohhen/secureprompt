@@ -91,3 +91,4 @@ monitoring/nginx/certs/
 
 # graphify tool cache (regenerable)
 graphify-out/cache/
+scripts/v6_*.py
