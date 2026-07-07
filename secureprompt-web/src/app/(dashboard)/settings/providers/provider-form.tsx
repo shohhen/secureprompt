@@ -87,7 +87,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
   async function handleTestConnection() {
     const credential = form.getValues("credential");
     const provider_type = form.getValues("provider_type");
-    if (!credential || credential.trim().length === 0) {
+    if (provider_type !== "vertex" && (!credential || credential.trim().length === 0)) {
       setTestResult({ success: false, error: "Enter an API key first." });
       return;
     }
@@ -101,7 +101,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
     try {
       const result = await testConn.mutateAsync({
         provider_type,
-        credential,
+        credential: credential || "",
         ...(config ? { config } : {}),
       });
       setTestResult(result);
