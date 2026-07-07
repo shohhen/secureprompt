@@ -161,6 +161,10 @@ impl ProviderCatalog {
             Arc::new(openai_compat::OpenAiCompatAdapter::google()),
         );
         adapters.insert(
+            "vertex".to_owned(),
+            Arc::new(vertex::VertexAdapter::new()),
+        );
+        adapters.insert(
             "anthropic".to_owned(),
             Arc::new(anthropic::AnthropicAdapter),
         );
