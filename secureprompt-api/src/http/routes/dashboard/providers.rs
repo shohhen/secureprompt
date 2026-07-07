@@ -184,7 +184,13 @@ async fn create_provider(
 
     let repo = ProviderRepository::new(state.db.clone());
     let record = repo
-        .create_provider(ctx.workspace_id, &body.name, &body.provider_type, encrypted)
+        .create_provider(
+            ctx.workspace_id,
+            &body.name,
+            &body.provider_type,
+            encrypted,
+            serde_json::json!({}),
+        )
         .await
         .map_err(api_error_response)?;
 
@@ -250,6 +256,7 @@ async fn update_provider(
             body.name.as_deref(),
             body.provider_type.as_deref(),
             encrypted_update,
+            None,
         )
         .await
         .map_err(api_error_response)?;

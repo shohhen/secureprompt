@@ -1308,6 +1308,7 @@ mod debug_payload_tests {
             provider_type: "openai".to_owned(),
             model_name: "gpt-4o-mini".to_owned(),
             encrypted_credential: None,
+            config: serde_json::json!({}),
         }
     }
 

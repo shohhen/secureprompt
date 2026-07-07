@@ -15,6 +15,7 @@ pub struct ProviderRow {
     pub encrypted_credential: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ pub struct ResolvedModelTarget {
     pub provider_type: String,
     pub model_name: String,
     pub encrypted_credential: Option<String>,
+    pub config: serde_json::Value,
 }
 
 impl ProviderRepository {
@@ -65,7 +67,7 @@ impl ProviderRepository {
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at
+            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
              FROM providers
              ORDER BY created_at DESC",
         )
@@ -87,6 +89,7 @@ impl ProviderRepository {
                 encrypted_credential: record.get("encrypted_credential"),
                 created_at: record.get("created_at"),
                 updated_at: record.get("updated_at"),
+                config: record.get("config"),
             })
             .collect())
     }
@@ -96,6 +99,10 @@ impl ProviderRepository {
     /// `encrypted_credential` is `Some(base64url(nonce||ct))` when the caller
     /// supplied a plaintext credential, `None` otherwise.
     ///
+    /// `config` carries provider-type-specific settings that aren't a single
+    /// credential string (e.g. Vertex's `{"region": "...", "project": "..."}`).
+    /// Pass `serde_json::json!({})` for provider types that don't need it.
+    ///
     /// # Errors
     /// Returns `ApiError::Database` on SQL failure.
     pub async fn create_provider(
@@ -104,6 +111,7 @@ impl ProviderRepository {
         name: &str,
         provider_type: &str,
         encrypted_credential: Option<String>,
+        config: serde_json::Value,
     ) -> Result<ProviderRow, ApiError> {
         let mut tx = self
             .pool
@@ -118,15 +126,16 @@ impl ProviderRepository {
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
         let row = sqlx::query(
-            "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+            "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, config, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config",
         )
         .bind(Uuid::new_v4())
         .bind(workspace_id.0)
         .bind(name)
         .bind(provider_type)
         .bind(encrypted_credential.as_deref())
+        .bind(config)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -143,12 +152,14 @@ impl ProviderRepository {
             encrypted_credential: row.get("encrypted_credential"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            config: row.get("config"),
         })
     }
 
-    /// Update a provider's name/type/credential. Passing `None` for
+    /// Update a provider's name/type/credential/config. Passing `None` for
     /// `encrypted_credential` leaves the stored credential unchanged; passing
-    /// `Some(None)` clears it.
+    /// `Some(None)` clears it. Passing `None` for `config` leaves the stored
+    /// config unchanged; passing `Some(value)` replaces it wholesale.
     ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the provider does not exist in this
@@ -160,6 +171,7 @@ impl ProviderRepository {
         name: Option<&str>,
         provider_type: Option<&str>,
         encrypted_credential: Option<Option<String>>,
+        config: Option<serde_json::Value>,
     ) -> Result<ProviderRow, ApiError> {
         // Build the SET clause dynamically based on which fields were provided.
         let mut sets: Vec<String> = vec!["updated_at = NOW()".to_owned()];
@@ -171,6 +183,9 @@ impl ProviderRepository {
         }
         if encrypted_credential.is_some() {
             sets.push(format!("encrypted_credential = ${}", sets.len() + 2));
+        }
+        if config.is_some() {
+            sets.push(format!("config = ${}", sets.len() + 2));
         }
 
         // Simpler approach: full-replace with explicit params.
@@ -188,7 +203,7 @@ impl ProviderRepository {
 
         // Fetch current to fill unset fields.
         let current = sqlx::query(
-            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at
+            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
              FROM providers WHERE id = $1 AND workspace_id = $2",
         )
         .bind(provider_id)
@@ -204,20 +219,25 @@ impl ProviderRepository {
             Some(v) => v,
             None => current.get("encrypted_credential"),
         };
+        let new_config: serde_json::Value = match config {
+            Some(v) => v,
+            None => current.get("config"),
+        };
 
         let _ = sets; // suppress the unused warning from the dynamic builder above
 
         let row = sqlx::query(
             "UPDATE providers
-             SET name = $3, provider_type = $4, encrypted_credential = $5, updated_at = NOW()
+             SET name = $3, provider_type = $4, encrypted_credential = $5, config = $6, updated_at = NOW()
              WHERE id = $1 AND workspace_id = $2
-             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config",
         )
         .bind(provider_id)
         .bind(workspace_id.0)
         .bind(&new_name)
         .bind(&new_type)
         .bind(new_cred.as_deref())
+        .bind(&new_config)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -234,6 +254,7 @@ impl ProviderRepository {
             encrypted_credential: row.get("encrypted_credential"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            config: row.get("config"),
         })
     }
 
@@ -517,7 +538,8 @@ impl ProviderRepository {
                     providers.id AS provider_id,
                     providers.name AS provider_name,
                     providers.provider_type,
-                    providers.encrypted_credential
+                    providers.encrypted_credential,
+                    providers.config
              FROM models
              INNER JOIN providers ON providers.id = models.provider_id
              WHERE models.workspace_id = $1::uuid
@@ -544,6 +566,7 @@ impl ProviderRepository {
                 provider_type: record.get("provider_type"),
                 model_name: record.get("model_name"),
                 encrypted_credential: record.get("encrypted_credential"),
+                config: record.get("config"),
             })
             .collect())
     }
