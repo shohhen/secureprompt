@@ -61,11 +61,23 @@ pub fn default_base_url(provider_type: &str) -> &'static str {
 
 /// Probe the provider with the given credentials. Selects the right
 /// protocol per `provider_type`. `base_url` overrides the default.
+/// `region`/`project` are Vertex-only (ignored by every other provider
+/// type) — see `probe_vertex`.
 pub async fn test_connection(
     provider_type: &str,
     api_key: &str,
     base_url: Option<&str>,
+    region: Option<&str>,
+    project: Option<&str>,
 ) -> TestResult {
+    // Vertex auth is OAuth (SA JSON or ADC), not a bearer API key, and the
+    // credential may legitimately be empty (ADC) — handle it before the
+    // shared empty-api_key short-circuit below applies to every other
+    // provider type.
+    if provider_type.eq_ignore_ascii_case("vertex") {
+        return probe_vertex(api_key, region, project).await;
+    }
+
     if api_key.trim().is_empty() {
         return TestResult::err("api_key is empty");
     }
@@ -93,6 +105,49 @@ pub async fn test_connection(
         "anthropic" => probe_anthropic(&client, &resolved_base, api_key).await,
         // openai, google, custom, openai_compat all use the same probe.
         _ => probe_openai_compat(&client, &resolved_base, api_key).await,
+    }
+}
+
+/// Vertex probe: mint an OAuth access token (SA JSON or ADC) and hit the
+/// publishers/models listing for the resolved region+project. Unlike the
+/// other providers, Vertex doesn't use a static bearer API key, so this
+/// bypasses the shared `reqwest`/`base_url` scaffolding in `test_connection`
+/// entirely.
+async fn probe_vertex(
+    credential: &str,
+    region: Option<&str>,
+    project: Option<&str>,
+) -> TestResult {
+    // For Vertex, `credential` is the SA JSON (may be empty => ADC).
+    let cred = if credential.trim().is_empty() { None } else { Some(credential) };
+    let token = match crate::providers::vertex::mint_access_token(cred).await {
+        Ok(t) => t,
+        Err(e) => return TestResult::err(format!("vertex auth failed: {e}")),
+    };
+    let region = region.filter(|s| !s.is_empty()).unwrap_or("us-central1");
+    let project = match project.filter(|s| !s.is_empty()) {
+        Some(p) => p.to_owned(),
+        None => match crate::providers::vertex::sa_project_id_public(cred) {
+            Some(p) => p,
+            None => return TestResult::err("vertex: project required (set project or use an SA key)"),
+        },
+    };
+    let host = if region == "global" {
+        "aiplatform.googleapis.com".to_owned()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    };
+    let url = format!(
+        "https://{host}/v1/projects/{project}/locations/{region}/publishers/google/models"
+    );
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(e) => return TestResult::err(format!("http client: {e}")),
+    };
+    match client.get(&url).bearer_auth(&token).send().await {
+        Ok(resp) if resp.status().is_success() => TestResult::ok(0),
+        Ok(resp) => TestResult::err(format!("vertex HTTP {}", resp.status())),
+        Err(e) => TestResult::err(format!("vertex request failed: {e}")),
     }
 }
 
@@ -310,14 +365,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_api_key_short_circuits() {
-        let result = test_connection("openai", "", None).await;
+        let result = test_connection("openai", "", None, None, None).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("empty"));
     }
 
     #[tokio::test]
     async fn unknown_provider_type_with_no_base_url_errors() {
-        let result = test_connection("nonexistent", "sk-test", None).await;
+        let result = test_connection("nonexistent", "sk-test", None, None, None).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("no default base_url"));
     }

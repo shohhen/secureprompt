@@ -150,6 +150,35 @@ fn sa_project_id(credential: Option<&str>) -> Option<String> {
     v.get("project_id").and_then(|p| p.as_str()).map(str::to_owned)
 }
 
+/// Public wrapper so the credential-test path (`credential_test.rs`) can
+/// derive a fallback project id from an SA JSON without exposing the
+/// private `sa_project_id` outside this module.
+pub(crate) fn sa_project_id_public(credential: Option<&str>) -> Option<String> {
+    sa_project_id(credential)
+}
+
+/// Standalone token mint for the credential-test path (no adapter cache).
+/// Kept deliberately separate from `VertexAdapter::access_token`, which
+/// caches the `TokenProvider` per credential fingerprint across requests —
+/// the test path is a one-shot probe, so a fresh provider per call is fine
+/// and avoids entangling the adapter's cache with credential-test traffic.
+pub(crate) async fn mint_access_token(credential: Option<&str>) -> Result<String, String> {
+    let provider: Arc<dyn TokenProvider> = match credential {
+        Some(sa_json) => Arc::new(
+            CustomServiceAccount::from_json(sa_json)
+                .map_err(|e| format!("invalid service-account JSON: {e}"))?,
+        ),
+        None => gcp_auth::provider()
+            .await
+            .map_err(|e| format!("no Application Default Credentials: {e}"))?,
+    };
+    let token = provider
+        .token(&[CLOUD_PLATFORM_SCOPE])
+        .await
+        .map_err(|e| format!("failed to mint access token: {e}"))?;
+    Ok(token.as_str().to_owned())
+}
+
 #[async_trait]
 impl ProviderAdapter for VertexAdapter {
     fn provider_type(&self) -> &'static str {

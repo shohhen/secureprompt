@@ -107,6 +107,11 @@ pub struct TestConnectionRequest {
     /// the provider_type's well-known endpoint when absent.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Provider-type-specific settings (Vertex: {region, project}) — same
+    /// shape as `CreateProviderRequest::config`. Only Vertex reads this
+    /// today; every other provider_type ignores it.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// `POST /v1/providers/{id}/models/sync` response — what the dashboard
@@ -430,10 +435,17 @@ async fn test_connection_unsaved(
     Json(body): Json<TestConnectionRequest>,
 ) -> Result<Json<crate::providers::credential_test::TestResult>, axum::response::Response> {
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
+    let vertex_cfg = body
+        .config
+        .as_ref()
+        .map(crate::providers::vertex::VertexConfig::from_value)
+        .unwrap_or(crate::providers::vertex::VertexConfig { region: None, project: None });
     let result = crate::providers::credential_test::test_connection(
         &body.provider_type,
         &body.credential,
         body.base_url.as_deref(),
+        vertex_cfg.region.as_deref(),
+        vertex_cfg.project.as_deref(),
     )
     .await;
     Ok(Json(result))
@@ -468,10 +480,13 @@ async fn test_connection_stored(
     let plaintext = decrypt_stored_credential(stored_credential, &state)
         .await
         .map_err(api_error_response)?;
+    let vertex_cfg = crate::providers::vertex::VertexConfig::from_value(&target.config);
     let result = crate::providers::credential_test::test_connection(
         &target.provider_type,
         &plaintext,
         None,
+        vertex_cfg.region.as_deref(),
+        vertex_cfg.project.as_deref(),
     )
     .await;
     Ok(Json(result))
