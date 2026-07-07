@@ -3,6 +3,7 @@ pub mod credential_test;
 pub mod ollama;
 pub mod openai;
 pub mod openai_compat;
+pub mod vertex;
 pub mod vllm;
 #[cfg(test)]
 mod tests;
