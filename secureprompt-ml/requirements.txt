@@ -34,5 +34,3 @@ openpyxl==3.1.5
 # torch CPU-only installed separately in Dockerfile:
 # pip install torch==2.6.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 
-# v7 data-engine (offline): robust news article-body extraction
-trafilatura>=1.6

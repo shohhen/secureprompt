@@ -3,3 +3,7 @@
 # ML_NER_BACKEND=gliner2 backend on transformers>=5.)
 # ML_USE_ONNX=true for XLM-R (ONNX int8 load path):
 optimum[onnxruntime]>=1.24
+
+# v7 data-engine (offline datagen only): robust news article-body extraction.
+# Has a regex fallback in datagen/news_harvest.py, so it's not needed at runtime.
+trafilatura>=1.6
