@@ -95,9 +95,9 @@ ml:
     language: "en"
     useOnnx: "false"
     # Active NER checkpoint(s) under app/resources/. Empty → image default
-    # (multilingual_ner_v5_cold_xlmr). Comma-separated to run several, or
-    # "all" to register every shipped checkpoint.
-    activeNerModels: ""
+    # (now multilingual_ner_v7_xlmr). Comma-separated to run several, or
+    # "all" to register every shipped checkpoint. Rollback: multilingual_ner_v5_cold_xlmr.
+    activeNerModels: "multilingual_ner_v7_xlmr"
 
 # ----------------------------------------------------------------------------
 # LibreChat (browser chat UI, SP-modified fork) + its MongoDB
