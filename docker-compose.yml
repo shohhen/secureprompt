@@ -51,9 +51,8 @@ services:
     environment:
       ML_LANGUAGE: en
       ML_USE_ONNX: "false"
-      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v7_xlmr.
-      # Comma-separated for several, or "all" to load every shipped checkpoint.
-      # Rollback to v5: set ACTIVE_NER_MODELS=multilingual_ner_v5_cold_xlmr (also shipped).
+      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v7_xlmr (only shipped
+      # checkpoint). Comma-separated for several, or "all" to load every shipped checkpoint.
       ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v7_xlmr}
       # XLM-R confidence floor. Recognizer is language-gated to ru/uz (never
       # scores English), so the legacy 0.85 dropped legitimate names (measured a

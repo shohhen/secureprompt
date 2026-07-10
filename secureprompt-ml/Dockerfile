@@ -100,13 +100,10 @@ COPY --from=compile /build/app ./app
 # Ship ONLY the encrypted weights — the plaintext file never touches this layer.
 # The .enc is produced on the host (see the header) and rides in via the build
 # context; .dockerignore excludes the plaintext model.safetensors next to it.
-# Active model dir: multilingual_ner_v7_xlmr (ACTIVE_NER_MODELS default). v5_cold's .enc is
-# also shipped so a rollback is an ACTIVE_NER_MODELS env change, not a rebuild.
-# To switch checkpoints, change both ACTIVE_NER_MODELS and (for a NEW checkpoint) add a COPY.
+# Active model dir: multilingual_ner_v7_xlmr (ACTIVE_NER_MODELS default).
+# To switch checkpoints, change both the src dir below and ACTIVE_NER_MODELS at runtime.
 COPY secureprompt-ml/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc \
      /app/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc
-COPY secureprompt-ml/app/resources/multilingual_ner_v5_cold_xlmr/model/model.safetensors.enc \
-     /app/app/resources/multilingual_ner_v5_cold_xlmr/model/model.safetensors.enc
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
