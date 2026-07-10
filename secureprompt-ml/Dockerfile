@@ -100,8 +100,10 @@ COPY --from=compile /build/app ./app
 # Ship ONLY the encrypted weights — the plaintext file never touches this layer.
 # The .enc is produced on the host (see the header) and rides in via the build
 # context; .dockerignore excludes the plaintext model.safetensors next to it.
-# Active model dir: multilingual_ner_v7_xlmr (ACTIVE_NER_MODELS default).
-# To switch checkpoints, change both the src dir below and ACTIVE_NER_MODELS at runtime.
+# Active model dir: multilingual_ner_v8_xlmr (ACTIVE_NER_MODELS default). v7_xlmr's .enc is
+# also shipped so a rollback is an ACTIVE_NER_MODELS env change, not a rebuild.
+COPY secureprompt-ml/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc \
+     /app/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc
 COPY secureprompt-ml/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc \
      /app/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc
 

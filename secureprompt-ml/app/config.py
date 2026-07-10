@@ -30,7 +30,7 @@ MODEL_KEY_REQUIRED: bool = os.getenv("SECUREPROMPT_MODEL_KEY_REQUIRED", "false")
 # (deferred SSN to the gateway regex). Set to another dir name to A/B, a
 # comma-separated list to run several, or `all`/`*` to register every
 # discovered checkpoint (legacy auto-discover-everything behaviour).
-ACTIVE_NER_MODELS: str = os.getenv("ACTIVE_NER_MODELS", "multilingual_ner_v7_xlmr")
+ACTIVE_NER_MODELS: str = os.getenv("ACTIVE_NER_MODELS", "multilingual_ner_v8_xlmr")
 
 # Texts longer than this (in characters) route to the bulk NER queue instead
 # of the inline one, so a single large document can't head-of-line-block
