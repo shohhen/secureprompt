@@ -78,6 +78,16 @@ def _emit_rects(page: PageBoxes, cs: int, ce: int, label: str, dpi: int, n: int,
         rects.append((px0, py0, px1, py1, label))
 
 
+def _word_bounded(text: str, cs: int, ce: int) -> bool:
+    """True when text[cs:ce] is not embedded inside a larger alphanumeric run — i.e.
+    the chars immediately before/after it are not letters/digits. The value-repeat
+    pass uses this so a short value (e.g. "от") is never boxed inside unrelated words
+    (со*от*ветствии / *от*носительно / к*от*орые)."""
+    before = text[cs - 1] if cs > 0 else ""
+    after = text[ce] if ce < len(text) else ""
+    return not (before.isalnum() or after.isalnum())
+
+
 def spans_to_rects(page: PageBoxes, detections, labels, dpi: int):
     b2c = byte_to_char_map(page.text)
     n = len(page.char_boxes)
@@ -112,7 +122,7 @@ def spans_to_rects(page: PageBoxes, detections, labels, dpi: int):
         while (i := page.text.find(value, start)) >= 0:
             cs, ce = i, i + len(value)
             start = ce
-            if not _overlaps(cs, ce):
+            if not _overlaps(cs, ce) and _word_bounded(page.text, cs, ce):
                 _emit_rects(page, cs, ce, label, dpi, n, rects)
                 covered.append((cs, ce))
     return rects
