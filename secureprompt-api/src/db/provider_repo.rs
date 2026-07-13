@@ -326,6 +326,7 @@ impl ProviderRepository {
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
              WHERE provider_id = $1
+               AND excluded = FALSE
              ORDER BY name ASC",
         )
         .bind(provider_id)
@@ -386,9 +387,12 @@ impl ProviderRepository {
         }
 
         // Try insert; if (workspace_id, provider_id, name) already exists,
-        // return the existing row.
+        // return the existing row. A previously-removed (excluded) model is
+        // revived here — a manual "Add model" is an explicit request to bring
+        // it back, so we clear the exclusion flag (this is what lets an admin
+        // undo a deletion the additive sync would otherwise permanently skip).
         let existing = sqlx::query(
-            "SELECT id, workspace_id, provider_id, name, created_at
+            "SELECT id, workspace_id, provider_id, name, created_at, excluded
              FROM models
              WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
         )
@@ -399,9 +403,17 @@ impl ProviderRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
         if let Some(row) = existing {
+            let id: Uuid = row.get("id");
+            if row.get::<bool, _>("excluded") {
+                sqlx::query("UPDATE models SET excluded = FALSE WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| ApiError::Database(e.to_string()))?;
+            }
             tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
             return Ok(ModelRow {
-                id: row.get("id"),
+                id,
                 workspace_id: row.get("workspace_id"),
                 provider_id: row.get("provider_id"),
                 name: row.get("name"),
@@ -454,9 +466,13 @@ impl ProviderRepository {
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        // Soft-delete: mark excluded rather than removing the row, so the
+        // additive upstream sync knows NOT to re-add this model. A hard DELETE
+        // would let the next credential-save / "Sync from upstream" re-import it.
         let result = sqlx::query(
-            "DELETE FROM models
-             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
+            "UPDATE models SET excluded = TRUE
+             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3
+               AND excluded = FALSE",
         )
         .bind(workspace_id.0)
         .bind(provider_id)
@@ -473,6 +489,79 @@ impl ProviderRepository {
             )));
         }
         Ok(())
+    }
+
+    /// Soft-delete many models at once (bulk "Delete selected" in the dashboard).
+    /// Idempotent: names that don't exist or are already excluded are skipped.
+    /// Returns the number of models newly excluded by this call.
+    pub async fn bulk_exclude_models(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+        names: &[String],
+    ) -> Result<u64, ApiError> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "UPDATE models SET excluded = TRUE
+             WHERE workspace_id = $1 AND provider_id = $2
+               AND name = ANY($3::text[]) AND excluded = FALSE",
+        )
+        .bind(workspace_id.0)
+        .bind(provider_id)
+        .bind(names)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Names of models the admin has removed (soft-deleted) for this provider.
+    /// `persist_synced_models` uses this to skip re-adding them during an
+    /// upstream sync, so curated deletions survive credential rotations.
+    pub async fn list_excluded_model_names_for_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+    ) -> Result<Vec<String>, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT name FROM models
+             WHERE provider_id = $1 AND excluded = TRUE",
+        )
+        .bind(provider_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
@@ -492,6 +581,7 @@ impl ProviderRepository {
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
+             WHERE excluded = FALSE
              ORDER BY created_at DESC",
         )
         .fetch_all(&mut *tx)

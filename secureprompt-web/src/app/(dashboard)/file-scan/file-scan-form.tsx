@@ -1,14 +1,7 @@
 "use client";
 
 import { useState, useRef } from "react";
-
-interface ScanResult {
-  pii_found: boolean;
-  secrets_found: boolean;
-  injection_detected: boolean;
-  entities: Array<{ text: string; label: string; score: number }>;
-  redacted_text: string | null;
-}
+import { scanFile, secureFile, type ScanResult } from "./file-scan-api";
 
 interface SecureSummary {
   entities_count: number;
@@ -38,14 +31,7 @@ export function FileScanForm() {
     setSecured(null);
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/proxy/ml/v1/scan-file", {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setResult(await res.json());
+      setResult(await scanFile(file));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Scan failed");
     } finally {
@@ -65,22 +51,14 @@ export function FileScanForm() {
     setSecured(null);
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/proxy/ml/v1/secure-file", {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) throw new Error(secureErrorMessage(res.status));
-
+      const { blob, contentDisposition, summaryHeader } = await secureFile(file);
       // Stream the redacted file straight to a browser download.
-      const blob = await res.blob();
       const filename = filenameFromDisposition(
-        res.headers.get("Content-Disposition"),
+        contentDisposition,
         defaultSecuredName(file.name),
       );
       triggerDownload(blob, filename);
-      setSecured(secureConfirmation(res.headers.get("X-Secure-Summary"), filename));
+      setSecured(secureConfirmation(summaryHeader, filename));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Securing failed");
     } finally {
@@ -191,13 +169,6 @@ export function FileScanForm() {
       )}
     </div>
   );
-}
-
-function secureErrorMessage(status: number): string {
-  if (status === 413) return "File too large (max 15 MB).";
-  if (status === 415) return "Unsupported file type for securing.";
-  if (status === 503) return "Model still loading — try again in a moment.";
-  return `Securing failed (HTTP ${status}).`;
 }
 
 function filenameFromDisposition(cd: string | null, fallback: string): string {

@@ -284,6 +284,37 @@ def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:
     return b"".join(parts).decode("utf-8", errors="replace")
 
 
+def _redact_reversible(text: str, dets: list[dict]) -> tuple[str, dict[str, str]]:
+    """Redact with REVERSIBLE ``{{Type_N}}`` tokens + return the token->value map.
+
+    Same scheme as the gateway vault and secure-file (``build_labels``): one token
+    per distinct (type, value), per-type first-appearance numbering, so the chat
+    gateway can preload its vault from ``token_map`` and restore the file's PII in
+    the model's response. Spans are BYTE offsets (detect() wire format)."""
+    from app.secure_labels import build_labels
+    labels = build_labels(sorted(dets, key=lambda d: d.get("start", 0)))
+    token_map = {label: value for (_typ, value), label in labels.items()}
+    if not labels:
+        return text, {}
+    byte_text = text.encode("utf-8")
+    spans = []
+    for d in dets:
+        token = labels.get((d["entity_type"].upper(), d["text"]))
+        if token:
+            spans.append((int(d["start"]), int(d["end"]), token))
+    spans.sort(key=lambda s: s[0])
+    parts: list[bytes] = []
+    cursor = 0
+    for start, end, token in spans:
+        if start < cursor or start > len(byte_text) or end > len(byte_text):
+            continue
+        parts.append(byte_text[cursor:start])
+        parts.append(token.encode("utf-8"))
+        cursor = end
+    parts.append(byte_text[cursor:])
+    return b"".join(parts).decode("utf-8", errors="replace"), token_map
+
+
 async def _scan_impl(raw: bytes) -> ScanFileResponse:
     """Run the full scan pipeline (decode → NER → injection → secrets →
     redact) on already-read file bytes. Shared by the sync and async
@@ -314,11 +345,9 @@ async def _scan_impl(raw: bytes) -> ScanFileResponse:
         for e in ner_raw
     ]
 
-    spans: list[tuple[int, int, str]] = [
-        (int(e["start"]), int(e["end"]), e["entity_type"].upper()) for e in ner_raw
-    ]
-
-    redacted_full = _redact(text, spans)
+    # Reversible {{Type_N}} tokens + token->value map so the chat gateway can
+    # restore the file's PII in the response (see gateway vault-stash preload).
+    redacted_full, token_map = _redact_reversible(text, ner_raw)
     preview_truncated = len(redacted_full) > _SCAN_FILE_TEXT_PREVIEW
     redacted_preview = redacted_full[:_SCAN_FILE_TEXT_PREVIEW]
 
@@ -330,6 +359,7 @@ async def _scan_impl(raw: bytes) -> ScanFileResponse:
         redacted_text=redacted_preview,
         file_size_bytes=len(raw),
         preview_truncated=preview_truncated,
+        token_map=token_map,
     )
 
 

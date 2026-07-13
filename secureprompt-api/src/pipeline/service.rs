@@ -116,8 +116,19 @@ impl PipelineService {
         request: &GatewayRequest,
     ) -> Result<Prepared, ApiError> {
         let request_id = RequestId::new();
-        let prompt = prompt_from_messages(&request.messages);
+        let mut prompt = prompt_from_messages(&request.messages);
         let mut pipeline_state = PipelineState::default();
+        // Reversible file-scan: an uploaded file's `{{Type_N}}` → original-PII map
+        // was stashed in Redis and referenced by an opaque `[[sp:v=…]]` marker in
+        // the message. Load those maps into the session vault (so restore_content
+        // brings the file's PII back into the response) and strip the markers
+        // before detection / redaction / forwarding to the provider.
+        preload_file_vault(
+            &mut prompt,
+            &mut pipeline_state.vault,
+            &self.state.redis_pool,
+        )
+        .await;
         let regex_detections = detect_content(&prompt);
         let ml_detections = self.state.ml_sidecar.detect_if_available(&prompt).await;
         pipeline_state.detections = merge_detections(regex_detections, ml_detections);
@@ -375,12 +386,16 @@ impl PipelineService {
             && secure_mode.redact_pii_in_responses
             && !self.state.config.chat_debug_mode
         {
+            // Freeze the client-provided originals before response redaction
+            // mutates the vault with its own entries.
+            let client_originals = pipeline_state.vault.original_values();
             match restored_content.as_deref() {
                 Some(text) => {
                     let regex = detect_content(text);
                     let ml = self.state.ml_sidecar.detect_if_available(text).await;
                     let merged = merge_detections(regex, ml);
-                    let detections = filter_response_side_detections(&merged);
+                    let detections =
+                        filter_response_side_detections(&merged, &client_originals);
                     let scrubbed = if detections.is_empty() {
                         text.to_owned()
                     } else {
@@ -591,6 +606,12 @@ impl PipelineService {
 
         let mut vault = pipeline_state.vault;
         let mut redaction_map = pipeline_state.redaction_map;
+        // The PII the client provided this turn, frozen before the stream loop.
+        // Response redaction re-redacts through `vault` and inserts its own
+        // entries as it goes; snapshotting here keeps the "already known to the
+        // client" set stable so a NEW entity the model repeats across segments
+        // isn't whitelisted by its own first-mention redaction.
+        let client_originals = vault.original_values();
 
         let stream = async_stream::stream! {
             let mut provider_stream = provider_stream;
@@ -613,7 +634,8 @@ impl PipelineService {
                     let regex = detect_content(&restored);
                     let ml = state.ml_sidecar.detect_if_available(&restored).await;
                     let merged = merge_detections(regex, ml);
-                    let detections = filter_response_side_detections(&merged);
+                    let detections =
+                        filter_response_side_detections(&merged, &client_originals);
                     if detections.is_empty() {
                         restored
                     } else {
@@ -913,6 +935,60 @@ fn prompt_from_messages(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Preload the session vault from `[[sp:v=<ref>]]` file-scan markers and strip
+/// them from `prompt`. Each ref points at a Redis-stashed `{{Type_N}}` → PII map
+/// (`POST /v1/vault/stash`); loading it lets `restore_content` bring the file's
+/// PII back into the model's response, while the marker — a bare ref, no PII — is
+/// removed before the prompt reaches detection / redaction / the provider.
+/// Best-effort: a missing or expired ref just leaves its tokens unrestored.
+async fn preload_file_vault(
+    prompt: &mut String,
+    vault: &mut secureprompt_common::types::TokenVault,
+    redis_pool: &deadpool_redis::Pool,
+) {
+    const OPEN: &str = "[[sp:v=";
+    const CLOSE: &str = "]]";
+    if !prompt.contains(OPEN) {
+        return;
+    }
+    let mut refs: Vec<String> = Vec::new();
+    let mut cleaned = String::with_capacity(prompt.len());
+    let mut rest = prompt.as_str();
+    while let Some(idx) = rest.find(OPEN) {
+        cleaned.push_str(&rest[..idx]);
+        let after = &rest[idx + OPEN.len()..];
+        match after.find(CLOSE) {
+            Some(end) => {
+                let vref = &after[..end];
+                if !vref.is_empty() {
+                    refs.push(vref.to_owned());
+                }
+                rest = &after[end + CLOSE.len()..];
+            }
+            None => {
+                // Unterminated marker — keep the remaining text verbatim.
+                cleaned.push_str(rest);
+                rest = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    *prompt = cleaned;
+
+    for vref in refs {
+        if let Some(json) = crate::redis::load_file_vault(redis_pool, &vref).await {
+            if let Ok(map) =
+                serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
+            {
+                for (token, value) in map {
+                    vault.insert(token, value);
+                }
+            }
+        }
+    }
+}
+
 /// Apply the workspace `secure_mode` configuration on top of the policy
 /// evaluation outcome. The intent: settings on the dashboard "Secure Mode"
 /// page must visibly affect gateway behavior.
@@ -1098,6 +1174,16 @@ fn apply_secure_mode_override(
 /// sees PII placeholders where there was no PII.
 ///
 /// Filter rules:
+///   * Drop any detection whose value is in `client_originals` — the PII the
+///     *client* provided this turn (a frozen snapshot of the input-side vault,
+///     taken before response redaction began). We just restored those values
+///     back into the reply; re-redacting them would show the client
+///     `{{Person_1}}` for their own name and break the tokenize→restore
+///     round-trip. Response redaction exists to catch NEW PII the model
+///     introduces, not to re-hide the client's own data. The set is frozen
+///     (not the live vault) so a new entity the model repeats across segments
+///     isn't whitelisted by its own first-mention redaction. Class-agnostic:
+///     names, emails, cards the client typed all pass through restored.
 ///   * Drop NER hits shorter than 3 visible characters (`I`, `me`, `Mr`,
 ///     `Dr`, etc.). Real person names are at least 3 chars.
 ///   * Drop NER hits with confidence < 0.85 — the classifier is well-
@@ -1110,6 +1196,7 @@ fn apply_secure_mode_override(
 ///     ARE genuinely PII the reviewer wants flagged.
 fn filter_response_side_detections(
     detections: &[secureprompt_common::types::Detection],
+    client_originals: &std::collections::HashSet<String>,
 ) -> Vec<secureprompt_common::types::Detection> {
     const MIN_NER_LEN: usize = 3;
     const MIN_NER_CONFIDENCE: f32 = 0.85;
@@ -1120,6 +1207,15 @@ fn filter_response_side_detections(
     detections
         .iter()
         .filter(|d| {
+            // The client's own PII (values they provided this turn) must pass
+            // through restored — never re-redact what we just detokenized for
+            // them. Check both the raw and trimmed value so incidental
+            // surrounding whitespace in a detection span can't defeat the match.
+            if client_originals.contains(&d.value)
+                || client_originals.contains(d.value.trim())
+            {
+                return false;
+            }
             let class_upper = d.class.to_uppercase();
             // Heuristic: NER-emitted classes are PERSON / ORGANIZATION /
             // LOCATION / etc. Regex-emitted classes are CREDIT_CARD,
@@ -1372,5 +1468,104 @@ mod debug_payload_tests {
         let p2 = payload.find("{{Person_1}}").unwrap();
         let p3 = payload.find("{{Person_2}}").unwrap();
         assert!(p1 < p2 && p2 < p3, "redaction map entries must be sorted");
+    }
+}
+
+#[cfg(test)]
+mod response_redaction_filter_tests {
+    use super::*;
+    use secureprompt_common::types::{Detection, TokenVault};
+
+    fn person(value: &str) -> Detection {
+        Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.99,
+            span: Some((0, value.len())),
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn vault_known_pii_is_not_re_redacted() {
+        // The client typed "Shohjahon"; it lives in the vault as the original
+        // behind `{{Person_1}}`. When it is restored into the model's reply and
+        // response-side redaction runs, we must NOT re-hide it — the client
+        // already knows their own name. Regression test for the chat rendering
+        // `{{Person_1}}` instead of the restored value.
+        let mut vault = TokenVault::default();
+        vault.insert("{{Person_1}}".to_owned(), "Shohjahon".to_owned());
+
+        let filtered =
+            filter_response_side_detections(&[person("Shohjahon")], &vault.original_values());
+
+        assert!(
+            filtered.is_empty(),
+            "client's own vault-known PII must pass through restored, not be re-redacted"
+        );
+    }
+
+    #[test]
+    fn new_model_introduced_pii_is_still_redacted() {
+        // A name the client never provided (not in the vault) is genuinely new
+        // PII the model surfaced — response redaction must still catch it.
+        let mut vault = TokenVault::default();
+        vault.insert("{{Person_1}}".to_owned(), "Shohjahon".to_owned());
+
+        let filtered =
+            filter_response_side_detections(&[person("Alice")], &vault.original_values());
+
+        assert_eq!(filtered.len(), 1, "new PII the model introduced must still be redacted");
+        assert_eq!(filtered[0].value, "Alice");
+    }
+
+    #[test]
+    fn snapshot_is_frozen_so_repeated_new_pii_is_still_redacted() {
+        // Regression for the streaming hazard: response redaction inserts the
+        // model's new PII ("Alice") into the SAME vault as it processes each
+        // segment. We filter against a snapshot taken BEFORE that, so a later
+        // segment repeating "Alice" is still redacted — never whitelisted by
+        // its own first-mention redaction (which would leak it).
+        let mut vault = TokenVault::default();
+        vault.insert("{{Person_1}}".to_owned(), "Shohjahon".to_owned());
+        let client_originals = vault.original_values(); // frozen: { "Shohjahon" }
+
+        // First segment redacted "Alice" → apply_redaction added it to the vault.
+        vault.insert("{{Person_2}}".to_owned(), "Alice".to_owned());
+
+        // A later segment mentions "Alice" again.
+        let filtered = filter_response_side_detections(&[person("Alice")], &client_originals);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "model-introduced PII must not be whitelisted by its own earlier redaction"
+        );
+    }
+
+    #[test]
+    fn non_ner_vault_value_also_passes_through() {
+        // The exclusion is class-agnostic: an email the client provided is in
+        // the vault too, and must not be re-redacted in the reply.
+        let mut vault = TokenVault::default();
+        vault.insert("{{Email_Address_1}}".to_owned(), "bob@example.com".to_owned());
+        let det = Detection {
+            class: "EMAIL_ADDRESS".to_owned(),
+            confidence: 1.0,
+            span: Some((0, 15)),
+            value: "bob@example.com".to_owned(),
+        };
+        assert!(filter_response_side_detections(&[det], &vault.original_values()).is_empty());
+    }
+
+    #[test]
+    fn empty_vault_preserves_existing_filter_behavior() {
+        // With no vault entries the function behaves exactly as before: valid
+        // NER person names pass through, short/pronoun ones are dropped.
+        let vault = TokenVault::default();
+        let filtered = filter_response_side_detections(
+            &[person("Shohjahon"), person("me")],
+            &vault.original_values(),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].value, "Shohjahon");
     }
 }

@@ -67,6 +67,47 @@ pub async fn blacklist_jti(pool: &Pool, jti: &str, ttl_secs: u64) -> Result<(), 
     Ok(())
 }
 
+/// Stash a file-scan token→value map (JSON) under a random ref with a TTL, so
+/// the chat pipeline can preload its vault and restore file PII in the response.
+/// The ref (a UUID) travels in the message as an opaque `[[sp:v=…]]` marker — the
+/// PII itself never touches LibreChat's DB.
+///
+/// # Errors
+/// Returns `ApiError::Internal` on Redis connection or `SET … EX` failure.
+pub async fn stash_file_vault(
+    pool: &Pool,
+    vault_ref: &str,
+    map_json: &str,
+    ttl_secs: u64,
+) -> Result<(), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
+    cmd("SET")
+        .arg(format!("filevault:{vault_ref}"))
+        .arg(map_json)
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async::<()>(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+    Ok(())
+}
+
+/// Load a stashed file-scan token map JSON by ref. Returns `None` on any error
+/// or if the ref has expired — the pipeline degrades to leaving the `{{Type_N}}`
+/// tokens unrestored rather than failing the request.
+pub async fn load_file_vault(pool: &Pool, vault_ref: &str) -> Option<String> {
+    let mut conn = pool.get().await.ok()?;
+    cmd("GET")
+        .arg(format!("filevault:{vault_ref}"))
+        .query_async::<Option<String>>(&mut conn)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Atomically increment a counter by `delta` and return the new value.
 ///
 /// If the key is newly created by this operation, sets its TTL to

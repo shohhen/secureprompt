@@ -46,7 +46,9 @@ raw = (d / "license.json").read_text()
 m = re.search(r'[A-Za-z0-9_\-]{40,}\.[A-Za-z0-9_\-]{40,}', raw)
 kj = json.load(open(d / "keys.json"))
 print(m.group(0) if m else "")
-print(kj.get("attest_kek", ""))
+# accept the pre-rename `kek` name too (older keys.json bundles predate the
+# gateway-KEK -> attest_kek rename from the model-IP hardening).
+print(kj.get("attest_kek") or kj.get("kek", ""))
 print(kj.get("vendor_pubkey", ""))
 PY
 )
@@ -121,6 +123,7 @@ echo "==> Helm upgrade --install ${RELEASE} (ns=${NAMESPACE})"
 helm upgrade --install "${RELEASE}" helm/secureprompt \
   --namespace "${NAMESPACE}" \
   --create-namespace \
+  --take-ownership \
   --set global.imageRegistry="" \
   --set api.image.repository="${IMAGE_PREFIX}/api"             --set api.image.tag="${IMAGE_TAG}" \
   --set worker.image.repository="${IMAGE_PREFIX}/worker"       --set worker.image.tag="${IMAGE_TAG}" \

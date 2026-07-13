@@ -106,6 +106,9 @@ spec:
             - containerPort: 3080
               name: http
           env:
+            # SecurePrompt branding — shown as the app title / header.
+            - name: APP_TITLE
+              value: "SP Chat"
             - name: HOST
               value: "0.0.0.0"
             - name: PORT
