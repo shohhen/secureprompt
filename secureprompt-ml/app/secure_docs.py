@@ -7,10 +7,26 @@ from typing import Callable
 
 from app.secure_boxes import byte_to_char_map
 from app.secure_labels import build_labels, redact_spans, value_repeat_spans
+from app.secure_media import redact_docx_images, scan_docx_images
+from app.text_norm import flatten_breaks
 
 
 def _by_value(labels: dict) -> dict[str, str]:
     return {val: lbl for (_typ, val), lbl in labels.items() if val}
+
+
+def _by_value_for(labels: dict, dets: list[dict]) -> dict[str, str]:
+    """`_by_value` restricted to values that `dets` actually reported — used to
+    keep OCR-derived values out of the prose repeat-sweep while still sharing one
+    label map with them."""
+    keys = {(d["entity_type"].upper(), d["text"]) for d in dets}
+    return {val: lbl for (typ, val), lbl in labels.items() if val and (typ, val) in keys}
+
+
+def _byte_len(texts: list[str]) -> int:
+    """Byte length of the joined detection text. Image detections are offset past
+    it so `build_labels` (first-appearance order) numbers prose before logos."""
+    return len("\n".join(texts).encode("utf-8")) + 1
 
 
 def _redact_container(text: str, spans: list, by_value: dict) -> str:
@@ -158,20 +174,38 @@ def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
     doc = docx.Document(io.BytesIO(data))
     paras = list(_iter_paragraphs(doc))
     texts = [p.text for p in paras]
-    dets = detect_fn("\n".join(texts))
-    labels = _ordered_labels(dets)
-    by_value = _by_value(labels)
+    # Detect on the break-flattened copy, redact the original. flatten_breaks is
+    # 1 byte -> 1 byte, so the offsets below still index `texts` exactly.
+    detect_texts = [flatten_breaks(t) for t in texts]
+    dets = detect_fn("\n".join(detect_texts))
+
+    # Text baked into embedded raster images (letterhead logos, scanned
+    # signatures, pasted screenshots) never reaches the text layer, so the loop
+    # below cannot see it. OCR those images and fold their hits into the SAME
+    # label map, so an org name blacked out in the logo carries the same
+    # {{Organization_N}} it got in the prose.
+    hits = scan_docx_images(data, detect_fn, base=_byte_len(detect_texts))
+    image_dets = [d for h in hits for d in h.dets]
+
+    labels = _ordered_labels(dets + image_dets)
+    # The repeat sweep over prose is driven by TEXT detections only: an OCR
+    # misread ("44)", a mangled glyph run) must never become a value we splice
+    # into the document's sentences.
+    by_value = _by_value_for(labels, dets)
     # Redact by span (see _container_spans) so noisy PII is removed even when the
     # cleaned detection value differs from the document text, plus a repeat sweep
     # so a detected value recurring in another paragraph (body vs header) is also
     # covered. A value straddling a paragraph boundary is a v1 limitation.
-    for p, t, spans in zip(paras, texts, _container_spans(texts, dets, labels)):
+    for p, t, spans in zip(paras, texts, _container_spans(detect_texts, dets, labels)):
         new = _redact_container(t, spans, by_value)
         if new != t:
             _set_paragraph_text(p, new)
     out = io.BytesIO()
     doc.save(out)
-    return out.getvalue(), dets
+    data_out = out.getvalue()
+    if hits:
+        data_out = redact_docx_images(data_out, hits, labels)
+    return data_out, dets + image_dets
 
 
 def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):

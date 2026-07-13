@@ -161,11 +161,16 @@ def extract_pdf(data: bytes) -> str:
 def extract_docx(data: bytes) -> str:
     import docx
 
+    from app.text_norm import flatten_breaks
+
     doc = docx.Document(io.BytesIO(data))
-    parts = [p.text for p in doc.paragraphs]
+    # Soft breaks (<w:br/>) are layout, not segment boundaries — flatten them, or
+    # a name laid out under a role title lands in a context-starved fragment and
+    # the model misses it. See text_norm.flatten_breaks.
+    parts = [flatten_breaks(p.text) for p in doc.paragraphs]
     for tbl in doc.tables:
         for row in tbl.rows:
-            parts.append("\t".join(c.text for c in row.cells))
+            parts.append("\t".join(flatten_breaks(c.text) for c in row.cells))
     return clean_extracted("\n".join(parts))
 
 

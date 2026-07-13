@@ -7,8 +7,11 @@ returns BYTE offsets, so spans are mapped byte->char before indexing char_boxes.
 from __future__ import annotations
 
 import io
+import logging
 import math
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -181,6 +184,67 @@ def _render_pdf_page(data: bytes, index: int, dpi: int):
     return imgs[0]
 
 
+def image_regions(layout) -> list[tuple]:
+    """Bounding boxes (PDF points) of the raster images drawn on a page."""
+    from pdfminer.layout import LTFigure, LTImage
+    out: list[tuple] = []
+
+    def walk(el):
+        for child in el:
+            if isinstance(child, LTImage):
+                out.append((child.x0, child.y0, child.x1, child.y1))
+            elif isinstance(child, LTFigure):
+                walk(child)
+
+    walk(layout)
+    return out
+
+
+# Regions smaller than this (PDF points) are rules/bullets/icons — no legible PII.
+_MIN_REGION_PT = 24.0
+
+
+def append_image_ocr(page: PageBoxes, data: bytes, index: int, regions: list[tuple],
+                     dpi: int) -> PageBoxes:
+    """OCR the raster regions of a TEXT page and append their words to the page.
+
+    A page with a real text layer never goes through OCR, so text baked into an
+    image on it — a letterhead logo, a scanned signature, a stamp — is invisible
+    to detection and survives redaction. We OCR only the image REGIONS (not the
+    whole page, which would re-read and duplicate the text layer) and append the
+    words with boxes converted back into PDF points, so the page keeps ONE
+    coordinate system (`is_ocr=False`) and `to_pixels` maps everything correctly.
+    """
+    from app.secure_media import ocr_variants
+    img = _render_pdf_page(data, index, dpi)
+    s = dpi / 72.0
+    h = page.height
+    text = page.text
+    boxes = list(page.char_boxes)
+
+    for x0, y0, x1, y1 in regions:
+        if (x1 - x0) < _MIN_REGION_PT or (y1 - y0) < _MIN_REGION_PT:
+            continue
+        # PDF points (bottom-left origin) -> render pixels (top-left origin)
+        cx0, cy0 = max(int(x0 * s), 0), max(int((h - y1) * s), 0)
+        cx1, cy1 = min(int(x1 * s), img.width), min(int((h - y0) * s), img.height)
+        if cx1 - cx0 < 8 or cy1 - cy0 < 8:
+            continue
+        crop = img.crop((cx0, cy0, cx1, cy1))
+        for otext, oboxes in ocr_variants(crop):
+            text += "\n" + otext
+            boxes.append(None)  # keeps char_boxes index-aligned to text
+            for b in oboxes:
+                if b is None:
+                    boxes.append(None)
+                    continue
+                bx0, by0, bx1, by1 = b
+                # crop pixels -> page pixels -> PDF points (y-flip back)
+                boxes.append(((cx0 + bx0) / s, h - (cy0 + by1) / s,
+                              (cx0 + bx1) / s, h - (cy0 + by0) / s))
+    return PageBoxes(page.width, page.height, text, boxes, False, page.image)
+
+
 def extract_boxes(data: bytes, is_pdf: bool, dpi: int, langs: str, min_chars: int):
     pages: list[PageBoxes] = []
     if is_pdf:
@@ -188,7 +252,14 @@ def extract_boxes(data: bytes, is_pdf: bool, dpi: int, langs: str, min_chars: in
         for idx, layout in enumerate(extract_pages(io.BytesIO(data))):
             text, boxes = _pdf_text_boxes(layout)
             if len(text.strip()) >= min_chars:
-                pages.append(PageBoxes(layout.width, layout.height, text, boxes, False))
+                page = PageBoxes(layout.width, layout.height, text, boxes, False)
+                regions = image_regions(layout)
+                if regions:
+                    try:
+                        page = append_image_ocr(page, data, idx, regions, dpi)
+                    except Exception as e:  # noqa: BLE001 — OCR must never break extraction
+                        logger.warning("embedded-image OCR failed on page %d (%s)", idx, e)
+                pages.append(page)
             else:
                 img = _render_pdf_page(data, idx, dpi)
                 otext, oboxes = _ocr_boxes(img, langs)

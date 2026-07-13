@@ -32,6 +32,30 @@ _HYPHENS = frozenset("-‐‑‒–")
 # break emails/phones). Leaves `+`, `@`, `(`, brackets, and hyphens intact.
 _EDGE_PUNCT = ",.;:!?"
 
+# Break chars a word processor emits for LAYOUT inside a single paragraph:
+# <w:br/> (python-docx renders it "\n"), CR, vertical tab, form feed. ASCII
+# only, deliberately: each is exactly ONE UTF-8 byte, so swapping it for a
+# space preserves byte offsets. U+2028/U+2029 are 3 bytes and would shift
+# every offset after them, so they are NOT folded here.
+_SOFT_BREAKS = frozenset("\n\r\v\f")
+
+
+def flatten_breaks(text: str) -> str:
+    """Turn soft line breaks INSIDE one container into spaces.
+
+    Detection segments on newlines, so a break that Word inserted purely for
+    layout becomes a hard segment boundary. A signature block laid out as
+    `Начальник⏎Отдела …⏎приложений      Кенжаев О.О.` is then fed to the model as
+    the fragment `приложений      Кенжаев О.О.`, which strips the name of the
+    context that keeps it above the model's confidence floor — the name scores
+    1.0 in the rejoined line and is missed entirely in the fragment.
+
+    Every substitution is 1 char -> 1 char (and 1 byte -> 1 byte in UTF-8), so
+    detected offsets still index the ORIGINAL text exactly. Callers rely on
+    this: they detect on the flattened copy and redact the original.
+    """
+    return "".join(" " if ch in _SOFT_BREAKS else ch for ch in text)
+
 
 def normalize_for_ner(text: str) -> tuple[str, list[int]]:
     """Return `(normalized_text, char_map)` where `char_map[k]` is the index in
