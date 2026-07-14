@@ -46,6 +46,7 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
 oauth2 = { workspace = true }
+gcp_auth = { workspace = true }
 sp-license = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 

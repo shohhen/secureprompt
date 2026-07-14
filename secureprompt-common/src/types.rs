@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -83,6 +83,22 @@ impl TokenVault {
     #[must_use]
     pub fn resolve(&self, placeholder: &str) -> Option<&str> {
         self.entries.get(placeholder).map(SecretValue::as_str)
+    }
+
+    /// Snapshot of every stored original value — the plaintext PII the client
+    /// provided this turn (the values behind the placeholders).
+    ///
+    /// Response-side redaction takes this snapshot *before* it runs, because
+    /// it re-redacts the reply through the SAME vault and would otherwise
+    /// pollute the set with its own freshly-inserted entries. Frozen, the set
+    /// answers one question: "did the client already give us this value?" —
+    /// if so we leave it restored (they already know it); only genuinely new
+    /// PII the model introduces (absent from this set) is redacted. Using a
+    /// live `contains`-style check instead would leak a new entity on its
+    /// second mention, once the first mention's redaction had added it.
+    #[must_use]
+    pub fn original_values(&self) -> HashSet<String> {
+        self.entries.values().map(|v| v.as_str().to_owned()).collect()
     }
 
     #[must_use]

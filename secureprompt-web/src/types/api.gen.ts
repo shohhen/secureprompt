@@ -55,6 +55,120 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/completions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Chat completions (OpenAI-compatible)
+         * @description Proxies to the configured LLM provider after PII redaction and policy enforcement. Supports streaming via `stream: true`. Use an API key (`sp-...`) in the Authorization header.
+         */
+        post: operations["chatCompletions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/completions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Text completions — legacy OpenAI endpoint */
+        post: operations["completions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/embeddings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Embeddings (OpenAI-compatible) */
+        post: operations["embeddings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/redact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Redact PII and secrets from text
+         * @description Runs regex + ML NER detection on the input text, replaces detected values with opaque tokens, and returns the redacted text along with the detection list. Respects workspace policy rules (may deny or further redact). Requires an API key.
+         */
+        post: operations["redact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tokens/estimate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Estimate token count for a text + model pair
+         * @description Approximates token count (1 token ≈ 4 characters, GPT-family heuristic). No auth required for this endpoint.
+         */
+        post: operations["estimateTokens"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dry-run policy evaluation (no provider call)
+         * @description Evaluates workspace policy rules against the given text without making a downstream provider call. Returns whether the request would be allowed and which policy events fired. Requires an API key.
+         */
+        post: operations["checkPolicy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/analytics/usage-daily": {
         parameters: {
             query?: never;
@@ -89,23 +203,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/analytics/policy-violations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Policy rule violation counts by workspace, rule, and day */
-        get: operations["getPolicyViolations"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/analytics/latency-pctiles": {
         parameters: {
             query?: never;
@@ -123,6 +220,228 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/analytics/policy-violations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Policy rule violation counts by workspace, rule, and day */
+        get: operations["getPolicyViolations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List gateway requests (cursor-paginated)
+         * @description Reads raw `request_events` + `policy_events` from ClickHouse. Maximum window: 90 days. Maximum page size: 200. Pagination: pass `next_cursor` from the previous response as `cursor`.
+         */
+        get: operations["listRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/requests/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a single request with policy events */
+        get: operations["getRequest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List API keys for the workspace */
+        get: operations["listKeys"];
+        put?: never;
+        /**
+         * Create a new API key (admin only)
+         * @description Returns the full plaintext key exactly once in `api_key`. Store it immediately — it cannot be retrieved again.
+         */
+        post: operations["createKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an API key (admin only) */
+        delete: operations["revokeKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys/{id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate an API key (admin only)
+         * @description Issues a new key and starts a grace period during which both keys are valid. Idempotent within the grace window.
+         */
+        post: operations["rotateKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List LLM providers */
+        get: operations["listProviders"];
+        put?: never;
+        /** Create a provider (admin only) */
+        post: operations["createProvider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update / rotate provider credential (admin only) */
+        put: operations["updateProvider"];
+        post?: never;
+        /** Delete a provider (admin only) */
+        delete: operations["deleteProvider"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List policy rules */
+        get: operations["listPolicyRules"];
+        put?: never;
+        /**
+         * Create a policy rule (admin only)
+         * @description Action must be one of: `deny`, `allow`, `redact`, `transform`, `flag`. Priority must be unique within the workspace (409 on conflict). The rule is immediately indexed in Qdrant for semantic policy lookup.
+         */
+        post: operations["createPolicyRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy-rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a single policy rule */
+        get: operations["getPolicyRule"];
+        /** Update a policy rule (admin only) */
+        put: operations["updatePolicyRule"];
+        post?: never;
+        /** Delete a policy rule (admin only) */
+        delete: operations["deletePolicyRule"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy-rules/{id}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Toggle enabled flag on a policy rule (admin only) */
+        patch: operations["togglePolicyRuleEnabled"];
+        trace?: never;
+    };
+    "/v1/policy-rules/{id}/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Toggle dry-run flag on a policy rule (admin only) */
+        patch: operations["togglePolicyRuleDryRun"];
+        trace?: never;
+    };
     "/v1/workspaces/{id}/budgets": {
         parameters: {
             query?: never;
@@ -131,12 +450,193 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read the current workspace budget limits and live usage
-         * @description Any authenticated workspace member may read budgets. Missing rows return defaults (null limits, behavior="warn", 0 usage). Current usage is read live from Redis INCRBY counters that the enforcement middleware writes to, so the dashboard always mirrors what the pipeline sees.
+         * Read workspace budget limits and live usage
+         * @description Any authenticated workspace member may read budgets. Missing rows return defaults (null limits, behavior="warn", 0 usage). Usage is read live from Redis counters.
          */
         get: operations["getWorkspaceBudget"];
         /** Upsert workspace budget limits (admin only) */
         put: operations["putWorkspaceBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/telemetry/client-error": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report a frontend error event
+         * @description Accepts bounded frontend error events. Logs via structured tracing and increments the Prometheus counter `secureprompt_dashboard_client_errors_total{component}`. Does NOT persist to Postgres or ClickHouse.
+         */
+        post: operations["reportClientError"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get current billing period usage */
+        get: operations["getBillingUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get billing limits and remaining allowance */
+        get: operations["getBillingLimits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/breakdown": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get billing breakdown by provider and model */
+        get: operations["getBillingBreakdown"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/trends": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get billing trends over time */
+        get: operations["getBillingTrends"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/secure-mode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get secure mode configuration */
+        get: operations["getSecureMode"];
+        /** Update secure mode configuration */
+        put: operations["putSecureMode"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all webhooks */
+        get: operations["listWebhooks"];
+        put?: never;
+        /** Create a new webhook */
+        post: operations["createWebhook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a webhook */
+        delete: operations["deleteWebhook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Prometheus metrics
+         * @description Prometheus text exposition format. No authentication required. Scrape this endpoint with your Prometheus instance.
+         */
+        get: operations["getMetrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/openapi.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * OpenAPI spec (JSON)
+         * @description This spec, served as JSON with CORS headers.
+         */
+        get: operations["getOpenApiSpec"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -158,18 +658,16 @@ export interface components {
             refresh_token: string;
         };
         TokenResponse: {
-            /** @description Opaque JWT bearer token */
             access_token: string;
-            /** @description Opaque refresh token (rotated on refresh) */
             refresh_token: string;
             /**
              * Format: int64
-             * @description Unix seconds when access_token expires
+             * @description Unix seconds
              */
             access_expires_at: number;
             /**
              * Format: int64
-             * @description Unix seconds when refresh_token expires
+             * @description Unix seconds
              */
             refresh_expires_at: number;
             user?: {
@@ -183,46 +681,272 @@ export interface components {
             /** @enum {string} */
             role?: "owner" | "admin" | "developer" | "viewer";
         };
-        ApiError: {
-            /**
-             * @description Stable error code for machine handling
-             * @example invalid_credentials
-             */
-            code: string;
-            /** @description Human-readable error message */
-            message: string;
-            details?: {
-                [key: string]: unknown;
+        ChatMessage: {
+            /** @enum {string} */
+            role: "system" | "user" | "assistant" | "tool";
+            content: string;
+        };
+        ChatCompletionsRequest: {
+            /** @example gpt-4o */
+            model: string;
+            messages: components["schemas"]["ChatMessage"][];
+            /** @default false */
+            stream: boolean;
+            stream_options?: {
+                include_usage?: boolean;
+            } | null;
+        };
+        ChatCompletionsResponse: {
+            id?: string;
+            /** @example chat.completion */
+            object?: string;
+            created?: number;
+            model?: string;
+            choices?: {
+                index?: number;
+                message?: components["schemas"]["ChatMessage"];
+                finish_reason?: string;
+            }[];
+            usage?: {
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                total_tokens?: number;
             };
         };
+        CompletionRequest: {
+            model: string;
+            /** @description String or array of strings */
+            prompt: string | string[];
+            /** @default false */
+            stream: boolean;
+        };
+        EmbeddingsRequest: {
+            /** @example text-embedding-3-small */
+            model: string;
+            /** @description String or array of strings */
+            input: string | string[];
+        };
+        RedactRequest: {
+            text: string;
+        };
+        DetectionItem: {
+            /** @example EMAIL */
+            class: string;
+            /** @example john@example.com */
+            value: string;
+        };
+        RedactResponse: {
+            redacted_text: string;
+            detections: components["schemas"]["DetectionItem"][];
+            vault_size: number;
+        };
+        EstimateRequest: {
+            text: string;
+            model?: string | null;
+        };
+        EstimateResponse: {
+            /** Format: int64 */
+            estimated_tokens: number;
+            model: string;
+        };
+        PolicyCheckRequest: {
+            text: string;
+            model?: string | null;
+        };
+        PolicyCheckResponse: {
+            allowed: boolean;
+            /** @example deny */
+            action: string;
+            events: string[];
+        };
+        RequestListItem: {
+            /** Format: uuid */
+            request_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+            provider: string;
+            model: string;
+            final_action: string;
+            input_tokens?: number | null;
+            output_tokens?: number | null;
+            /** Format: double */
+            cost_usd: number;
+            has_violation: boolean;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ListRequestsResponse: {
+            items: components["schemas"]["RequestListItem"][];
+            /** @description Opaque cursor for the next page; null when no more pages */
+            next_cursor?: string | null;
+        };
+        PolicyEventSummary: {
+            /** Format: uuid */
+            rule_id: string;
+            rule_name: string;
+            action: string;
+            dry_run: boolean;
+        };
+        RequestDetail: {
+            /** Format: uuid */
+            request_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+            provider: string;
+            model: string;
+            final_action: string;
+            input_tokens?: number | null;
+            output_tokens?: number | null;
+            reasoning_tokens?: number | null;
+            cache_read_tokens?: number | null;
+            cache_write_tokens?: number | null;
+            /** Format: double */
+            cost_usd: number;
+            /** Format: date-time */
+            created_at: string;
+            policy_events: components["schemas"]["PolicyEventSummary"][];
+        };
+        CreateKeyRequest: {
+            name: string;
+        };
+        KeyResponse: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @description First 8 characters of the key (safe to display) */
+            prefix: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            revoked_at?: string | null;
+        };
+        CreateKeyResponse: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @description Full plaintext key — shown once, never stored */
+            api_key: string;
+            prefix: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        RotateKeyResponse: {
+            /** @description Plaintext replacement key — shown once */
+            new_key: string;
+            /**
+             * Format: date-time
+             * @description When the old key expires
+             */
+            grace_expires_at: string;
+        };
+        ProviderResponse: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @example openai */
+            provider_type: string;
+            /** @description True when an encrypted credential is stored */
+            has_credential: boolean;
+            /** Format: date-time */
+            last_rotated_at: string;
+            /** Format: date-time */
+            created_at: string;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
+        };
+        CreateProviderRequest: {
+            name: string;
+            /** @example openai */
+            provider_type: string;
+            /** @description Plaintext API key — encrypted before storage */
+            credential?: string | null;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
+        };
+        UpdateProviderRequest: {
+            name?: string | null;
+            provider_type?: string | null;
+            /** @description New plaintext key; omit to leave existing unchanged */
+            credential?: string | null;
+            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
+            config?: Record<string, unknown> | null;
+        };
+        /** @enum {string} */
+        PolicyAction: "deny" | "allow" | "redact" | "transform" | "flag";
+        PolicyRuleResponse: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            workspace_id: string;
+            name: string;
+            /** @description Lower = higher precedence; must be unique per workspace */
+            priority: number;
+            /** @description Rule conditions (arbitrary JSON) */
+            conditions: Record<string, never>;
+            action: components["schemas"]["PolicyAction"];
+            /** @description Action parameters (arbitrary JSON) */
+            action_params: Record<string, never>;
+            enabled: boolean;
+            dry_run: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        CreateRuleRequest: {
+            name: string;
+            priority: number;
+            conditions?: Record<string, never> | null;
+            action: components["schemas"]["PolicyAction"];
+            action_params?: Record<string, never> | null;
+            /** @default true */
+            enabled: boolean;
+            /** @default false */
+            dry_run: boolean;
+        };
+        UpdateRuleRequest: {
+            name: string;
+            priority: number;
+            conditions?: Record<string, never> | null;
+            action: components["schemas"]["PolicyAction"];
+            action_params?: Record<string, never> | null;
+            /** @default true */
+            enabled: boolean;
+            /** @default false */
+            dry_run: boolean;
+        };
+        ToggleRequest: {
+            value: boolean;
+        };
+        PriorityConflict: {
+            /** @example priority_conflict */
+            code: string;
+            message: string;
+        };
+        ClientErrorEvent: {
+            component: string;
+            message: string;
+            url: string;
+            user_agent?: string | null;
+            /** @description Arbitrary structured context; max 2 KB serialized */
+            context?: Record<string, never> | null;
+        };
         /**
-         * @description Enforcement behavior when a workspace crosses its limit. `block` → HTTP 402 ApiError{code:"budget_exceeded"}. `warn`  → 200 + response header `X-SecurePrompt-Budget-Warning: daily|monthly`. `flag`  → 200 (silent; analytics-only signal).
+         * @description `block` → HTTP 402. `warn` → 200 + `X-SecurePrompt-Budget-Warning` header. `flag` → 200, analytics-only.
          * @enum {string}
          */
         BudgetBehavior: "block" | "warn" | "flag";
         BudgetResponse: {
-            /**
-             * Format: int64
-             * @description Daily token ceiling; null = unlimited.
-             */
+            /** Format: int64 */
             daily_token_limit?: number | null;
-            /**
-             * Format: int64
-             * @description Monthly token ceiling; null = unlimited.
-             */
+            /** Format: int64 */
             monthly_token_limit?: number | null;
             behavior: components["schemas"]["BudgetBehavior"];
             /** Format: date-time */
             updated_at: string;
-            /**
-             * Format: int64
-             * @description Current UTC-day Redis counter.
-             */
+            /** Format: int64 */
             daily_used: number;
-            /**
-             * Format: int64
-             * @description Current UTC-month Redis counter.
-             */
+            /** Format: int64 */
             monthly_used: number;
         };
         PutBudgetRequest: {
@@ -295,9 +1019,165 @@ export interface components {
             /** Format: int64 */
             sample_count: number;
         };
+        BillingUsage: {
+            /** Format: date-time */
+            period_start: string;
+            /** Format: date-time */
+            period_end: string;
+            /** Format: int64 */
+            total_tokens: number;
+            /** Format: double */
+            total_cost_usd: number;
+            /** Format: int64 */
+            requests_count: number;
+        };
+        BillingLimits: {
+            /** Format: int64 */
+            monthly_token_limit?: number | null;
+            monthly_cost_limit_usd?: number | null;
+            /** Format: int64 */
+            tokens_remaining?: number | null;
+            cost_remaining_usd?: number | null;
+            /** @enum {string} */
+            limit_enforcement: "soft" | "hard";
+        };
+        BillingBreakdownItem: {
+            provider: string;
+            model: string;
+            /** Format: int64 */
+            tokens: number;
+            /** Format: double */
+            cost_usd: number;
+            /** Format: int64 */
+            requests: number;
+        };
+        BillingBreakdown: {
+            by_provider: components["schemas"]["BillingBreakdownItem"][];
+        };
+        BillingTrendItem: {
+            /** Format: date */
+            date: string;
+            /** Format: int64 */
+            tokens: number;
+            /** Format: double */
+            cost_usd: number;
+            /** Format: int64 */
+            requests: number;
+        };
+        BillingTrends: {
+            days: components["schemas"]["BillingTrendItem"][];
+        };
+        SecureMode: {
+            enabled: boolean;
+            /** @enum {string} */
+            level: "permissive" | "standard" | "strict";
+            block_on_pii_detection: boolean;
+            block_on_injection_detection: boolean;
+            redact_pii_in_responses: boolean;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        SecureModeRequest: {
+            enabled?: boolean;
+            /** @enum {string} */
+            level?: "permissive" | "standard" | "strict";
+            block_on_pii_detection?: boolean;
+            block_on_injection_detection?: boolean;
+            redact_pii_in_responses?: boolean;
+        };
+        Webhook: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uri */
+            url: string;
+            events: string[];
+            enabled: boolean;
+            /** Format: date-time */
+            created_at: string;
+        };
+        WebhookRequest: {
+            /** Format: uri */
+            url: string;
+            events: string[];
+            /** @description Optional HMAC secret */
+            secret?: string | null;
+        };
+        WebhookList: {
+            webhooks: components["schemas"]["Webhook"][];
+        };
+        ApiError: {
+            error: {
+                message: string;
+                /** @example secureprompt_error */
+                type: string;
+                /** @description Stable machine-readable code (e.g. budget_exceeded) */
+                code?: string;
+            };
+        };
+        BudgetExceededError: {
+            error: {
+                /** @example budget_exceeded */
+                code: string;
+                message: string;
+                /** @example secureprompt_error */
+                type: string;
+            };
+        };
     };
-    responses: never;
-    parameters: never;
+    responses: {
+        /** @description Bad request — validation failed */
+        BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ApiError"];
+            };
+        };
+        /** @description Missing or invalid bearer token */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ApiError"];
+            };
+        };
+        /** @description Insufficient role or workspace mismatch */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ApiError"];
+            };
+        };
+        /** @description Resource not found */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ApiError"];
+            };
+        };
+        /** @description Workspace budget exhausted */
+        BudgetExceeded: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["BudgetExceededError"];
+            };
+        };
+    };
+    parameters: {
+        IdPath: string;
+        FromDate: string;
+        ToDate: string;
+        /** @description IDOR guard — must equal the JWT workspace_id when provided */
+        WorkspaceIdQuery: string;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -326,15 +1206,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenResponse"];
                 };
             };
-            /** @description Invalid credentials */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
+            401: components["responses"]["Unauthorized"];
         };
     };
     refreshToken: {
@@ -359,15 +1231,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenResponse"];
                 };
             };
-            /** @description Refresh token invalid / replayed */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
+            401: components["responses"]["Unauthorized"];
         };
     };
     logout: {
@@ -388,12 +1252,172 @@ export interface operations {
             };
         };
     };
+    chatCompletions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCompletionsRequest"];
+            };
+        };
+        responses: {
+            /** @description OpenAI-compatible chat completion response, or a server-sent event stream when `stream: true`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCompletionsResponse"];
+                    "text/event-stream": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            402: components["responses"]["BudgetExceeded"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    completions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CompletionRequest"];
+            };
+        };
+        responses: {
+            /** @description OpenAI-compatible completion response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "text/event-stream": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            402: components["responses"]["BudgetExceeded"];
+        };
+    };
+    embeddings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmbeddingsRequest"];
+            };
+        };
+        responses: {
+            /** @description OpenAI-compatible embeddings response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            402: components["responses"]["BudgetExceeded"];
+        };
+    };
+    redact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RedactRequest"];
+            };
+        };
+        responses: {
+            /** @description Redacted text with detection list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RedactResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    estimateTokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EstimateRequest"];
+            };
+        };
+        responses: {
+            /** @description Token estimate */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EstimateResponse"];
+                };
+            };
+        };
+    };
+    checkPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyCheckRequest"];
+            };
+        };
+        responses: {
+            /** @description Policy check result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCheckResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
     getUsageDaily: {
         parameters: {
             query: {
-                from: string;
-                to: string;
-                workspace_id?: string;
+                from: components["parameters"]["FromDate"];
+                to: components["parameters"]["ToDate"];
+                /** @description IDOR guard — must equal the JWT workspace_id when provided */
+                workspace_id?: components["parameters"]["WorkspaceIdQuery"];
                 model?: string;
             };
             header?: never;
@@ -411,41 +1435,18 @@ export interface operations {
                     "application/json": components["schemas"]["UsageDailyRow"][];
                 };
             };
-            /** @description Missing or invalid bearer token */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description workspace_id mismatch (IDOR guard) */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description Mart not populated — run dbt build */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getCostByModel: {
         parameters: {
             query: {
-                from: string;
-                to: string;
-                workspace_id?: string;
+                from: components["parameters"]["FromDate"];
+                to: components["parameters"]["ToDate"];
+                /** @description IDOR guard — must equal the JWT workspace_id when provided */
+                workspace_id?: components["parameters"]["WorkspaceIdQuery"];
             };
             header?: never;
             path?: never;
@@ -462,92 +1463,18 @@ export interface operations {
                     "application/json": components["schemas"]["CostByModelRow"][];
                 };
             };
-            /** @description Missing or invalid bearer token */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description workspace_id mismatch (IDOR guard) */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description Mart not populated — run dbt build */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-        };
-    };
-    getPolicyViolations: {
-        parameters: {
-            query: {
-                from: string;
-                to: string;
-                workspace_id?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Policy violations rows */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PolicyViolationsRow"][];
-                };
-            };
-            /** @description Missing or invalid bearer token */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description workspace_id mismatch (IDOR guard) */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
-            /** @description Mart not populated — run dbt build */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getLatencyPctiles: {
         parameters: {
             query: {
-                from: string;
-                to: string;
-                workspace_id?: string;
+                from: components["parameters"]["FromDate"];
+                to: components["parameters"]["ToDate"];
+                /** @description IDOR guard — must equal the JWT workspace_id when provided */
+                workspace_id?: components["parameters"]["WorkspaceIdQuery"];
                 model?: string;
             };
             header?: never;
@@ -565,33 +1492,492 @@ export interface operations {
                     "application/json": components["schemas"]["LatencyPctilesRow"][];
                 };
             };
-            /** @description Missing or invalid bearer token */
-            401: {
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getPolicyViolations: {
+        parameters: {
+            query: {
+                from: components["parameters"]["FromDate"];
+                to: components["parameters"]["ToDate"];
+                /** @description IDOR guard — must equal the JWT workspace_id when provided */
+                workspace_id?: components["parameters"]["WorkspaceIdQuery"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Policy violations rows */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApiError"];
+                    "application/json": components["schemas"]["PolicyViolationsRow"][];
                 };
             };
-            /** @description workspace_id mismatch (IDOR guard) */
-            403: {
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listRequests: {
+        parameters: {
+            query?: {
+                /** @description Start of time window (default now - 7 days; max 90 days ago) */
+                from?: string;
+                /** @description End of time window (default now) */
+                to?: string;
+                model?: string;
+                /** @description Filter to only requests that triggered at least one policy event */
+                has_violation?: boolean;
+                /** @description Opaque cursor from previous response's `next_cursor` */
+                cursor?: string;
+                limit?: number;
+                /** @description IDOR guard — must equal the JWT workspace_id when provided */
+                workspace_id?: components["parameters"]["WorkspaceIdQuery"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paginated request list */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApiError"];
+                    "application/json": components["schemas"]["ListRequestsResponse"];
                 };
             };
-            /** @description Mart not populated — run dbt build */
-            404: {
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    getRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Request detail with policy events */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApiError"];
+                    "application/json": components["schemas"]["RequestDetail"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of API keys (plaintext never included) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeyResponse"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Key created — plaintext returned once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateKeyResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    revokeKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Key revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    rotateKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New key issued — plaintext returned once */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RotateKeyResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listProviders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of providers (credential never included) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderResponse"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Provider created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    updateProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Provider updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    deleteProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Provider deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listPolicyRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of policy rules */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createPolicyRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Rule created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Priority already in use */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PriorityConflict"];
+                };
+            };
+        };
+    };
+    getPolicyRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Policy rule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updatePolicyRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Rule updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description Priority already in use */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PriorityConflict"];
+                };
+            };
+        };
+    };
+    deletePolicyRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rule deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    togglePolicyRuleEnabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToggleRequest"];
+            };
+        };
+        responses: {
+            /** @description Rule updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    togglePolicyRuleDryRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ToggleRequest"];
+            };
+        };
+        responses: {
+            /** @description Rule updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyRuleResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getWorkspaceBudget: {
@@ -599,7 +1985,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: string;
+                id: components["parameters"]["IdPath"];
             };
             cookie?: never;
         };
@@ -614,15 +2000,8 @@ export interface operations {
                     "application/json": components["schemas"]["BudgetResponse"];
                 };
             };
-            /** @description IDOR guard — requester is not in the target workspace */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiError"];
-                };
-            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
         };
     };
     putWorkspaceBudget: {
@@ -630,7 +2009,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                id: string;
+                id: components["parameters"]["IdPath"];
             };
             cookie?: never;
         };
@@ -649,22 +2028,269 @@ export interface operations {
                     "application/json": components["schemas"]["BudgetResponse"];
                 };
             };
-            /** @description Workspace budget exceeded (enforcement path). */
-            402: {
+            401: components["responses"]["Unauthorized"];
+            402: components["responses"]["BudgetExceeded"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    reportClientError: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClientErrorEvent"];
+            };
+        };
+        responses: {
+            /** @description Event accepted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getBillingUsage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Billing usage for current period */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApiError"];
+                    "application/json": components["schemas"]["BillingUsage"];
                 };
             };
-            /** @description IDOR guard or non-admin role */
-            403: {
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getBillingLimits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Billing limits and remaining allowance */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApiError"];
+                    "application/json": components["schemas"]["BillingLimits"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getBillingBreakdown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Billing breakdown by provider and model */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BillingBreakdown"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getBillingTrends: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Billing trends by day */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BillingTrends"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getSecureMode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current secure mode configuration */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecureMode"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    putSecureMode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecureModeRequest"];
+            };
+        };
+        responses: {
+            /** @description Secure mode configuration updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecureMode"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    listWebhooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of webhooks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Webhook"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    deleteWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Webhook deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getMetrics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Prometheus metrics text */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    getOpenApiSpec: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OpenAPI 3.0 spec */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
                 };
             };
         };

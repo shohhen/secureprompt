@@ -78,6 +78,19 @@ impl OpenAiCompatAdapter {
             base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         }
     }
+
+    /// Resolve the bearer token from the invocation's decrypted credential,
+    /// preserving the previous "no credential configured" error behavior.
+    fn bearer(&self, invocation: &ProviderInvocation) -> Result<String, ProviderFailure> {
+        invocation
+            .decrypted_credential
+            .as_deref()
+            .map(str::to_owned)
+            .ok_or_else(|| ProviderFailure {
+                message: format!("{}: no credential configured", self.provider_type),
+                retryable: false,
+            })
+    }
 }
 
 #[async_trait]
@@ -88,30 +101,36 @@ impl ProviderAdapter for OpenAiCompatAdapter {
 
     async fn complete(
         &self,
-        target: &ModelTarget,
+        _target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure> {
-        invoke(self.provider_type, self.base_url, target, invocation, false).await
+        let bearer = self.bearer(invocation)?;
+        let url = format!("{}/chat/completions", self.base_url);
+        invoke(self.provider_type, &url, &bearer, &invocation.model, invocation, false).await
     }
 
     async fn stream(
         &self,
-        target: &ModelTarget,
+        _target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure> {
         // Buffered fallback: fetch the full response in one shot. Retained for
         // callers that still want a complete `ProviderOutput` (and as the
         // default `stream_events` adapter's source). True incremental
         // streaming lives in `stream_events` below.
-        invoke(self.provider_type, self.base_url, target, invocation, true).await
+        let bearer = self.bearer(invocation)?;
+        let url = format!("{}/chat/completions", self.base_url);
+        invoke(self.provider_type, &url, &bearer, &invocation.model, invocation, true).await
     }
 
     async fn stream_events(
         &self,
-        target: &ModelTarget,
+        _target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderEventStream, ProviderFailure> {
-        invoke_stream(self.provider_type, self.base_url, target, invocation).await
+        let bearer = self.bearer(invocation)?;
+        let url = format!("{}/chat/completions", self.base_url);
+        invoke_stream(self.provider_type, &url, &bearer, &invocation.model, invocation).await
     }
 }
 
@@ -119,21 +138,13 @@ impl ProviderAdapter for OpenAiCompatAdapter {
 /// parses the `text/event-stream` body into `ProviderEvent`s as bytes arrive,
 /// so the first token can reach the client as soon as the model emits it
 /// instead of after the whole answer is generated.
-async fn invoke_stream(
+pub(crate) async fn invoke_stream(
     provider_type: &'static str,
-    base_url: &'static str,
-    _target: &ModelTarget,
+    completions_url: &str,
+    bearer_token: &str,
+    model: &str,
     invocation: &ProviderInvocation,
 ) -> Result<ProviderEventStream, ProviderFailure> {
-    let api_key = invocation
-        .decrypted_credential
-        .as_deref()
-        .ok_or_else(|| ProviderFailure {
-            message: format!("{provider_type}: no credential configured"),
-            retryable: false,
-        })?
-        .to_owned();
-
     let client = shared_http_client();
 
     let extra_map = match &invocation.extra_params {
@@ -142,7 +153,7 @@ async fn invoke_stream(
     };
 
     let body = ChatRequest {
-        model: &invocation.model,
+        model,
         messages: invocation
             .messages
             .iter()
@@ -155,11 +166,11 @@ async fn invoke_stream(
         extra: extra_map,
     };
 
-    let url = format!("{base_url}/chat/completions");
+    let url = completions_url;
     let send_started = Instant::now();
     let response = client
-        .post(&url)
-        .bearer_auth(&api_key)
+        .post(url)
+        .bearer_auth(bearer_token)
         .json(&body)
         .send()
         .await
@@ -353,20 +364,14 @@ struct UsageBody {
     completion_tokens: Option<u32>,
 }
 
-async fn invoke(
+pub(crate) async fn invoke(
     provider_type: &'static str,
-    base_url: &'static str,
-    _target: &ModelTarget,
+    completions_url: &str,
+    bearer_token: &str,
+    model: &str,
     invocation: &ProviderInvocation,
     streaming: bool,
 ) -> Result<ProviderOutput, ProviderFailure> {
-    let api_key = invocation.decrypted_credential.as_deref().ok_or_else(|| {
-        ProviderFailure {
-            message: format!("{provider_type}: no credential configured"),
-            retryable: false,
-        }
-    })?;
-
     // Reuse a process-wide reqwest::Client so HTTP/2 streams + idle TLS
     // connections are kept alive across requests. Building a fresh client
     // per call paid the full TCP+TLS handshake every time (~50–300ms
@@ -386,7 +391,7 @@ async fn invoke(
     };
 
     let body = ChatRequest {
-        model: &invocation.model,
+        model,
         messages: invocation
             .messages
             .iter()
@@ -399,11 +404,11 @@ async fn invoke(
         extra: extra_map,
     };
 
-    let url = format!("{base_url}/chat/completions");
+    let url = completions_url;
     let send_started = Instant::now();
     let response = client
-        .post(&url)
-        .bearer_auth(api_key)
+        .post(url)
+        .bearer_auth(bearer_token)
         .json(&body)
         .send()
         .await

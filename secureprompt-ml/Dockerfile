@@ -44,7 +44,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -m spacy download en_core_web_sm
 
-RUN python -c "from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner_multi_pii-v1')"
+# Bake the default English NER model (GLiNER2-PII) into the image cache.
+RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-privacy-filter-PII-multi')"
 RUN python -c "from transformers import pipeline; pipeline('text-classification', model='protectai/deberta-v3-base-prompt-injection-v2', device=-1)"
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')"
 
@@ -77,6 +78,14 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
+# OCR fallback for /v1/scan-file: pytesseract shells out to `tesseract`, and
+# pdf2image shells out to poppler's `pdftoppm`. Language packs: eng (base) + rus
+# + Uzbek (Latin & Cyrillic). Runtime binaries only — no build toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-uzb tesseract-ocr-uzb-cyrl \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /app/.cache/torch /app/.cache/huggingface
 
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
@@ -91,10 +100,12 @@ COPY --from=compile /build/app ./app
 # Ship ONLY the encrypted weights — the plaintext file never touches this layer.
 # The .enc is produced on the host (see the header) and rides in via the build
 # context; .dockerignore excludes the plaintext model.safetensors next to it.
-# Active model dir: multilingual_ner_v5_cold_xlmr (ACTIVE_NER_MODELS default).
-# To switch checkpoints, change both the src dir below and ACTIVE_NER_MODELS at runtime.
-COPY secureprompt-ml/app/resources/multilingual_ner_v5_cold_xlmr/model/model.safetensors.enc \
-     /app/app/resources/multilingual_ner_v5_cold_xlmr/model/model.safetensors.enc
+# Active model dir: multilingual_ner_v8_xlmr (ACTIVE_NER_MODELS default). v7_xlmr's .enc is
+# also shipped so a rollback is an ACTIVE_NER_MODELS env change, not a rebuild.
+COPY secureprompt-ml/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc \
+     /app/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc
+COPY secureprompt-ml/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc \
+     /app/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

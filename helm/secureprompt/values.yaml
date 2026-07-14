@@ -77,6 +77,12 @@ ml:
     # Always: 0.1.x tags are mutable (re-pushed per build); IfNotPresent would
     # serve a stale node-cached layer after a rebuild (e.g. the lang-router fix).
     pullPolicy: Always
+  # NOTE (whole-branch review): the async /v1/scan-file/task polling flow
+  # (secureprompt-ml/app/main.py's `_scan_tasks`) is an in-memory,
+  # process-local store — keep replicaCount=1 unless/until session affinity
+  # (sticky routing to the replica that created the task) or a shared task
+  # store (e.g. Redis) is added, or polls can spuriously 404 on a different
+  # replica.
   replicaCount: 1
   # The sidecar loads four models into memory: GLiNER multi-PII, the DeBERTa
   # injection classifier, the MiniLM embedder, and the decrypted XLM-R NER
@@ -89,9 +95,9 @@ ml:
     language: "en"
     useOnnx: "false"
     # Active NER checkpoint(s) under app/resources/. Empty → image default
-    # (multilingual_ner_v5_cold_xlmr). Comma-separated to run several, or
-    # "all" to register every shipped checkpoint.
-    activeNerModels: ""
+    # (multilingual_ner_v8_xlmr). Comma-separated to run several, or "all" to register
+    # every shipped checkpoint. Rollback to v7: multilingual_ner_v7_xlmr (also shipped).
+    activeNerModels: "multilingual_ner_v8_xlmr"
 
 # ----------------------------------------------------------------------------
 # LibreChat (browser chat UI, SP-modified fork) + its MongoDB

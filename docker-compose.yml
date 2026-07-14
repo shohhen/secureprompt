@@ -51,13 +51,18 @@ services:
     environment:
       ML_LANGUAGE: en
       ML_USE_ONNX: "false"
-      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v5_cold_xlmr.
+      # Active NER checkpoint(s); defaults in-image to multilingual_ner_v8_xlmr.
       # Comma-separated for several, or "all" to load every shipped checkpoint.
-      ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v5_cold_xlmr}
+      # Rollback to v7: set ACTIVE_NER_MODELS=multilingual_ner_v7_xlmr (also shipped).
+      ACTIVE_NER_MODELS: ${ACTIVE_NER_MODELS:-multilingual_ner_v8_xlmr}
       # XLM-R confidence floor. Recognizer is language-gated to ru/uz (never
-      # scores English), so the legacy 0.85 mostly drops legitimate lone-name
-      # detections. Tune via .env; experiment default below.
-      XLMR_CONFIDENCE_FLOOR: ${XLMR_CONFIDENCE_FLOOR:-0.85}
+      # scores English), so the legacy 0.85 dropped legitimate names (measured a
+      # real résumé name at 0.64, silently leaked). 0.60 recovers them; tune via
+      # .env. Runtime env var — takes effect on `up`/recreate, no image rebuild.
+      XLMR_CONFIDENCE_FLOOR: ${XLMR_CONFIDENCE_FLOOR:-0.70}
+      # GLiNER model prediction threshold (English PII). Runtime env vars; safe
+      # at 0.70 because extracted text is normalized before detection.
+      GLINER_THRESHOLD: ${GLINER_THRESHOLD:-0.70}
       QDRANT_URL: http://qdrant:6333
       # Shared secret the gateway uses to relay the license's WRAPPED model key
       # to POST /internal/model-key. The sidecar's compiled .so unwraps it.
@@ -115,6 +120,10 @@ services:
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       ML_SIDECAR_URL: http://secureprompt-ml:8080
+      # NER on document-scale input (multi-page résumé/scan) legitimately takes
+      # a few seconds on CPU; the 5s default timed out and failed open to
+      # "no PII". Give headroom (batched NER keeps a 2-page doc ~5s).
+      ML_SIDECAR_TIMEOUT_MS: ${ML_SIDECAR_TIMEOUT_MS:-30000}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
       SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}

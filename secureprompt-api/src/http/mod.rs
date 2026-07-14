@@ -33,6 +33,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(routes::openai::metrics))
         .route("/openapi.json", get(openapi_json))
         .route("/v1/redact", post(routes::mcp_routes::redact))
+        .route("/v1/vault/stash", post(routes::mcp_routes::vault_stash))
         .route(
             "/v1/tokens/estimate",
             post(routes::mcp_routes::tokens_estimate),

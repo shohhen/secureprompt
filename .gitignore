@@ -44,6 +44,7 @@ out/
 # from app/resources/ separately). The legacy v2/v3 trainers were removed.
 scripts/*_v4*.py
 scripts/*_v5*.py
+scripts/*_v6*.py
 scripts/gen_prompt_v5.txt
 scripts/run_v5_*.sh
 
@@ -87,3 +88,7 @@ secrets/
 # License material + generated TLS certs (secrets — never commit)
 etc/secureprompt/
 monitoring/nginx/certs/
+
+# graphify tool cache (regenerable)
+graphify-out/cache/
+scripts/v6_*.py

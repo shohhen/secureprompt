@@ -58,6 +58,12 @@ cache: true
 # manually-added entries would never inject into requests — the feature
 # would be a dangling UI that silently does nothing. Hide it instead.
 interface:
+  # SP branding shown in the chat UI.
+  appTitle: "SP Chat"
+  # No customWelcome — the blank chat shows a time-based "Good morning/afternoon/
+  # evening, <name>" greeting (see Landing.tsx getGreeting()).
+  # Replaces LibreChat's default "[LibreChat ...](librechat.ai)" footer.
+  customFooter: "SP Chat — secured by SecurePrompt"
   parameters: false
   agents:
     use: false

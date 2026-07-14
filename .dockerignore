@@ -1,4 +1,10 @@
 target/
+# `target/` above is root-anchored; nested Rust build dirs (esp. git worktrees
+# under .worktrees/, ~7.5 GB of debug artifacts) leak into the context and
+# exhaust the Docker VM disk mid-build. Exclude worktrees wholesale + any nested
+# target/.
+.worktrees/
+**/target/
 .claude/
 .planning/
 .git/

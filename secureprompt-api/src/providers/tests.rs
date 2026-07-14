@@ -35,6 +35,7 @@ mod provider_adapter_tests {
             provider_type: provider_type.to_owned(),
             model_name: model.to_owned(),
             encrypted_credential: None,
+            config: serde_json::json!({}),
         }
     }
 

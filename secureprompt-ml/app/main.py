@@ -1,29 +1,69 @@
 import asyncio
 import hmac
+import json
+import logging
+import os
+import time as _time
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from urllib.parse import quote
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response
+from app import config
 from app.models import (
     NerRequest, NerResponse, NerEntity,
     InjectionRequest, InjectionResponse,
     EmbedRequest, EmbedResponse,
     RagCheckRequest, RagCheckResponse, RagCheckMatch,
     ScanFileEntity, ScanFileResponse,
+    ScanTaskCreated, ScanTaskStatus,
+    SecureTaskCreated, SecureSummary, SecureTaskStatus,
 )
 from app.detection.ner import _load_analyzer as _load_analyzer_base, detect
 from app.detection.injection import _load_injection_pipeline, classify_injection
 from app.detection.batching import drain_worker
-from app.detection.secrets import scan_secrets
 from app.embeddings.embed import _load_embedder, embed
 from app.qdrant_init import get_qdrant_client, ensure_collections
 from app.rag import rag_check
+from app.async_tasks import TaskStore
+from app.secure_file import UnsupportedFormat, secure_file as _secure_file
 
 _ready = asyncio.Event()
 _models: dict = {}
 _ner_queue: asyncio.Queue | None = None
+_ner_queue_bulk: asyncio.Queue | None = None
 
 # Module-level state for the deferred key delivery flow.
 _model_key: bytes | None = None
 _key_event = asyncio.Event()
+
+
+def _route_queue(text: str) -> asyncio.Queue:
+    """Inline lane for chat-sized texts; bulk lane for documents, so a big
+    scan can never head-of-line-block interactive traffic (two drain
+    workers → two independent worker threads).
+
+    NOTE (whole-branch review, do not conflate): routing by size here picks
+    a QUEUE for throughput isolation only — it does NOT change XLM-R/GLiNER
+    coverage caps (see detection/scan_profile.py's inline vs. bulk
+    `scan_profile`). `/detect/ner` always runs with INLINE caps regardless
+    of which queue lane it lands on; only `/v1/scan-file` opts into the
+    wider BULK caps.
+    """
+    from app import config
+    if len(text) > config.NER_BULK_THRESHOLD_CHARS and _ner_queue_bulk is not None:
+        return _ner_queue_bulk
+    return _ner_queue
+
+
+def _make_process_batch():
+    async def _process_batch(texts: list[str]) -> list[list[dict]]:
+        # Run the whole batch in ONE worker thread: detect() is CPU-bound
+        # (torch inference) and previously starved the event loop — /health
+        # and every enqueued request stalled behind a big document.
+        def _run(ts: list[str]) -> list[list[dict]]:
+            return [detect(_models["analyzer"], t) for t in ts]
+        return await asyncio.to_thread(_run, texts)
+    return _process_batch
 
 
 def _load_analyzer(model_key: bytes | None = None):
@@ -55,7 +95,7 @@ def _load_analyzer(model_key: bytes | None = None):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ner_queue
+    global _ner_queue, _ner_queue_bulk
     from app import config
 
     # Always load these synchronous, non-encrypted models first.
@@ -65,9 +105,8 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_collections, _models["qdrant"])
 
     _ner_queue = asyncio.Queue(maxsize=100)
-
-    async def _process_batch(texts: list[str]) -> list[list[dict]]:
-        return [detect(_models["analyzer"], t) for t in texts]
+    _ner_queue_bulk = asyncio.Queue(maxsize=20)
+    _process_batch = _make_process_batch()
 
     if not config.MODEL_KEY_REQUIRED:
         # Default / backward-compatible path: load XLM-R immediately,
@@ -75,6 +114,9 @@ async def lifespan(app: FastAPI):
         _models["analyzer"] = await asyncio.to_thread(_load_analyzer)
         asyncio.create_task(
             drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+        asyncio.create_task(
+            drain_worker(_ner_queue_bulk, _process_batch, deadline_ms=50, max_batch=2)
         )
         _ready.set()
         yield
@@ -86,6 +128,9 @@ async def lifespan(app: FastAPI):
         # Inference routes gate on _ready (503 until it is set).
         asyncio.create_task(
             drain_worker(_ner_queue, _process_batch, deadline_ms=50, max_batch=16)
+        )
+        asyncio.create_task(
+            drain_worker(_ner_queue_bulk, _process_batch, deadline_ms=50, max_batch=2)
         )
 
         async def _wait_for_key_then_load():
@@ -166,7 +211,7 @@ async def detect_ner(req: NerRequest):
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
     try:
-        _ner_queue.put_nowait((future, req.text))
+        _route_queue(req.text).put_nowait((future, req.text))
     except asyncio.QueueFull:
         raise HTTPException(status_code=429, detail="NER queue full")
     entities_raw = await future
@@ -206,39 +251,11 @@ async def rag_check_endpoint(req: RagCheckRequest):
 
 
 # Cap the amount of file content we decode before scanning — protects the
-# sidecar from OOM on large uploads. 2 MiB is enough for any reasonable text
-# prompt or config file; PDFs are handled best-effort.
-_SCAN_FILE_MAX_BYTES = 2 * 1024 * 1024
+# sidecar from OOM on large uploads. Env-tunable; default 15 MiB (covers
+# multi-page PDFs/DOCX). Chat side already allows more (nginx 25M, multer 20M),
+# so this sidecar cap is the binding limit.
+_SCAN_FILE_MAX_BYTES = int(os.getenv("ML_SCAN_FILE_MAX_BYTES", str(15 * 1024 * 1024)))
 _SCAN_FILE_TEXT_PREVIEW = 8 * 1024  # keep redacted_text small in the response
-
-
-def _decode_best_effort(data: bytes) -> str:
-    """Decode file bytes to text. PDFs/DOCX are extracted lazily when the
-    corresponding library is installed; otherwise fall back to latin-1 so we
-    can still run regex + NER on whatever printable ASCII is embedded."""
-    head = data[:4]
-    # PDF
-    if head == b"%PDF":
-        try:
-            from pypdf import PdfReader  # type: ignore
-            import io
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join((p.extract_text() or "") for p in reader.pages)
-        except Exception:
-            pass
-    # DOCX (zip + word/document.xml)
-    if head[:2] == b"PK":
-        try:
-            import docx  # type: ignore
-            import io
-            doc = docx.Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            pass
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="replace")
 
 
 def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:
@@ -267,6 +284,85 @@ def _redact(text: str, spans: list[tuple[int, int, str]]) -> str:
     return b"".join(parts).decode("utf-8", errors="replace")
 
 
+def _redact_reversible(text: str, dets: list[dict]) -> tuple[str, dict[str, str]]:
+    """Redact with REVERSIBLE ``{{Type_N}}`` tokens + return the token->value map.
+
+    Same scheme as the gateway vault and secure-file (``build_labels``): one token
+    per distinct (type, value), per-type first-appearance numbering, so the chat
+    gateway can preload its vault from ``token_map`` and restore the file's PII in
+    the model's response. Spans are BYTE offsets (detect() wire format)."""
+    from app.secure_labels import build_labels
+    labels = build_labels(sorted(dets, key=lambda d: d.get("start", 0)))
+    token_map = {label: value for (_typ, value), label in labels.items()}
+    if not labels:
+        return text, {}
+    byte_text = text.encode("utf-8")
+    spans = []
+    for d in dets:
+        token = labels.get((d["entity_type"].upper(), d["text"]))
+        if token:
+            spans.append((int(d["start"]), int(d["end"]), token))
+    spans.sort(key=lambda s: s[0])
+    parts: list[bytes] = []
+    cursor = 0
+    for start, end, token in spans:
+        if start < cursor or start > len(byte_text) or end > len(byte_text):
+            continue
+        parts.append(byte_text[cursor:start])
+        parts.append(token.encode("utf-8"))
+        cursor = end
+    parts.append(byte_text[cursor:])
+    return b"".join(parts).decode("utf-8", errors="replace"), token_map
+
+
+async def _scan_impl(raw: bytes) -> ScanFileResponse:
+    """Run the full scan pipeline (decode → NER → injection → secrets →
+    redact) on already-read file bytes. Shared by the sync and async
+    `/v1/scan-file` endpoints so their behavior stays byte-identical."""
+    from app.document_scan import scan_document
+
+    # scan_document runs in-thread and sets the bulk scan profile internally
+    # (detect_all -> scan_scope("bulk")), so no outer wrapper is needed.
+    doc = await asyncio.to_thread(scan_document, raw, "upload", _models["analyzer"])
+    text = doc.text
+    ner_raw = doc.detections
+
+    # Prompt-injection on a bounded prefix (the model has a 2 KiB limit).
+    injection_text = text[:2000]
+    injection = await asyncio.to_thread(
+        classify_injection, _models["injection"], injection_text
+    )
+
+    # `scan_document` (detect_all) already folded regex secrets into `ner_raw`
+    # with byte offsets and an `is_secret` flag — do NOT re-scan (that duplicated
+    # every secret and let a char-offset copy shadow the correct byte-offset one).
+    entities = [
+        ScanFileEntity(
+            text=e["text"],
+            label=e["entity_type"],
+            score=float(e["score"]),
+        )
+        for e in ner_raw
+    ]
+
+    # Reversible {{Type_N}} tokens + token->value map so the chat gateway can
+    # restore the file's PII in the response (see gateway vault-stash preload).
+    redacted_full, token_map = _redact_reversible(text, ner_raw)
+    preview_truncated = len(redacted_full) > _SCAN_FILE_TEXT_PREVIEW
+    redacted_preview = redacted_full[:_SCAN_FILE_TEXT_PREVIEW]
+
+    return ScanFileResponse(
+        pii_found=any(not e.get("is_secret") for e in ner_raw),
+        secrets_found=any(e.get("is_secret") for e in ner_raw),
+        injection_detected=bool(injection.get("is_injection")),
+        entities=entities,
+        redacted_text=redacted_preview,
+        file_size_bytes=len(raw),
+        preview_truncated=preview_truncated,
+        token_map=token_map,
+    )
+
+
 @app.post("/v1/scan-file", response_model=ScanFileResponse)
 async def scan_file_endpoint(file: UploadFile = File(...)):
     if not _ready.is_set():
@@ -279,49 +375,176 @@ async def scan_file_endpoint(file: UploadFile = File(...)):
             detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)",
         )
 
-    text = await asyncio.to_thread(_decode_best_effort, raw)
+    return await _scan_impl(raw)
 
-    # NER (PII) detection — same analyzer as /detect/ner.
-    ner_raw = await asyncio.to_thread(detect, _models["analyzer"], text)
 
-    # Prompt-injection on a bounded prefix (the model has a 2 KiB limit).
-    injection_text = text[:2000]
-    injection = await asyncio.to_thread(
-        classify_injection, _models["injection"], injection_text
+# In-memory task store for the async scan flow. No persistence, no locks —
+# a single asyncio event loop gives us atomic dict access between awaits, and
+# terminal entries are TTL-pruned on each new task creation so this never
+# grows unbounded across a long-running sidecar process.
+#
+# SCALING NOTE (whole-branch review): this store is PROCESS-LOCAL. Async
+# scan-file endpoints (/v1/scan-file/async + its poll/status routes) require
+# `ml.replicaCount=1` (or sticky/session-affinity routing, or swapping this
+# for a shared store like Redis) before horizontally scaling the ML sidecar —
+# otherwise a poll request can land on a different replica than the one that
+# created the task and spuriously 404. See helm/secureprompt/values.yaml's
+# `ml.replicaCount`.
+_scan_tasks: dict[str, dict] = {}
+_SCAN_TASK_TTL_S = 15 * 60
+# Cap on concurrently-running background scans — each one is a CPU-bound
+# NER pass in a worker thread, so unbounded enqueueing is a trivial DoS.
+_SCAN_ASYNC_MAX_RUNNING = int(os.getenv("ML_SCAN_ASYNC_MAX_RUNNING", "4"))
+# Strong refs to in-flight scan tasks: the event loop only keeps a WEAK
+# reference to tasks, so a create_task() result that nobody holds can be
+# garbage-collected mid-flight (poller then sees "running" forever).
+_scan_task_refs: set = set()
+
+
+def _prune_scan_tasks() -> None:
+    cutoff = _time.monotonic() - _SCAN_TASK_TTL_S
+    for tid in [
+        t for t, v in _scan_tasks.items()
+        if v["created"] < cutoff and v["status"] != "running"
+    ]:
+        _scan_tasks.pop(tid, None)
+
+
+@app.post("/v1/scan-file/async", response_model=ScanTaskCreated, status_code=202)
+async def scan_file_async(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    _prune_scan_tasks()
+    running = sum(1 for v in _scan_tasks.values() if v["status"] == "running")
+    if running >= _SCAN_ASYNC_MAX_RUNNING:
+        raise HTTPException(status_code=429, detail="too many concurrent scans")
+    tid = uuid.uuid4().hex
+    _scan_tasks[tid] = {"status": "running", "result": None, "error": None,
+                        "created": _time.monotonic()}
+
+    async def _run():
+        try:
+            result = await _scan_impl(raw)
+            entry = _scan_tasks.get(tid)
+            if entry is not None:
+                entry["result"] = result
+                entry["status"] = "done"
+        except Exception as exc:  # fail visible, never silent
+            entry = _scan_tasks.get(tid)
+            if entry is not None:
+                entry["status"] = "error"
+                entry["error"] = str(exc)
+
+    t = asyncio.create_task(_run())
+    _scan_task_refs.add(t)
+    t.add_done_callback(_scan_task_refs.discard)
+    return ScanTaskCreated(task_id=tid)
+
+
+@app.get("/v1/scan-file/tasks/{task_id}", response_model=ScanTaskStatus)
+async def scan_file_task_status(task_id: str):
+    t = _scan_tasks.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    return ScanTaskStatus(status=t["status"], result=t["result"], error=t["error"])
+
+
+# Reusable async task store for the secure-file flow (see app.async_tasks).
+# Same PROCESS-LOCAL scaling caveat as _scan_tasks above.
+_secure_store = TaskStore(max_running=int(os.getenv("ML_SECURE_ASYNC_MAX_RUNNING", "4")))
+_secure_log = logging.getLogger("secureprompt.ml.secure_file")
+
+
+async def _run_secure(raw: bytes, filename: str):
+    def _work():
+        try:
+            return _secure_file(raw, filename, _models["analyzer"])
+        except UnsupportedFormat:
+            # Re-raise with a fixed message so the async TaskStore never stores
+            # attacker-controlled bytes — otherwise both GET .../tasks/{id}
+            # (status error) and .../download (500 detail) would echo them back.
+            raise UnsupportedFormat("unsupported file type") from None
+        except Exception:
+            # Parser errors (pdfminer/PIL/openpyxl) can embed input-derived
+            # fragments. Log the real detail server-side; surface a generic
+            # message so neither the status nor download surface leaks content.
+            _secure_log.exception("secure-file processing failed")
+            raise RuntimeError("secure-file processing failed") from None
+    return await asyncio.to_thread(_work)
+
+
+def _content_disposition(filename: str) -> str:
+    """RFC 6266/5987 header: ASCII fallback + UTF-8 ``filename*`` so non-ASCII
+    (Cyrillic/Uzbek) names don't hit Starlette's latin-1 header encoding and 500."""
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace('"', "")
+    return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (
+        ascii_fallback, quote(filename, safe=""))
+
+
+def _file_response(secured) -> Response:
+    return Response(
+        content=secured.data,
+        media_type=secured.mime,
+        headers={
+            "Content-Disposition": _content_disposition(secured.filename),
+            "X-Secure-Summary": json.dumps(secured.summary),
+        },
     )
 
-    # Secret regexes on the full decoded text.
-    secret_hits = scan_secrets(text)
 
-    entities = [
-        ScanFileEntity(
-            text=e["text"],
-            label=e["entity_type"],
-            score=float(e["score"]),
-        )
-        for e in ner_raw
-    ]
-    # Include secrets as entities too so the UI can list them.
-    for s in secret_hits:
-        entities.append(
-            ScanFileEntity(text=s.text, label=s.kind.upper(), score=1.0)
-        )
+@app.post("/v1/secure-file")
+async def secure_file_sync(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    try:
+        secured = await _run_secure(raw, file.filename or "file")
+    except UnsupportedFormat:
+        # Do NOT echo str(e) here — UnsupportedFormat's message embeds raw
+        # file bytes (`head={head!r}`); a fixed detail avoids reflecting
+        # uploaded content back into the HTTP response.
+        raise HTTPException(status_code=415, detail="unsupported file type")
+    return _file_response(secured)
 
-    spans: list[tuple[int, int, str]] = [
-        (int(e["start"]), int(e["end"]), e["entity_type"].upper()) for e in ner_raw
-    ]
-    spans.extend((s.start, s.end, s.kind.upper()) for s in secret_hits)
 
-    redacted_full = _redact(text, spans)
-    preview_truncated = len(redacted_full) > _SCAN_FILE_TEXT_PREVIEW
-    redacted_preview = redacted_full[:_SCAN_FILE_TEXT_PREVIEW]
+@app.post("/v1/secure-file/async", response_model=SecureTaskCreated, status_code=202)
+async def secure_file_async(file: UploadFile = File(...)):
+    if not _ready.is_set():
+        raise HTTPException(status_code=503, detail="loading")
+    raw = await file.read(_SCAN_FILE_MAX_BYTES + 1)
+    if len(raw) > _SCAN_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {_SCAN_FILE_MAX_BYTES} bytes)")
+    if _secure_store.at_capacity():
+        raise HTTPException(status_code=429, detail="too many concurrent secure-file jobs")
+    fname = file.filename or "file"
+    tid = _secure_store.start(lambda: _run_secure(raw, fname))
+    return SecureTaskCreated(task_id=tid)
 
-    return ScanFileResponse(
-        pii_found=bool(ner_raw),
-        secrets_found=bool(secret_hits),
-        injection_detected=bool(injection.get("is_injection")),
-        entities=entities,
-        redacted_text=redacted_preview,
-        file_size_bytes=len(raw),
-        preview_truncated=preview_truncated,
-    )
+
+@app.get("/v1/secure-file/tasks/{task_id}", response_model=SecureTaskStatus)
+async def secure_file_status(task_id: str):
+    t = _secure_store.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    if t["status"] == "done":
+        return SecureTaskStatus(status="done", summary=SecureSummary(**t["result"].summary))
+    if t["status"] == "error":
+        return SecureTaskStatus(status="error", error=t["error"])
+    return SecureTaskStatus(status="running")
+
+
+@app.get("/v1/secure-file/tasks/{task_id}/download")
+async def secure_file_download(task_id: str):
+    t = _secure_store.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t["error"])
+    if t["status"] != "done":
+        raise HTTPException(status_code=409, detail="not ready")
+    return _file_response(t["result"])

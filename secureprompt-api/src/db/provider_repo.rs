@@ -15,6 +15,7 @@ pub struct ProviderRow {
     pub encrypted_credential: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ pub struct ResolvedModelTarget {
     pub provider_type: String,
     pub model_name: String,
     pub encrypted_credential: Option<String>,
+    pub config: serde_json::Value,
 }
 
 impl ProviderRepository {
@@ -65,7 +67,7 @@ impl ProviderRepository {
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at
+            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
              FROM providers
              ORDER BY created_at DESC",
         )
@@ -87,6 +89,7 @@ impl ProviderRepository {
                 encrypted_credential: record.get("encrypted_credential"),
                 created_at: record.get("created_at"),
                 updated_at: record.get("updated_at"),
+                config: record.get("config"),
             })
             .collect())
     }
@@ -96,6 +99,10 @@ impl ProviderRepository {
     /// `encrypted_credential` is `Some(base64url(nonce||ct))` when the caller
     /// supplied a plaintext credential, `None` otherwise.
     ///
+    /// `config` carries provider-type-specific settings that aren't a single
+    /// credential string (e.g. Vertex's `{"region": "...", "project": "..."}`).
+    /// Pass `serde_json::json!({})` for provider types that don't need it.
+    ///
     /// # Errors
     /// Returns `ApiError::Database` on SQL failure.
     pub async fn create_provider(
@@ -104,6 +111,7 @@ impl ProviderRepository {
         name: &str,
         provider_type: &str,
         encrypted_credential: Option<String>,
+        config: serde_json::Value,
     ) -> Result<ProviderRow, ApiError> {
         let mut tx = self
             .pool
@@ -118,15 +126,16 @@ impl ProviderRepository {
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
         let row = sqlx::query(
-            "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+            "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, config, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config",
         )
         .bind(Uuid::new_v4())
         .bind(workspace_id.0)
         .bind(name)
         .bind(provider_type)
         .bind(encrypted_credential.as_deref())
+        .bind(config)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -143,12 +152,14 @@ impl ProviderRepository {
             encrypted_credential: row.get("encrypted_credential"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            config: row.get("config"),
         })
     }
 
-    /// Update a provider's name/type/credential. Passing `None` for
+    /// Update a provider's name/type/credential/config. Passing `None` for
     /// `encrypted_credential` leaves the stored credential unchanged; passing
-    /// `Some(None)` clears it.
+    /// `Some(None)` clears it. Passing `None` for `config` leaves the stored
+    /// config unchanged; passing `Some(value)` replaces it wholesale.
     ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the provider does not exist in this
@@ -160,6 +171,7 @@ impl ProviderRepository {
         name: Option<&str>,
         provider_type: Option<&str>,
         encrypted_credential: Option<Option<String>>,
+        config: Option<serde_json::Value>,
     ) -> Result<ProviderRow, ApiError> {
         // Build the SET clause dynamically based on which fields were provided.
         let mut sets: Vec<String> = vec!["updated_at = NOW()".to_owned()];
@@ -171,6 +183,9 @@ impl ProviderRepository {
         }
         if encrypted_credential.is_some() {
             sets.push(format!("encrypted_credential = ${}", sets.len() + 2));
+        }
+        if config.is_some() {
+            sets.push(format!("config = ${}", sets.len() + 2));
         }
 
         // Simpler approach: full-replace with explicit params.
@@ -188,7 +203,7 @@ impl ProviderRepository {
 
         // Fetch current to fill unset fields.
         let current = sqlx::query(
-            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at
+            "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
              FROM providers WHERE id = $1 AND workspace_id = $2",
         )
         .bind(provider_id)
@@ -204,20 +219,25 @@ impl ProviderRepository {
             Some(v) => v,
             None => current.get("encrypted_credential"),
         };
+        let new_config: serde_json::Value = match config {
+            Some(v) => v,
+            None => current.get("config"),
+        };
 
         let _ = sets; // suppress the unused warning from the dynamic builder above
 
         let row = sqlx::query(
             "UPDATE providers
-             SET name = $3, provider_type = $4, encrypted_credential = $5, updated_at = NOW()
+             SET name = $3, provider_type = $4, encrypted_credential = $5, config = $6, updated_at = NOW()
              WHERE id = $1 AND workspace_id = $2
-             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at",
+             RETURNING id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config",
         )
         .bind(provider_id)
         .bind(workspace_id.0)
         .bind(&new_name)
         .bind(&new_type)
         .bind(new_cred.as_deref())
+        .bind(&new_config)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -234,6 +254,7 @@ impl ProviderRepository {
             encrypted_credential: row.get("encrypted_credential"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            config: row.get("config"),
         })
     }
 
@@ -305,6 +326,7 @@ impl ProviderRepository {
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
              WHERE provider_id = $1
+               AND excluded = FALSE
              ORDER BY name ASC",
         )
         .bind(provider_id)
@@ -365,9 +387,12 @@ impl ProviderRepository {
         }
 
         // Try insert; if (workspace_id, provider_id, name) already exists,
-        // return the existing row.
+        // return the existing row. A previously-removed (excluded) model is
+        // revived here — a manual "Add model" is an explicit request to bring
+        // it back, so we clear the exclusion flag (this is what lets an admin
+        // undo a deletion the additive sync would otherwise permanently skip).
         let existing = sqlx::query(
-            "SELECT id, workspace_id, provider_id, name, created_at
+            "SELECT id, workspace_id, provider_id, name, created_at, excluded
              FROM models
              WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
         )
@@ -378,9 +403,17 @@ impl ProviderRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
         if let Some(row) = existing {
+            let id: Uuid = row.get("id");
+            if row.get::<bool, _>("excluded") {
+                sqlx::query("UPDATE models SET excluded = FALSE WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| ApiError::Database(e.to_string()))?;
+            }
             tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
             return Ok(ModelRow {
-                id: row.get("id"),
+                id,
                 workspace_id: row.get("workspace_id"),
                 provider_id: row.get("provider_id"),
                 name: row.get("name"),
@@ -433,9 +466,13 @@ impl ProviderRepository {
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        // Soft-delete: mark excluded rather than removing the row, so the
+        // additive upstream sync knows NOT to re-add this model. A hard DELETE
+        // would let the next credential-save / "Sync from upstream" re-import it.
         let result = sqlx::query(
-            "DELETE FROM models
-             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3",
+            "UPDATE models SET excluded = TRUE
+             WHERE workspace_id = $1 AND provider_id = $2 AND name = $3
+               AND excluded = FALSE",
         )
         .bind(workspace_id.0)
         .bind(provider_id)
@@ -452,6 +489,79 @@ impl ProviderRepository {
             )));
         }
         Ok(())
+    }
+
+    /// Soft-delete many models at once (bulk "Delete selected" in the dashboard).
+    /// Idempotent: names that don't exist or are already excluded are skipped.
+    /// Returns the number of models newly excluded by this call.
+    pub async fn bulk_exclude_models(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+        names: &[String],
+    ) -> Result<u64, ApiError> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "UPDATE models SET excluded = TRUE
+             WHERE workspace_id = $1 AND provider_id = $2
+               AND name = ANY($3::text[]) AND excluded = FALSE",
+        )
+        .bind(workspace_id.0)
+        .bind(provider_id)
+        .bind(names)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Names of models the admin has removed (soft-deleted) for this provider.
+    /// `persist_synced_models` uses this to skip re-adding them during an
+    /// upstream sync, so curated deletions survive credential rotations.
+    pub async fn list_excluded_model_names_for_provider(
+        &self,
+        workspace_id: WorkspaceId,
+        provider_id: Uuid,
+    ) -> Result<Vec<String>, ApiError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT name FROM models
+             WHERE provider_id = $1 AND excluded = TRUE",
+        )
+        .bind(provider_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| ApiError::Database(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
@@ -471,6 +581,7 @@ impl ProviderRepository {
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
+             WHERE excluded = FALSE
              ORDER BY created_at DESC",
         )
         .fetch_all(&mut *tx)
@@ -517,7 +628,8 @@ impl ProviderRepository {
                     providers.id AS provider_id,
                     providers.name AS provider_name,
                     providers.provider_type,
-                    providers.encrypted_credential
+                    providers.encrypted_credential,
+                    providers.config
              FROM models
              INNER JOIN providers ON providers.id = models.provider_id
              WHERE models.workspace_id = $1::uuid
@@ -544,6 +656,7 @@ impl ProviderRepository {
                 provider_type: record.get("provider_type"),
                 model_name: record.get("model_name"),
                 encrypted_credential: record.get("encrypted_credential"),
+                config: record.get("config"),
             })
             .collect())
     }

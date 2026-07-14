@@ -5,8 +5,9 @@ import { Providers } from "@/components/providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SecurePrompt",
-  description: "LLM security gateway — governance dashboard",
+  title: "SecurePrompt Console",
+  description:
+    "SecurePrompt Console — the control plane for the LLM security gateway: redact secrets and PII, enforce policy, and track token usage, cost, and governance across AI providers.",
 };
 
 export default async function RootLayout({ children }: { children: ReactNode }) {

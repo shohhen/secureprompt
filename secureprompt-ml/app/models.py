@@ -68,3 +68,36 @@ class ScanFileResponse(BaseModel):
     redacted_text: str | None = None
     file_size_bytes: int
     preview_truncated: bool
+    # Reversible {{Type_N}} token -> original PII value, so the chat gateway can
+    # restore the file's PII in the model's response (vault-preload). Empty when
+    # nothing was redacted.
+    token_map: dict[str, str] = {}
+
+
+class ScanTaskCreated(BaseModel):
+    task_id: str
+
+
+class ScanTaskStatus(BaseModel):
+    status: str  # running | done | error
+    result: ScanFileResponse | None = None
+    error: str | None = None
+
+
+class SecureTaskCreated(BaseModel):
+    task_id: str
+
+
+class SecureSummary(BaseModel):
+    entities_count: int
+    types: dict[str, int]
+    pages: int
+    ocr_used: bool
+    output_mime: str
+    output_filename: str
+
+
+class SecureTaskStatus(BaseModel):
+    status: str  # running | done | error
+    summary: SecureSummary | None = None
+    error: str | None = None

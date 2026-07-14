@@ -49,6 +49,9 @@ pub struct ProviderResponse {
     /// When the credential was last written (`updated_at`).
     pub last_rotated_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Provider-type-specific settings (Vertex: {region, project}).
+    #[serde(default)]
+    pub config: serde_json::Value,
     /// Models registered for this provider. Used by LibreChat's discovery
     /// client to populate the model picker; omitted (empty array) when
     /// no models are registered yet — caller falls back to per-type
@@ -74,6 +77,9 @@ pub struct CreateProviderRequest {
     pub provider_type: String,
     /// Optional plaintext credential (e.g. "sk-..."). Encrypted before storage.
     pub credential: Option<String>,
+    /// Provider-type-specific settings (Vertex: {region, project}).
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +88,9 @@ pub struct UpdateProviderRequest {
     pub provider_type: Option<String>,
     /// New plaintext credential. `None` = leave existing unchanged.
     pub credential: Option<String>,
+    /// Provider-type-specific settings (Vertex: {region, project}).
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// `POST /v1/providers/test-connection` body — tests credentials BEFORE
@@ -98,6 +107,11 @@ pub struct TestConnectionRequest {
     /// the provider_type's well-known endpoint when absent.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Provider-type-specific settings (Vertex: {region, project}) — same
+    /// shape as `CreateProviderRequest::config`. Only Vertex reads this
+    /// today; every other provider_type ignores it.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// `POST /v1/providers/{id}/models/sync` response — what the dashboard
@@ -119,6 +133,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/test-connection", post(test_connection_stored))
         .route("/{id}/models", get(list_provider_models).post(add_provider_model))
         .route("/{id}/models/sync", post(sync_provider_models))
+        .route("/{id}/models/bulk-delete", post(bulk_delete_provider_models))
         .route("/{id}/models/{name}", axum::routing::delete(delete_provider_model))
 }
 
@@ -156,6 +171,7 @@ async fn list_providers(
             has_credential: r.encrypted_credential.is_some(),
             last_rotated_at: r.updated_at,
             created_at: r.created_at,
+            config: r.config.clone(),
             models,
         });
     }
@@ -184,7 +200,13 @@ async fn create_provider(
 
     let repo = ProviderRepository::new(state.db.clone());
     let record = repo
-        .create_provider(ctx.workspace_id, &body.name, &body.provider_type, encrypted)
+        .create_provider(
+            ctx.workspace_id,
+            &body.name,
+            &body.provider_type,
+            encrypted,
+            body.config.clone().unwrap_or_else(|| serde_json::json!({})),
+        )
         .await
         .map_err(api_error_response)?;
 
@@ -217,6 +239,7 @@ async fn create_provider(
             has_credential: record.encrypted_credential.is_some(),
             last_rotated_at: record.updated_at,
             created_at: record.created_at,
+            config: record.config.clone(),
             models,
         }),
     ))
@@ -250,6 +273,7 @@ async fn update_provider(
             body.name.as_deref(),
             body.provider_type.as_deref(),
             encrypted_update,
+            body.config.clone(),
         )
         .await
         .map_err(api_error_response)?;
@@ -283,6 +307,7 @@ async fn update_provider(
         has_credential: record.encrypted_credential.is_some(),
         last_rotated_at: record.updated_at,
         created_at: record.created_at,
+        config: record.config.clone(),
         models,
     }))
 }
@@ -369,6 +394,36 @@ async fn delete_provider_model(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(serde::Deserialize)]
+struct BulkDeleteModelsRequest {
+    names: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BulkDeleteModelsResponse {
+    deleted: u64,
+}
+
+/// `POST /v1/providers/{id}/models/bulk-delete` — admin-only.
+///
+/// Soft-delete every model name in the body in one round-trip (the dashboard's
+/// "Delete selected" action). Like the single delete, these are marked
+/// `excluded` so a later upstream sync won't resurrect them.
+async fn bulk_delete_provider_models(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<JwtAuthContext>,
+    Path(provider_id): Path<Uuid>,
+    Json(body): Json<BulkDeleteModelsRequest>,
+) -> Result<Json<BulkDeleteModelsResponse>, axum::response::Response> {
+    require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
+    let repo = ProviderRepository::new(state.db.clone());
+    let deleted = repo
+        .bulk_exclude_models(ctx.workspace_id, provider_id, &body.names)
+        .await
+        .map_err(api_error_response)?;
+    Ok(Json(BulkDeleteModelsResponse { deleted }))
+}
+
 /// `POST /v1/providers/test-connection` — admin-only. Tests a credential
 /// BEFORE it's persisted. Body: `{provider_type, credential, base_url?}`.
 /// Returns `TestResult { success, model_count?, error? }` so the dashboard
@@ -380,10 +435,17 @@ async fn test_connection_unsaved(
     Json(body): Json<TestConnectionRequest>,
 ) -> Result<Json<crate::providers::credential_test::TestResult>, axum::response::Response> {
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
+    let vertex_cfg = body
+        .config
+        .as_ref()
+        .map(crate::providers::vertex::VertexConfig::from_value)
+        .unwrap_or(crate::providers::vertex::VertexConfig { region: None, project: None });
     let result = crate::providers::credential_test::test_connection(
         &body.provider_type,
         &body.credential,
         body.base_url.as_deref(),
+        vertex_cfg.region.as_deref(),
+        vertex_cfg.project.as_deref(),
     )
     .await;
     Ok(Json(result))
@@ -418,10 +480,13 @@ async fn test_connection_stored(
     let plaintext = decrypt_stored_credential(stored_credential, &state)
         .await
         .map_err(api_error_response)?;
+    let vertex_cfg = crate::providers::vertex::VertexConfig::from_value(&target.config);
     let result = crate::providers::credential_test::test_connection(
         &target.provider_type,
         &plaintext,
         None,
+        vertex_cfg.region.as_deref(),
+        vertex_cfg.project.as_deref(),
     )
     .await;
     Ok(Json(result))
@@ -492,12 +557,24 @@ async fn persist_synced_models(
         .into_iter()
         .map(|m| m.name)
         .collect();
+    // Admin-curated deletions must survive re-syncs. `excluded` holds the models
+    // the admin removed; we skip them here so a credential rotation or a "Sync
+    // from upstream" click never re-imports a model that was deliberately pruned.
+    let excluded: std::collections::HashSet<String> = repo
+        .list_excluded_model_names_for_provider(workspace_id, provider_id)
+        .await?
+        .into_iter()
+        .collect();
 
     let mut added = Vec::new();
     let mut kept = Vec::new();
     for id in upstream_ids {
         let trimmed = id.trim();
         if trimmed.is_empty() || trimmed.len() > 200 {
+            continue;
+        }
+        if excluded.contains(trimmed) {
+            // Deliberately removed by the admin — leave it out.
             continue;
         }
         if existing.contains(trimmed) {

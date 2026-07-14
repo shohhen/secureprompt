@@ -1,0 +1,244 @@
+"""In-document redaction for DOCX / XLSX / TXT — replace PII strings with
+`{{Type_N}}` labels so the underlying text is genuinely removed."""
+from __future__ import annotations
+
+import io
+from typing import Callable
+
+from app.secure_boxes import byte_to_char_map
+from app.secure_labels import build_labels, redact_spans, value_repeat_spans
+from app.secure_media import redact_docx_images, scan_docx_images
+from app.text_norm import flatten_breaks
+
+
+def _by_value(labels: dict) -> dict[str, str]:
+    return {val: lbl for (_typ, val), lbl in labels.items() if val}
+
+
+def _by_value_for(labels: dict, dets: list[dict]) -> dict[str, str]:
+    """`_by_value` restricted to values that `dets` actually reported — used to
+    keep OCR-derived values out of the prose repeat-sweep while still sharing one
+    label map with them."""
+    keys = {(d["entity_type"].upper(), d["text"]) for d in dets}
+    return {val: lbl for (typ, val), lbl in labels.items() if val and (typ, val) in keys}
+
+
+def _byte_len(texts: list[str]) -> int:
+    """Byte length of the joined detection text. Image detections are offset past
+    it so `build_labels` (first-appearance order) numbers prose before logos."""
+    return len("\n".join(texts).encode("utf-8")) + 1
+
+
+def _redact_container(text: str, spans: list, by_value: dict) -> str:
+    """Splice detected spans (noise-tolerant) plus any remaining exact repeats of
+    detected values; redact_spans de-overlaps so each region is labeled once."""
+    return redact_spans(text, spans + value_repeat_spans(text, by_value))
+
+
+def _container_spans(texts: list[str], dets: list[dict], labels: dict):
+    """Map global byte-offset detections (into ``"\\n".join(texts)``) back to each
+    container as ``(char_start, char_end, label)`` spans.
+
+    Detection reports UTF-8 byte offsets into the joined text; we convert to char
+    offsets and locate the owning container. Redacting by span (not by matching
+    the cleaned display value) means noise inside the original span — NBSP,
+    zero-width chars, collapsed whitespace — is removed too, closing the
+    fail-open gap where a noisy value never matched its cleaned form. A span
+    straddling a container boundary is a v1 limitation and is skipped.
+    """
+    full = "\n".join(texts)
+    b2c = byte_to_char_map(full)
+    ranges = []
+    pos = 0
+    for t in texts:
+        ranges.append((pos, pos + len(t)))
+        pos += len(t) + 1  # trailing "\n" join char
+    per: list[list[tuple[int, int, str]]] = [[] for _ in texts]
+    for d in dets:
+        cs = b2c.get(d["start"])
+        ce = b2c.get(d["end"])
+        if cs is None or ce is None or cs >= ce:
+            continue
+        label = labels.get((d["entity_type"].upper(), d["text"]), "")
+        if not label:
+            continue
+        for i, (a, b) in enumerate(ranges):
+            if a <= cs and ce <= b:
+                per[i].append((cs - a, ce - a, label))
+                break
+    return per
+
+
+def _ordered_labels(dets: list[dict]) -> dict:
+    """build_labels in first-appearance (byte-offset) order."""
+    return build_labels(sorted(dets, key=lambda d: d.get("start", 0)))
+
+
+def _set_paragraph_text(paragraph, text: str) -> None:
+    """Put `text` in the first direct run (keeps its formatting), blank the rest.
+
+    PII inside ``<w:hyperlink>`` runs is NOT part of ``paragraph.runs`` even
+    though it IS part of ``paragraph.text`` — so we must blank hyperlink-nested
+    runs too, else the original hyperlinked PII survives in the file (a security
+    hole for a redaction control). PII that spanned multiple runs is flattened to
+    run[0]'s style, and a redacted hyperlink loses its link formatting — both are
+    v1 limitations; text removal (the security property) is unaffected.
+    """
+    for hl in paragraph.hyperlinks:
+        for r in hl.runs:
+            r.text = ""
+    direct = paragraph.runs
+    if direct:
+        direct[0].text = text
+        for r in direct[1:]:
+            r.text = ""
+    elif text:
+        paragraph.add_run(text)
+
+
+def _iter_cell_paragraphs(cell):
+    """Cell body paragraphs plus paragraphs in any NESTED tables (recursive)."""
+    for p in cell.paragraphs:
+        yield p
+    for table in cell.tables:
+        for row in table.rows:
+            for c in row.cells:
+                yield from _iter_cell_paragraphs(c)
+
+
+def _txbx_paragraphs(element, parent):
+    """Paragraphs inside text boxes (``<w:txbxContent>``) under ``element``.
+
+    Text-box text is NOT part of ``doc.paragraphs`` / header ``.paragraphs`` —
+    it lives in the drawing/VML tree — so a name in a letterhead text box would
+    survive without this. Best-effort: any structural surprise is swallowed so a
+    text box never aborts the whole redaction."""
+    try:
+        from docx.oxml.ns import qn
+        from docx.text.paragraph import Paragraph
+        for txbx in element.iter(qn("w:txbxContent")):
+            for p in txbx.iterfind(qn("w:p")):
+                yield Paragraph(p, parent)
+    except Exception:  # noqa: BLE001 — text boxes are a best-effort extra surface
+        return
+
+
+def _iter_paragraphs(doc):
+    """Every redactable paragraph: body, tables (incl. nested), headers/footers
+    (all first/even/default variants), and text boxes. Deduplicated by paragraph
+    XML element so linked-section headers (which share one part) aren't processed
+    twice — double-processing would splice a label into already-redacted runs."""
+    seen: set[int] = set()
+
+    def _fresh(p):
+        k = id(p._p)
+        if k in seen:
+            return False
+        seen.add(k)
+        return True
+
+    for p in doc.paragraphs:
+        if _fresh(p):
+            yield p
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in _iter_cell_paragraphs(cell):
+                    if _fresh(p):
+                        yield p
+    for section in doc.sections:
+        for hf in (section.header, section.footer,
+                   section.first_page_header, section.first_page_footer,
+                   section.even_page_header, section.even_page_footer):
+            if hf is None:
+                continue
+            for p in hf.paragraphs:
+                if _fresh(p):
+                    yield p
+            for table in hf.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for p in _iter_cell_paragraphs(cell):
+                            if _fresh(p):
+                                yield p
+            for p in _txbx_paragraphs(hf._element, hf):
+                if _fresh(p):
+                    yield p
+    for p in _txbx_paragraphs(doc.element.body, doc):
+        if _fresh(p):
+            yield p
+
+
+def secure_docx(data: bytes, detect_fn: Callable[[str], list[dict]]):
+    import docx
+    doc = docx.Document(io.BytesIO(data))
+    paras = list(_iter_paragraphs(doc))
+    texts = [p.text for p in paras]
+    # Detect on the break-flattened copy, redact the original. flatten_breaks is
+    # 1 byte -> 1 byte, so the offsets below still index `texts` exactly.
+    detect_texts = [flatten_breaks(t) for t in texts]
+    dets = detect_fn("\n".join(detect_texts))
+
+    # Text baked into embedded raster images (letterhead logos, scanned
+    # signatures, pasted screenshots) never reaches the text layer, so the loop
+    # below cannot see it. OCR those images and fold their hits into the SAME
+    # label map, so an org name blacked out in the logo carries the same
+    # {{Organization_N}} it got in the prose.
+    hits = scan_docx_images(data, detect_fn, base=_byte_len(detect_texts))
+    image_dets = [d for h in hits for d in h.dets]
+
+    labels = _ordered_labels(dets + image_dets)
+    # The repeat sweep over prose is driven by TEXT detections only: an OCR
+    # misread ("44)", a mangled glyph run) must never become a value we splice
+    # into the document's sentences.
+    by_value = _by_value_for(labels, dets)
+    # Redact by span (see _container_spans) so noisy PII is removed even when the
+    # cleaned detection value differs from the document text, plus a repeat sweep
+    # so a detected value recurring in another paragraph (body vs header) is also
+    # covered. A value straddling a paragraph boundary is a v1 limitation.
+    for p, t, spans in zip(paras, texts, _container_spans(detect_texts, dets, labels)):
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            _set_paragraph_text(p, new)
+    out = io.BytesIO()
+    doc.save(out)
+    data_out = out.getvalue()
+    if hits:
+        data_out = redact_docx_images(data_out, hits, labels)
+    return data_out, dets + image_dets
+
+
+def secure_xlsx(data: bytes, detect_fn: Callable[[str], list[dict]]):
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data))
+    value_cells = [c for ws in wb.worksheets for row in ws.iter_rows()
+                   for c in row if isinstance(c.value, str)]
+    comment_cells = [c for ws in wb.worksheets for row in ws.iter_rows()
+                     for c in row if c.comment is not None and c.comment.text]
+    # cell string values first, then comment texts — both are redactable containers.
+    # (Sheet names are left intact: renaming them would break formula references.)
+    texts = [c.value for c in value_cells] + [c.comment.text for c in comment_cells]
+    dets = detect_fn("\n".join(texts))
+    labels = _ordered_labels(dets)
+    by_value = _by_value(labels)
+    per = _container_spans(texts, dets, labels)
+    n = len(value_cells)
+    for c, t, spans in zip(value_cells, texts[:n], per[:n]):
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            c.value = new
+    for c, t, spans in zip(comment_cells, texts[n:], per[n:]):
+        new = _redact_container(t, spans, by_value)
+        if new != t:
+            c.comment.text = new
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), dets
+
+
+def secure_text(data: bytes, detect_fn: Callable[[str], list[dict]]):
+    text = data.decode("utf-8", "replace")
+    dets = detect_fn(text)
+    labels = _ordered_labels(dets)
+    spans = _container_spans([text], dets, labels)[0]
+    return _redact_container(text, spans, _by_value(labels)).encode("utf-8"), dets

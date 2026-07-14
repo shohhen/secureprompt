@@ -2636,6 +2636,11 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Provider-type-specific settings (Vertex: {region, project})."
           }
         }
       },
@@ -2657,6 +2662,11 @@
             "type": "string",
             "nullable": true,
             "description": "Plaintext API key \u2014 encrypted before storage"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Provider-type-specific settings (Vertex: {region, project})."
           }
         }
       },
@@ -2675,6 +2685,11 @@
             "type": "string",
             "nullable": true,
             "description": "New plaintext key; omit to leave existing unchanged"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Provider-type-specific settings (Vertex: {region, project})."
           }
         }
       },

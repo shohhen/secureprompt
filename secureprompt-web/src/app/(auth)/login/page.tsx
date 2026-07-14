@@ -39,9 +39,10 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Sign in</CardTitle>
+        <CardTitle>Sign in to SecurePrompt</CardTitle>
         <CardDescription>
-          Enter your email and password to access the dashboard.
+          Access the SecurePrompt Console — redact secrets &amp; PII, enforce
+          policy, and monitor LLM usage, cost, and governance.
         </CardDescription>
       </CardHeader>
       <CardContent>

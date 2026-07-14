@@ -37,6 +37,7 @@ pub struct ModelTarget {
     pub provider_type: String,
     pub model_name: String,
     pub encrypted_credential: Option<String>,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +133,7 @@ pub async fn resolve_model(
                 provider_type: p.provider_type,
                 model_name: public_model.to_owned(),
                 encrypted_credential: p.encrypted_credential,
+                config: p.config,
             };
             return Ok(ResolvedModel {
                 public_model: public_model.to_owned(),
@@ -166,6 +168,7 @@ impl From<ResolvedModelTarget> for ModelTarget {
             provider_type: value.provider_type,
             model_name: value.model_name,
             encrypted_credential: value.encrypted_credential,
+            config: value.config,
         }
     }
 }
@@ -223,6 +226,7 @@ mod tests {
                 provider_type: "openai".to_owned(),
                 model_name: "gpt-4o-mini".to_owned(),
                 encrypted_credential: None,
+                config: serde_json::json!({}),
             }],
         };
 
@@ -235,5 +239,22 @@ mod tests {
         assert_eq!(cached.public_model, "gpt-4o-mini");
         assert_eq!(cached.targets.len(), 1);
         assert_eq!(cached.targets[0].provider_type, "openai");
+    }
+
+    #[test]
+    fn model_target_from_resolved_carries_config() {
+        let cfg = serde_json::json!({"region": "us-central1", "project": "p"});
+        let resolved = ResolvedModelTarget {
+            model_id: uuid::Uuid::nil(),
+            workspace_id: WorkspaceId(uuid::Uuid::nil()),
+            provider_id: ProviderId(uuid::Uuid::nil()),
+            provider_name: "v".into(),
+            provider_type: "vertex".into(),
+            model_name: "gemini-2.5-flash".into(),
+            encrypted_credential: None,
+            config: cfg.clone(),
+        };
+        let target = ModelTarget::from(resolved);
+        assert_eq!(target.config, cfg);
     }
 }

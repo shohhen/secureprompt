@@ -42,6 +42,49 @@ pub struct DetectionItem {
     pub value: String,
 }
 
+// ── /v1/vault/stash ─────────────────────────────────────────────────────────
+// Reversible file-scan support. A scanned file's `{{Type_N}}` → original-PII map
+// is stashed here (Redis, TTL); the chat pipeline preloads its vault from the ref
+// embedded as an opaque `[[sp:v=<ref>]]` marker in the message, and
+// `restore_content` puts the real values back in the model's response. The map
+// (with PII) lives only in Redis — never in LibreChat's message DB.
+
+#[derive(Deserialize)]
+pub struct VaultStashRequest {
+    pub token_map: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub struct VaultStashResponse {
+    pub vault_ref: String,
+}
+
+/// TTL for a stashed file vault — long enough to upload then send the message,
+/// short enough to bound memory.
+const FILE_VAULT_TTL_SECS: u64 = 6 * 60 * 60;
+
+pub async fn vault_stash(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<VaultStashRequest>,
+) -> Result<Json<VaultStashResponse>, axum::response::Response> {
+    // A stash holds PII — require the same per-user auth as every data route.
+    let _auth = authenticate_request(&headers, &state)
+        .await
+        .map_err(api_error_response)?;
+    if body.token_map.is_empty() {
+        return Ok(Json(VaultStashResponse {
+            vault_ref: String::new(),
+        }));
+    }
+    let vault_ref = RequestId::new().to_string();
+    let map_json = serde_json::to_string(&body.token_map).unwrap_or_default();
+    crate::redis::stash_file_vault(&state.redis_pool, &vault_ref, &map_json, FILE_VAULT_TTL_SECS)
+        .await
+        .map_err(api_error_response)?;
+    Ok(Json(VaultStashResponse { vault_ref }))
+}
+
 pub async fn redact(
     State(state): State<AppState>,
     headers: HeaderMap,
