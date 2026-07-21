@@ -18,7 +18,7 @@ _ch() { clickhouse-client --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" \
 log "clickhouse: verify+decrypt -> Disk(backups,$_name)"
 sp_open "$OUTDIR/clickhouse.zip.enc" "$CH_BACKUP_MOUNT/$_name"   # aborts on bad MAC
 log "clickhouse: DROP + RESTORE DATABASE $CLICKHOUSE_DB"
-_ch --query "DROP DATABASE IF EXISTS \`$CLICKHOUSE_DB\`"
-_ch --query "RESTORE DATABASE \`$CLICKHOUSE_DB\` FROM Disk('backups', '$_name')"
+_ch --query "DROP DATABASE IF EXISTS \`$CLICKHOUSE_DB\`" >/dev/null
+_ch --query "RESTORE DATABASE \`$CLICKHOUSE_DB\` FROM Disk('backups', '$_name')" >/dev/null
 rm -f "$CH_BACKUP_MOUNT/$_name"
 log "clickhouse: restore complete"

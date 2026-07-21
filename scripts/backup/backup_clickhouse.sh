@@ -19,7 +19,7 @@ _ch() { clickhouse-client --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" \
         --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" "$@"; }
 
 log "clickhouse: BACKUP DATABASE $CLICKHOUSE_DB -> Disk(backups,$_name)"
-_ch --query "BACKUP DATABASE \`$CLICKHOUSE_DB\` TO Disk('backups', '$_name')"
+_ch --query "BACKUP DATABASE \`$CLICKHOUSE_DB\` TO Disk('backups', '$_name')" >/dev/null
 
 sp_seal "$CH_BACKUP_MOUNT/$_name" "$OUTDIR/clickhouse.zip.enc"
 printf '%s' "$_name" > "$OUTDIR/clickhouse.name"   # remember the disk-relative name
