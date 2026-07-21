@@ -25,6 +25,21 @@ spec:
                       key: backup-key
                 - name: PGHOST
                   value: {{ include "secureprompt.fullname" . }}-postgres
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-user
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-password
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-database
                 - name: CLICKHOUSE_HOST
                   value: {{ include "secureprompt.fullname" . }}-clickhouse
                 - name: QDRANT_URL
