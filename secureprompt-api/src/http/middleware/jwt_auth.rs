@@ -276,6 +276,18 @@ pub async fn require(
         )));
     }
 
+    // 2FA (Task 4 review fix): self-enforcing ordering invariant. The
+    // `is_access_claims` guard above must have already rejected any purpose
+    // token before we reach role parsing — `claims.role` is an empty
+    // placeholder on purpose tokens (see `encode_purpose_token`) and would
+    // fail `from_db_str` anyway, but this makes a future reorder of the two
+    // checks trip loudly in test/debug builds instead of silently relying on
+    // that coincidence.
+    debug_assert!(
+        is_access_claims(&claims),
+        "purpose tokens must be rejected before role parsing"
+    );
+
     let role = UserRole::from_db_str(&claims.role).map_err(|_| {
         api_error_response(ApiError::Unauthorized("Invalid credentials".into()))
     })?;
