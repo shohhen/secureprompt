@@ -82,14 +82,6 @@ pub async fn test_connection(
         return TestResult::err("api_key is empty");
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return TestResult::err(format!("failed to build HTTP client: {e}")),
-    };
-
     let resolved_base = base_url
         .map(|s| s.trim_end_matches('/').to_owned())
         .filter(|s| !s.is_empty())
@@ -100,6 +92,19 @@ pub async fn test_connection(
             "no default base_url for provider_type={provider_type}; supply one explicitly"
         ));
     }
+
+    // SSRF guard: validate + resolve + screen before any connection, then
+    // pin the validated address so the host cannot be re-resolved.
+    let policy = crate::security::EgressPolicy::from_env();
+    let validated = match crate::security::validate_outbound_url(&resolved_base, &policy).await {
+        Ok(v) => v,
+        Err(e) => return TestResult::err(format!("base_url rejected: {e}")),
+    };
+
+    let client = match crate::security::build_pinned_client(&validated, Duration::from_secs(10)) {
+        Ok(c) => c,
+        Err(e) => return TestResult::err(format!("failed to build HTTP client: {e}")),
+    };
 
     match provider_type.to_lowercase().as_str() {
         "anthropic" => probe_anthropic(&client, &resolved_base, api_key).await,
@@ -415,5 +420,35 @@ mod tests {
         assert!(is_chat_capable("google", "gemini-2.5-flash"));
         assert!(is_chat_capable("google", "gemini-2.5-pro"));
         assert!(is_chat_capable("anthropic", "claude-sonnet-4-5"));
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_connection_refuses_metadata_base_url() {
+        let r = test_connection(
+            "openai",
+            "sk-test",
+            Some("http://169.254.169.254/latest/meta-data"),
+            None,
+            None,
+        )
+        .await;
+        assert!(!r.success, "metadata endpoint must be refused");
+        let msg = r.error.unwrap_or_default();
+        assert!(
+            msg.contains("blocked") || msg.contains("metadata"),
+            "error should name the egress refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_refuses_file_scheme() {
+        let r = test_connection("openai", "sk-test", Some("file:///etc/passwd"), None, None).await;
+        assert!(!r.success);
+        assert!(r.error.unwrap_or_default().contains("scheme"));
     }
 }
