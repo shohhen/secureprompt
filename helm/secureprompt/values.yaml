@@ -249,7 +249,9 @@ kms:
 backup:
   enabled: false
   schedule: "0 2 * * *"
-  image: "sp-backup:latest"
+  image:
+    repository: sp-backup
+    tag: "latest"
   keySecret: "secureprompt-backup-key"
   retentionDaily: 7
   # PVC mounted at /backups by the CronJob.

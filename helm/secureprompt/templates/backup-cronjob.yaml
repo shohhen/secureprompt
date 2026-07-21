@@ -16,7 +16,7 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: backup
-              image: {{ .Values.backup.image | quote }}
+              image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
               env:
                 - name: SECUREPROMPT_BACKUP_KEY
                   valueFrom:

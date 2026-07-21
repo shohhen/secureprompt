@@ -15,7 +15,7 @@ trap 'rm -f "$_plain"' EXIT   # never leave a decrypted plaintext dump, even on 
 log "postgres: verify+decrypt"
 sp_open "$OUTDIR/postgres.dump.enc" "$_plain"   # aborts on bad MAC
 log "postgres: pg_restore --clean --if-exists into $PGDATABASE"
-pg_restore --clean --if-exists --no-owner \
+pg_restore --clean --if-exists --no-owner --single-transaction \
     -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" "$_plain"
 rm -f "$_plain"
 log "postgres: restore complete"
