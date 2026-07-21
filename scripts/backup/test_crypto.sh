@@ -40,4 +40,20 @@ export SECUREPROMPT_BACKUP_KEY="test-key-do-not-use-in-prod"
 sp_derive_keys
 [ "$SP_ENC_KEY" != "$SP_MAC_KEY" ] || { echo "FAIL: enc key == mac key"; exit 1; }
 
+# 6. sp_seal fails (non-zero) and leaves NO sealed file when input is missing
+rm -f "$TMP/nope.enc" "$TMP/nope.enc.mac"
+if sp_seal "$TMP/does-not-exist" "$TMP/nope.enc" 2>/dev/null; then
+  echo "FAIL: sp_seal returned success on missing input"; exit 1
+fi
+[ ! -f "$TMP/nope.enc" ] || { echo "FAIL: sealed file left behind after seal failure"; exit 1; }
+
+# 7. tampering a byte in the IV region (first 16 bytes) is also detected
+cp "$TMP/sealed" "$TMP/tampered_iv"
+printf 'Z' | dd of="$TMP/tampered_iv" bs=1 seek=2 count=1 conv=notrunc 2>/dev/null
+rm -f "$TMP/out_tampered_iv"
+if sp_open "$TMP/tampered_iv" "$TMP/out_tampered_iv" 2>/dev/null; then
+  echo "FAIL: tampered IV was accepted"; exit 1
+fi
+[ ! -f "$TMP/out_tampered_iv" ] || { echo "FAIL: output written despite tampered IV"; exit 1; }
+
 echo "ALL CRYPTO TESTS PASSED"

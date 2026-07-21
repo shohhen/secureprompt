@@ -31,12 +31,17 @@ sp_seal() {
     _in=$1; _out=$2
     sp_derive_keys || return 1
     _iv=$(openssl rand -hex 16)
-    # Write IV (raw 16 bytes) then the CBC ciphertext into OUTFILE.
-    printf '%s' "$_iv" | xxd -r -p > "$_out"
-    openssl enc -aes-256-cbc -e -K "$SP_ENC_KEY" -iv "$_iv" -in "$_in" >> "$_out"
+    printf '%s' "$_iv" | xxd -r -p > "$_out" || {
+        echo "sp_crypto: failed to write IV to $_out" >&2; rm -f "$_out"; return 1; }
+    if ! openssl enc -aes-256-cbc -e -K "$SP_ENC_KEY" -iv "$_iv" -in "$_in" >> "$_out"; then
+        echo "sp_crypto: encryption failed for $_in" >&2; rm -f "$_out"; return 1
+    fi
     # MAC over the whole sealed file (IV + ciphertext) — encrypt-then-MAC.
-    openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SP_MAC_KEY" -r "$_out" \
-        | cut -d' ' -f1 > "$_out.mac"
+    if ! openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SP_MAC_KEY" -r "$_out" \
+        | cut -d' ' -f1 > "$_out.mac"; then
+        echo "sp_crypto: MAC computation failed for $_out" >&2
+        rm -f "$_out" "$_out.mac"; return 1
+    fi
 }
 
 # sp_open INFILE OUTFILE -> verify INFILE.mac, then decrypt to OUTFILE.
@@ -50,15 +55,17 @@ sp_open() {
     _expected=$(cat "$_in.mac")
     _actual=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SP_MAC_KEY" -r "$_in" \
         | cut -d' ' -f1)
+    # Plain string compare — acceptable here: local file MAC, no networked
+    # timing oracle. (NOT a constant-time compare; do not claim otherwise.)
     if [ "$_expected" != "$_actual" ]; then
         echo "sp_crypto: HMAC verification FAILED for $_in — refusing to decrypt" >&2
         return 1
     fi
-    # Read IV (first 16 bytes) as hex, decrypt the remainder.
-    _iv=$(dd if="$_in" bs=1 count=16 2>/dev/null | xxd -p -c256)
+    # IV = first 16 bytes; body = byte 17 onward. tail -c is efficient on
+    # large files (dd bs=1 would read a GB dump one byte at a time).
+    _iv=$(dd if="$_in" bs=16 count=1 2>/dev/null | xxd -p -c256)
     _tmp="$_out.part"
-    # Skip the 16-byte IV, decrypt the rest.
-    if dd if="$_in" bs=1 skip=16 2>/dev/null \
+    if tail -c +17 "$_in" \
         | openssl enc -aes-256-cbc -d -K "$SP_ENC_KEY" -iv "$_iv" > "$_tmp"; then
         mv "$_tmp" "$_out"
     else
