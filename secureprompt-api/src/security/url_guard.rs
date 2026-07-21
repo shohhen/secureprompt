@@ -263,7 +263,7 @@ pub async fn validate_outbound_url(
 /// Build a client that will only ever connect to the addresses validated
 /// in `v`, and that never follows redirects.
 ///
-/// Two deliberate choices:
+/// Three deliberate choices:
 ///
 /// 1. `resolve_to_addrs` pins the validated addresses for this host, so the
 ///    name cannot be re-resolved to a different address between validation
@@ -274,11 +274,17 @@ pub async fn validate_outbound_url(
 ///    should re-run `validate_outbound_url` on the `Location` header and
 ///    issue a fresh request (see `credential_test`), which keeps every hop
 ///    screened.
+/// 3. `.no_proxy()` — without it, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env
+///    vars would route the connection through a proxy that resolves and
+///    connects to the target itself, silently bypassing the
+///    `resolve_to_addrs` pin. (This is a deliberate behavior: the guarded
+///    credential-test path performs direct egress, not proxied egress.)
 pub fn build_pinned_client(v: &ValidatedUrl, timeout: Duration) -> Result<reqwest::Client, SsrfError> {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .use_rustls_tls()
+        .no_proxy()
         .resolve_to_addrs(&v.host, &v.addrs)
         .build()
         .map_err(|e| SsrfError::InvalidUrl(format!("failed to build pinned client: {e}")))
