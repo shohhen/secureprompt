@@ -184,6 +184,13 @@ impl WorkspaceRepository {
             password_hash: user_row.get("password_hash"),
             created_at: user_row.get("created_at"),
             updated_at: user_row.get("updated_at"),
+            // Migration 016 (`totp_*` columns) — a freshly created owner has
+            // never enrolled in 2FA, matching the columns' NULL/0 defaults.
+            totp_secret_encrypted: None,
+            totp_confirmed_at: None,
+            totp_last_timestep: None,
+            totp_failed_attempts: 0,
+            totp_locked_until: None,
         };
 
         Ok((ws, user))
