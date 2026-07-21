@@ -20,10 +20,17 @@ trap 'rm -f "$_snap"' EXIT   # never leave a plaintext qdrant snapshot, even on 
 
 for _c in $QDRANT_COLLECTIONS; do
     log "qdrant: snapshot $_c"
-    # Create a snapshot; response .result.name is the snapshot filename.
-    _name=$(curl -fsS -X POST "$QDRANT_URL/collections/$_c/snapshots" \
-        | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
-    [ -n "$_name" ] || { log "qdrant: no snapshot name for $_c (collection missing?)"; continue; }
+    # Capture the response so curl's own exit status is checked. A piped
+    # `curl | sed` reports sed's status (POSIX sh has no pipefail), so a real
+    # Qdrant outage would look like an empty name = "collection missing" and the
+    # whole backup would exit 0 having written nothing (phantom success).
+    if ! _resp=$(curl -fsS -X POST "$QDRANT_URL/collections/$_c/snapshots"); then
+        log "qdrant: create-snapshot request FAILED for $_c (server down?)"; exit 1
+    fi
+    # Compact JSON {"result":{"name":"...","size":...}}. An empty match here
+    # (HTTP 200 but no name) legitimately means the collection is absent -> skip.
+    _name=$(printf '%s' "$_resp" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+    [ -n "$_name" ] || { log "qdrant: no snapshot for $_c (collection missing?), skipping"; continue; }
     _snap="$OUTDIR/qdrant-$_c.snapshot"
     curl -fsS "$QDRANT_URL/collections/$_c/snapshots/$_name" -o "$_snap"
     sp_seal "$_snap" "$OUTDIR/qdrant-$_c.snapshot.enc"
