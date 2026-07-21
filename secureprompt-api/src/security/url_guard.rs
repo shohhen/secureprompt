@@ -182,6 +182,32 @@ fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
+/// Synchronous structural checks: scheme, credentials, host presence.
+///
+/// Uses `reqwest::Url` (a re-export of `url::Url`) so no extra dependency
+/// is pulled in.
+pub fn parse_and_check_url(raw: &str) -> Result<reqwest::Url, SsrfError> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(SsrfError::ForbiddenScheme(other.to_owned())),
+    }
+
+    // Credentials in the URL are both a credential-leak risk and a classic
+    // parser-confusion vector (`http://trusted.com@evil.com/`).
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SsrfError::CredentialsInUrl);
+    }
+
+    if url.host_str().is_none() {
+        return Err(SsrfError::MissingHost);
+    }
+
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +322,44 @@ mod tests {
     fn ssrf_error_displays_reason() {
         let e = SsrfError::ForbiddenScheme("file".into());
         assert!(e.to_string().contains("file"));
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for raw in [
+            "file:///etc/passwd",
+            "gopher://example.com/",
+            "ftp://example.com/",
+            "dict://example.com:11211/",
+        ] {
+            match parse_and_check_url(raw) {
+                Err(SsrfError::ForbiddenScheme(_)) => {}
+                other => panic!("{raw} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_embedded_credentials() {
+        assert_eq!(
+            parse_and_check_url("http://user:pass@example.com/"),
+            Err(SsrfError::CredentialsInUrl)
+        );
+        assert_eq!(
+            parse_and_check_url("http://user@example.com/"),
+            Err(SsrfError::CredentialsInUrl)
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_and_hostless_urls() {
+        assert!(matches!(parse_and_check_url("not a url"), Err(SsrfError::InvalidUrl(_))));
+        assert!(matches!(parse_and_check_url(""), Err(SsrfError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn accepts_ordinary_http_and_https() {
+        assert!(parse_and_check_url("https://api.openai.com/v1").is_ok());
+        assert!(parse_and_check_url("  http://example.com:8080/x  ").is_ok());
     }
 }
