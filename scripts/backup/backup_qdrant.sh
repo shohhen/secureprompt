@@ -24,12 +24,29 @@ for _c in $QDRANT_COLLECTIONS; do
     # `curl | sed` reports sed's status (POSIX sh has no pipefail), so a real
     # Qdrant outage would look like an empty name = "collection missing" and the
     # whole backup would exit 0 having written nothing (phantom success).
-    if ! _resp=$(curl -fsS -X POST "$QDRANT_URL/collections/$_c/snapshots"); then
-        log "qdrant: create-snapshot request FAILED for $_c (server down?)"; exit 1
+    #
+    # NOTE: deliberately NOT using curl -f here. Qdrant returns HTTP 404 (not
+    # 200-with-empty-name) for POST .../snapshots against a collection that
+    # doesn't exist -- confirmed empirically. -f would make curl itself exit
+    # nonzero on that 404, indistinguishable from a real outage, and the whole
+    # backup would abort just because one optional collection was never
+    # created. So: capture status+body ourselves and branch on the status —
+    # 404 is a legitimate "missing collection, skip"; anything else non-2xx,
+    # or a curl transport failure (connection refused / timeout / DNS), is
+    # still fatal.
+    if ! _resp=$(curl -sS -w '\n%{http_code}' -X POST "$QDRANT_URL/collections/$_c/snapshots"); then
+        log "qdrant: create-snapshot request FAILED for $_c (connection error)"; exit 1
     fi
+    _code=$(printf '%s\n' "$_resp" | tail -n1)
+    _body=$(printf '%s\n' "$_resp" | sed '$d')
+    case "$_code" in
+        200) ;;
+        404) log "qdrant: collection $_c missing, skipping"; continue ;;
+        *) log "qdrant: create-snapshot request FAILED for $_c (HTTP $_code)"; exit 1 ;;
+    esac
     # Compact JSON {"result":{"name":"...","size":...}}. An empty match here
     # (HTTP 200 but no name) legitimately means the collection is absent -> skip.
-    _name=$(printf '%s' "$_resp" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+    _name=$(printf '%s' "$_body" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
     [ -n "$_name" ] || { log "qdrant: no snapshot for $_c (collection missing?), skipping"; continue; }
     _snap="$OUTDIR/qdrant-$_c.snapshot"
     curl -fsS "$QDRANT_URL/collections/$_c/snapshots/$_name" -o "$_snap"

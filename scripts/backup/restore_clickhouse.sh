@@ -17,6 +17,18 @@ _ch() { clickhouse-client --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" \
 
 log "clickhouse: verify+decrypt -> Disk(backups,$_name)"
 sp_open "$OUTDIR/clickhouse.zip.enc" "$CH_BACKUP_MOUNT/$_name"   # aborts on bad MAC
+# sp_open (umask 077) writes the decrypted artifact as this container's user
+# (root, uid 0) mode 0600. The clickhouse-server process itself runs as a
+# non-root uid (101, "clickhouse" -- confirmed against the official 24.8
+# image) inside its own container, so it cannot open a root-owned 0600 file:
+# `RESTORE DATABASE ... FROM Disk('backups', ...)` fails with CANNOT_OPEN_FILE
+# / errno 13 Permission denied. Root bypasses permission checks when reading,
+# which is why the symmetric backup-side read (CH-owned file, read by this
+# root container) never hits this. Widen to world-readable so the server can
+# open it; this directory is the internal `clickhouse_backups` Docker volume,
+# mounted only by the clickhouse and backup services (not host-exposed), and
+# the file is immediately removed after RESTORE (or by the EXIT trap).
+chmod 644 "$CH_BACKUP_MOUNT/$_name"
 log "clickhouse: DROP + RESTORE DATABASE $CLICKHOUSE_DB"
 _ch --query "DROP DATABASE IF EXISTS \`$CLICKHOUSE_DB\`" >/dev/null
 _ch --query "RESTORE DATABASE \`$CLICKHOUSE_DB\` FROM Disk('backups', '$_name')" >/dev/null
