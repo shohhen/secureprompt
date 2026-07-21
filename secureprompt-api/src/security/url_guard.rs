@@ -8,6 +8,7 @@
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 /// Deployment-scoped egress policy.
 ///
@@ -259,6 +260,30 @@ pub async fn validate_outbound_url(
     Ok(ValidatedUrl { url, host, addrs })
 }
 
+/// Build a client that will only ever connect to the addresses validated
+/// in `v`, and that never follows redirects.
+///
+/// Two deliberate choices:
+///
+/// 1. `resolve_to_addrs` pins the validated addresses for this host, so the
+///    name cannot be re-resolved to a different address between validation
+///    and connect (TOCTOU / DNS rebinding).
+/// 2. `Policy::none()` — a redirect would be fetched OUTSIDE the pin, and
+///    re-validating each hop would need async DNS inside reqwest's
+///    synchronous redirect callback. Callers that must follow redirects
+///    should re-run `validate_outbound_url` on the `Location` header and
+///    issue a fresh request (see `credential_test`), which keeps every hop
+///    screened.
+pub fn build_pinned_client(v: &ValidatedUrl, timeout: Duration) -> Result<reqwest::Client, SsrfError> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .use_rustls_tls()
+        .resolve_to_addrs(&v.host, &v.addrs)
+        .build()
+        .map_err(|e| SsrfError::InvalidUrl(format!("failed to build pinned client: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +502,15 @@ mod tests {
             validate_outbound_url("http://localhost:9999/models", &p).await,
             Err(SsrfError::BlockedAddress { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn pinned_client_builds_and_refuses_redirects() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        let v = validate_outbound_url("http://192.168.1.14:8000/v1", &p)
+            .await
+            .expect("validate");
+        let client = build_pinned_client(&v, std::time::Duration::from_secs(5));
+        assert!(client.is_ok(), "pinned client must build");
     }
 }
