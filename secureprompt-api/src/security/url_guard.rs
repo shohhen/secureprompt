@@ -6,6 +6,7 @@
 //! (TOCTOU / DNS-rebinding defence).
 
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Deployment-scoped egress policy.
@@ -208,6 +209,56 @@ pub fn parse_and_check_url(raw: &str) -> Result<reqwest::Url, SsrfError> {
     Ok(url)
 }
 
+/// A URL that passed every egress check, together with the exact addresses
+/// it resolved to. Callers MUST connect using these addresses (see
+/// `build_pinned_client`) rather than re-resolving the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedUrl {
+    pub url: reqwest::Url,
+    pub host: String,
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// Full egress validation: structure, denied hosts, DNS resolution, and
+/// range screening of EVERY resolved address.
+///
+/// Screening every resolved address (not just an IP literal) is what stops
+/// `evil.example.com A 169.254.169.254` from walking straight through.
+pub async fn validate_outbound_url(
+    raw: &str,
+    policy: &EgressPolicy,
+) -> Result<ValidatedUrl, SsrfError> {
+    let url = parse_and_check_url(raw)?;
+    let host = url.host_str().ok_or(SsrfError::MissingHost)?.to_ascii_lowercase();
+
+    if ALWAYS_DENIED_HOSTS.contains(&host.as_str())
+        || policy
+            .extra_denied_hosts
+            .iter()
+            .any(|h| h.to_ascii_lowercase() == host)
+    {
+        return Err(SsrfError::DeniedHost(host));
+    }
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| SsrfError::DnsFailure(e.to_string()))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(SsrfError::DnsFailure(format!("{host} resolved to no addresses")));
+    }
+
+    for sa in &addrs {
+        if let Some(reason) = classify_ip(sa.ip(), policy.allow_private_ranges) {
+            return Err(SsrfError::BlockedAddress { host, addr: sa.ip(), reason });
+        }
+    }
+
+    Ok(ValidatedUrl { url, host, addrs })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +412,70 @@ mod tests {
     fn accepts_ordinary_http_and_https() {
         assert!(parse_and_check_url("https://api.openai.com/v1").is_ok());
         assert!(parse_and_check_url("  http://example.com:8080/x  ").is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_ip_literal_in_blocked_range() {
+        let p = EgressPolicy::deny_private();
+        match validate_outbound_url("http://169.254.169.254/latest/meta-data/", &p).await {
+            Err(SsrfError::BlockedAddress { reason, .. }) => {
+                assert_eq!(reason, "cloud metadata endpoint");
+            }
+            other => panic!("metadata IP must be blocked, got {other:?}"),
+        }
+        assert!(matches!(
+            validate_outbound_url("http://127.0.0.1:8080/models", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+        assert!(matches!(
+            validate_outbound_url("http://192.168.1.14/v1", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn allows_private_literal_when_policy_permits() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        let v = validate_outbound_url("http://192.168.1.14:8000/v1", &p)
+            .await
+            .expect("on-prem private endpoint must be allowed");
+        assert_eq!(v.host, "192.168.1.14");
+        // ...but metadata is still refused under the same policy.
+        assert!(matches!(
+            validate_outbound_url("http://169.254.169.254/", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_always_denied_hostnames() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        assert_eq!(
+            validate_outbound_url("http://metadata.google.internal/x", &p).await,
+            Err(SsrfError::DeniedHost("metadata.google.internal".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_extra_denied_hosts_case_insensitively() {
+        let p = EgressPolicy {
+            allow_private_ranges: false,
+            extra_denied_hosts: vec!["Blocked.Example.COM".into()],
+        };
+        assert_eq!(
+            validate_outbound_url("https://blocked.example.com/v1", &p).await,
+            Err(SsrfError::DeniedHost("blocked.example.com".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_localhost_name_to_blocked_address() {
+        // Name-based bypass: "localhost" is not an IP literal, so this only
+        // fails if DNS resolution actually happens before classification.
+        let p = EgressPolicy::deny_private();
+        assert!(matches!(
+            validate_outbound_url("http://localhost:9999/models", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
     }
 }

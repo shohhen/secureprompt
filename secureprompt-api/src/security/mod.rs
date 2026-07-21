@@ -6,9 +6,6 @@
 
 pub mod url_guard;
 
-// NOTE: `build_pinned_client`, `validate_outbound_url`, and `ValidatedUrl` are
-// added to this re-export list by Task 4 (DNS resolution / async validation)
-// and Task 5 (pinned HTTP client builder) once `url_guard` defines them. The
-// plan's mod.rs listing shows the final state; re-exporting them here before
-// they exist does not compile, so Task 1 exports only what it produces.
-pub use url_guard::{EgressPolicy, SsrfError};
+// NOTE: `build_pinned_client` is added to this re-export list by Task 5
+// (pinned HTTP client builder) once `url_guard` defines it.
+pub use url_guard::{validate_outbound_url, EgressPolicy, SsrfError, ValidatedUrl};
