@@ -10,5 +10,6 @@ pub mod pipeline;
 pub mod policy;
 pub mod providers;
 pub mod redis;
+pub mod security;
 pub mod token_usage;
 pub mod vault;
