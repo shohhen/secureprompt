@@ -124,8 +124,10 @@ fn validate_vertex_region(region: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// GCP project IDs are `[a-z0-9-]` (6-30 chars). Rejecting anything else
-/// prevents path traversal / query injection into the request URL.
+/// GCP project IDs use `[a-z0-9-]`. We enforce non-empty and ≤40 chars and
+/// reject any other character, which prevents path traversal / query
+/// injection into the request URL. (We don't reproduce GCP's exact 6-30
+/// length rule — the charset restriction is what closes the injection.)
 fn validate_vertex_project(project: &str) -> bool {
     !project.is_empty()
         && project.len() <= 40
@@ -172,7 +174,11 @@ async fn probe_vertex(
     let url = format!(
         "https://{host}/v1/projects/{project}/locations/{region}/publishers/google/models"
     );
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return TestResult::err(format!("http client: {e}")),
     };

@@ -159,6 +159,12 @@ fn classify_v4(v4: Ipv4Addr, allow_private: bool) -> Option<&'static str> {
     if v4.is_unspecified() {
         return Some("unspecified");
     }
+    // 0.0.0.0/8 ("this network", RFC 1122): 0.x.x.x can address local
+    // hosts on Linux, so block the whole block — not just 0.0.0.0, which
+    // the unspecified check above already caught with a more specific reason.
+    if v4.octets()[0] == 0 {
+        return Some("this-network");
+    }
     if is_cgnat_v4(v4) {
         return Some("CGNAT");
     }
@@ -328,6 +334,14 @@ mod tests {
         // legitimate *remote* provider endpoint.
         assert_eq!(classify_ip(v4(127, 0, 0, 1), true), Some("loopback"));
         assert_eq!(classify_ip(v4(169, 254, 1, 1), true), Some("link-local"));
+    }
+
+    #[test]
+    fn blocks_this_network_0_0_0_0_slash_8() {
+        assert_eq!(classify_ip(v4(0, 0, 0, 1), false), Some("this-network"));
+        assert_eq!(classify_ip(v4(0, 255, 1, 2), true), Some("this-network"));
+        // 0.0.0.0 itself stays "unspecified" (checked before this-network).
+        assert_eq!(classify_ip(v4(0, 0, 0, 0), false), Some("unspecified"));
     }
 
     #[test]
