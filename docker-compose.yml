@@ -110,6 +110,21 @@ services:
       timeout: 5s
       retries: 10
 
+  backup:
+    build:
+      context: ./scripts/backup
+    profiles: ["backup"]
+    depends_on: [postgres, clickhouse, qdrant]
+    environment:
+      SECUREPROMPT_BACKUP_KEY: ${SECUREPROMPT_BACKUP_KEY:-dev-backup-key-change-me}
+      PGHOST: postgres
+      CLICKHOUSE_HOST: clickhouse
+      QDRANT_URL: http://qdrant:6333
+      CH_BACKUP_MOUNT: /var/lib/clickhouse/backups
+    volumes:
+      - ./backups:/backups
+      - clickhouse_backups:/var/lib/clickhouse/backups
+
   api:
     build:
       context: .
