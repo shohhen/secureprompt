@@ -108,6 +108,22 @@ pub(crate) fn classify_ip(addr: IpAddr, allow_private: bool) -> Option<&'static 
             if v6.is_unspecified() {
                 return Some("unspecified");
             }
+            // Deprecated IPv4-compatible form (::a.b.c.d, RFC 4291): first six
+            // segments are zero and the low 32 bits embed a v4 address.
+            // `to_ipv4_mapped()` does NOT unwrap this form, so `::169.254.169.254`
+            // would otherwise fall through to None and defeat the metadata
+            // invariant. Runs after the loopback/unspecified special cases above so
+            // `::` and `::1` keep their v6 meaning.
+            let seg = v6.segments();
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return classify_v4(v4, allow_private);
+            }
             if v6.is_multicast() {
                 return Some("multicast");
             }
@@ -240,6 +256,22 @@ mod tests {
         assert_eq!(classify_ip(mapped, true), Some("cloud metadata endpoint"));
         let mapped_priv = IpAddr::V6(Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped());
         assert_eq!(classify_ip(mapped_priv, false), Some("private range"));
+    }
+
+    #[test]
+    fn blocks_ipv4_compatible_ipv6_metadata_and_private() {
+        // Deprecated ::a.b.c.d form must NOT bypass classification.
+        let meta: IpAddr = "::169.254.169.254".parse().unwrap();
+        assert_eq!(classify_ip(meta, true), Some("cloud metadata endpoint"));
+        assert_eq!(classify_ip(meta, false), Some("cloud metadata endpoint"));
+
+        let priv_: IpAddr = "::10.0.0.5".parse().unwrap();
+        assert_eq!(classify_ip(priv_, false), Some("private range"));
+        assert_eq!(classify_ip(priv_, true), None); // relaxed only when allowed
+
+        // ::1 and :: keep their v6 meaning, not reinterpreted as v4.
+        assert_eq!(classify_ip("::1".parse().unwrap(), false), Some("loopback"));
+        assert_eq!(classify_ip("::".parse().unwrap(), false), Some("unspecified"));
     }
 
     #[test]
