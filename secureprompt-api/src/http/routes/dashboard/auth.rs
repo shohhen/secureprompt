@@ -38,7 +38,7 @@ use crate::{
         refresh_token_repo::RotationOutcome,
         user_repo::{self, UserRepository},
     },
-    http::middleware::jwt_auth::{self, Claims, JwtAuthContext},
+    http::middleware::jwt_auth::{self, Claims, JwtAuthContext, UserRole},
     redis as sp_redis,
 };
 
@@ -184,7 +184,117 @@ pub async fn token(
         return generic_401(None);
     }
 
-    issue_token_pair(&state, creds.id, creds.workspace_id, &creds.role, &creds.email).await
+    // 2FA (Task 5): parse the DB role string once so `decide_2fa` gets a
+    // typed `UserRole` — same parser `jwt_auth::require` uses for the
+    // `role` claim, so an unrecognised value fails the same way here as it
+    // would fail on a subsequent authenticated request.
+    let role = match UserRole::from_db_str(&creds.role) {
+        Ok(role) => role,
+        Err(err) => return api_error_to_response(err),
+    };
+
+    match decide_2fa(role, creds.totp_confirmed_at.is_some()) {
+        TwoFaDecision::Access => {
+            // Routed through `TokenOr2fa::Access` (not `issue_token_pair`
+            // directly) so the 200 body is provably the same
+            // `(StatusCode::OK, JsonResponse(TokenResponse))` shape as the
+            // 202 branches below share a type with — see `TokenOr2fa`.
+            match build_token_pair_body(&state, creds.id, creds.workspace_id, &creds.role, &creds.email)
+                .await
+            {
+                Ok(body) => TokenOr2fa::Access(body).into_response(),
+                Err(err) => api_error_to_response(err),
+            }
+        }
+        TwoFaDecision::Challenge => {
+            match encode_purpose_token(&state, creds.id, creds.workspace_id, "2fa_challenge", 300) {
+                Ok(challenge_token) => TokenOr2fa::Challenge { challenge_token }.into_response(),
+                Err(err) => api_error_to_response(err),
+            }
+        }
+        TwoFaDecision::Enroll => {
+            match encode_purpose_token(&state, creds.id, creds.workspace_id, "2fa_enroll", 300) {
+                Ok(enrollment_token) => TokenOr2fa::Enroll { enrollment_token }.into_response(),
+                Err(err) => api_error_to_response(err),
+            }
+        }
+    }
+}
+
+// ---------- 2FA login-branch decision (Task 5) ----------
+
+/// Outcome of `decide_2fa`: what `POST /v1/auth/token` should do once the
+/// password has verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwoFaDecision {
+    /// No 2FA in play — proceed straight to `build_token_pair_body` (200).
+    Access,
+    /// Already enrolled (`totp_confirmed_at` is some) — every login from
+    /// here on is challenged, regardless of role. Issue a `2fa_challenge`
+    /// purpose token (202) instead of access/refresh.
+    Challenge,
+    /// Role requires 2FA (Owner/Admin) but the user hasn't completed
+    /// enrollment yet — issue a `2fa_enroll` purpose token (202) so the
+    /// client can drive first-time enrollment before any access token is
+    /// minted.
+    Enroll,
+}
+
+/// Pure decision function — no I/O, no `AppState` — so the branch the login
+/// handler takes is unit-testable without a database.
+///
+/// Truth table:
+///   * `totp_confirmed = true`  → `Challenge`, for every role (once
+///     enrolled, always challenged).
+///   * `totp_confirmed = false` + role ∈ {Owner, Admin} → `Enroll` (forced
+///     first-time enrollment for roles that must have 2FA).
+///   * `totp_confirmed = false` + any other role → `Access` (2FA optional,
+///     not enrolled).
+#[must_use]
+const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDecision {
+    if totp_confirmed {
+        TwoFaDecision::Challenge
+    } else if matches!(role, UserRole::Owner | UserRole::Admin) {
+        TwoFaDecision::Enroll
+    } else {
+        TwoFaDecision::Access
+    }
+}
+
+/// `POST /v1/auth/token` response shape (2FA, Task 5). `Access` carries the
+/// pre-existing `TokenResponse` unchanged — serializing it here is byte-
+/// identical to the old `(StatusCode::OK, JsonResponse(TokenResponse))`
+/// path the console + `/v1/auth/register` depend on. `Challenge`/`Enroll`
+/// are new 202 bodies that carry a short-lived purpose token instead of
+/// access/refresh.
+enum TokenOr2fa {
+    Access(TokenResponse),
+    Challenge { challenge_token: String },
+    Enroll { enrollment_token: String },
+}
+
+impl IntoResponse for TokenOr2fa {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
+            Self::Challenge { challenge_token } => (
+                StatusCode::ACCEPTED,
+                JsonResponse(json!({
+                    "twofa_required": true,
+                    "challenge_token": challenge_token,
+                })),
+            )
+                .into_response(),
+            Self::Enroll { enrollment_token } => (
+                StatusCode::ACCEPTED,
+                JsonResponse(json!({
+                    "enroll_required": true,
+                    "enrollment_token": enrollment_token,
+                })),
+            )
+                .into_response(),
+        }
+    }
 }
 
 /// `POST /v1/auth/refresh` — rotate a refresh token atomically.
@@ -577,3 +687,55 @@ struct UserIdentity {
 // in tests that mount this router.
 #[allow(dead_code)]
 type AuthResponseBody = Body;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhaustive truth table for `decide_2fa` (2FA, Task 5) — DB-free, no
+    /// `AppState` required. Covers every `UserRole` variant crossed with
+    /// both `totp_confirmed` states (10 combinations), matching the plan's
+    /// explicit cases plus the remaining roles for full coverage.
+    #[test]
+    fn decide_2fa_truth_table() {
+        let cases = [
+            // (role, totp_confirmed, expected)
+            (UserRole::Owner, false, TwoFaDecision::Enroll),
+            (UserRole::Admin, false, TwoFaDecision::Enroll),
+            (UserRole::Owner, true, TwoFaDecision::Challenge),
+            (UserRole::Admin, true, TwoFaDecision::Challenge),
+            (UserRole::Viewer, false, TwoFaDecision::Access),
+            (UserRole::Developer, false, TwoFaDecision::Access),
+            (UserRole::Employee, false, TwoFaDecision::Access),
+            // Once enrolled, every role is challenged — not just Owner/Admin.
+            (UserRole::Viewer, true, TwoFaDecision::Challenge),
+            (UserRole::Developer, true, TwoFaDecision::Challenge),
+            (UserRole::Employee, true, TwoFaDecision::Challenge),
+        ];
+
+        for (role, totp_confirmed, expected) in cases {
+            let actual = decide_2fa(role, totp_confirmed);
+            assert_eq!(
+                actual, expected,
+                "decide_2fa({role:?}, totp_confirmed={totp_confirmed}) = {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_2fa_confirmed_always_wins_over_role() {
+        // Regression guard for the "once enrolled, always challenged"
+        // invariant: even a role that doesn't *require* 2FA (Viewer) must
+        // still be challenged if it has previously confirmed enrollment
+        // (e.g. an opt-in Viewer per Task 6's enroll flow).
+        for role in [
+            UserRole::Owner,
+            UserRole::Admin,
+            UserRole::Developer,
+            UserRole::Employee,
+            UserRole::Viewer,
+        ] {
+            assert_eq!(decide_2fa(role, true), TwoFaDecision::Challenge);
+        }
+    }
+}

@@ -30,8 +30,11 @@ pub struct UserRow {
     pub totp_locked_until: Option<DateTime<Utc>>,
 }
 
-/// Extended projection used by `/v1/auth/token`. Includes `role` so the
-/// handler can embed it in the JWT claim without a second query.
+/// Extended projection used by `/v1/auth/token`.
+///
+/// Includes `role` so the handler can embed it in the JWT claim without a
+/// second query, and `totp_confirmed_at` (2FA, Task 5) so the login
+/// handler can decide access-vs-challenge-vs-enroll without a second query.
 #[derive(Debug, Clone)]
 pub struct UserCredentials {
     pub id: Uuid,
@@ -39,6 +42,7 @@ pub struct UserCredentials {
     pub email: String,
     pub password_hash: String,
     pub role: String,
+    pub totp_confirmed_at: Option<DateTime<Utc>>,
 }
 
 /// Process-lifetime cached dummy Argon2id hash. The login handler runs
@@ -178,8 +182,10 @@ impl UserRepository {
         Ok(row.get::<i64, _>("n"))
     }
 
-    /// Look up a user by email including the `role` column. Used by
-    /// `/v1/auth/token`.
+    /// Look up a user by email including the `role` column and TOTP
+    /// enrollment state. Used by `/v1/auth/token` (2FA, Task 5 — the
+    /// `totp_confirmed_at` column feeds `decide_2fa` so the handler can
+    /// branch access/challenge/enroll without a second query).
     ///
     /// # Errors
     /// Returns `ApiError::Database` for pool/query failures.
@@ -188,7 +194,7 @@ impl UserRepository {
         email: &str,
     ) -> Result<Option<UserCredentials>, ApiError> {
         let row = sqlx::query(
-            "SELECT id, workspace_id, email, password_hash, role
+            "SELECT id, workspace_id, email, password_hash, role, totp_confirmed_at
              FROM users
              WHERE email = $1",
         )
@@ -202,6 +208,7 @@ impl UserRepository {
             email: record.get("email"),
             password_hash: record.get("password_hash"),
             role: record.get("role"),
+            totp_confirmed_at: record.get("totp_confirmed_at"),
         }))
     }
 
