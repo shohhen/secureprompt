@@ -113,6 +113,27 @@ pub async fn test_connection(
     }
 }
 
+/// Vertex regions are `[a-z0-9-]` only (e.g. `us-central1`) or `global`.
+/// Anything else can inject a different host into the `{region}-aiplatform`
+/// format string.
+fn validate_vertex_region(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 40
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// GCP project IDs are `[a-z0-9-]` (6-30 chars). Rejecting anything else
+/// prevents path traversal / query injection into the request URL.
+fn validate_vertex_project(project: &str) -> bool {
+    !project.is_empty()
+        && project.len() <= 40
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Vertex probe: mint an OAuth access token (SA JSON or ADC) and hit the
 /// publishers/models listing for the resolved region+project. Unlike the
 /// other providers, Vertex doesn't use a static bearer API key, so this
@@ -137,6 +158,12 @@ async fn probe_vertex(
             None => return TestResult::err("vertex: project required (set project or use an SA key)"),
         },
     };
+    if !validate_vertex_region(region) {
+        return TestResult::err("vertex: invalid region format");
+    }
+    if !validate_vertex_project(&project) {
+        return TestResult::err("vertex: invalid project format");
+    }
     let host = if region == "global" {
         "aiplatform.googleapis.com".to_owned()
     } else {
@@ -450,5 +477,24 @@ mod ssrf_tests {
         let r = test_connection("openai", "sk-test", Some("file:///etc/passwd"), None, None).await;
         assert!(!r.success);
         assert!(r.error.unwrap_or_default().contains("scheme"));
+    }
+
+    #[test]
+    fn vertex_region_rejects_host_injection() {
+        assert!(validate_vertex_region("us-central1"));
+        assert!(validate_vertex_region("global"));
+        assert!(validate_vertex_region("europe-west4"));
+
+        for bad in ["evil.com#", "evil.com/", "a@evil.com", "a:1", "us central1", "../x", ""] {
+            assert!(!validate_vertex_region(bad), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn vertex_project_rejects_path_injection() {
+        assert!(validate_vertex_project("my-project-123"));
+        for bad in ["../../etc", "a/b", "a?b", "a#b", ""] {
+            assert!(!validate_vertex_project(bad), "{bad} must be rejected");
+        }
     }
 }
