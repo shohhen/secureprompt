@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod app_state;
+pub mod auth;
 pub mod db;
 pub mod detection;
 pub mod http;
