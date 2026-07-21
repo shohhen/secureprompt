@@ -99,6 +99,8 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/backup_disk.xml:/etc/clickhouse-server/config.d/backup_disk.xml:ro
+      - clickhouse_backups:/var/lib/clickhouse/backups
     ports:
       - "8123:8123"
       - "9000:9000"
@@ -331,6 +333,7 @@ services:
 volumes:
   postgres_data:
   clickhouse_data:
+  clickhouse_backups:
   grafana_data:
   qdrant_data:
   librechat_mongo_data:
