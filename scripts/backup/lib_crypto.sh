@@ -37,9 +37,14 @@ sp_seal() {
         echo "sp_crypto: encryption failed for $_in" >&2; rm -f "$_out"; return 1
     fi
     # MAC over the whole sealed file (IV + ciphertext) — encrypt-then-MAC.
-    if ! openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SP_MAC_KEY" -r "$_out" \
-        | cut -d' ' -f1 > "$_out.mac"; then
+    # Capture dgst's output in a variable so its OWN exit status is checked:
+    # a `dgst | cut > file` pipeline reports cut's status (POSIX sh has no
+    # pipefail), which succeeds even if dgst failed. Do not refactor to a pipe.
+    _mac=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SP_MAC_KEY" -r "$_out") || {
         echo "sp_crypto: MAC computation failed for $_out" >&2
+        rm -f "$_out"; return 1; }
+    if ! printf '%s\n' "${_mac%% *}" > "$_out.mac"; then
+        echo "sp_crypto: failed to write MAC for $_out" >&2
         rm -f "$_out" "$_out.mac"; return 1
     fi
 }
