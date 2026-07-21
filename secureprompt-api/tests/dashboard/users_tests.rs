@@ -102,6 +102,7 @@ fn make_jwt(workspace_id: Uuid, user_id: Uuid, role: &str) -> String {
         jti: Uuid::new_v4().to_string(),
         exp: (chrono::Utc::now() + chrono::Duration::seconds(900)).timestamp(),
         iat: chrono::Utc::now().timestamp(),
+        purpose: None,
     };
     encode(
         &Header::new(Algorithm::HS256),

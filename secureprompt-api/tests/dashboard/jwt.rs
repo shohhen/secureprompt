@@ -51,10 +51,28 @@ fn mint_token(encoding: &EncodingKey, ttl_secs: i64) -> (String, Claims) {
         iat: now.timestamp(),
         exp: (now + Duration::seconds(ttl_secs)).timestamp(),
         jti: Uuid::new_v4().to_string(),
+        purpose: None,
     };
     let token = encode(&Header::new(Algorithm::HS256), &claims, encoding)
         .expect("encode test token");
     (token, claims)
+}
+
+/// 2FA (Task 4): mint a single-purpose token the way
+/// `dashboard::auth::encode_purpose_token` does — same claim shape, just
+/// with `purpose = Some(purpose)` set.
+fn mint_purpose_token(encoding: &EncodingKey, purpose: &str, ttl_secs: i64) -> String {
+    let now = Utc::now();
+    let claims = Claims {
+        sub: Uuid::new_v4(),
+        ws: Uuid::new_v4(),
+        role: String::new(),
+        iat: now.timestamp(),
+        exp: (now + Duration::seconds(ttl_secs)).timestamp(),
+        jti: Uuid::new_v4().to_string(),
+        purpose: Some(purpose.to_string()),
+    };
+    encode(&Header::new(Algorithm::HS256), &claims, encoding).expect("encode purpose token")
 }
 
 fn build_state(pool: PgPool) -> AppState {
@@ -178,6 +196,36 @@ async fn happy_path_accepts_valid_token(pool: PgPool) -> sqlx::Result<()> {
         StatusCode::OK,
         "valid JWT must yield 200 on the protected route"
     );
+
+    Ok(())
+}
+
+/// 2FA (Task 4) — the core security boundary: a challenge/enrollment token
+/// (`purpose = Some(_)`) must be rejected by the normal JWT auth middleware
+/// even though it is validly signed and unexpired. Only a purposeless
+/// access token may reach a protected route.
+#[sqlx::test]
+async fn purpose_token_rejected_as_access_token(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+    let app = router(state.clone());
+
+    for purpose in ["2fa_challenge", "2fa_enroll"] {
+        let token =
+            mint_purpose_token(&EncodingKey::from_secret(test_secret().as_bytes()), purpose, 300);
+
+        let request = Request::builder()
+            .uri("/protected")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("valid request");
+
+        let response = app.clone().oneshot(request).await.expect("router runs");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a {purpose} token must NOT authorize a normal protected route"
+        );
+    }
 
     Ok(())
 }

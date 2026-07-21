@@ -26,7 +26,7 @@ use axum::{
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, Algorithm, Header};
+use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -230,6 +230,7 @@ pub async fn refresh(
                 iat: now.timestamp(),
                 exp: access_exp.timestamp(),
                 jti,
+                purpose: None,
             };
             let access_token = match encode_access(&state, &access_claims) {
                 Ok(token) => token,
@@ -391,6 +392,7 @@ pub(crate) async fn build_token_pair_body(
         iat: now.timestamp(),
         exp: access_exp.timestamp(),
         jti,
+        purpose: None,
     };
     let access_token = encode_access(state, &access_claims)?;
 
@@ -430,6 +432,74 @@ pub(crate) async fn issue_token_pair(
 fn encode_access(state: &AppState, claims: &Claims) -> Result<String, ApiError> {
     encode(&Header::new(Algorithm::HS256), claims, &state.jwt.encoding)
         .map_err(|error| ApiError::Internal(format!("jwt encode failed: {error}")))
+}
+
+/// Mint a short-lived, single-purpose token for the 2FA challenge/enrollment flow.
+///
+/// Signed with the exact same key + alg as `encode_access` — verification
+/// stays on one code path — but the `purpose` claim (`Some(purpose)`) makes
+/// `jwt_auth::require` (the normal-route auth middleware) reject it outright
+/// (see `jwt_auth::is_access_claims`), so it can only ever be redeemed by the
+/// dedicated `/v1/auth/2fa/*` extractor that calls `decode_purpose_token`
+/// below.
+///
+/// `role` is intentionally omitted from the signature (per plan Task 4) —
+/// a purpose token never reaches role-gated logic, so an empty placeholder
+/// is stored rather than a real role.
+///
+/// # Errors
+/// Returns `ApiError::Internal` if JWT encoding fails (mirrors `encode_access`).
+pub fn encode_purpose_token(
+    state: &AppState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    purpose: &str,
+    ttl_secs: i64,
+) -> Result<String, ApiError> {
+    let now = Utc::now();
+    let claims = Claims {
+        sub: user_id,
+        ws: workspace_id,
+        role: String::new(),
+        iat: now.timestamp(),
+        exp: (now + Duration::seconds(ttl_secs)).timestamp(),
+        jti: Uuid::new_v4().to_string(),
+        purpose: Some(purpose.to_owned()),
+    };
+    encode_access(state, &claims)
+}
+
+/// Verify a token minted by `encode_purpose_token`: signature, expiry, and
+/// that its `purpose` claim matches `expected_purpose` exactly. Returns
+/// `(user_id, workspace_id)` on success.
+///
+/// A normal access token (`purpose = None`) or a token for a *different*
+/// purpose (e.g. presenting a `2fa_enroll` token where `2fa_challenge` is
+/// required) is rejected with the same generic `Unauthorized` used
+/// elsewhere on the auth surface, so failure reasons don't leak.
+///
+/// # Errors
+/// Returns `ApiError::Unauthorized` on a bad/expired signature or a
+/// missing/mismatched `purpose` claim.
+pub fn decode_purpose_token(
+    state: &AppState,
+    token: &str,
+    expected_purpose: &str,
+) -> Result<(Uuid, Uuid), ApiError> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 60;
+    validation.validate_exp = true;
+    validation.set_required_spec_claims(&["exp", "iat", "sub"]);
+
+    let decoded = decode::<Claims>(token, &state.jwt.decoding, &validation)
+        .map_err(|_| ApiError::Unauthorized("Invalid credentials".into()))?;
+    let claims = decoded.claims;
+
+    if claims.purpose.as_deref() != Some(expected_purpose) {
+        return Err(ApiError::Unauthorized("Invalid credentials".into()));
+    }
+
+    Ok((claims.sub, claims.ws))
 }
 
 fn random_refresh_token() -> String {
