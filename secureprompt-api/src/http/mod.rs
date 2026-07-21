@@ -42,7 +42,9 @@ pub fn build_router(state: AppState) -> Router {
         .nest(
             "/v1/auth",
             routes::dashboard::auth::build_router(state.clone())
-                .merge(routes::dashboard::oidc::routes()),
+                .merge(routes::dashboard::oidc::routes())
+                // 2FA (Task 6): `/v1/auth/2fa/{enroll,verify}` — not JWT-gated here; see twofactor.rs.
+                .nest("/2fa", routes::dashboard::twofactor::routes()),
         )
         .nest(
             "/v1/analytics",

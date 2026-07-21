@@ -19,6 +19,9 @@ pub mod providers;
 pub mod requests;
 pub mod role;
 pub mod secure_mode;
+// 2FA (Task 6): `/v1/auth/2fa/{enroll,verify}` — TOTP enrollment + first
+// confirmation. Mounted under `/v1/auth` in `http/mod.rs` (Task 9).
+pub mod twofactor;
 pub mod users;
 
 // Task 5-01-C wires `auth` into `Router::nest("/v1/auth", ...)`.
