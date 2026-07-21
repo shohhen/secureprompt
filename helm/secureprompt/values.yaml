@@ -246,6 +246,16 @@ license:
 kms:
   backend: "file"
 
+backup:
+  enabled: false
+  schedule: "0 2 * * *"
+  image: "sp-backup:latest"
+  keySecret: "secureprompt-backup-key"
+  retentionDaily: 7
+  # PVC mounted at /backups by the CronJob.
+  storageSize: 20Gi
+  storageClass: "standard-rwo"
+
 serviceMesh:
   enabled: false
   provider: "linkerd"
