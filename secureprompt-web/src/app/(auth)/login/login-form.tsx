@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
 import { useForm } from "react-hook-form";
@@ -17,14 +17,9 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import {
-  loginStep1,
-  enroll,
-  verify2fa,
-  type EnrollResult,
-  type Tokens,
-} from "@/lib/twofa-api";
+import { loginStep1, type Tokens } from "@/lib/twofa-api";
 import { TwoFactorChallenge } from "./two-factor-challenge";
+import { TwoFactorEnroll } from "./two-factor-enroll";
 
 const loginSchema = z.object({
   email: z.string().email("Enter a valid email address"),
@@ -179,146 +174,5 @@ export function LoginForm({ callbackUrl }: LoginFormProps) {
         </Button>
       </form>
     </Form>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Temporary placeholder for Task 6
-// (docs/superpowers/plans/2026-07-22-2fa-console.md).
-//
-// This is NOT the real enrollment screen — just enough to compile, wire the
-// branching above end-to-end, and exercise the real `enroll()`/`verify2fa()`
-// calls against the backend. It calls `enroll(bearer)` on mount (the
-// backend's `/2fa/verify` 401s until `/2fa/enroll` has created+stored a
-// secret) and renders the raw `secretB32` for manual authenticator entry
-// plus the backup codes — no QR yet, but a user CAN complete enrollment
-// with it. Task 6 replaces this with `./two-factor-enroll.tsx` (adds the
-// `TwoFactorQr` QR code + nicer layout, same `enroll()`/`verify2fa()`
-// calls), keeping the SAME prop contract used here:
-//
-//   TwoFactorEnroll({ bearer, onSuccess }: { bearer: string; onSuccess: (t: Tokens) => void })
-// ---------------------------------------------------------------------------
-
-function TwoFactorEnroll({
-  bearer,
-  onSuccess,
-}: {
-  bearer: string;
-  onSuccess: (t: Tokens) => void;
-}) {
-  const [code, setCode] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [enrollment, setEnrollment] = useState<EnrollResult | null>(null);
-  const [loadError, setLoadError] = useState(false);
-
-  // Deliberately no ref-guard against React strict-mode's dev
-  // double-invoke: an early version tried to dedupe with a `startedRef`,
-  // but combined with the per-invocation `cancelled` flag that caused a
-  // PERMANENT loading hang under strict mode (the exact environment
-  // Task 8's KPI demo runs in via `pnpm dev`) — the 1st invocation's
-  // result got dropped by its own cleanup-set `cancelled`, and the 2nd
-  // (persisting) invocation's early-return on `startedRef` meant nothing
-  // ever called `setEnrollment`/`setLoadError`. The plain cancelled-only
-  // pattern below lets `enroll()` fire twice in dev; that's harmless — the
-  // backend's /2fa/enroll overwrites the secret + backup codes on repeat
-  // calls for an unconfirmed account — and only the second (persisting)
-  // invocation's result reaches state, matching the actually-stored
-  // secret. Production has no double-invoke at all.
-  useEffect(() => {
-    let cancelled = false;
-    enroll(bearer)
-      .then((res) => {
-        if (cancelled) return;
-        if (res) setEnrollment(res);
-        else setLoadError(true);
-      })
-      .catch(() => {
-        if (!cancelled) setLoadError(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [bearer]);
-
-  async function submit() {
-    setBusy(true);
-    try {
-      const tokens = await verify2fa(bearer, code);
-      if (!tokens) {
-        toast.error("Invalid code. Please try again.");
-        setCode("");
-        return;
-      }
-      onSuccess(tokens);
-    } catch {
-      toast.error("Something went wrong. Please try again.");
-      setCode("");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (loadError) {
-    return (
-      <p className="text-sm text-destructive">
-        Something went wrong setting up two-factor authentication. Please try
-        again.
-      </p>
-    );
-  }
-
-  if (!enrollment) {
-    return (
-      <p className="text-sm text-muted-foreground">
-        Setting up two-factor authentication…
-      </p>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      <p className="text-sm text-muted-foreground">
-        Two-factor authentication is required for this account. Add the
-        secret below to your authenticator app (Google Authenticator,
-        1Password, etc. — manual entry; a scannable QR ships in a later
-        update), then enter the code it generates to continue.
-      </p>
-      <div className="space-y-1">
-        <p className="text-xs font-medium text-muted-foreground">
-          Manual entry secret
-        </p>
-        <code className="block select-all break-all rounded-md border bg-muted px-3 py-2 text-sm">
-          {enrollment.secretB32}
-        </code>
-      </div>
-      <div className="space-y-1">
-        <p className="text-xs font-medium text-muted-foreground">
-          Backup codes — save these now, shown only once
-        </p>
-        <ul className="grid grid-cols-2 gap-1 rounded-md border bg-muted p-3 font-mono text-sm">
-          {enrollment.backupCodes.map((backupCode) => (
-            <li key={backupCode} className="select-all">
-              {backupCode}
-            </li>
-          ))}
-        </ul>
-      </div>
-      <Input
-        inputMode="numeric"
-        autoComplete="one-time-code"
-        autoFocus
-        disabled={busy}
-        value={code}
-        onChange={(e) => setCode(e.target.value)}
-      />
-      <Button
-        type="button"
-        className="w-full"
-        disabled={busy || !code}
-        onClick={submit}
-      >
-        {busy ? "Verifying…" : "Verify & continue"}
-      </Button>
-    </div>
   );
 }
