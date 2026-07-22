@@ -108,6 +108,58 @@ pub async fn seed_unique_workspace(pool: &PgPool) -> sqlx::Result<UniqueWorkspac
     })
 }
 
+/// Mint a JWT access token directly for the given workspace/user/role,
+/// bypassing the `/v1/auth/token` HTTP endpoint entirely.
+///
+/// 2FA collateral fix: `POST /v1/auth/token` now forces Owner/Admin roles
+/// into the enrollment branch (202 `enroll_required`) instead of returning
+/// an access token (see `dashboard::routes::auth::decide_2fa`). Tests that
+/// only need an authenticated admin *session* to exercise some other
+/// surface (budgets, RLS, ...) — and are not themselves testing the login
+/// flow — should mint the token directly with this helper instead of
+/// logging in as an Owner/Admin fixture. This is the same pattern
+/// `dashboard::settings_tests::mint_jwt` used before 2FA existed, extracted
+/// here so every fixture-consuming test file can share it. Tests that
+/// genuinely exercise the login/refresh/logout flow itself must keep going
+/// through the real HTTP endpoint (see `dashboard::auth_tests`).
+#[allow(dead_code)]
+pub fn mint_jwt(secret: &str, workspace_id: Uuid, user_id: Uuid, role: &str) -> String {
+    use chrono::{Duration, Utc};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+
+    // Deliberately omits the `purpose` claim (`purpose: Option<String>` on
+    // the real `jwt_auth::Claims`) so this always mints a normal, purposeless
+    // access token — the real struct marks it
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a
+    // missing field decodes as `None` exactly like a real access token.
+    #[derive(Serialize)]
+    struct Claims {
+        sub: Uuid,
+        ws: Uuid,
+        role: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
+    }
+
+    let now = Utc::now();
+    let claims = Claims {
+        sub: user_id,
+        ws: workspace_id,
+        role: role.to_owned(),
+        iat: now.timestamp(),
+        exp: (now + Duration::hours(1)).timestamp(),
+        jti: Uuid::new_v4().to_string(),
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("mint test JWT")
+}
+
 /// Hash a plaintext password with Argon2id using a fresh random salt.
 /// Used both by the fixture seeder and by the refresh-token tests.
 #[allow(dead_code)]

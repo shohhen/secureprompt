@@ -243,7 +243,7 @@ async fn get_empty(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
 
     let response = send_json(
         &router,
@@ -272,7 +272,7 @@ async fn put_happy(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
 
     let put_body = json!({
         "daily_token_limit": 100_000,
@@ -345,7 +345,7 @@ async fn idor_guard(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws_b.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws_a.admin_email, &ws_a.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
 
     // IDOR via PUT — target workspace B while signed in as admin A.
     let response = send_json(
@@ -383,7 +383,7 @@ async fn rls_isolation(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws_b.workspace_id).await;
 
     let (_state, router) = build_app(pool.clone());
-    let token = login(&router, &ws_a.admin_email, &ws_a.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
 
     let response = send_json(
         &router,
@@ -425,7 +425,7 @@ async fn current_usage_from_redis(pool: PgPool) -> sqlx::Result<()> {
     set_counter(&redis_pool, &daily, 500).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
 
     let response = send_json(
         &router,
@@ -460,7 +460,7 @@ async fn daily_counter(pool: PgPool) -> sqlx::Result<()> {
     // Use the repo indirectly via a PUT through the router so this test
     // stays hermetic (no private-module access).
     let (state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
     let response = send_json(
         &router,
         "PUT",
@@ -506,7 +506,7 @@ async fn block_402(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
     let response = send_json(
         &router,
         "PUT",
@@ -548,7 +548,7 @@ async fn warn_header(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
     let response = send_json(
         &router,
         "PUT",
@@ -597,7 +597,7 @@ async fn flag_silent(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
     let response = send_json(
         &router,
         "PUT",
@@ -648,7 +648,7 @@ async fn parallel_no_bypass(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
     let response = send_json(
         &router,
         "PUT",
@@ -726,7 +726,7 @@ async fn prometheus_events(pool: PgPool) -> sqlx::Result<()> {
     flush_budget_keys(&redis_pool, ws.workspace_id).await;
 
     let (_state, router) = build_app(pool);
-    let token = login(&router, &ws.admin_email, &ws.password).await;
+    let token = fixtures::mint_jwt(TEST_JWT_SECRET, ws.workspace_id, ws.admin_id, "admin");
 
     // Behavior=block, Redis=2, limit=1 → one "block/exceeded" event.
     let _ = send_json(

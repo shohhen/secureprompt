@@ -192,6 +192,12 @@ async fn token_flow(pool: PgPool) -> sqlx::Result<()> {
 
 /// VALIDATION 5-01-02: refresh rotation — new pair issued, old refresh
 /// row has `revoked_at IS NOT NULL`.
+///
+/// 2FA collateral fix: uses `VIEWER_A_EMAIL` (2FA-optional, never enrolled)
+/// rather than `ADMIN_A_EMAIL` — this test is about refresh-token rotation
+/// mechanics, not role behavior, and `decide_2fa` now forces Owner/Admin
+/// logins into the 202 enrollment branch. See `token_flow`'s doc comment
+/// for the same reasoning.
 #[sqlx::test]
 async fn refresh_rotation(pool: PgPool) -> sqlx::Result<()> {
     let _seeded = fixtures::seed_two_workspaces(&pool).await?;
@@ -201,7 +207,7 @@ async fn refresh_rotation(pool: PgPool) -> sqlx::Result<()> {
         &router,
         "/v1/auth/token",
         serde_json::json!({
-            "email": fixtures::ADMIN_A_EMAIL,
+            "email": fixtures::VIEWER_A_EMAIL,
             "password": fixtures::SHARED_PASSWORD,
         }),
         &[],
@@ -245,6 +251,10 @@ async fn refresh_rotation(pool: PgPool) -> sqlx::Result<()> {
 
 /// VALIDATION 5-01-03: replay detection — replaying a revoked refresh
 /// triggers `revoke_all_for_user`.
+///
+/// 2FA collateral fix: uses `VIEWER_A_EMAIL` for the same reason as
+/// `refresh_rotation` above — this test is about replay-detection
+/// mechanics, not role behavior.
 #[sqlx::test]
 async fn refresh_replay_detect(pool: PgPool) -> sqlx::Result<()> {
     let seeded = fixtures::seed_two_workspaces(&pool).await?;
@@ -254,7 +264,7 @@ async fn refresh_replay_detect(pool: PgPool) -> sqlx::Result<()> {
         &router,
         "/v1/auth/token",
         serde_json::json!({
-            "email": fixtures::ADMIN_A_EMAIL,
+            "email": fixtures::VIEWER_A_EMAIL,
             "password": fixtures::SHARED_PASSWORD,
         }),
         &[],
@@ -286,12 +296,12 @@ async fn refresh_replay_detect(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(replay_status, StatusCode::UNAUTHORIZED, "replay must 401");
     assert_eq!(replay_body["error"]["code"], "invalid_credentials");
 
-    // All active refresh rows for admin_a must now be revoked.
+    // All active refresh rows for viewer_a must now be revoked.
     let active: i64 = sqlx::query(
         "SELECT COUNT(*)::bigint AS c FROM refresh_tokens
          WHERE user_id = $1 AND revoked_at IS NULL",
     )
-    .bind(seeded.admin_a)
+    .bind(seeded.viewer_a)
     .fetch_one(&pool)
     .await?
     .get("c");
@@ -301,6 +311,10 @@ async fn refresh_replay_detect(pool: PgPool) -> sqlx::Result<()> {
 
 /// VALIDATION 5-01-04: logout blacklists the jti and subsequent use of
 /// the same access token yields 401 through the middleware.
+///
+/// 2FA collateral fix: uses `VIEWER_A_EMAIL` for the same reason as
+/// `refresh_rotation` above — this test is about jti-blacklist mechanics,
+/// not role behavior.
 #[sqlx::test]
 async fn logout_jti(pool: PgPool) -> sqlx::Result<()> {
     let _seeded = fixtures::seed_two_workspaces(&pool).await?;
@@ -310,7 +324,7 @@ async fn logout_jti(pool: PgPool) -> sqlx::Result<()> {
         &router,
         "/v1/auth/token",
         serde_json::json!({
-            "email": fixtures::ADMIN_A_EMAIL,
+            "email": fixtures::VIEWER_A_EMAIL,
             "password": fixtures::SHARED_PASSWORD,
         }),
         &[],
