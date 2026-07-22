@@ -219,10 +219,22 @@ impl UserRepository {
     /// the caller encrypts it via `state.kms` before calling this; the
     /// repo never sees the plaintext secret.
     ///
+    /// Security fix (post-Task-6 review): also deletes every backup code
+    /// for `user_id` in the SAME transaction as the secret UPDATE. Backup
+    /// codes are single-use but `consume_backup_code` matches any row with
+    /// `used_at IS NULL` regardless of which secret/enrollment it was
+    /// issued under — without this, an old unused (e.g. leaked, or simply
+    /// never-used) backup code from a prior enrollment would remain a
+    /// permanent backdoor after a brand-new secret is set. The transaction
+    /// makes this atomic: a mid-way failure rolls back rather than leaving
+    /// a fresh secret paired with stale codes.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` if `user_id` doesn't exist,
-    /// `ApiError::Database` for pool/query failures.
+    /// `ApiError::Database` for pool/query/transaction failures.
     pub async fn set_totp_secret(&self, user_id: Uuid, encrypted: &[u8]) -> Result<(), ApiError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
         let result = sqlx::query(
             "UPDATE users
              SET totp_secret_encrypted = $2,
@@ -231,11 +243,23 @@ impl UserRepository {
         )
         .bind(user_id)
         .bind(encrypted)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
 
-        require_row(result, user_id)
+        if result.rows_affected() == 0 {
+            // Transaction drops here without commit → auto-rollback.
+            return Err(ApiError::NotFound(format!("user {user_id} not found")));
+        }
+
+        sqlx::query("DELETE FROM user_backup_codes WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
     }
 
     /// Mark enrollment complete after the first valid code is verified.

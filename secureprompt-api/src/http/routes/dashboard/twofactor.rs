@@ -56,11 +56,30 @@ const BACKUP_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 /// `POST /v1/auth/2fa/enroll` response — the ONLY time the plaintext secret
 /// and plaintext backup codes are ever shown.
-#[derive(Debug, Serialize)]
+///
+/// `Debug` is hand-rolled (not derived) and redacts `secret_b32`,
+/// `backup_codes`, AND `provisioning_uri` — the URI embeds the same secret
+/// as a `secret=` query parameter (RFC otpauth format), so redacting only
+/// the other two fields would still leak it via a stray
+/// `tracing::debug!("{:?}", resp)` on this struct.
+#[derive(Serialize)]
 pub struct EnrollResponse {
     pub provisioning_uri: String,
     pub secret_b32: String,
     pub backup_codes: Vec<String>,
+}
+
+impl std::fmt::Debug for EnrollResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollResponse")
+            .field("provisioning_uri", &"<redacted: embeds secret>")
+            .field("secret_b32", &"<redacted>")
+            .field(
+                "backup_codes",
+                &format!("<{} redacted>", self.backup_codes.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,13 +230,19 @@ fn strip_backup_code_format(code: &str) -> String {
 
 // ---------- Handlers ----------
 
-/// `POST /v1/auth/2fa/enroll` — start (or restart) TOTP enrollment.
+/// `POST /v1/auth/2fa/enroll` — start (or restart, if unconfirmed) TOTP
+/// enrollment.
+///
+/// Rejects with `409 Conflict` if the account already has CONFIRMED 2FA
+/// (see the `totp_confirmed_at` check below) — resetting a confirmed
+/// account must go through `/disable` (code-gated) first.
 ///
 /// Generates a new secret, encrypts it via `state.kms` and stores it
-/// unconfirmed (`set_totp_secret` clears `totp_confirmed_at`), generates and
-/// stores 10 hashed backup codes, and returns the provisioning URI +
-/// plaintext secret + plaintext backup codes — the only time either
-/// plaintext value is ever shown.
+/// unconfirmed (`set_totp_secret` clears `totp_confirmed_at` and — as of the
+/// Task 6 review fix — atomically deletes any backup codes left over from a
+/// prior enrollment), generates and stores 10 freshly hashed backup codes,
+/// and returns the provisioning URI + plaintext secret + plaintext backup
+/// codes — the only time either plaintext value is ever shown.
 pub async fn enroll(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (user_id, _workspace_id) = match accept_enroll_or_access(&state, &headers).await {
         Ok(pair) => pair,
@@ -232,6 +257,22 @@ pub async fn enroll(State(state): State<AppState>, headers: HeaderMap) -> Respon
         }
         Err(err) => return api_error_response(err),
     };
+
+    // Security fix (post-Task-6 review): a CONFIRMED account must not be
+    // re-enrollable via a bare access token — `set_totp_secret` clears
+    // `totp_confirmed_at`, so without this gate anyone holding an access
+    // token (e.g. a Viewer who never needed 2FA) could call `/enroll` on
+    // an already-2FA'd account and silently downgrade it back to
+    // password-only login. Fresh enrollment (`totp_confirmed_at` was never
+    // set) and forced re-enrollment (unconfirmed) are unaffected — only a
+    // CONFIRMED account is blocked. The documented reset path is
+    // `/disable` (which itself requires a valid code) followed by a fresh
+    // `/enroll`.
+    if user.totp_confirmed_at.is_some() {
+        return api_error_response(ApiError::Conflict(
+            "2FA is already enabled; disable it first".into(),
+        ));
+    }
 
     let secret_b32 = totp::generate_secret();
 
@@ -282,11 +323,12 @@ pub async fn enroll(State(state): State<AppState>, headers: HeaderMap) -> Respon
 
 /// `POST /v1/auth/2fa/verify` — confirm enrollment with the first valid code.
 ///
-/// On success, marks the account fully enrolled and issues a real
-/// access/refresh pair so enrollment flows straight into a logged-in
-/// session; on failure, records the attempt (feeding the same
-/// `totp_failed_attempts`/`totp_locked_until` lockout counters the Task 7
-/// challenge endpoint enforces) and returns 401.
+/// Enforces `totp_locked_until` up front (Task 6 review fix — `429` without
+/// attempting verification if still locked). On success, marks the account
+/// fully enrolled and issues a real access/refresh pair so enrollment flows
+/// straight into a logged-in session; on failure, records the attempt
+/// (`totp_failed_attempts`/`totp_locked_until` — the same columns the Task 7
+/// challenge endpoint shares) and returns 401.
 pub async fn verify(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -305,6 +347,21 @@ pub async fn verify(
         }
         Err(err) => return api_error_response(err),
     };
+
+    // Security fix (post-Task-6 review): enforce the lockout `verify()`
+    // itself writes via `record_totp_failure` below. Without this read,
+    // `totp_locked_until` was written but never consulted, so a locked
+    // account still allowed unthrottled code-guessing against this
+    // endpoint — Task 7's `/challenge` checks the same column; this closes
+    // the identical gap on `/verify`.
+    if let Some(locked_until) = user.totp_locked_until {
+        if locked_until > Utc::now() {
+            return api_error_response(ApiError::TooManyRequests(format!(
+                "too many attempts, locked until {}",
+                locked_until.to_rfc3339()
+            )));
+        }
+    }
 
     let Some(ciphertext) = user.totp_secret_encrypted.as_ref() else {
         // No enrollment in progress — same generic 401 as a bad code so the
