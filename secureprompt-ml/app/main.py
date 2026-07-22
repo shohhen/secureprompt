@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response
 from app import config
+from app import metrics
 from app.models import (
     NerRequest, NerResponse, NerEntity,
     InjectionRequest, InjectionResponse,
@@ -119,6 +120,8 @@ async def lifespan(app: FastAPI):
             drain_worker(_ner_queue_bulk, _process_batch, deadline_ms=50, max_batch=2)
         )
         _ready.set()
+        metrics.set_model_info(config.ACTIVE_NER_MODELS, config.ML_NER_BACKEND)
+        metrics.set_ready(True)
         yield
     else:
         # Encrypted-weights path: spawn a background task that waits for
@@ -139,15 +142,50 @@ async def lifespan(app: FastAPI):
                 _load_analyzer, _model_key
             )
             _ready.set()
+            metrics.set_model_info(config.ACTIVE_NER_MODELS, config.ML_NER_BACKEND)
+            metrics.set_ready(True)
 
         asyncio.create_task(_wait_for_key_then_load())
         yield
 
     _models.clear()
     _ready.clear()
+    metrics.set_ready(False)
 
 
 app = FastAPI(title="SecurePrompt ML Sidecar", lifespan=lifespan)
+
+# Prometheus scrape endpoint. Unauthenticated, matching the API's /metrics.
+app.mount("/metrics", metrics.metrics_asgi_app)
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Time every request and record it via app.metrics, keyed by the
+    matched route TEMPLATE (never a path with a live ID) so label
+    cardinality stays bounded. Never lets a metrics failure break the
+    actual response — /metrics itself is skipped to avoid the endpoint
+    scraping its own request."""
+    path = request.url.path
+    if path == "/metrics" or path.startswith("/metrics/"):
+        return await call_next(request)
+
+    start = _time.perf_counter()
+    status = "error"
+    try:
+        response = await call_next(request)
+        status = "ok" if response.status_code < 500 else "error"
+        return response
+    finally:
+        elapsed = _time.perf_counter() - start
+        try:
+            route = request.scope.get("route")
+            endpoint = getattr(route, "path", None) or "unmatched"
+            metrics.observe_request(endpoint, status, elapsed)
+        except Exception:
+            logging.getLogger("secureprompt.ml.metrics").debug(
+                "metrics observe_request failed", exc_info=True
+            )
 
 
 @app.post("/internal/model-key")
@@ -216,6 +254,7 @@ async def detect_ner(req: NerRequest):
         raise HTTPException(status_code=429, detail="NER queue full")
     entities_raw = await future
     entities = [NerEntity(**e) for e in entities_raw]
+    metrics.record_ner(entities)
     return NerResponse(entities=entities)
 
 
