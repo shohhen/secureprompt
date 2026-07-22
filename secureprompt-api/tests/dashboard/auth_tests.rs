@@ -150,6 +150,17 @@ async fn extract_jti(access_token: &str) -> String {
 
 /// VALIDATION 5-01-01: successful email+password round-trip returns a
 /// 200 with the full TokenResponse shape.
+///
+/// 2FA update (backend 2FA plan, Task 10): `decide_2fa` (`auth.rs`) forces
+/// `Owner`/`Admin` roles into the enrollment branch (202
+/// `enroll_required`) on every login until they've confirmed TOTP, so this
+/// VALIDATION-5-01-01 round-trip check — which is about the plain
+/// email+password → access/refresh mechanics, not 2FA — now uses
+/// `VIEWER_A_EMAIL` (role `viewer`, 2FA-optional and never enrolled here),
+/// which still takes the unchanged `Access` branch and returns the
+/// identical byte-for-byte 200 `TokenResponse` shape this test asserts.
+/// The 2FA-required-role path (202 `enroll_required`) is covered
+/// end-to-end by `secureprompt-api/tests/twofactor.rs`.
 #[sqlx::test]
 async fn token_flow(pool: PgPool) -> sqlx::Result<()> {
     let seeded = fixtures::seed_two_workspaces(&pool).await?;
@@ -159,7 +170,7 @@ async fn token_flow(pool: PgPool) -> sqlx::Result<()> {
         &router,
         "/v1/auth/token",
         serde_json::json!({
-            "email": fixtures::ADMIN_A_EMAIL,
+            "email": fixtures::VIEWER_A_EMAIL,
             "password": fixtures::SHARED_PASSWORD,
         }),
         &[],
@@ -170,10 +181,10 @@ async fn token_flow(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert!(body["access_token"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(body["refresh_token"].as_str().is_some_and(|s| !s.is_empty()));
-    assert_eq!(body["user"]["id"].as_str().expect("user id"), seeded.admin_a.to_string());
-    assert_eq!(body["user"]["email"], fixtures::ADMIN_A_EMAIL);
+    assert_eq!(body["user"]["id"].as_str().expect("user id"), seeded.viewer_a.to_string());
+    assert_eq!(body["user"]["email"], fixtures::VIEWER_A_EMAIL);
     assert_eq!(body["workspace_id"], seeded.workspace_a.to_string());
-    assert_eq!(body["role"], "admin");
+    assert_eq!(body["role"], "viewer");
     assert!(body["access_expires_at"].as_i64().unwrap_or(0) > Utc::now().timestamp());
     assert!(body["refresh_expires_at"].as_i64().unwrap_or(0) > Utc::now().timestamp());
     Ok(())
