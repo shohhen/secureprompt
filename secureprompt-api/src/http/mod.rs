@@ -43,8 +43,13 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/auth",
             routes::dashboard::auth::build_router(state.clone())
                 .merge(routes::dashboard::oidc::routes())
-                // 2FA (Task 6): `/v1/auth/2fa/{enroll,verify}` — not JWT-gated here; see twofactor.rs.
-                .nest("/2fa", routes::dashboard::twofactor::routes()),
+                // 2FA: `/v1/auth/2fa/{enroll,verify,challenge}` are NOT
+                // JWT-gated here (they accept purpose tokens instead — see
+                // twofactor.rs); `/disable` (Task 8) IS JWT-gated, which is
+                // why `build_router(state)` (not the bare `routes()`) is
+                // used — it swaps in the real `jwt_auth::require` layer for
+                // just that one route.
+                .nest("/2fa", routes::dashboard::twofactor::build_router(state.clone())),
         )
         .nest(
             "/v1/analytics",

@@ -9,11 +9,25 @@
 //! `2fa_challenge` purpose token (minted by `token()`'s `Challenge` branch)
 //! — never a normal access token (the caller doesn't have one yet — that's
 //! the whole point of the challenge) and never a `2fa_enroll` token. None of
-//! the three handlers uses `Extension<JwtAuthContext>` — the normal JWT auth
-//! middleware (`jwt_auth::require`) rejects purpose tokens outright (Task
-//! 4) — so the bearer token is decoded directly here via
+//! these three handlers uses `Extension<JwtAuthContext>` — the normal JWT
+//! auth middleware (`jwt_auth::require`) rejects purpose tokens outright
+//! (Task 4) — so the bearer token is decoded directly here via
 //! `accept_enroll_or_access` (enroll/verify) or `accept_challenge`
 //! (challenge).
+//!
+//! `disable` (Task 8) is the opposite shape: it sits BEHIND full login, so
+//! it uses the normal `Extension<JwtAuthContext>` guard like every other
+//! authenticated dashboard route — there is no purpose-token dance because
+//! the caller already holds a real access token. But a valid access token
+//! ALONE is not enough to strip 2FA: the request body must also carry a
+//! currently-valid TOTP code or an unused backup code (checked the same way
+//! `challenge()` checks one), so a stolen/short-lived access token cannot
+//! silently downgrade an account out of 2FA (the concern raised in the Task
+//! 6 review). Because `jwt_auth::require` needs a concrete `AppState` to
+//! construct (`from_fn_with_state`), `/disable` is guarded the same way
+//! `auth.rs` guards `/logout`: `routes()` mounts it behind a
+//! request-rejecting stub layer, and `build_router(state)` swaps in the
+//! real JWT layer once `http/mod.rs` has a concrete `state` to hand it.
 //!
 //! The plaintext TOTP secret and the plaintext backup codes are returned to
 //! the client exactly once, in the `enroll` response body. From that point
@@ -22,8 +36,9 @@
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode},
+    middleware::from_fn_with_state,
     response::{IntoResponse, Json as JsonResponse, Response},
     routing::post,
     Json, Router,
@@ -32,6 +47,7 @@ use chrono::Utc;
 use jsonwebtoken::{decode, Algorithm, Validation};
 use secureprompt_common::errors::ApiError;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -40,7 +56,7 @@ use crate::{
     db::user_repo::{self, UserRepository},
     http::{
         api_error_response,
-        middleware::jwt_auth::{self, Claims},
+        middleware::jwt_auth::{self, Claims, JwtAuthContext},
     },
     redis as sp_redis,
 };
@@ -93,19 +109,76 @@ pub struct VerifyRequest {
     pub code: String,
 }
 
+/// `POST /v1/auth/2fa/disable` response.
+#[derive(Debug, Serialize)]
+pub struct DisableResponse {
+    pub disabled: bool,
+}
+
 // ---------- Router ----------
 
-/// 2FA enroll/verify routes.
+/// 2FA enroll/verify/challenge/disable routes.
 ///
-/// Mounted by `http/mod.rs` under `/v1/auth/2fa` (Task 9) — deliberately NOT
-/// wrapped in the `jwt_auth::require` layer, since that middleware rejects
-/// the `2fa_enroll` purpose token these handlers must also accept; auth is
-/// done per-handler via `accept_enroll_or_access` instead.
+/// `enroll`, `verify`, and `challenge` are deliberately NOT wrapped in the
+/// `jwt_auth::require` layer, since that middleware rejects the purpose
+/// tokens those handlers must accept; auth is done per-handler via
+/// `accept_enroll_or_access` / `accept_challenge` instead.
+///
+/// `/disable` is the opposite: it needs the real `jwt_auth::require` layer
+/// so `Extension<JwtAuthContext>` is populated (Task 8). Building that layer
+/// requires a concrete `AppState` (`from_fn_with_state`), which this
+/// state-agnostic `routes()` fn doesn't have — so, mirroring `auth.rs`'s
+/// `/logout` pattern, `/disable` is mounted here behind a request-rejecting
+/// stub layer. `build_router(state)` below is the real entry point
+/// `http/mod.rs` should mount: it swaps the stub for the genuine JWT guard.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/enroll", post(enroll))
         .route("/verify", post(verify))
         .route("/challenge", post(challenge))
+        .route(
+            "/disable",
+            post(disable).layer(axum::middleware::from_fn(stub_layer)),
+        )
+}
+
+/// Real construction helper.
+///
+/// Registers the genuine per-route JWT layer on `/disable` with the
+/// concrete `AppState`. `http/mod.rs` should mount
+/// `twofactor::build_router(state)` under `/v1/auth/2fa` instead of the bare
+/// `routes()` so `/disable` is actually reachable (the stub layer in
+/// `routes()` rejects every request). `enroll`/`verify`/`challenge` are
+/// unaffected — they carry their own bearer-decoding auth regardless of
+/// which constructor is used.
+pub fn build_router(state: AppState) -> Router<AppState> {
+    let jwt_layer = from_fn_with_state(state, jwt_auth::require);
+    Router::new()
+        .route("/enroll", post(enroll))
+        .route("/verify", post(verify))
+        .route("/challenge", post(challenge))
+        .route("/disable", post(disable).route_layer(jwt_layer))
+}
+
+/// Guards `/disable` when `routes()` (not `build_router`) is mounted
+/// directly — rejects every request with the same generic 401 body used
+/// elsewhere on this surface. Mirrors `auth.rs`'s `stub_layer` for
+/// `/logout` exactly: it exists so an accidental bare `routes()` mount
+/// fails closed instead of exposing `/disable` with no auth at all.
+async fn stub_layer(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let _ = request;
+    let _ = next;
+    (
+        StatusCode::UNAUTHORIZED,
+        JsonResponse(json!({
+            "error": {
+                "code": "invalid_credentials",
+                "message": "Invalid credentials",
+                "type": "secureprompt_error"
+            }
+        })),
+    )
+        .into_response()
 }
 
 // ---------- Auth acceptance (enroll/verify share this) ----------
@@ -625,6 +698,105 @@ pub async fn challenge(
         Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
         Err(err) => api_error_response(err),
     }
+}
+
+/// `POST /v1/auth/2fa/disable` — turn TOTP off for the CURRENT, already
+/// logged-in user (Task 8).
+///
+/// Unlike `enroll`/`verify`/`challenge`, auth here is the normal
+/// `Extension<JwtAuthContext>` guard — this endpoint sits behind full login
+/// (mounted with the real `jwt_auth::require` layer via `build_router`; see
+/// the module doc for why a separate constructor is needed). But a valid
+/// access token by itself is NOT sufficient: the request body must also
+/// carry a currently-valid TOTP code OR an unused backup code, checked the
+/// same way `challenge()` checks one (TOTP first, backup code as
+/// fallback). Without this second-factor proof, a stolen or short-lived
+/// access token could silently strip 2FA from the account — exactly the
+/// downgrade concern the Task 6 review raised.
+///
+/// Ordering:
+/// 1. If the account has no CONFIRMED 2FA, return `400` immediately —
+///    there's nothing to disable, and demanding a code for an account with
+///    no secret on file would be a confusing dead end (per plan: "don't
+///    require a code to disable nothing").
+/// 2. Lockout check (`totp_locked_until`) FIRST, same as `verify()`/
+///    `challenge()` — a locked account gets `429` without attempting
+///    anything.
+/// 3. Verify `code` as TOTP, falling back to a backup code — identical
+///    order to `challenge()`.
+/// 4. On success: `disable_totp` (NULLs the secret/confirmation/replay
+///    state, resets the failure counter and lock, deletes backup codes)
+///    and return `200 { "disabled": true }`.
+/// 5. On failure of both checks: `record_totp_failure` (same 5-attempt /
+///    15-minute threshold as `verify()`/`challenge()`, so brute-forcing
+///    `/disable` is throttled/locked identically) and return `401`.
+pub async fn disable(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<JwtAuthContext>,
+    Json(body): Json<VerifyRequest>,
+) -> Response {
+    let repo = UserRepository::new(state.db.clone());
+    let user = match repo.find_by_id(ctx.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return api_error_response(ApiError::Unauthorized("Invalid credentials".into()))
+        }
+        Err(err) => return api_error_response(err),
+    };
+
+    // Nothing to disable — don't demand a code for an account that was
+    // never confirmed (an in-progress, unconfirmed enrollment is cleaned up
+    // by starting a fresh `/enroll`, not by `/disable`).
+    if user.totp_confirmed_at.is_none() {
+        return api_error_response(ApiError::BadRequest("2FA is not enabled".into()));
+    }
+
+    // Lockout check FIRST — same Task-6-review ordering `verify()` and
+    // `challenge()` apply: reject a locked account without attempting
+    // anything (no KMS call, no code check, no failure-counter bump).
+    if let Some(locked_until) = user.totp_locked_until {
+        if locked_until > Utc::now() {
+            return api_error_response(ApiError::TooManyRequests(format!(
+                "too many attempts, locked until {}",
+                locked_until.to_rfc3339()
+            )));
+        }
+    }
+
+    let now_unix = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+
+    // TOTP first; if that doesn't verify, fall through and try the same
+    // input as a backup code — identical order to `challenge()`.
+    let verified = match verify_totp_step(&state, &user, &body.code, now_unix).await {
+        Some(_step) => true,
+        None => match repo
+            .consume_backup_code(ctx.user_id, &strip_backup_code_format(&body.code))
+            .await
+        {
+            Ok(consumed) => consumed,
+            Err(err) => return api_error_response(err),
+        },
+    };
+
+    if !verified {
+        // Neither the TOTP code nor a backup code matched. Same
+        // threshold/window as `verify()`/`challenge()` (5 failures / 15
+        // minutes, shared `totp_failed_attempts`/`totp_locked_until`
+        // columns) — brute-forcing `/disable` is throttled identically to
+        // brute-forcing the login challenge.
+        let _ = repo.record_totp_failure(ctx.user_id, 5, 900).await;
+        return api_error_response(ApiError::Unauthorized("Invalid credentials".into()));
+    }
+
+    // `disable_totp` itself resets `totp_failed_attempts`/
+    // `totp_locked_until` (along with nulling the secret/confirmation/replay
+    // state and deleting backup codes) — no separate `record_totp_success`
+    // call is needed on this path.
+    if let Err(err) = repo.disable_totp(ctx.user_id).await {
+        return api_error_response(err);
+    }
+
+    (StatusCode::OK, JsonResponse(DisableResponse { disabled: true })).into_response()
 }
 
 #[cfg(test)]
