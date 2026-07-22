@@ -7,8 +7,24 @@ global:
 otel:
   enabled: false
 
+# Self-contained (no Prometheus Operator, no external OTLP collector) — image
+# pulls are Never/internal-registry-only, same as every other service below,
+# so this fits the air-gap constraint. Enabled to match the chart default
+# (base values.yaml); grafana.enabled (also true by default) is unset here
+# and inherits from base the same way.
 prometheus:
-  enabled: false
+  enabled: true
+  image:
+    repository: prom/prometheus
+    tag: "v2.55.1"
+    pullPolicy: Never
+
+alertmanager:
+  enabled: true
+  image:
+    repository: prom/alertmanager
+    tag: "v0.27.0"
+    pullPolicy: Never
 
 api:
   image:

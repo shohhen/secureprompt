@@ -47,6 +47,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/grafana
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /api/health
@@ -63,6 +72,18 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        # Provisioning (templates/grafana-provisioning-configmap.yaml) — mounted
+        # as separate volumes at subdirectories of /var/lib/grafana so they
+        # don't clobber the `data` PVC mount above.
+        - name: datasources
+          configMap:
+            name: {{ include "secureprompt.fullname" . }}-grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: {{ include "secureprompt.fullname" . }}-grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: {{ include "secureprompt.fullname" . }}-grafana-dashboards
 {{- if .Values.grafana.persistence.enabled }}
 ---
 apiVersion: v1

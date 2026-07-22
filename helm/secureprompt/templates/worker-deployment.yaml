@@ -22,9 +22,29 @@ spec:
         - name: worker
           image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
           imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- if .Values.worker.metrics.enabled }}
+          ports:
+            - containerPort: {{ .Values.worker.metrics.port }}
+              protocol: TCP
+              name: metrics
+          {{- end }}
           env:
             - name: LOG_LEVEL
               value: "info"
+            # Prometheus scrape target (prometheus-configmap.yaml's
+            # secureprompt-worker job) — see secureprompt-worker/src/main.rs
+            # for the env var names/defaults (default is already
+            # enabled=true, port=9091; set explicitly so it's driven by
+            # values.yaml, not the binary's built-in default).
+            {{- if .Values.worker.metrics.enabled }}
+            - name: SECUREPROMPT_WORKER_METRICS_ENABLED
+              value: "true"
+            - name: WORKER_METRICS_PORT
+              value: {{ .Values.worker.metrics.port | quote }}
+            {{- else }}
+            - name: SECUREPROMPT_WORKER_METRICS_ENABLED
+              value: "false"
+            {{- end }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

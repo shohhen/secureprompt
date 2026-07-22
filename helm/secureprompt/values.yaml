@@ -54,6 +54,11 @@ worker:
   resources:
     requests: { cpu: "50m",  memory: "128Mi" }
     limits:   { cpu: "300m", memory: "384Mi" }
+  # /metrics endpoint (secureprompt-worker/src/metrics.rs) — scraped by the
+  # in-cluster Prometheus job "secureprompt-worker" (prometheus-configmap.yaml).
+  metrics:
+    enabled: true
+    port: 9091
 
 web:
   image:
@@ -265,5 +270,31 @@ serviceMesh:
 otel:
   enabled: false
 
+# ----------------------------------------------------------------------------
+# Monitoring (KPI-2) — self-contained Prometheus + Alertmanager, NO Prometheus
+# Operator/CRDs. Grafana (above) is provisioned to point at these in-cluster
+# Services via templates/grafana-provisioning-configmap.yaml.
+# ----------------------------------------------------------------------------
 prometheus:
-  enabled: false
+  enabled: true
+  image:
+    repository: prom/prometheus
+    tag: "v2.55.1"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: "10Gi"
+    storageClass: "standard-rwo"
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "1Gi" }
+
+alertmanager:
+  enabled: true
+  image:
+    repository: prom/alertmanager
+    tag: "v0.27.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: { cpu: "25m",  memory: "64Mi" }
+    limits:   { cpu: "100m", memory: "128Mi" }
