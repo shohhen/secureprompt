@@ -30,7 +30,10 @@ use serde_json::json;
 
 use crate::{
     app_state::AppState,
-    http::routes::dashboard::auth::issue_token_pair,
+    http::middleware::jwt_auth::UserRole,
+    http::routes::dashboard::auth::{
+        decide_2fa, encode_purpose_token, issue_token_pair, TokenOr2fa, TwoFaDecision,
+    },
     redis as sp_redis,
 };
 use secureprompt_common::errors::ApiError;
@@ -259,8 +262,46 @@ pub async fn oidc_callback(
         Err(e) => return api_error_to_response(e),
     };
 
-    // Issue the SecurePrompt token pair (same envelope as credentials flow).
-    issue_token_pair(&state, row.id, row.workspace_id, &row.role, &row.email).await
+    // 2FA parity (security review, whole-branch fix): OIDC used to mint a
+    // full session unconditionally here, bypassing the TOTP gate that
+    // `token()` (password login) enforces for Owner/Admin. Delegate to the
+    // same decision `token()` uses instead of inlining it, both to keep
+    // this function short and so the two login paths cannot drift apart.
+    issue_token_or_2fa_response(&state, &row).await
+}
+
+/// Shared tail of `oidc_callback`: apply the exact same 2FA decision
+/// `token()` applies after password verification — via the shared
+/// `decide_2fa`/`TokenOr2fa`/`encode_purpose_token` machinery — so an
+/// OIDC-authenticated Owner/Admin cannot skip 2FA by using this path
+/// instead of `/v1/auth/token`.
+async fn issue_token_or_2fa_response(
+    state: &AppState,
+    row: &crate::db::user_repo::UserCredentials,
+) -> Response {
+    let role = match UserRole::from_db_str(&row.role) {
+        Ok(role) => role,
+        Err(err) => return api_error_to_response(err),
+    };
+
+    match decide_2fa(role, row.totp_confirmed_at.is_some()) {
+        TwoFaDecision::Access => {
+            // Unchanged — same envelope as the credentials flow.
+            issue_token_pair(state, row.id, row.workspace_id, &row.role, &row.email).await
+        }
+        TwoFaDecision::Challenge => {
+            match encode_purpose_token(state, row.id, row.workspace_id, "2fa_challenge", 300) {
+                Ok(challenge_token) => TokenOr2fa::Challenge { challenge_token }.into_response(),
+                Err(err) => api_error_to_response(err),
+            }
+        }
+        TwoFaDecision::Enroll => {
+            match encode_purpose_token(state, row.id, row.workspace_id, "2fa_enroll", 300) {
+                Ok(enrollment_token) => TokenOr2fa::Enroll { enrollment_token }.into_response(),
+                Err(err) => api_error_to_response(err),
+            }
+        }
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

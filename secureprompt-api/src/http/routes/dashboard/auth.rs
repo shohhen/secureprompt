@@ -225,8 +225,13 @@ pub async fn token(
 
 /// Outcome of `decide_2fa`: what `POST /v1/auth/token` should do once the
 /// password has verified.
+///
+/// `pub(crate)` (Task: OIDC 2FA parity) so `oidc_callback` can drive the
+/// exact same decision after an OIDC-authenticated lookup instead of
+/// duplicating the branch — two divergent copies of this table is how the
+/// bypass happened in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TwoFaDecision {
+pub(crate) enum TwoFaDecision {
     /// No 2FA in play — proceed straight to `build_token_pair_body` (200).
     Access,
     /// Already enrolled (`totp_confirmed_at` is some) — every login from
@@ -250,8 +255,11 @@ enum TwoFaDecision {
 ///     first-time enrollment for roles that must have 2FA).
 ///   * `totp_confirmed = false` + any other role → `Access` (2FA optional,
 ///     not enrolled).
+///
+/// `pub(crate)` (Task: OIDC 2FA parity) — shared by `token()` and
+/// `oidc_callback` so both login paths enforce identically.
 #[must_use]
-const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDecision {
+pub(crate) const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDecision {
     if totp_confirmed {
         TwoFaDecision::Challenge
     } else if matches!(role, UserRole::Owner | UserRole::Admin) {
@@ -267,7 +275,10 @@ const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDecision {
 /// path the console + `/v1/auth/register` depend on. `Challenge`/`Enroll`
 /// are new 202 bodies that carry a short-lived purpose token instead of
 /// access/refresh.
-enum TokenOr2fa {
+///
+/// `pub(crate)` (Task: OIDC 2FA parity) so `oidc_callback` returns byte-
+/// identical `Challenge`/`Enroll` bodies to the password login path.
+pub(crate) enum TokenOr2fa {
     Access(TokenResponse),
     Challenge { challenge_token: String },
     Enroll { enrollment_token: String },
