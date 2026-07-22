@@ -19,13 +19,12 @@ import {
 } from "@/components/ui/form";
 import {
   loginStep1,
-  challenge,
   enroll,
   verify2fa,
-  TwoFaLockedError,
   type EnrollResult,
   type Tokens,
 } from "@/lib/twofa-api";
+import { TwoFactorChallenge } from "./two-factor-challenge";
 
 const loginSchema = z.object({
   email: z.string().email("Enter a valid email address"),
@@ -184,83 +183,21 @@ export function LoginForm({ callbackUrl }: LoginFormProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Temporary placeholders for Tasks 5 & 6
+// Temporary placeholder for Task 6
 // (docs/superpowers/plans/2026-07-22-2fa-console.md).
 //
-// These are NOT the real challenge/enroll screens — just enough to compile,
-// wire the branching above end-to-end, and exercise the real
-// `challenge()`/`enroll()`/`verify2fa()` calls against the backend.
-// `TwoFactorEnroll` calls `enroll(bearer)` on mount (the backend's
-// `/2fa/verify` 401s until `/2fa/enroll` has created+stored a secret) and
-// renders the raw `secretB32` for manual authenticator entry plus the
-// backup codes — no QR yet, but a user CAN complete enrollment with it.
-// Task 5 replaces `TwoFactorChallenge` with `./two-factor-challenge.tsx`
-// (styled card, 429 lockout messaging via `TwoFaLockedError`); Task 6
-// replaces `TwoFactorEnroll` with `./two-factor-enroll.tsx` (adds the
-// `TwoFactorQr` QR code + nicer layout, same `enroll()`/`verify2fa()` calls).
-// Both keep the SAME prop contract used here, so swapping in the real
-// components is a one-line import change plus deleting these two stubs:
+// This is NOT the real enrollment screen — just enough to compile, wire the
+// branching above end-to-end, and exercise the real `enroll()`/`verify2fa()`
+// calls against the backend. It calls `enroll(bearer)` on mount (the
+// backend's `/2fa/verify` 401s until `/2fa/enroll` has created+stored a
+// secret) and renders the raw `secretB32` for manual authenticator entry
+// plus the backup codes — no QR yet, but a user CAN complete enrollment
+// with it. Task 6 replaces this with `./two-factor-enroll.tsx` (adds the
+// `TwoFactorQr` QR code + nicer layout, same `enroll()`/`verify2fa()`
+// calls), keeping the SAME prop contract used here:
 //
-//   TwoFactorChallenge({ challengeToken, onSuccess }: { challengeToken: string; onSuccess: (t: Tokens) => void })
 //   TwoFactorEnroll({ bearer, onSuccess }: { bearer: string; onSuccess: (t: Tokens) => void })
 // ---------------------------------------------------------------------------
-
-function TwoFactorChallenge({
-  challengeToken,
-  onSuccess,
-}: {
-  challengeToken: string;
-  onSuccess: (t: Tokens) => void;
-}) {
-  const [code, setCode] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function submit() {
-    setBusy(true);
-    try {
-      const tokens = await challenge(challengeToken, code);
-      if (!tokens) {
-        toast.error("Invalid code. Please try again.");
-        setCode("");
-        return;
-      }
-      onSuccess(tokens);
-    } catch (err) {
-      if (err instanceof TwoFaLockedError) {
-        toast.error(err.message);
-      } else {
-        toast.error("Something went wrong. Please try again.");
-      }
-      setCode("");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="space-y-4">
-      <p className="text-sm text-muted-foreground">
-        Enter the 6-digit code from your authenticator app (or a backup code).
-      </p>
-      <Input
-        inputMode="numeric"
-        autoComplete="one-time-code"
-        autoFocus
-        disabled={busy}
-        value={code}
-        onChange={(e) => setCode(e.target.value)}
-      />
-      <Button
-        type="button"
-        className="w-full"
-        disabled={busy || !code}
-        onClick={submit}
-      >
-        {busy ? "Verifying…" : "Verify"}
-      </Button>
-    </div>
-  );
-}
 
 function TwoFactorEnroll({
   bearer,
