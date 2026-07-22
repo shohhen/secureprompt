@@ -57,11 +57,18 @@ impl ApiKeyRepository {
             .await
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
+        // Explicit tenant filter. RLS on api_keys is a defence-in-depth second
+        // layer only — the runtime connects as a Postgres SUPERUSER, which
+        // bypasses RLS unconditionally (FORCE ROW LEVEL SECURITY does not stop a
+        // superuser), so this WHERE is the actual isolation boundary. Do not
+        // remove it in reliance on the set_config above.
         let rows = sqlx::query(
             "SELECT id, workspace_id, name, key_hash, created_at, revoked_at, assigned_user_id
              FROM api_keys
+             WHERE workspace_id = $1
              ORDER BY created_at DESC",
         )
+        .bind(workspace_id.0)
         .fetch_all(&mut *tx)
         .await
         .map_err(|error| ApiError::Database(error.to_string()))?;

@@ -66,11 +66,16 @@ impl ProviderRepository {
             .await
             .map_err(|error| ApiError::Database(error.to_string()))?;
 
+        // Explicit tenant filter — the runtime DB role is a superuser that
+        // bypasses RLS, so this WHERE (not the set_config above) is the real
+        // isolation boundary. Do not remove.
         let rows = sqlx::query(
             "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
              FROM providers
+             WHERE workspace_id = $1
              ORDER BY created_at DESC",
         )
+        .bind(workspace_id.0)
         .fetch_all(&mut *tx)
         .await
         .map_err(|error| ApiError::Database(error.to_string()))?;

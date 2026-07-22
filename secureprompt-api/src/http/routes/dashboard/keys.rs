@@ -13,7 +13,7 @@
 //!   * RLS: every repo call wraps `set_config('app.current_workspace_id', …)`.
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
@@ -95,11 +95,31 @@ pub fn routes() -> Router<AppState> {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
+/// Optional `workspace_id` IDOR guard — if present it MUST equal the JWT
+/// workspace (mirrors the analytics/requests convention, T-05-05). Without
+/// this, a `?workspace_id=<other>` query param was silently ignored rather
+/// than rejected.
+#[derive(Debug, Deserialize)]
+struct ListKeysParams {
+    #[serde(default)]
+    workspace_id: Option<Uuid>,
+}
+
 /// `GET /v1/keys` — list API keys for the workspace (any role).
 async fn list_keys(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
+    Query(params): Query<ListKeysParams>,
 ) -> Result<Json<Vec<KeyResponse>>, axum::response::Response> {
+    // IDOR guard: a mismatched ?workspace_id must be rejected (403), not
+    // silently scoped to the caller's own workspace.
+    if let Some(w) = params.workspace_id {
+        if w != ctx.workspace_id.0 {
+            return Err(api_error_response(ApiError::Forbidden(
+                "workspace_id mismatch".into(),
+            )));
+        }
+    }
     let repo = ApiKeyRepository::new(state.db.clone());
     let rows = repo
         .list_api_keys(ctx.workspace_id)
