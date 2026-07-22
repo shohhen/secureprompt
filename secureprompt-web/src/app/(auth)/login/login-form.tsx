@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
 import { useForm } from "react-hook-form";
@@ -273,24 +273,31 @@ function TwoFactorEnroll({
   const [busy, setBusy] = useState(false);
   const [enrollment, setEnrollment] = useState<EnrollResult | null>(null);
   const [loadError, setLoadError] = useState(false);
-  // Guards against React strict-mode's dev double-invoke of effects, which
-  // would otherwise fire `enroll()` twice (the backend allows re-enrolling
-  // before verify, but there's no reason to burn two calls / two secrets).
-  const startedRef = useRef(false);
 
+  // Deliberately no ref-guard against React strict-mode's dev
+  // double-invoke: an early version tried to dedupe with a `startedRef`,
+  // but combined with the per-invocation `cancelled` flag that caused a
+  // PERMANENT loading hang under strict mode (the exact environment
+  // Task 8's KPI demo runs in via `pnpm dev`) — the 1st invocation's
+  // result got dropped by its own cleanup-set `cancelled`, and the 2nd
+  // (persisting) invocation's early-return on `startedRef` meant nothing
+  // ever called `setEnrollment`/`setLoadError`. The plain cancelled-only
+  // pattern below lets `enroll()` fire twice in dev; that's harmless — the
+  // backend's /2fa/enroll overwrites the secret + backup codes on repeat
+  // calls for an unconfirmed account — and only the second (persisting)
+  // invocation's result reaches state, matching the actually-stored
+  // secret. Production has no double-invoke at all.
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
     let cancelled = false;
-    (async () => {
-      const result = await enroll(bearer);
-      if (cancelled) return;
-      if (!result) {
-        setLoadError(true);
-        return;
-      }
-      setEnrollment(result);
-    })();
+    enroll(bearer)
+      .then((res) => {
+        if (cancelled) return;
+        if (res) setEnrollment(res);
+        else setLoadError(true);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true);
+      });
     return () => {
       cancelled = true;
     };
