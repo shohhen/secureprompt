@@ -115,6 +115,12 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request: &GatewayRequest,
     ) -> Result<Prepared, ApiError> {
+        // KPI-2 monitoring, Task 2 — request-entry timestamp for the
+        // policy-denied short-circuit below, which completes (and calls
+        // `record_request(false)`) before any provider target is resolved,
+        // so `execute`/`execute_stream`'s post-provider `Instant` isn't in
+        // scope yet.
+        let start = Instant::now();
         let request_id = RequestId::new();
         let mut prompt = prompt_from_messages(&request.messages);
         let mut pipeline_state = PipelineState::default();
@@ -244,6 +250,14 @@ impl PipelineService {
             }
         }
 
+        // KPI-2 monitoring, Task 2 — the final enforcement action for this
+        // request is now settled (policy rule, secure-mode override, and
+        // the default-redact safety net have all had their say). Record a
+        // policy violation for anything that isn't a plain `allow`.
+        if let Some(action) = policy_violation_label(&policy_outcome.result.final_action) {
+            self.state.metrics.record_policy_violation(action);
+        }
+
         if policy_outcome.denied {
             let usage = TokenUsage::default();
             let cost_usd = self
@@ -274,6 +288,11 @@ impl PipelineService {
                 .analytics
                 .enqueue(event, self.state.metrics.as_ref())
                 .await;
+            // No provider target was resolved on this short-circuit path —
+            // `"unknown"` per the KPI-2 monitoring plan's fallback label.
+            self.state
+                .metrics
+                .observe_request_duration("unknown", start.elapsed());
             self.state.metrics.record_request(false);
             log_request_finish(
                 request_id,
@@ -523,6 +542,12 @@ impl PipelineService {
             .enqueue(event, self.state.metrics.as_ref())
             .await;
 
+        // KPI-2 monitoring, Task 2 — `t0` above already times the upstream
+        // provider call; `chosen_target.model_name` is the resolved
+        // provider model this request actually used.
+        self.state
+            .metrics
+            .observe_request_duration(&chosen_target.model_name, t0.elapsed());
         self.state.metrics.record_request(true);
         log_request_finish(
             request_id,
@@ -750,6 +775,12 @@ impl PipelineService {
             event.restored_response =
                 if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
+            // KPI-2 monitoring, Task 2 — `t0` above already times this
+            // stream from just before the upstream provider connect;
+            // `chosen_target.model_name` is the resolved provider model.
+            state
+                .metrics
+                .observe_request_duration(&chosen_target.model_name, t0.elapsed());
             state.metrics.record_request(stream_ok);
             log_request_finish(request_id, workspace_id, &final_action, stream_ok);
 
@@ -933,6 +964,32 @@ fn prompt_from_messages(messages: &[Message]) -> String {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Map `policy_outcome.result.final_action` — which comes from
+/// `policy::engine::evaluate`'s `VALID_ACTIONS`
+/// (`deny`/`allow`/`redact`/`transform`/`flag`) or a secure-mode override
+/// (`deny`/`redact`/`allow`) — onto the bounded
+/// `secureprompt_policy_violations_total{action}` label set mandated by the
+/// KPI-2 monitoring plan: `block`/`redact`/`flag`/`warn`.
+///
+/// `"allow"` returns `None` (not a violation — nothing to record).
+/// `"deny"` maps to `"block"`: the pipeline's own doc comments and the
+/// dashboard's audit-table badge already treat `deny` and `block` as the
+/// same concept (a request that did not go through). `"transform"` maps to
+/// `"redact"`: both mean "the request content was rewritten by policy
+/// before reaching the provider" and the plan's label set has no separate
+/// bucket for it. `"warn"` is not produced by any action currently wired
+/// into the policy engine or secure-mode override — it's part of the
+/// reserved label set for a future warn-only enforcement level — so no
+/// input maps to it today; that is expected, not a bug.
+fn policy_violation_label(action: &str) -> Option<&'static str> {
+    match action {
+        "deny" => Some("block"),
+        "redact" | "transform" => Some("redact"),
+        "flag" => Some("flag"),
+        _ => None,
+    }
 }
 
 /// Preload the session vault from `[[sp:v=<ref>]]` file-scan markers and strip
@@ -1567,5 +1624,48 @@ mod response_redaction_filter_tests {
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].value, "Shohjahon");
+    }
+}
+
+#[cfg(test)]
+mod policy_violation_label_tests {
+    use super::*;
+
+    // KPI-2 monitoring, Task 2 — `policy_violation_label` is the pure
+    // mapping `prepare()` calls before `record_policy_violation`. Unit
+    // tested directly here since exercising it through `prepare()` needs a
+    // full `AppState` (DB pool, policy repo, ML sidecar) that a focused
+    // metrics test shouldn't have to stand up.
+
+    #[test]
+    fn deny_maps_to_block() {
+        assert_eq!(policy_violation_label("deny"), Some("block"));
+    }
+
+    #[test]
+    fn redact_maps_to_redact() {
+        assert_eq!(policy_violation_label("redact"), Some("redact"));
+    }
+
+    #[test]
+    fn transform_maps_to_redact() {
+        assert_eq!(policy_violation_label("transform"), Some("redact"));
+    }
+
+    #[test]
+    fn flag_maps_to_flag() {
+        assert_eq!(policy_violation_label("flag"), Some("flag"));
+    }
+
+    #[test]
+    fn allow_is_not_a_violation() {
+        assert_eq!(policy_violation_label("allow"), None);
+    }
+
+    #[test]
+    fn unknown_action_string_fails_safe_to_none() {
+        // Defensive: any future VALID_ACTIONS addition this function
+        // doesn't know about yet must not emit an unbounded label.
+        assert_eq!(policy_violation_label("some-future-action"), None);
     }
 }

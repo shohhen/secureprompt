@@ -169,6 +169,18 @@ pub struct MetricsRegistry {
     /// Counter `secureprompt_dashboard_client_errors_total{component}`.
     /// Incremented by POST /v1/telemetry/client-error (Plan 05-06).
     dashboard_client_errors: Mutex<Vec<(String, u64)>>,
+
+    // ── KPI-2 monitoring, Task 2 ───────────────────────────────────────────
+
+    /// `secureprompt_request_duration_seconds{model}` — real bucketed
+    /// histogram, one series per resolved provider `model` (fallback
+    /// `"unknown"` when no provider was resolved, e.g. a policy-denied
+    /// request short-circuited before target selection).
+    request_duration: Mutex<Vec<(String, Histogram)>>,
+    /// Counter `secureprompt_policy_violations_total{action}`. `action` is a
+    /// bounded label — one of `block`/`redact`/`flag`/`warn` — never a
+    /// free-text rule name or id.
+    policy_violations: Mutex<Vec<(String, u64)>>,
 }
 
 impl MetricsRegistry {
@@ -354,6 +366,92 @@ impl MetricsRegistry {
             .map_or(0, |(_, _, hist)| hist.count())
     }
 
+    // ── KPI-2 monitoring, Task 2 ────────────────────────────────────────────
+
+    /// Record one upstream request's total duration, labelled by the
+    /// resolved provider `model`.
+    ///
+    /// Called at every request-completion site in
+    /// `pipeline::service::PipelineService` (buffered, streaming, and the
+    /// policy-denied short-circuit) alongside `record_request`. Callers pass
+    /// `"unknown"` for `model` when no provider target was resolved yet
+    /// (e.g. the request was denied by policy before target selection).
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn observe_request_duration(&self, model: &str, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        let mut guard = self
+            .request_duration
+            .lock()
+            .expect("request_duration mutex");
+        if let Some((_, hist)) = guard.iter_mut().find(|(m, _)| m == model) {
+            hist.observe(secs);
+        } else {
+            let hist = Histogram::default();
+            hist.observe(secs);
+            guard.push((model.to_owned(), hist));
+        }
+    }
+
+    /// Return the request-duration observation count for a given `model`.
+    ///
+    /// Used by tests to assert the histogram was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn request_duration_count(&self, model: &str) -> u64 {
+        let guard = self
+            .request_duration
+            .lock()
+            .expect("request_duration mutex");
+        guard
+            .iter()
+            .find(|(m, _)| m == model)
+            .map_or(0, |(_, hist)| hist.count())
+    }
+
+    /// Record one policy-enforcement violation. `action` must be one of the
+    /// bounded label set `block`/`redact`/`flag`/`warn` — never a free-text
+    /// rule name, id, or workspace/user identifier (unbounded cardinality).
+    ///
+    /// Called from `pipeline::service::PipelineService::prepare` wherever a
+    /// policy rule's (or secure-mode override's) action is enforced against
+    /// a request and that action is not `allow`.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn record_policy_violation(&self, action: &str) {
+        let mut guard = self
+            .policy_violations
+            .lock()
+            .expect("policy_violations mutex");
+        if let Some(row) = guard.iter_mut().find(|(a, _)| a == action) {
+            row.1 += 1;
+        } else {
+            guard.push((action.to_owned(), 1));
+        }
+    }
+
+    /// Return the policy-violation count for a given `action`.
+    ///
+    /// Used by tests to assert the counter was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn policy_violation_count(&self, action: &str) -> u64 {
+        let guard = self
+            .policy_violations
+            .lock()
+            .expect("policy_violations mutex");
+        guard
+            .iter()
+            .find(|(a, _)| a == action)
+            .map_or(0, |(_, count)| *count)
+    }
+
     /// Render all counters in Prometheus text exposition format.
     ///
     /// # Panics
@@ -471,6 +569,38 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_dashboard_client_errors_total{{component=\"{component}\"}} {value}"
+                    );
+                }
+            }
+        }
+
+        // KPI-2 monitoring, Task 2 — request-duration histogram.
+        {
+            let guard = self
+                .request_duration
+                .lock()
+                .expect("request_duration mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_request_duration_seconds histogram\n");
+                for (model, hist) in guard.iter() {
+                    let labels = format!("model=\"{model}\"");
+                    hist.render_into(&mut out, "secureprompt_request_duration_seconds", &labels);
+                }
+            }
+        }
+
+        // KPI-2 monitoring, Task 2 — policy-violation counter.
+        {
+            let guard = self
+                .policy_violations
+                .lock()
+                .expect("policy_violations mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_policy_violations_total counter\n");
+                for (action, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_policy_violations_total{{action=\"{action}\"}} {value}"
                     );
                 }
             }

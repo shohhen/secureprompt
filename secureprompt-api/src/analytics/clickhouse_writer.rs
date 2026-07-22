@@ -80,6 +80,15 @@ impl AnalyticsHandle {
                     if let Err(e2) = req_inserter.write(&req_row).await {
                         tracing::error!(error = %e2, "request_events write failed after retry; dropping");
                         metrics_task.record_clickhouse_insert_failure();
+                        // Retry exhausted: this event (request_events row +
+                        // everything downstream in this loop iteration —
+                        // policy_events/latency_samples/token_usage — is
+                        // abandoned wholesale via `continue`. Distinct from
+                        // `record_analytics_drop()` (buffer-full backpressure
+                        // in `enqueue`, event never entered the channel):
+                        // this event WAS dequeued but a real, non-retryable
+                        // write failure abandoned it.
+                        metrics_task.record_analytics_failure();
                         continue;
                     }
                 }
