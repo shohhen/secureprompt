@@ -14,7 +14,7 @@
       "type": "timeseries",
       "title": "p95 Latency by Model (Prometheus)",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum(rate(secureprompt_request_duration_seconds_bucket[5m])) by (le, model))",
@@ -27,7 +27,7 @@
       "type": "table",
       "title": "Daily p95/p99 Latency (ClickHouse mart_latency_pctiles)",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "ClickHouse" },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
           "rawSql": "SELECT usage_date, model, workspace_id, p95_latency_ms, p99_latency_ms, sample_count FROM secureprompt_marts.default.mart_latency_pctiles ORDER BY usage_date DESC LIMIT 100",

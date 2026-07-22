@@ -14,7 +14,7 @@
       "type": "stat",
       "title": "Total Requests",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{ "expr": "secureprompt_requests_total", "legendFormat": "Requests" }]
     },
     {
@@ -22,7 +22,7 @@
       "type": "stat",
       "title": "Request Failures",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{ "expr": "secureprompt_request_failures_total", "legendFormat": "Failures" }]
     },
     {
@@ -30,7 +30,7 @@
       "type": "stat",
       "title": "Analytics Dropped",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{ "expr": "secureprompt_analytics_dropped_total", "legendFormat": "Dropped" }]
     },
     {
@@ -38,7 +38,7 @@
       "type": "stat",
       "title": "ClickHouse Insert Failures",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [{ "expr": "secureprompt_clickhouse_insert_failures_total", "legendFormat": "CH Failures" }]
     },
     {
@@ -46,7 +46,7 @@
       "type": "table",
       "title": "Policy Violations by Rule (ClickHouse)",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 4 },
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "ClickHouse" },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
           "rawSql": "SELECT violation_date, workspace_id, rule_name, action, violation_count, dry_run_count, enforced_count FROM secureprompt_marts.default.mart_policy_violations ORDER BY violation_date DESC, violation_count DESC LIMIT 200",

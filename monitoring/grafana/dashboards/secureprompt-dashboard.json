@@ -13,7 +13,7 @@
       "title": "Dashboard Request Duration (P50 / P95 / P99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Request latency percentiles across all dashboard API endpoints. Source: secureprompt_dashboard_request_duration_seconds.",
       "targets": [
         {
@@ -45,7 +45,7 @@
       "title": "Dashboard Error Rate by Endpoint",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Rate of dashboard API errors per endpoint and HTTP status code. Source: secureprompt_dashboard_errors_total.",
       "targets": [
         {
@@ -67,7 +67,7 @@
       "title": "Mart Query Duration P95 by Mart",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "P95 query latency broken down by mart (mart_usage_daily, mart_cost_by_model, etc.). Source: secureprompt_dashboard_mart_query_duration_seconds.",
       "targets": [
         {
@@ -89,7 +89,7 @@
       "title": "Budget Events by Behavior (block / warn / flag)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Stacked rate of budget enforcement events. block=402 returned, warn=header set, flag=silent log. Source: secureprompt_dashboard_budget_events_total.",
       "targets": [
         {
@@ -113,17 +113,5 @@
         "legend": { "displayMode": "list", "placement": "bottom" }
       }
     }
-  ],
-  "templating": {
-    "list": [
-      {
-        "name": "datasource",
-        "type": "datasource",
-        "pluginId": "prometheus",
-        "label": "Prometheus",
-        "hide": 0,
-        "current": {}
-      }
-    ]
-  }
+  ]
 }
