@@ -98,6 +98,15 @@ struct Prepared {
     policy_outcome: PolicyEvaluationOutcome,
     secure_mode: SecureModeRow,
     pipeline_input: PipelineInput,
+    /// Request-entry `Instant`, captured at the top of `prepare` — the
+    /// single start point `secureprompt_request_duration_seconds` uses on
+    /// EVERY completion path (denied, debug-mode, success, streaming) so
+    /// the histogram always measures true end-to-end latency (input-side
+    /// detection/RAG/policy included), not just the post-`prepare` upstream
+    /// call. Kept separate from the buffered/streaming paths' own `t0`
+    /// (which still times only the upstream call, for `latency_ms` /
+    /// `event.latency_ms` — unchanged by this).
+    start: Instant,
 }
 
 impl PipelineService {
@@ -115,11 +124,15 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request: &GatewayRequest,
     ) -> Result<Prepared, ApiError> {
-        // KPI-2 monitoring, Task 2 — request-entry timestamp for the
-        // policy-denied short-circuit below, which completes (and calls
-        // `record_request(false)`) before any provider target is resolved,
-        // so `execute`/`execute_stream`'s post-provider `Instant` isn't in
-        // scope yet.
+        // KPI-2 monitoring, Task 2 (fix-up) — request-entry timestamp. Used
+        // directly by the policy-denied short-circuit below (which
+        // completes, and calls `record_request(false)`, before any
+        // provider target is resolved) AND returned to the caller via
+        // `Prepared::start` so `execute`/`execute_stream`'s success paths
+        // measure `secureprompt_request_duration_seconds` from the same
+        // point — true end-to-end, including the input-side work `prepare`
+        // itself performs (regex/ML detection, RAG, policy eval) — rather
+        // than only the post-`prepare` upstream call.
         let start = Instant::now();
         let request_id = RequestId::new();
         let mut prompt = prompt_from_messages(&request.messages);
@@ -324,6 +337,7 @@ impl PipelineService {
             policy_outcome,
             secure_mode,
             pipeline_input,
+            start,
         })
     }
 
@@ -342,6 +356,7 @@ impl PipelineService {
             policy_outcome,
             secure_mode,
             pipeline_input,
+            start,
         } = self.prepare(auth, resolved, &request).await?;
 
         let t0 = Instant::now();
@@ -542,12 +557,18 @@ impl PipelineService {
             .enqueue(event, self.state.metrics.as_ref())
             .await;
 
-        // KPI-2 monitoring, Task 2 — `t0` above already times the upstream
-        // provider call; `chosen_target.model_name` is the resolved
-        // provider model this request actually used.
+        // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`) times
+        // this request end-to-end, matching the denied short-circuit's start
+        // point above so the histogram has consistent semantics across every
+        // path; `t0` still only covers the upstream call and remains the
+        // source for `latency_ms`/`event.latency_ms`, unchanged.
+        // `model_label` bounds the label: the real resolved model name, or
+        // `"unknown"` when `chosen_target` is the synthetic no-exact-match
+        // fallback (`model_id` nil) carrying the raw, client-supplied model
+        // string — see `model_label`'s doc comment.
         self.state
             .metrics
-            .observe_request_duration(&chosen_target.model_name, t0.elapsed());
+            .observe_request_duration(model_label(&chosen_target), start.elapsed());
         self.state.metrics.record_request(true);
         log_request_finish(
             request_id,
@@ -599,6 +620,7 @@ impl PipelineService {
             policy_outcome,
             secure_mode,
             pipeline_input,
+            start,
         } = self.prepare(auth, resolved, &request).await?;
 
         let kind = match request.request_kind {
@@ -775,12 +797,17 @@ impl PipelineService {
             event.restored_response =
                 if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
-            // KPI-2 monitoring, Task 2 — `t0` above already times this
-            // stream from just before the upstream provider connect;
-            // `chosen_target.model_name` is the resolved provider model.
+            // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`,
+            // captured outside this generator and moved in) times this
+            // request end-to-end, same start point as the buffered path and
+            // the denied short-circuit; `t0` above still only covers from
+            // just before the upstream provider connect and remains the
+            // source for `latency_ms`/`event.latency_ms`, unchanged.
+            // `model_label` bounds the label the same way as the buffered
+            // path — see its doc comment.
             state
                 .metrics
-                .observe_request_duration(&chosen_target.model_name, t0.elapsed());
+                .observe_request_duration(model_label(&chosen_target), start.elapsed());
             state.metrics.record_request(stream_ok);
             log_request_finish(request_id, workspace_id, &final_action, stream_ok);
 
@@ -964,6 +991,31 @@ fn prompt_from_messages(messages: &[Message]) -> String {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Bound the `model` label used by `secureprompt_request_duration_seconds`.
+///
+/// `http::model_router::resolve_model` returns a **synthetic** `ModelTarget`
+/// (`model_id: Uuid::nil()`) when a workspace has a provider configured but
+/// no exact `models` row matches the requested name (Phase 1 fallback —
+/// see `resolve_model`'s `targets.is_empty()` branch). In that case
+/// `model_name` is set to the raw, client-supplied model string from the
+/// request body, verbatim — no allow-list, no length cap. Emitting that
+/// directly as a Prometheus label value would let any caller mint unbounded
+/// label cardinality on the `request_duration` histogram (a
+/// `Mutex<Vec<(String, Histogram)>>` with no eviction).
+///
+/// Real targets come from `ProviderRepository::resolve_model_targets`,
+/// which populates `model_id` from `models.id` — a Postgres-generated UUID
+/// primary key that is never the nil UUID in practice — so
+/// `model_id.is_nil()` reliably distinguishes the synthetic fallback from a
+/// real, workspace-configured model.
+fn model_label(target: &ModelTarget) -> &str {
+    if target.model_id.is_nil() {
+        "unknown"
+    } else {
+        &target.model_name
+    }
 }
 
 /// Map `policy_outcome.result.final_action` — which comes from
@@ -1667,5 +1719,59 @@ mod policy_violation_label_tests {
         // Defensive: any future VALID_ACTIONS addition this function
         // doesn't know about yet must not emit an unbounded label.
         assert_eq!(policy_violation_label("some-future-action"), None);
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use super::*;
+    use crate::http::model_router::ModelTarget;
+    use secureprompt_common::types::{ProviderId, WorkspaceId};
+    use uuid::Uuid;
+
+    // Code-review fix-up (post commit 46a2f65) — `model_label` is the pure
+    // mapping between a resolved `ModelTarget` and the bounded
+    // `secureprompt_request_duration_seconds{model}` label. The critical
+    // case: `http::model_router::resolve_model`'s Phase-1 fallback returns
+    // a *synthetic* target (`model_id: Uuid::nil()`) whose `model_name` is
+    // the raw, client-supplied model string — unbounded, attacker/client
+    // controlled. That string must never reach the label directly.
+
+    fn target(model_id: Uuid, model_name: &str) -> ModelTarget {
+        ModelTarget {
+            model_id,
+            workspace_id: WorkspaceId(Uuid::new_v4()),
+            provider_id: ProviderId(Uuid::new_v4()),
+            provider_name: "openai".to_owned(),
+            provider_type: "openai".to_owned(),
+            model_name: model_name.to_owned(),
+            encrypted_credential: None,
+            config: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn synthetic_fallback_target_yields_unknown_not_the_raw_string() {
+        // A hostile / high-cardinality raw model string, exactly the shape
+        // `resolve_model`'s synthetic branch would pass through verbatim
+        // (no allow-list, no length cap) if `model_label` didn't intervene.
+        let hostile_name = "x".repeat(500) + "; DROP TABLE models; --🔥";
+        let t = target(Uuid::nil(), &hostile_name);
+        assert_eq!(model_label(&t), "unknown");
+    }
+
+    #[test]
+    fn synthetic_fallback_with_ordinary_looking_name_still_maps_to_unknown() {
+        // Even a plausible-looking model name must not leak through when
+        // `model_id` is nil — the nil check, not the string's shape, is the
+        // only signal `model_label` trusts.
+        let t = target(Uuid::nil(), "gpt-4o-mini");
+        assert_eq!(model_label(&t), "unknown");
+    }
+
+    #[test]
+    fn real_target_with_non_nil_model_id_passes_model_name_through() {
+        let t = target(Uuid::new_v4(), "gpt-4o-mini");
+        assert_eq!(model_label(&t), "gpt-4o-mini");
     }
 }
