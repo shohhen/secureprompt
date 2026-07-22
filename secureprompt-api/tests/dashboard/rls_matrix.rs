@@ -131,23 +131,6 @@ async fn send_raw(
     (status, val)
 }
 
-/// Log in and return an access token.
-async fn login(router: &Router, email: &str) -> String {
-    let (status, body) = send_raw(
-        router,
-        "POST",
-        "/v1/auth/token",
-        Some(json!({ "email": email, "password": fixtures::SHARED_PASSWORD })),
-        "",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "login must succeed: {body}");
-    body["access_token"]
-        .as_str()
-        .expect("access_token field")
-        .to_owned()
-}
-
 // ---------- Matrix -----------------------------------------------------------
 
 /// A single endpoint under test.
@@ -276,8 +259,13 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
 
     let (_state, router) = build_app(pool);
 
-    // Authenticate as admin_a (workspace A).
-    let token_a = login(&router, fixtures::ADMIN_A_EMAIL).await;
+    // Authenticate as admin_a (workspace A). Minted directly rather than via
+    // POST /v1/auth/token: the 2FA gate now forces Admin/Owner logins into
+    // the enrollment branch (202 `enroll_required`) instead of returning an
+    // access token, and this test needs an authenticated admin session, not
+    // the login flow itself — see `fixtures::mint_jwt` for why this bypass
+    // is safe.
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, seeded.workspace_a, seeded.admin_a, "admin");
 
     let workspace_b = seeded.workspace_b;
     let cases = matrix_cases();

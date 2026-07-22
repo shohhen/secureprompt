@@ -82,14 +82,6 @@ pub async fn test_connection(
         return TestResult::err("api_key is empty");
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return TestResult::err(format!("failed to build HTTP client: {e}")),
-    };
-
     let resolved_base = base_url
         .map(|s| s.trim_end_matches('/').to_owned())
         .filter(|s| !s.is_empty())
@@ -101,11 +93,47 @@ pub async fn test_connection(
         ));
     }
 
+    // SSRF guard: validate + resolve + screen before any connection, then
+    // pin the validated address so the host cannot be re-resolved.
+    let policy = crate::security::EgressPolicy::from_env();
+    let validated = match crate::security::validate_outbound_url(&resolved_base, &policy).await {
+        Ok(v) => v,
+        Err(e) => return TestResult::err(format!("base_url rejected: {e}")),
+    };
+
+    let client = match crate::security::build_pinned_client(&validated, Duration::from_secs(10)) {
+        Ok(c) => c,
+        Err(e) => return TestResult::err(format!("failed to build HTTP client: {e}")),
+    };
+
     match provider_type.to_lowercase().as_str() {
         "anthropic" => probe_anthropic(&client, &resolved_base, api_key).await,
         // openai, google, custom, openai_compat all use the same probe.
         _ => probe_openai_compat(&client, &resolved_base, api_key).await,
     }
+}
+
+/// Vertex regions are `[a-z0-9-]` only (e.g. `us-central1`) or `global`.
+/// Anything else can inject a different host into the `{region}-aiplatform`
+/// format string.
+fn validate_vertex_region(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 40
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// GCP project IDs use `[a-z0-9-]`. We enforce non-empty and ≤40 chars and
+/// reject any other character, which prevents path traversal / query
+/// injection into the request URL. (We don't reproduce GCP's exact 6-30
+/// length rule — the charset restriction is what closes the injection.)
+fn validate_vertex_project(project: &str) -> bool {
+    !project.is_empty()
+        && project.len() <= 40
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Vertex probe: mint an OAuth access token (SA JSON or ADC) and hit the
@@ -132,6 +160,12 @@ async fn probe_vertex(
             None => return TestResult::err("vertex: project required (set project or use an SA key)"),
         },
     };
+    if !validate_vertex_region(region) {
+        return TestResult::err("vertex: invalid region format");
+    }
+    if !validate_vertex_project(&project) {
+        return TestResult::err("vertex: invalid project format");
+    }
     let host = if region == "global" {
         "aiplatform.googleapis.com".to_owned()
     } else {
@@ -140,7 +174,11 @@ async fn probe_vertex(
     let url = format!(
         "https://{host}/v1/projects/{project}/locations/{region}/publishers/google/models"
     );
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return TestResult::err(format!("http client: {e}")),
     };
@@ -415,5 +453,54 @@ mod tests {
         assert!(is_chat_capable("google", "gemini-2.5-flash"));
         assert!(is_chat_capable("google", "gemini-2.5-pro"));
         assert!(is_chat_capable("anthropic", "claude-sonnet-4-5"));
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_connection_refuses_metadata_base_url() {
+        let r = test_connection(
+            "openai",
+            "sk-test",
+            Some("http://169.254.169.254/latest/meta-data"),
+            None,
+            None,
+        )
+        .await;
+        assert!(!r.success, "metadata endpoint must be refused");
+        let msg = r.error.unwrap_or_default();
+        assert!(
+            msg.contains("blocked") || msg.contains("metadata"),
+            "error should name the egress refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_refuses_file_scheme() {
+        let r = test_connection("openai", "sk-test", Some("file:///etc/passwd"), None, None).await;
+        assert!(!r.success);
+        assert!(r.error.unwrap_or_default().contains("scheme"));
+    }
+
+    #[test]
+    fn vertex_region_rejects_host_injection() {
+        assert!(validate_vertex_region("us-central1"));
+        assert!(validate_vertex_region("global"));
+        assert!(validate_vertex_region("europe-west4"));
+
+        for bad in ["evil.com#", "evil.com/", "a@evil.com", "a:1", "us central1", "../x", ""] {
+            assert!(!validate_vertex_region(bad), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn vertex_project_rejects_path_injection() {
+        assert!(validate_vertex_project("my-project-123"));
+        for bad in ["../../etc", "a/b", "a?b", "a#b", ""] {
+            assert!(!validate_vertex_project(bad), "{bad} must be rejected");
+        }
     }
 }

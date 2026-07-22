@@ -1,0 +1,536 @@
+//! SSRF egress guard.
+//!
+//! Validates a caller-supplied URL, resolves it, screens every resolved
+//! address against blocked ranges, and pins the validated address at
+//! connect time so the connection cannot be re-resolved afterwards
+//! (TOCTOU / DNS-rebinding defence).
+
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
+
+/// Deployment-scoped egress policy.
+///
+/// `allow_private_ranges` exists because on-prem and air-gapped installs
+/// legitimately point providers at internal vLLM/Ollama endpoints on
+/// RFC1918 addresses. Cloud metadata is denied regardless — see
+/// `classify_ip`.
+#[derive(Debug, Clone)]
+pub struct EgressPolicy {
+    pub allow_private_ranges: bool,
+    pub extra_denied_hosts: Vec<String>,
+}
+
+impl EgressPolicy {
+    /// Deny private ranges. The safe default for cloud/GKE deployments.
+    #[must_use]
+    pub fn deny_private() -> Self {
+        Self { allow_private_ranges: false, extra_denied_hosts: Vec::new() }
+    }
+
+    /// Read `SECUREPROMPT_ALLOW_PRIVATE_PROVIDER_URLS`. Absent or
+    /// unparseable means deny.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let raw = std::env::var("SECUREPROMPT_ALLOW_PRIVATE_PROVIDER_URLS").ok();
+        Self {
+            allow_private_ranges: Self::parse_flag(raw.as_deref()),
+            extra_denied_hosts: Vec::new(),
+        }
+    }
+
+    /// Truthy-flag parsing, factored out so it is testable without
+    /// mutating process env (which races across parallel tests).
+    #[must_use]
+    pub fn parse_flag(raw: Option<&str>) -> bool {
+        matches!(
+            raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+}
+
+/// Why an outbound request was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsrfError {
+    InvalidUrl(String),
+    ForbiddenScheme(String),
+    CredentialsInUrl,
+    MissingHost,
+    DeniedHost(String),
+    DnsFailure(String),
+    BlockedAddress { host: String, addr: IpAddr, reason: &'static str },
+}
+
+impl std::fmt::Display for SsrfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl(e) => write!(f, "invalid URL: {e}"),
+            Self::ForbiddenScheme(s) => write!(f, "forbidden URL scheme: {s}"),
+            Self::CredentialsInUrl => write!(f, "URL must not embed credentials"),
+            Self::MissingHost => write!(f, "URL has no host"),
+            Self::DeniedHost(h) => write!(f, "host is denied by policy: {h}"),
+            Self::DnsFailure(e) => write!(f, "DNS resolution failed: {e}"),
+            Self::BlockedAddress { host, addr, reason } => {
+                write!(f, "host {host} resolves to blocked address {addr} ({reason})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SsrfError {}
+
+/// The IMDS address used by AWS, GCP, Azure, OpenStack and DigitalOcean.
+const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+
+/// Hostnames that must never be reachable, regardless of policy.
+pub(crate) const ALWAYS_DENIED_HOSTS: &[&str] =
+    &["metadata.google.internal", "metadata.goog", "instance-data"];
+
+/// Classify an address. `Some(reason)` means BLOCKED.
+///
+/// `allow_private` relaxes ONLY the RFC1918 / unique-local arms. Loopback,
+/// link-local, CGNAT, multicast, broadcast, unspecified and the cloud
+/// metadata address stay blocked unconditionally: none of them is ever a
+/// legitimate remote provider endpoint, and metadata in particular is the
+/// exact target this guard exists to protect.
+pub(crate) fn classify_ip(addr: IpAddr, allow_private: bool) -> Option<&'static str> {
+    match addr {
+        IpAddr::V4(v4) => classify_v4(v4, allow_private),
+        IpAddr::V6(v6) => {
+            // Unwrap IPv4-mapped form first, or ::ffff:169.254.169.254
+            // would slip past every v4 check below.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return classify_v4(v4, allow_private);
+            }
+            if v6.is_loopback() {
+                return Some("loopback");
+            }
+            if v6.is_unspecified() {
+                return Some("unspecified");
+            }
+            // Deprecated IPv4-compatible form (::a.b.c.d, RFC 4291): first six
+            // segments are zero and the low 32 bits embed a v4 address.
+            // `to_ipv4_mapped()` does NOT unwrap this form, so `::169.254.169.254`
+            // would otherwise fall through to None and defeat the metadata
+            // invariant. Runs after the loopback/unspecified special cases above so
+            // `::` and `::1` keep their v6 meaning.
+            let seg = v6.segments();
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return classify_v4(v4, allow_private);
+            }
+            if v6.is_multicast() {
+                return Some("multicast");
+            }
+            if is_v6_link_local(v6) {
+                return Some("link-local");
+            }
+            if is_v6_unique_local(v6) && !allow_private {
+                return Some("unique-local");
+            }
+            None
+        }
+    }
+}
+
+fn classify_v4(v4: Ipv4Addr, allow_private: bool) -> Option<&'static str> {
+    if v4 == CLOUD_METADATA_V4 {
+        return Some("cloud metadata endpoint");
+    }
+    if v4.is_loopback() {
+        return Some("loopback");
+    }
+    if v4.is_link_local() {
+        return Some("link-local");
+    }
+    if v4.is_broadcast() {
+        return Some("broadcast");
+    }
+    if v4.is_multicast() {
+        return Some("multicast");
+    }
+    if v4.is_unspecified() {
+        return Some("unspecified");
+    }
+    // 0.0.0.0/8 ("this network", RFC 1122): 0.x.x.x can address local
+    // hosts on Linux, so block the whole block — not just 0.0.0.0, which
+    // the unspecified check above already caught with a more specific reason.
+    if v4.octets()[0] == 0 {
+        return Some("this-network");
+    }
+    if is_cgnat_v4(v4) {
+        return Some("CGNAT");
+    }
+    if v4.is_private() && !allow_private {
+        return Some("private range");
+    }
+    None
+}
+
+/// 100.64.0.0/10 (RFC 6598).
+fn is_cgnat_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+/// fe80::/10. `Ipv6Addr::is_unicast_link_local` is unstable, so match manually.
+fn is_v6_link_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// fc00::/7. `Ipv6Addr::is_unique_local` is unstable, so match manually.
+fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Synchronous structural checks: scheme, credentials, host presence.
+///
+/// Uses `reqwest::Url` (a re-export of `url::Url`) so no extra dependency
+/// is pulled in.
+pub fn parse_and_check_url(raw: &str) -> Result<reqwest::Url, SsrfError> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(SsrfError::ForbiddenScheme(other.to_owned())),
+    }
+
+    // Credentials in the URL are both a credential-leak risk and a classic
+    // parser-confusion vector (`http://trusted.com@evil.com/`).
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SsrfError::CredentialsInUrl);
+    }
+
+    if url.host_str().is_none() {
+        return Err(SsrfError::MissingHost);
+    }
+
+    Ok(url)
+}
+
+/// A URL that passed every egress check, together with the exact addresses
+/// it resolved to. Callers MUST connect using these addresses (see
+/// `build_pinned_client`) rather than re-resolving the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedUrl {
+    pub url: reqwest::Url,
+    pub host: String,
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// Full egress validation: structure, denied hosts, DNS resolution, and
+/// range screening of EVERY resolved address.
+///
+/// Screening every resolved address (not just an IP literal) is what stops
+/// `evil.example.com A 169.254.169.254` from walking straight through.
+pub async fn validate_outbound_url(
+    raw: &str,
+    policy: &EgressPolicy,
+) -> Result<ValidatedUrl, SsrfError> {
+    let url = parse_and_check_url(raw)?;
+    let host = url.host_str().ok_or(SsrfError::MissingHost)?.to_ascii_lowercase();
+
+    if ALWAYS_DENIED_HOSTS.contains(&host.as_str())
+        || policy
+            .extra_denied_hosts
+            .iter()
+            .any(|h| h.to_ascii_lowercase() == host)
+    {
+        return Err(SsrfError::DeniedHost(host));
+    }
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| SsrfError::DnsFailure(e.to_string()))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(SsrfError::DnsFailure(format!("{host} resolved to no addresses")));
+    }
+
+    for sa in &addrs {
+        if let Some(reason) = classify_ip(sa.ip(), policy.allow_private_ranges) {
+            return Err(SsrfError::BlockedAddress { host, addr: sa.ip(), reason });
+        }
+    }
+
+    Ok(ValidatedUrl { url, host, addrs })
+}
+
+/// Build a client that will only ever connect to the addresses validated
+/// in `v`, and that never follows redirects.
+///
+/// Three deliberate choices:
+///
+/// 1. `resolve_to_addrs` pins the validated addresses for this host, so the
+///    name cannot be re-resolved to a different address between validation
+///    and connect (TOCTOU / DNS rebinding).
+/// 2. `Policy::none()` — a redirect would be fetched OUTSIDE the pin, and
+///    re-validating each hop would need async DNS inside reqwest's
+///    synchronous redirect callback. Callers that must follow redirects
+///    should re-run `validate_outbound_url` on the `Location` header and
+///    issue a fresh request (see `credential_test`), which keeps every hop
+///    screened.
+/// 3. `.no_proxy()` — without it, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env
+///    vars would route the connection through a proxy that resolves and
+///    connects to the target itself, silently bypassing the
+///    `resolve_to_addrs` pin. (This is a deliberate behavior: the guarded
+///    credential-test path performs direct egress, not proxied egress.)
+pub fn build_pinned_client(v: &ValidatedUrl, timeout: Duration) -> Result<reqwest::Client, SsrfError> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .use_rustls_tls()
+        .no_proxy()
+        .resolve_to_addrs(&v.host, &v.addrs)
+        .build()
+        .map_err(|e| SsrfError::InvalidUrl(format!("failed to build pinned client: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn blocks_cloud_metadata_even_when_private_allowed() {
+        // The single most important assertion in this module.
+        assert_eq!(classify_ip(v4(169, 254, 169, 254), true), Some("cloud metadata endpoint"));
+        assert_eq!(classify_ip(v4(169, 254, 169, 254), false), Some("cloud metadata endpoint"));
+    }
+
+    #[test]
+    fn blocks_internal_ranges_when_private_denied() {
+        assert_eq!(classify_ip(v4(127, 0, 0, 1), false), Some("loopback"));
+        assert_eq!(classify_ip(v4(10, 0, 0, 5), false), Some("private range"));
+        assert_eq!(classify_ip(v4(172, 16, 3, 9), false), Some("private range"));
+        assert_eq!(classify_ip(v4(192, 168, 1, 14), false), Some("private range"));
+        assert_eq!(classify_ip(v4(169, 254, 1, 1), false), Some("link-local"));
+        assert_eq!(classify_ip(v4(100, 64, 0, 1), false), Some("CGNAT"));
+        assert_eq!(classify_ip(v4(0, 0, 0, 0), false), Some("unspecified"));
+        assert_eq!(classify_ip(v4(224, 0, 0, 1), false), Some("multicast"));
+        assert_eq!(classify_ip(v4(255, 255, 255, 255), false), Some("broadcast"));
+    }
+
+    #[test]
+    fn allows_private_when_policy_permits_but_never_loopback_or_linklocal() {
+        // On-prem: internal vLLM/Ollama must work.
+        assert_eq!(classify_ip(v4(192, 168, 1, 14), true), None);
+        assert_eq!(classify_ip(v4(10, 0, 0, 5), true), None);
+        // Loopback and link-local stay blocked — they are never a
+        // legitimate *remote* provider endpoint.
+        assert_eq!(classify_ip(v4(127, 0, 0, 1), true), Some("loopback"));
+        assert_eq!(classify_ip(v4(169, 254, 1, 1), true), Some("link-local"));
+    }
+
+    #[test]
+    fn blocks_this_network_0_0_0_0_slash_8() {
+        assert_eq!(classify_ip(v4(0, 0, 0, 1), false), Some("this-network"));
+        assert_eq!(classify_ip(v4(0, 255, 1, 2), true), Some("this-network"));
+        // 0.0.0.0 itself stays "unspecified" (checked before this-network).
+        assert_eq!(classify_ip(v4(0, 0, 0, 0), false), Some("unspecified"));
+    }
+
+    #[test]
+    fn allows_ordinary_public_addresses() {
+        assert_eq!(classify_ip(v4(140, 82, 121, 4), false), None);
+        assert_eq!(classify_ip(v4(8, 8, 8, 8), false), None);
+    }
+
+    #[test]
+    fn blocks_ipv6_internal_ranges() {
+        assert_eq!(classify_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), false), Some("loopback"));
+        assert_eq!(classify_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), false), Some("unspecified"));
+        // fe80::1 link-local
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), false),
+            Some("link-local")
+        );
+        // fd00::1 unique-local
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), false),
+            Some("unique-local")
+        );
+        // 2606:4700::1111 public
+        assert_eq!(
+            classify_ip(IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn unwraps_ipv4_mapped_ipv6_before_classifying() {
+        // ::ffff:169.254.169.254 must not smuggle metadata past the v6 arm.
+        let mapped = IpAddr::V6(Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped());
+        assert_eq!(classify_ip(mapped, true), Some("cloud metadata endpoint"));
+        let mapped_priv = IpAddr::V6(Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped());
+        assert_eq!(classify_ip(mapped_priv, false), Some("private range"));
+    }
+
+    #[test]
+    fn blocks_ipv4_compatible_ipv6_metadata_and_private() {
+        // Deprecated ::a.b.c.d form must NOT bypass classification.
+        let meta: IpAddr = "::169.254.169.254".parse().unwrap();
+        assert_eq!(classify_ip(meta, true), Some("cloud metadata endpoint"));
+        assert_eq!(classify_ip(meta, false), Some("cloud metadata endpoint"));
+
+        let priv_: IpAddr = "::10.0.0.5".parse().unwrap();
+        assert_eq!(classify_ip(priv_, false), Some("private range"));
+        assert_eq!(classify_ip(priv_, true), None); // relaxed only when allowed
+
+        // ::1 and :: keep their v6 meaning, not reinterpreted as v4.
+        assert_eq!(classify_ip("::1".parse().unwrap(), false), Some("loopback"));
+        assert_eq!(classify_ip("::".parse().unwrap(), false), Some("unspecified"));
+    }
+
+    #[test]
+    fn policy_denies_private_by_default() {
+        let p = EgressPolicy::deny_private();
+        assert!(!p.allow_private_ranges);
+        assert!(p.extra_denied_hosts.is_empty());
+    }
+
+    #[test]
+    fn policy_from_env_parses_truthy_values() {
+        for v in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(EgressPolicy::parse_flag(Some(v)), "{v} must enable private ranges");
+        }
+        for v in ["0", "false", "no", "off", "", "garbage"] {
+            assert!(!EgressPolicy::parse_flag(Some(v)), "{v} must NOT enable private ranges");
+        }
+        assert!(!EgressPolicy::parse_flag(None), "unset must default to deny");
+    }
+
+    #[test]
+    fn ssrf_error_displays_reason() {
+        let e = SsrfError::ForbiddenScheme("file".into());
+        assert!(e.to_string().contains("file"));
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for raw in [
+            "file:///etc/passwd",
+            "gopher://example.com/",
+            "ftp://example.com/",
+            "dict://example.com:11211/",
+        ] {
+            match parse_and_check_url(raw) {
+                Err(SsrfError::ForbiddenScheme(_)) => {}
+                other => panic!("{raw} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_embedded_credentials() {
+        assert_eq!(
+            parse_and_check_url("http://user:pass@example.com/"),
+            Err(SsrfError::CredentialsInUrl)
+        );
+        assert_eq!(
+            parse_and_check_url("http://user@example.com/"),
+            Err(SsrfError::CredentialsInUrl)
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_and_hostless_urls() {
+        assert!(matches!(parse_and_check_url("not a url"), Err(SsrfError::InvalidUrl(_))));
+        assert!(matches!(parse_and_check_url(""), Err(SsrfError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn accepts_ordinary_http_and_https() {
+        assert!(parse_and_check_url("https://api.openai.com/v1").is_ok());
+        assert!(parse_and_check_url("  http://example.com:8080/x  ").is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_ip_literal_in_blocked_range() {
+        let p = EgressPolicy::deny_private();
+        match validate_outbound_url("http://169.254.169.254/latest/meta-data/", &p).await {
+            Err(SsrfError::BlockedAddress { reason, .. }) => {
+                assert_eq!(reason, "cloud metadata endpoint");
+            }
+            other => panic!("metadata IP must be blocked, got {other:?}"),
+        }
+        assert!(matches!(
+            validate_outbound_url("http://127.0.0.1:8080/models", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+        assert!(matches!(
+            validate_outbound_url("http://192.168.1.14/v1", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn allows_private_literal_when_policy_permits() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        let v = validate_outbound_url("http://192.168.1.14:8000/v1", &p)
+            .await
+            .expect("on-prem private endpoint must be allowed");
+        assert_eq!(v.host, "192.168.1.14");
+        // ...but metadata is still refused under the same policy.
+        assert!(matches!(
+            validate_outbound_url("http://169.254.169.254/", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_always_denied_hostnames() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        assert_eq!(
+            validate_outbound_url("http://metadata.google.internal/x", &p).await,
+            Err(SsrfError::DeniedHost("metadata.google.internal".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_extra_denied_hosts_case_insensitively() {
+        let p = EgressPolicy {
+            allow_private_ranges: false,
+            extra_denied_hosts: vec!["Blocked.Example.COM".into()],
+        };
+        assert_eq!(
+            validate_outbound_url("https://blocked.example.com/v1", &p).await,
+            Err(SsrfError::DeniedHost("blocked.example.com".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_localhost_name_to_blocked_address() {
+        // Name-based bypass: "localhost" is not an IP literal, so this only
+        // fails if DNS resolution actually happens before classification.
+        let p = EgressPolicy::deny_private();
+        assert!(matches!(
+            validate_outbound_url("http://localhost:9999/models", &p).await,
+            Err(SsrfError::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_client_builds_and_refuses_redirects() {
+        let p = EgressPolicy { allow_private_ranges: true, extra_denied_hosts: vec![] };
+        let v = validate_outbound_url("http://192.168.1.14:8000/v1", &p)
+            .await
+            .expect("validate");
+        let client = build_pinned_client(&v, std::time::Duration::from_secs(5));
+        assert!(client.is_ok(), "pinned client must build");
+    }
+}

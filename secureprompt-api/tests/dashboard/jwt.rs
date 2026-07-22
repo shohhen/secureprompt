@@ -21,7 +21,10 @@ use deadpool_redis::Config as RedisPoolConfig;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use secureprompt_api::{
     app_state::AppState,
-    http::middleware::jwt_auth::{self, Claims, JwtAuthContext},
+    http::{
+        middleware::jwt_auth::{self, Claims, JwtAuthContext},
+        routes::dashboard::auth::{decode_purpose_token, encode_purpose_token},
+    },
     ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
@@ -51,10 +54,28 @@ fn mint_token(encoding: &EncodingKey, ttl_secs: i64) -> (String, Claims) {
         iat: now.timestamp(),
         exp: (now + Duration::seconds(ttl_secs)).timestamp(),
         jti: Uuid::new_v4().to_string(),
+        purpose: None,
     };
     let token = encode(&Header::new(Algorithm::HS256), &claims, encoding)
         .expect("encode test token");
     (token, claims)
+}
+
+/// 2FA (Task 4): mint a single-purpose token the way
+/// `dashboard::auth::encode_purpose_token` does — same claim shape, just
+/// with `purpose = Some(purpose)` set.
+fn mint_purpose_token(encoding: &EncodingKey, purpose: &str, ttl_secs: i64) -> String {
+    let now = Utc::now();
+    let claims = Claims {
+        sub: Uuid::new_v4(),
+        ws: Uuid::new_v4(),
+        role: String::new(),
+        iat: now.timestamp(),
+        exp: (now + Duration::seconds(ttl_secs)).timestamp(),
+        jti: Uuid::new_v4().to_string(),
+        purpose: Some(purpose.to_string()),
+    };
+    encode(&Header::new(Algorithm::HS256), &claims, encoding).expect("encode purpose token")
 }
 
 fn build_state(pool: PgPool) -> AppState {
@@ -177,6 +198,125 @@ async fn happy_path_accepts_valid_token(pool: PgPool) -> sqlx::Result<()> {
         response.status(),
         StatusCode::OK,
         "valid JWT must yield 200 on the protected route"
+    );
+
+    Ok(())
+}
+
+/// 2FA (Task 4) — the core security boundary: a challenge/enrollment token
+/// (`purpose = Some(_)`) must be rejected by the normal JWT auth middleware
+/// even though it is validly signed and unexpired. Only a purposeless
+/// access token may reach a protected route.
+#[sqlx::test]
+async fn purpose_token_rejected_as_access_token(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+    let app = router(state.clone());
+
+    for purpose in ["2fa_challenge", "2fa_enroll"] {
+        let token =
+            mint_purpose_token(&EncodingKey::from_secret(test_secret().as_bytes()), purpose, 300);
+
+        let request = Request::builder()
+            .uri("/protected")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("valid request");
+
+        let response = app.clone().oneshot(request).await.expect("router runs");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a {purpose} token must NOT authorize a normal protected route"
+        );
+    }
+
+    Ok(())
+}
+
+/// 2FA (Task 4 review fix) — happy path: `decode_purpose_token` round-trips
+/// the exact `(user_id, workspace_id)` pair `encode_purpose_token` was given,
+/// when the presented `expected_purpose` matches what was minted.
+#[sqlx::test]
+async fn decode_purpose_token_happy_path_round_trips_ids(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+    let user_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+
+    let token = encode_purpose_token(&state, user_id, workspace_id, "2fa_challenge", 300)
+        .expect("encode purpose token");
+
+    let (decoded_user, decoded_ws) = decode_purpose_token(&state, &token, "2fa_challenge")
+        .expect("matching purpose must decode");
+
+    assert_eq!(decoded_user, user_id);
+    assert_eq!(decoded_ws, workspace_id);
+
+    Ok(())
+}
+
+/// 2FA (Task 4 review fix) — the exact security case flagged in review: a
+/// `2fa_enroll` token must NOT be redeemable where a `2fa_challenge` is
+/// required, and vice versa. Without this check an attacker who completes
+/// enrollment could replay the enrollment token at the challenge endpoint
+/// (or skip straight from a stale enrollment token into a session).
+#[sqlx::test]
+async fn decode_purpose_token_rejects_purpose_mismatch(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+
+    let enroll_token = encode_purpose_token(&state, Uuid::new_v4(), Uuid::new_v4(), "2fa_enroll", 300)
+        .expect("encode enroll token");
+    assert!(
+        decode_purpose_token(&state, &enroll_token, "2fa_challenge").is_err(),
+        "an enroll token must not decode as a challenge token"
+    );
+
+    let challenge_token =
+        encode_purpose_token(&state, Uuid::new_v4(), Uuid::new_v4(), "2fa_challenge", 300)
+            .expect("encode challenge token");
+    assert!(
+        decode_purpose_token(&state, &challenge_token, "2fa_enroll").is_err(),
+        "a challenge token must not decode as an enroll token"
+    );
+
+    Ok(())
+}
+
+/// 2FA (Task 4 review fix) — a normal access token (`purpose = None`, minted
+/// the same way `encode_access`/`build_token_pair_body` do) must be rejected
+/// by `decode_purpose_token` regardless of `expected_purpose`. This is the
+/// mirror image of the `jwt_auth::require` guard: neither direction (access
+/// token at a purpose endpoint, purpose token at a normal endpoint) may
+/// cross the boundary.
+#[sqlx::test]
+async fn decode_purpose_token_rejects_normal_access_token(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+
+    let (access_token, _claims) =
+        mint_token(&EncodingKey::from_secret(test_secret().as_bytes()), 900);
+
+    assert!(
+        decode_purpose_token(&state, &access_token, "2fa_challenge").is_err(),
+        "a purposeless access token must not decode as any purpose token"
+    );
+
+    Ok(())
+}
+
+/// 2FA (Task 4 review fix) — an expired purpose token must be rejected even
+/// when its `purpose` claim matches. `ttl_secs = -3600` mints a token whose
+/// `exp` is an hour in the past, well outside the 60s `Validation` leeway
+/// `decode_purpose_token` uses (matches the pattern `jwt_auth::tests::
+/// expired_token_is_rejected` uses for the plain-access-token case).
+#[sqlx::test]
+async fn decode_purpose_token_rejects_expired_token(pool: PgPool) -> sqlx::Result<()> {
+    let state = build_state(pool);
+
+    let token = encode_purpose_token(&state, Uuid::new_v4(), Uuid::new_v4(), "2fa_challenge", -3600)
+        .expect("encode already-expired purpose token");
+
+    assert!(
+        decode_purpose_token(&state, &token, "2fa_challenge").is_err(),
+        "an expired purpose token must be rejected even with a matching purpose"
     );
 
     Ok(())

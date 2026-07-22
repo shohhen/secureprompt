@@ -99,6 +99,8 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/backup_disk.xml:/etc/clickhouse-server/config.d/backup_disk.xml:ro
+      - clickhouse_backups:/var/lib/clickhouse/backups
     ports:
       - "8123:8123"
       - "9000:9000"
@@ -107,6 +109,21 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  backup:
+    build:
+      context: ./scripts/backup
+    profiles: ["backup"]
+    depends_on: [postgres, clickhouse, qdrant]
+    environment:
+      SECUREPROMPT_BACKUP_KEY: ${SECUREPROMPT_BACKUP_KEY:-dev-backup-key-change-me}
+      PGHOST: postgres
+      CLICKHOUSE_HOST: clickhouse
+      QDRANT_URL: http://qdrant:6333
+      CH_BACKUP_MOUNT: /var/lib/clickhouse/backups
+    volumes:
+      - ./backups:/backups
+      - clickhouse_backups:/var/lib/clickhouse/backups
 
   api:
     build:
@@ -331,6 +348,7 @@ services:
 volumes:
   postgres_data:
   clickhouse_data:
+  clickhouse_backups:
   grafana_data:
   qdrant_data:
   librechat_mongo_data:

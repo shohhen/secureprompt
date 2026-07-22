@@ -168,6 +168,16 @@ impl CachedAuthEntry {
 
 /// JWT payload. Short field names (`sub`, `ws`) keep the encoded token
 /// compact on the wire.
+///
+/// `purpose` (2FA, Task 4): absent/`None` on every normal access token —
+/// `#[serde(default, ...)]` means tokens minted before this field existed
+/// (and any hand-built `Claims` that omit it) deserialize with
+/// `purpose = None` and keep authorizing exactly as before
+/// (BACKWARD COMPAT). `Some("2fa_challenge")` / `Some("2fa_enroll")` mark a
+/// short-lived single-purpose token minted by `encode_purpose_token`
+/// (`routes/dashboard/auth.rs`); `is_access_claims` — and therefore
+/// `require` below — rejects those outright so a partial-login token can
+/// never reach an authenticated route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
@@ -176,6 +186,19 @@ pub struct Claims {
     pub iat: i64,
     pub exp: i64,
     pub jti: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+/// True when `claims` represents a normal (purposeless) access token — the
+/// only kind allowed to authorize protected routes. Challenge/enrollment
+/// tokens (`purpose = Some(_)`) return `false` here.
+///
+/// Pure predicate (no I/O) so it can be unit-tested directly without
+/// building a full request/response cycle.
+#[must_use]
+pub const fn is_access_claims(claims: &Claims) -> bool {
+    claims.purpose.is_none()
 }
 
 /// Axum middleware compatible with `middleware::from_fn_with_state`.
@@ -207,6 +230,15 @@ pub async fn require(
         .map_err(|_| api_error_response(ApiError::Unauthorized("Invalid credentials".into())))?;
 
     let claims = decoded.claims;
+
+    // 2FA (Task 4): a challenge/enrollment token (`purpose = Some(_)`) is
+    // single-purpose and must never authorize a normal route — reject
+    // before touching the jti blacklist / cache / role parsing below.
+    if !is_access_claims(&claims) {
+        return Err(api_error_response(ApiError::Unauthorized(
+            "Invalid credentials".into(),
+        )));
+    }
 
     // jti blacklist gate — `POST /v1/auth/logout` plants these entries.
     // On Redis failure, fall back to in-memory cache (D-15, PG-04).
@@ -243,6 +275,18 @@ pub async fn require(
             "Invalid credentials".into(),
         )));
     }
+
+    // 2FA (Task 4 review fix): self-enforcing ordering invariant. The
+    // `is_access_claims` guard above must have already rejected any purpose
+    // token before we reach role parsing — `claims.role` is an empty
+    // placeholder on purpose tokens (see `encode_purpose_token`) and would
+    // fail `from_db_str` anyway, but this makes a future reorder of the two
+    // checks trip loudly in test/debug builds instead of silently relying on
+    // that coincidence.
+    debug_assert!(
+        is_access_claims(&claims),
+        "purpose tokens must be rejected before role parsing"
+    );
 
     let role = UserRole::from_db_str(&claims.role).map_err(|_| {
         api_error_response(ApiError::Unauthorized("Invalid credentials".into()))
@@ -307,6 +351,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + ttl).timestamp(),
             jti: Uuid::new_v4().to_string(),
+            purpose: None,
         };
         (
             claims,
@@ -385,5 +430,91 @@ mod tests {
         validation.leeway = 0;
         let result = decode::<Claims>(&token, &decoding, &validation);
         assert!(result.is_err(), "expired token must fail decode");
+    }
+
+    // ---- 2FA (Task 4): purpose-claim guard -------------------------------
+
+    #[test]
+    fn purposeless_claims_are_a_valid_access_token() {
+        let (claims, _decoding, _encoding) = sample_claims(Duration::minutes(15));
+        assert_eq!(claims.purpose, None);
+        assert!(
+            is_access_claims(&claims),
+            "a normal access token (purpose = None) must authorize"
+        );
+    }
+
+    #[test]
+    fn purpose_claims_are_rejected_as_an_access_token() {
+        let (mut claims, _decoding, _encoding) = sample_claims(Duration::minutes(5));
+        for purpose in ["2fa_challenge", "2fa_enroll"] {
+            claims.purpose = Some(purpose.to_string());
+            assert!(
+                !is_access_claims(&claims),
+                "a {purpose} token must NOT be treated as an access token"
+            );
+        }
+    }
+
+    #[test]
+    fn purpose_token_round_trips_and_is_rejected_by_the_guard() {
+        // Full encode → decode round trip (same path `require` runs) proves
+        // the rejection isn't an artifact of hand-building `Claims` — a
+        // genuinely signed+decoded challenge token still fails the guard.
+        let secret = b"test-secret-value";
+        let now = Utc::now();
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            ws: Uuid::new_v4(),
+            role: String::new(),
+            iat: now.timestamp(),
+            exp: (now + Duration::minutes(5)).timestamp(),
+            jti: Uuid::new_v4().to_string(),
+            purpose: Some("2fa_challenge".to_string()),
+        };
+        let encoding = EncodingKey::from_secret(secret);
+        let decoding = DecodingKey::from_secret(secret);
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &encoding)
+            .expect("encode purpose token");
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.leeway = 60;
+        let decoded = decode::<Claims>(&token, &decoding, &validation).expect("decode");
+        assert_eq!(decoded.claims.purpose.as_deref(), Some("2fa_challenge"));
+        assert!(!is_access_claims(&decoded.claims));
+    }
+
+    /// BACKWARD-COMPAT REGRESSION GUARD: a token minted before the `purpose`
+    /// claim existed has no `purpose` key in its JSON payload at all. If
+    /// `#[serde(default)]` were ever dropped from the field, this old-shape
+    /// JSON would fail to deserialize and every already-issued access token
+    /// would suddenly log its holder out. It must deserialize cleanly with
+    /// `purpose = None`, i.e. still treated as a valid access token.
+    #[test]
+    fn old_access_token_json_without_purpose_key_deserializes_to_none() {
+        let json = r#"{
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "ws": "22222222-2222-2222-2222-222222222222",
+            "role": "owner",
+            "iat": 1700000000,
+            "exp": 1700003600,
+            "jti": "33333333-3333-3333-3333-333333333333"
+        }"#;
+        let claims: Claims =
+            serde_json::from_str(json).expect("old-format claims (no purpose key) must deserialize");
+        assert_eq!(claims.purpose, None);
+        assert!(is_access_claims(&claims), "old token must still authorize");
+    }
+
+    /// Serializing a normal access token must NOT emit a `purpose` key at
+    /// all (wire-format regression guard for `skip_serializing_if`) — keeps
+    /// tokens minted post-2FA byte-shape-compatible with pre-2FA consumers.
+    #[test]
+    fn access_token_serialization_omits_purpose_key_when_none() {
+        let (claims, _decoding, _encoding) = sample_claims(Duration::minutes(15));
+        let value = serde_json::to_value(&claims).expect("serialize claims");
+        assert!(
+            value.get("purpose").is_none(),
+            "purpose key must be omitted when None, got: {value}"
+        );
     }
 }

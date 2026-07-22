@@ -1,0 +1,56 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-backup
+  labels: {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              env:
+                - name: SECUREPROMPT_BACKUP_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.keySecret | quote }}
+                      key: backup-key
+                - name: PGHOST
+                  value: {{ include "secureprompt.fullname" . }}-postgres
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-user
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-password
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "secureprompt.fullname" . }}-secrets
+                      key: postgres-database
+                - name: CLICKHOUSE_HOST
+                  value: {{ include "secureprompt.fullname" . }}-clickhouse
+                - name: QDRANT_URL
+                  value: http://{{ include "secureprompt.fullname" . }}-qdrant:6333
+                - name: RETENTION_DAILY
+                  value: {{ .Values.backup.retentionDaily | quote }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "secureprompt.fullname" . }}-backups
+{{- end }}

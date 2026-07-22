@@ -94,8 +94,92 @@ export const authConfig: NextAuthConfig = {
       credentials: {
         email: { label: "Email", type: "email" },
         password: { label: "Password", type: "password" },
+        // --- Pre-obtained-tokens path (2FA flow; see docs/superpowers/
+        // plans/2026-07-22-2fa-console.md) ---
+        // `login-form.tsx` never renders NextAuth's built-in credentials
+        // form, so these never need a real `<input>`; they're declared
+        // here purely to document the contract `authorize()` accepts.
+        // The form completes the whole password -> 2FA-challenge/enroll
+        // -> verify dance itself against the Rust API (`twofa-api.ts`)
+        // and, once it holds a final token pair, calls
+        // `signIn("credentials", { accessToken, refreshToken, user, ... })`.
+        accessToken: { label: "Access Token", type: "text" },
+        refreshToken: { label: "Refresh Token", type: "text" },
+        // JSON-stringified `AppSessionUser` (`{ id, email }` — see
+        // `twofa-api.ts`'s `Tokens.user`), e.g. `JSON.stringify(tokens.user)`.
+        user: { label: "User", type: "text" },
+        workspaceId: { label: "Workspace Id", type: "text" },
+        role: { label: "Role", type: "text" },
+        accessExpiresAt: { label: "Access Expires At", type: "text" },
+        refreshExpiresAt: { label: "Refresh Expires At", type: "text" },
       },
       async authorize(credentials) {
+        // --- Path 2: pre-obtained tokens (2FA flow) ---
+        // By the time this branch runs, the login form has already
+        // completed the full auth dance directly against the Rust
+        // gateway over HTTPS (password -> 202 challenge/enroll -> code
+        // verify -> final token pair; see `twofa-api.ts`). `authorize()`
+        // here is a thin session wrapper: it just shapes the
+        // already-issued tokens into the NextAuth `User` object.
+        //
+        // We deliberately do NOT verify the JWT client-side — there is
+        // no signing secret available on this side to check it against,
+        // and it isn't needed for security: every subsequent request
+        // sends this access token to the Rust gateway, which
+        // independently validates signature/expiry/revocation on every
+        // call. A forged or stale token simply fails there, same as it
+        // would for a token obtained via the password path.
+        if (
+          typeof credentials?.accessToken === "string" &&
+          credentials.accessToken
+        ) {
+          const refreshToken =
+            typeof credentials.refreshToken === "string"
+              ? credentials.refreshToken
+              : "";
+          if (!refreshToken) return null;
+
+          let parsedUser: { id?: string; email?: string } = {};
+          if (typeof credentials.user === "string") {
+            try {
+              parsedUser = JSON.parse(credentials.user) as {
+                id?: string;
+                email?: string;
+              };
+            } catch {
+              parsedUser = {};
+            }
+          }
+
+          const email =
+            parsedUser.email ??
+            (typeof credentials.email === "string" ? credentials.email : "");
+          if (!email) return null;
+          const id = parsedUser.id ?? email;
+          const workspaceId =
+            typeof credentials.workspaceId === "string"
+              ? credentials.workspaceId
+              : "";
+          const role = (
+            typeof credentials.role === "string" ? credentials.role : "viewer"
+          ) as AppRole;
+          const accessExpiresAt = Number(credentials.accessExpiresAt ?? 0);
+          const refreshExpiresAt = Number(credentials.refreshExpiresAt ?? 0);
+
+          return {
+            id,
+            email,
+            workspaceId,
+            role,
+            accessToken: credentials.accessToken,
+            refreshToken,
+            accessExpiresAt,
+            refreshExpiresAt,
+          };
+        }
+
+        // --- Path 1: email + password (existing, non-2FA users;
+        // unchanged) ---
         const email = typeof credentials?.email === "string" ? credentials.email : "";
         const password =
           typeof credentials?.password === "string" ? credentials.password : "";

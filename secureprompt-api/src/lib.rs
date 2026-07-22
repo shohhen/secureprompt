@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod app_state;
+pub mod auth;
 pub mod db;
 pub mod detection;
 pub mod http;
@@ -10,5 +11,6 @@ pub mod pipeline;
 pub mod policy;
 pub mod providers;
 pub mod redis;
+pub mod security;
 pub mod token_usage;
 pub mod vault;
