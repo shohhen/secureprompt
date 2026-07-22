@@ -520,6 +520,20 @@ pub async fn verify(
             if let Err(err) = repo.confirm_totp(user_id).await {
                 return api_error_response(err);
             }
+
+            // Final-review Fix 1: turning 2FA ON must invalidate every
+            // refresh token minted BEFORE enrollment — otherwise a
+            // pre-2FA refresh token stays valid forever via `/refresh`
+            // (which never re-checks 2FA state), letting a session from
+            // before this device/browser had 2FA silently outlive it.
+            // Best-effort/non-fatal, mirroring `auth.rs`'s
+            // `revoke_all_for_user` call sites (replay detection,
+            // logout): a transient revoke failure must not strand the
+            // user mid-enrollment with a confirmed-but-unusable account,
+            // and the freshly-issued pair below is minted AFTER this
+            // call, so it is never itself revoked.
+            let _ = state.refresh_tokens.revoke_all_for_user(user_id).await;
+
             let step_i64 = i64::try_from(step).unwrap_or(i64::MAX);
             if let Err(err) = repo.record_totp_success(user_id, step_i64).await {
                 return api_error_response(err);
@@ -556,26 +570,58 @@ pub async fn verify(
     }
 }
 
-/// Try `code` as a TOTP against the user's stored (KMS-decrypted) secret.
+/// Outcome of trying `code` as a TOTP against the user's stored
+/// (KMS-decrypted) secret — final-review Fix 2.
 ///
-/// Returns `None` — not `Err` — for EVERY failure mode: no secret on file,
-/// KMS decrypt failure, non-UTF8 plaintext, or an invalid/replayed code.
-/// `challenge()`'s next step is identical for all of these: fall through
-/// and try `code` as a backup code instead (Task 7: "a 6-digit TOTP OR a
-/// backup code", tried in that order).
+/// Split out from a plain `Option<u64>` specifically so callers can tell a
+/// genuinely WRONG code apart from a SYSTEM fault that made verification
+/// impossible in the first place. Before this fix, `verify_totp_step`
+/// collapsed both into `None`, so a transient KMS-decrypt failure on a
+/// CORRECT code looked identical to a wrong code — `challenge()`/
+/// `disable()` would fall through to the backup-code check (which the user
+/// never intended to use), fail that too, and call `record_totp_failure`,
+/// accruing lockout for an availability blip that was never the user's
+/// fault. `verify()` (the enrollment-confirm handler) already sidesteps
+/// this by returning early on a KMS error without recording a failure;
+/// this brings `challenge()`/`disable()` in line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TotpStepOutcome {
+    /// Secret decrypted fine and `code` matched at this RFC 6238 timestep.
+    Matched(u64),
+    /// Secret decrypted fine but `code` didn't match / was replayed — a
+    /// genuine wrong-code outcome. Callers should try the backup-code
+    /// fallback next, and only THIS case should ever reach
+    /// `record_totp_failure`.
+    NoMatch,
+    /// Verification could not be attempted at all: no secret on file, KMS
+    /// decrypt failed, or the decrypted plaintext wasn't valid UTF-8.
+    /// Callers must NOT call `record_totp_failure` for this — see the
+    /// enum doc — and should surface it as a 503/500, not a 401.
+    SystemError,
+}
+
 async fn verify_totp_step(
     state: &AppState,
     user: &user_repo::UserRow,
     code: &str,
     now_unix: u64,
-) -> Option<u64> {
-    let ciphertext = user.totp_secret_encrypted.as_ref()?;
-    let secret_bytes = state.kms.decrypt(ciphertext).await.ok()?;
-    let secret_b32 = String::from_utf8(secret_bytes).ok()?;
+) -> TotpStepOutcome {
+    let Some(ciphertext) = user.totp_secret_encrypted.as_ref() else {
+        return TotpStepOutcome::SystemError;
+    };
+    let Ok(secret_bytes) = state.kms.decrypt(ciphertext).await else {
+        return TotpStepOutcome::SystemError;
+    };
+    let Ok(secret_b32) = String::from_utf8(secret_bytes) else {
+        return TotpStepOutcome::SystemError;
+    };
     let last_timestep = user
         .totp_last_timestep
         .map(|step| u64::try_from(step).unwrap_or(0));
-    totp::verify_code(&secret_b32, code, last_timestep, now_unix).ok()
+    match totp::verify_code(&secret_b32, code, last_timestep, now_unix) {
+        Ok(step) => TotpStepOutcome::Matched(step),
+        Err(_totp_error) => TotpStepOutcome::NoMatch,
+    }
 }
 
 /// `POST /v1/auth/2fa/challenge` — second step of a 2FA-gated login (Task 7).
@@ -655,8 +701,18 @@ pub async fn challenge(
     // stored/matched on their raw alphanumeric form).
     let success_timestep: Option<i64> =
         match verify_totp_step(&state, &user, &body.code, now_unix).await {
-            Some(step) => Some(i64::try_from(step).unwrap_or(i64::MAX)),
-            None => match repo
+            TotpStepOutcome::Matched(step) => Some(i64::try_from(step).unwrap_or(i64::MAX)),
+            TotpStepOutcome::SystemError => {
+                // Final-review Fix 2: a KMS/decrypt fault, not a wrong
+                // code — return without touching the failure counter/
+                // lockout (see `TotpStepOutcome` doc) and without trying
+                // the backup-code fallback, which the user never intended
+                // to invoke.
+                return api_error_response(ApiError::ServiceUnavailable(
+                    "2fa verification temporarily unavailable".into(),
+                ));
+            }
+            TotpStepOutcome::NoMatch => match repo
                 .consume_backup_code(user_id, &strip_backup_code_format(&body.code))
                 .await
             {
@@ -768,8 +824,16 @@ pub async fn disable(
     // TOTP first; if that doesn't verify, fall through and try the same
     // input as a backup code — identical order to `challenge()`.
     let verified = match verify_totp_step(&state, &user, &body.code, now_unix).await {
-        Some(_step) => true,
-        None => match repo
+        TotpStepOutcome::Matched(_step) => true,
+        TotpStepOutcome::SystemError => {
+            // Final-review Fix 2: same treatment as `challenge()` — a
+            // KMS/decrypt fault must not count toward lockout and must not
+            // fall through to the backup-code check.
+            return api_error_response(ApiError::ServiceUnavailable(
+                "2fa verification temporarily unavailable".into(),
+            ));
+        }
+        TotpStepOutcome::NoMatch => match repo
             .consume_backup_code(ctx.user_id, &strip_backup_code_format(&body.code))
             .await
         {
@@ -795,6 +859,14 @@ pub async fn disable(
     if let Err(err) = repo.disable_totp(ctx.user_id).await {
         return api_error_response(err);
     }
+
+    // Final-review Fix 1: turning 2FA OFF must not leave stale sessions
+    // around — unlike `verify()`, `disable()` issues no new token pair, so
+    // this simply logs the user out of every session (same best-effort,
+    // non-fatal treatment as `verify()`/`auth.rs`'s other
+    // `revoke_all_for_user` call sites: a revoke hiccup must not leave the
+    // user stuck unable to confirm 2FA is off).
+    let _ = state.refresh_tokens.revoke_all_for_user(ctx.user_id).await;
 
     (StatusCode::OK, JsonResponse(DisableResponse { disabled: true })).into_response()
 }
