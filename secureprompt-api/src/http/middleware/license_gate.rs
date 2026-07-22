@@ -78,6 +78,22 @@ mod tests {
         assert!(is_allowlisted("/internal/attestation"));
     }
 
+    /// Task 9 (2FA backend plan): `/v1/auth/2fa/*` must stay reachable even
+    /// when the license is revoked/hard-stale, exactly like `/v1/auth/login`
+    /// — otherwise a revoked deployment could lock an operator out mid-login
+    /// (forced enrollment or a pending challenge) with no way to finish
+    /// authenticating. These already pass today because `is_allowlisted`
+    /// matches on the `/v1/auth/` prefix, which `/v1/auth/2fa/...` falls
+    /// under; this test pins that behavior so a future narrowing of the
+    /// prefix match can't silently re-block the 2FA routes.
+    #[test]
+    fn twofactor_routes_are_allowlisted() {
+        assert!(is_allowlisted("/v1/auth/2fa/enroll"));
+        assert!(is_allowlisted("/v1/auth/2fa/verify"));
+        assert!(is_allowlisted("/v1/auth/2fa/challenge"));
+        assert!(is_allowlisted("/v1/auth/2fa/disable"));
+    }
+
     #[test]
     fn data_plane_is_blocked() {
         assert!(!is_allowlisted("/v1/chat/completions"));
