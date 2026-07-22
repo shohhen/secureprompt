@@ -25,6 +25,7 @@ metadata:
   labels:
     {{- include "secureprompt.labels" . | nindent 4 }}
 data:
+  {{- if .Values.prometheus.enabled }}
   prometheus.yaml: |
     apiVersion: 1
     datasources:
@@ -35,6 +36,7 @@ data:
         url: http://{{ include "secureprompt.fullname" . }}-prometheus:9090
         isDefault: true
         editable: false
+  {{- end }}
   clickhouse.yaml: |
     apiVersion: 1
     datasources:

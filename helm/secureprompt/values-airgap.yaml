@@ -14,6 +14,9 @@ otel:
 # and inherits from base the same way.
 prometheus:
   enabled: true
+  scrapeInterval: 15s
+  evaluationInterval: 15s
+  retention: 15d
   image:
     repository: prom/prometheus
     tag: "v2.55.1"
