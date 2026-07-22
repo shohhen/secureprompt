@@ -15,35 +15,43 @@
  * below), so it re-implements the small enroll/verify UI here instead of
  * threading a new prop through the Task 6 component.
  *
- * ---- How 2FA status is determined (no dedicated status endpoint) ----
+ * ---- How 2FA status is shown (no dedicated status endpoint, and no
+ * ---- probing write on page load) ----
  * There is no `GET /v1/auth/2fa/status` (or similar) on the backend --
  * confirmed against `secureprompt-api/src/http/routes/dashboard/
- * twofactor.rs`. Inventing one is out of scope for this task. Instead this
- * panel infers status from `POST /v1/auth/2fa/enroll` itself:
- *   - 200  -> the account is NOT yet enrolled. The backend generates a
- *             fresh secret + backup codes on every call to an unconfirmed
- *             account, so this "status probe" doubles as fetching the QR
- *             data for the enrollment flow below -- no wasted round trip.
- *   - 409  -> the account already has CONFIRMED 2FA (the backend's
- *             `enroll()` handler explicitly rejects re-enrollment of a
- *             confirmed account: "2FA is already enabled; disable it
- *             first"). Surfaced client-side as `TwoFaAlreadyEnabledError`
- *             (twofa-api.ts) so it doesn't collapse into the same falsy
- *             result as a genuine failure.
- *   - anything else (network, 500, ...) -> status is genuinely unknown.
- * The "unknown" state is shown honestly (not guessed as enabled/disabled)
- * and offers BOTH actions with a retry, so the user is never stuck -- the
- * backend remains the real enforcer of whichever action they take.
+ * twofactor.rs`. Inventing one is out of scope for this task.
+ *
+ * `POST /v1/auth/2fa/enroll` CANNOT be used as a passive status check: for
+ * an unconfirmed account it's a real write on every call (generates a new
+ * secret, re-encrypts it via KMS, and invalidates/regenerates all backup
+ * codes) -- see the handler's doc comment. Calling it just to render the
+ * page would silently invalidate a QR the user already scanned and cost a
+ * DB write + KMS encrypt on every visit. So this panel does NOT probe on
+ * mount. The default view is neutral -- "Enable 2FA" and "Disable 2FA" are
+ * both offered up front, honestly reflecting that the client doesn't know
+ * the status without asking. `enroll()` only fires when the user clicks
+ * "Enable two-factor authentication", which is the point where a write is
+ * actually intended:
+ *   - 200  -> not yet enrolled; the same click's response supplies the QR
+ *             data, so there's no extra round trip.
+ *   - 409  -> already CONFIRMED (the backend's `enroll()` handler rejects
+ *             re-enrolling a confirmed account: "2FA is already enabled;
+ *             disable it first"), surfaced as `TwoFaAlreadyEnabledError`
+ *             (twofa-api.ts) -- shown as an info toast, no QR, no side
+ *             effect on the backend.
+ *   - anything else (network, 500, ...) -> generic error toast; stays on
+ *             the neutral view so the user can retry.
+ * `disable()` never re-triggers `enroll()` -- a successful disable just
+ * returns to the neutral view; a user who wants to re-enable clicks
+ * "Enable 2FA" again (their own explicit action, a fresh write).
  */
 
-import { useEffect, useState } from "react";
-import { useSession } from "next-auth/react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
 import { TwoFactorQr } from "@/components/two-factor/qr-code";
 import { TwoFaAlreadyEnabledError, type EnrollResult } from "@/lib/twofa-api";
 import {
@@ -52,69 +60,54 @@ import {
   useDisable2fa,
 } from "@/lib/hooks/use-two-factor";
 
-type Status = "checking" | "not_enabled" | "enabled" | "unknown";
+/**
+ * "idle" is the default AND the post-disable view -- neutral, both actions
+ * offered, no assumption about current status. "enrolling" only follows an
+ * explicit Enable click that got a 200. "known_enabled" only follows either
+ * an explicit Enable click that got a 409, or a successful verify.
+ */
+type Status = "idle" | "enrolling" | "known_enabled";
 
 export function SecurityClient() {
-  const { status: sessionStatus } = useSession();
-
-  const [status, setStatus] = useState<Status>("checking");
+  const [status, setStatus] = useState<Status>("idle");
   const [enrollment, setEnrollment] = useState<EnrollResult | null>(null);
   const [verifyCode, setVerifyCode] = useState("");
   const [disableCode, setDisableCode] = useState("");
 
-  const { mutateAsync: startEnroll } = useEnroll2fa();
+  const enrollMutation = useEnroll2fa();
   const verifyMutation = useVerify2fa();
   const disableMutation = useDisable2fa();
 
-  // Status probe on mount -- see the file-level comment above for why a
-  // POST to /2fa/enroll is the status check. Deliberately NO start-guard
-  // ref: React Strict Mode's dev double-invoke of effects would otherwise
-  // drop BOTH invocations' results (the exact hazard already diagnosed and
-  // fixed in two-factor-enroll.tsx -- a startedRef combined with a
-  // per-invocation `cancelled` flag causes a PERMANENT loading hang,
-  // because the first invocation's result is dropped by its own
-  // cleanup-set `cancelled` while the second early-returns on the ref).
-  // The cancelled-flag-only pattern below lets the probe fire twice in dev
-  // (harmless -- enrolling twice just regenerates the secret again); only
-  // the persisting (second) invocation's result reaches state.
-  useEffect(() => {
-    if (sessionStatus !== "authenticated") return;
-    let cancelled = false;
-    startEnroll()
-      .then((data) => {
-        if (cancelled) return;
-        if (data) {
-          setEnrollment(data);
-          setStatus("not_enabled");
-        } else {
-          setStatus("unknown");
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setStatus(
-          err instanceof TwoFaAlreadyEnabledError ? "enabled" : "unknown",
-        );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionStatus, startEnroll]);
-
-  async function handleRetryProbe() {
-    setStatus("checking");
+  /** Fires ONLY on the explicit "Enable two-factor authentication" click --
+   *  never on mount, never after a disable. See the file-level comment for
+   *  why: `enroll()` is a write for an unconfirmed account, so it must only
+   *  run when the user actually intends to start enrollment. */
+  async function handleEnableClick() {
     try {
-      const data = await startEnroll();
+      const data = await enrollMutation.mutateAsync();
       if (data) {
         setEnrollment(data);
-        setStatus("not_enabled");
+        setStatus("enrolling");
       } else {
-        setStatus("unknown");
+        toast.error("Couldn't start setup. Please try again.");
       }
     } catch (err) {
-      setEnrollment(null);
-      setStatus(err instanceof TwoFaAlreadyEnabledError ? "enabled" : "unknown");
+      if (err instanceof TwoFaAlreadyEnabledError) {
+        // No side effect on this path -- the backend rejected before
+        // touching the account. Inform the user; the Disable form (always
+        // visible on the idle view) is how they'd turn it off.
+        toast("Two-factor authentication is already enabled.");
+        setStatus("known_enabled");
+      } else {
+        toast.error("Something went wrong. Please try again.");
+      }
     }
+  }
+
+  function handleCancelEnroll() {
+    setEnrollment(null);
+    setVerifyCode("");
+    setStatus("idle");
   }
 
   async function copy(value: string, label: string) {
@@ -144,7 +137,7 @@ export function SecurityClient() {
       toast.success("Two-factor authentication enabled.");
       setEnrollment(null);
       setVerifyCode("");
-      setStatus("enabled");
+      setStatus("known_enabled");
     } catch {
       toast.error("Something went wrong. Please try again.");
       setVerifyCode("");
@@ -163,27 +156,48 @@ export function SecurityClient() {
       }
       toast.success("Two-factor authentication disabled.");
       setDisableCode("");
-      // Re-probe rather than assume "not_enabled" so the QR/secret shown
-      // next reflects a freshly generated (post-disable) enrollment.
-      await handleRetryProbe();
+      // Return to the neutral view -- do NOT call enroll() here. A fresh
+      // enrollment (and its fresh QR/backup codes) only happens if the
+      // user explicitly clicks "Enable 2FA" again.
+      setStatus("idle");
     } catch {
       toast.error("Something went wrong. Please try again.");
       setDisableCode("");
     }
   }
 
-  if (status === "checking") {
-    return (
-      <div className="space-y-3">
-        <Skeleton className="h-24 w-full" />
-        <Skeleton className="h-10 w-1/2" />
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6 max-w-lg">
-      {status === "enabled" && (
+      {status === "idle" && (
+        <div className="rounded-lg border p-5 space-y-4">
+          <div>
+            <p className="font-medium text-sm">Two-factor authentication</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              Add an extra layer of protection with an authenticator app, or
+              turn it off below if you already have it enabled.
+            </p>
+          </div>
+          <Button
+            type="button"
+            onClick={handleEnableClick}
+            disabled={enrollMutation.isPending}
+          >
+            {enrollMutation.isPending
+              ? "Starting setup…"
+              : "Enable two-factor authentication"}
+          </Button>
+          <div className="pt-2 border-t">
+            <DisableForm
+              code={disableCode}
+              onCodeChange={setDisableCode}
+              onSubmit={handleDisable}
+              submitting={disableMutation.isPending}
+            />
+          </div>
+        </div>
+      )}
+
+      {status === "known_enabled" && (
         <div className="rounded-lg border p-5 space-y-4">
           <div className="flex items-center gap-3">
             <Badge>Enabled</Badge>
@@ -200,11 +214,11 @@ export function SecurityClient() {
         </div>
       )}
 
-      {status === "not_enabled" && enrollment && (
+      {status === "enrolling" && enrollment && (
         <div className="rounded-lg border p-5 space-y-4">
           <div>
             <p className="font-medium text-sm">
-              Two-factor authentication is not enabled
+              Set up two-factor authentication
             </p>
             <p className="text-sm text-muted-foreground mt-1">
               Scan the QR code below with an authenticator app (Google
@@ -279,42 +293,26 @@ export function SecurityClient() {
               value={verifyCode}
               onChange={(e) => setVerifyCode(e.target.value)}
             />
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={verifyMutation.isPending || !verifyCode}
-            >
-              {verifyMutation.isPending
-                ? "Verifying…"
-                : "Verify & enable two-factor authentication"}
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="submit"
+                className="flex-1"
+                disabled={verifyMutation.isPending || !verifyCode}
+              >
+                {verifyMutation.isPending
+                  ? "Verifying…"
+                  : "Verify & enable two-factor authentication"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleCancelEnroll}
+                disabled={verifyMutation.isPending}
+              >
+                Cancel
+              </Button>
+            </div>
           </form>
-        </div>
-      )}
-
-      {status === "unknown" && (
-        <div className="rounded-lg border p-5 space-y-4">
-          <p className="text-sm text-muted-foreground">
-            We couldn&apos;t confirm your current two-factor authentication
-            status. If it&apos;s already on, disable it below with a
-            current code; otherwise, try setting it up again.
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleRetryProbe}
-          >
-            Set up two-factor authentication
-          </Button>
-          <div className="pt-2 border-t">
-            <DisableForm
-              code={disableCode}
-              onCodeChange={setDisableCode}
-              onSubmit={handleDisable}
-              submitting={disableMutation.isPending}
-            />
-          </div>
         </div>
       )}
     </div>
