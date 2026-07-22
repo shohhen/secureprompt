@@ -393,6 +393,62 @@ async fn prometheus_counters_incremented(pool: PgPool) {
         prom.contains("secureprompt_dashboard_request_duration_seconds"),
         "Prometheus output must contain dashboard request duration metric"
     );
+
+    // KPI-2 monitoring, Task 1 — the three duration metrics are now real
+    // bucketed histograms, not summaries: assert the `# TYPE ... histogram`
+    // header and a `le="+Inf"` bucket line (with the actual labels this
+    // request produced) are present.
+    assert!(
+        prom.contains("# TYPE secureprompt_dashboard_request_duration_seconds histogram"),
+        "secureprompt_dashboard_request_duration_seconds must be exposed as a histogram; got:\n{prom}"
+    );
+    let request_outcome = if success >= 1 { "success" } else { "error" };
+    assert!(
+        prom.contains(&format!(
+            "secureprompt_dashboard_request_duration_seconds_bucket{{endpoint=\"usage-daily\",outcome=\"{request_outcome}\",le=\"+Inf\"}}"
+        )),
+        "expected a +Inf bucket line for endpoint=usage-daily,outcome={request_outcome}; got:\n{prom}"
+    );
+
+    assert!(
+        prom.contains("# TYPE secureprompt_dashboard_mart_query_duration_seconds histogram"),
+        "secureprompt_dashboard_mart_query_duration_seconds must be exposed as a histogram; got:\n{prom}"
+    );
+    assert!(
+        prom.contains(
+            "secureprompt_dashboard_mart_query_duration_seconds_bucket{mart=\"mart_usage_daily\",le=\"+Inf\"}"
+        ),
+        "expected a +Inf bucket line for mart=mart_usage_daily; got:\n{prom}"
+    );
+
+    // The always-emitted (unlabelled) budget-check histogram must also have
+    // converted, even though this test never calls `time_budget_check`.
+    assert!(
+        prom.contains("# TYPE secureprompt_dashboard_budget_check_duration_seconds histogram"),
+        "secureprompt_dashboard_budget_check_duration_seconds must be exposed as a histogram; got:\n{prom}"
+    );
+    assert!(
+        prom.contains("secureprompt_dashboard_budget_check_duration_seconds_bucket{le=\"+Inf\"}"),
+        "expected an unlabelled +Inf bucket line for the budget-check histogram; got:\n{prom}"
+    );
+
+    // Guard against accidentally dropping a previously-emitted counter family
+    // while converting the three histograms above (the `/metrics` scrape also
+    // doubles as the k8s health probe — every family must still appear).
+    for family in [
+        "secureprompt_requests_total",
+        "secureprompt_request_failures_total",
+        "secureprompt_analytics_dropped_total",
+        "secureprompt_analytics_failures_total",
+        "secureprompt_clickhouse_insert_failures_total",
+        "secureprompt_clickhouse_insert_retries_total",
+        "secureprompt_budget_redis_failure_total",
+    ] {
+        assert!(
+            prom.contains(&format!("# TYPE {family} counter")),
+            "expected counter family {family} to still be emitted; got:\n{prom}"
+        );
+    }
 }
 
 // ── CI gate: mart_only_gate ───────────────────────────────────────────────────
