@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { href: "/settings/policy-rules", label: "Policy Rules" },
   { href: "/settings/workspace", label: "Workspace" },
   { href: "/settings/members", label: "Members" },
+  { href: "/settings/security", label: "Security" },
   { href: "/settings/license", label: "License" },
 ];
 

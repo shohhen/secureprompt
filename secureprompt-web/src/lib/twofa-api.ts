@@ -91,6 +91,31 @@ export class TwoFaLockedError extends Error {
   }
 }
 
+/**
+ * Thrown by `enroll()` on HTTP 409 (`secureprompt-api/src/http/routes/
+ * dashboard/twofactor.rs` `enroll()`: "2FA is already enabled; disable it
+ * first" when `totp_confirmed_at` is already set).
+ *
+ * There is no dedicated "is 2FA enabled" GET endpoint (Task 7 of
+ * docs/superpowers/plans/2026-07-22-2fa-console.md). `settings/security/
+ * page.tsx` infers status pragmatically by calling `enroll()` and reading
+ * the outcome: a 200 means "not enrolled yet" (and doubles as fetching the
+ * QR data), a 409 means "already enrolled" -- surfaced via this typed error
+ * so the caller can tell it apart from a genuine failure (network/500,
+ * still `null`) instead of collapsing both into the same falsy result.
+ * Same pattern as `TwoFaLockedError` above for `challenge()`'s 429.
+ * Existing callers that don't care about the distinction (the login flow's
+ * forced-enrollment screen, `two-factor-enroll.tsx`) already funnel any
+ * thrown error into a generic "something went wrong" state, so this is a
+ * behavior-preserving change for them.
+ */
+export class TwoFaAlreadyEnabledError extends Error {
+  constructor(message = "Two-factor authentication is already enabled.") {
+    super(message);
+    this.name = "TwoFaAlreadyEnabledError";
+  }
+}
+
 function mapTokens(body: BackendTokenResponse): Tokens {
   return {
     accessToken: body.access_token,
@@ -198,7 +223,8 @@ export async function challenge(
  * Begin 2FA enrollment (`POST /v1/auth/2fa/enroll`, no request body).
  * `bearer` may be an `enrollment_token` (mandatory-enrollment flow from
  * `loginStep1`) or a normal access token (Settings -> Security opt-in).
- * Returns `null` on any non-200 (e.g. 409 if already enrolled).
+ * Returns `null` on a non-200/409 failure (network, 500, ...). Throws
+ * `TwoFaAlreadyEnabledError` on 409 -- see that class's doc comment.
  */
 export async function enroll(bearer: string): Promise<EnrollResult | null> {
   let res: Response;
@@ -211,6 +237,9 @@ export async function enroll(bearer: string): Promise<EnrollResult | null> {
     return null;
   }
 
+  if (res.status === 409) {
+    throw new TwoFaAlreadyEnabledError();
+  }
   if (res.status !== 200) return null;
 
   const body = await safeJson<BackendEnrollResponse>(res);
