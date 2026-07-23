@@ -7,9 +7,17 @@ metadata:
 spec:
   type: ClusterIP
   ports:
+    # NOTE: the worker binds nothing on 8080 (stale/orphan port, pre-dates
+    # KPI-2 monitoring); left in place, out of scope for this change.
     - port: 8080
       targetPort: 8080
       protocol: TCP
       name: http
+    {{- if .Values.worker.metrics.enabled }}
+    - port: {{ .Values.worker.metrics.port }}
+      targetPort: {{ .Values.worker.metrics.port }}
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     app: {{ include "secureprompt.fullname" . }}-worker

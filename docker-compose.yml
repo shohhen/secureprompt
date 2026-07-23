@@ -250,6 +250,28 @@ services:
       clickhouse:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
   # ---------------------------------------------------------------------------
   # LibreChat stack (task 30) — chat UI + its own MongoDB + an nginx that
   # terminates TLS on host port 8443. Lives in the same docker-compose so
@@ -351,4 +373,5 @@ volumes:
   clickhouse_backups:
   grafana_data:
   qdrant_data:
+  prometheus_data:
   librechat_mongo_data:

@@ -1,0 +1,15 @@
+{{- if .Values.alertmanager.enabled }}
+# Byte-for-byte copy of monitoring/alertmanager/alertmanager.yml (via
+# files/alertmanager/alertmanager.yml) — the routing tree ships to the "null"
+# (no-op) receiver out of the box and has no compose-specific service names,
+# so it's target-independent and safe to reuse verbatim in-cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-alertmanager-config
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+  alertmanager.yml: |
+{{ .Files.Get "files/alertmanager/alertmanager.yml" | indent 4 }}
+{{- end }}

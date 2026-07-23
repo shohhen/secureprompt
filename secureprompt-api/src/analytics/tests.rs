@@ -287,6 +287,46 @@ mod analytics_tests {
         // The counter value is unpredictable in async context, but the call must succeed.
     }
 
+    // ── KPI-2 monitoring, Task 2 — analytics_failures_total wiring ───────────
+
+    #[tokio::test]
+    async fn analytics_handle_unreachable_clickhouse_increments_analytics_failure_counter() {
+        // No ClickHouse server is listening on this port in the test
+        // environment (same assumption the other AnalyticsHandle tests
+        // above already rely on for localhost:8123). The request_events
+        // write fails, retries once after a 500ms backoff, and fails again
+        // — the non-retryable terminal point where the whole event is
+        // abandoned. That must move BOTH the pre-existing
+        // clickhouse_insert_failures_total counter AND the
+        // previously-dead analytics_failures_total counter.
+        let metrics = Arc::new(MetricsRegistry::default());
+        let handle = make_handle(metrics.clone());
+        let usage = TokenUsage::default();
+        let event = RequestEvent::new(
+            RequestId::new(),
+            WorkspaceId::new(),
+            "openai".to_owned(),
+            "gpt-4o-mini".to_owned(),
+            "allow".to_owned(),
+            &usage,
+            false,
+            0.0,
+            vec![],
+        );
+        handle.enqueue(event, &metrics).await;
+
+        // Give the background task time to: attempt the write, fail, sleep
+        // 500ms, retry, and fail again.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+        let output = metrics.render_prometheus();
+        assert!(
+            !output.contains("secureprompt_analytics_failures_total 0"),
+            "analytics_failures_total should have moved off zero after a real \
+             non-retryable ClickHouse write failure; got:\n{output}"
+        );
+    }
+
     #[tokio::test]
     async fn analytics_multiple_events_enqueued_without_panic() {
         let metrics = Arc::new(MetricsRegistry::default());

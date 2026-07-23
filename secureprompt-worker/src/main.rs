@@ -1,7 +1,9 @@
+mod metrics;
 mod tasks;
 
 use anyhow::Context;
 use deadpool_redis::redis::cmd;
+use metrics::WorkerMetrics;
 use secureprompt_common::{
     config::{
         AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
@@ -10,11 +12,34 @@ use secureprompt_common::{
     tasks::{TaskEnvelope, ALL_QUEUES},
     telemetry::init_telemetry,
 };
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_cron_scheduler::{Job, JobScheduler};
+
+/// Whether the `/metrics` endpoint should be bound.
+/// `SECUREPROMPT_WORKER_METRICS_ENABLED` — default `true`; any of
+/// `"false"`/`"0"`/`"no"` (case-insensitive) disables it.
+fn metrics_enabled_from_env() -> bool {
+    match std::env::var("SECUREPROMPT_WORKER_METRICS_ENABLED") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+        Err(_) => true,
+    }
+}
+
+/// Port the `/metrics` endpoint binds to. `WORKER_METRICS_PORT` — default
+/// `9091`. Falls back to the default on missing/unparseable values.
+fn metrics_port_from_env() -> u16 {
+    std::env::var("WORKER_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9091)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let metrics_enabled = metrics_enabled_from_env();
+    let metrics_port = metrics_port_from_env();
+
     let config = AppConfig {
         database: DatabaseConfig {
             url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -28,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         },
         telemetry: TelemetryConfig {
             otel_enabled: false,
-            prometheus_enabled: false,
+            prometheus_enabled: metrics_enabled,
             log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
         },
         server: ServerConfig {
@@ -64,6 +89,31 @@ async fn main() -> anyhow::Result<()> {
 
     init_telemetry(&config.telemetry);
 
+    // Prometheus `/metrics` endpoint (KPI-2 monitoring, Task 4). The worker
+    // previously bound no HTTP server at all, so nothing was scrapable.
+    let metrics = Arc::new(WorkerMetrics::default());
+    if config.telemetry.prometheus_enabled {
+        let metrics_router = metrics::router(metrics.clone());
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{metrics_port}");
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr = %addr, "secureprompt-worker metrics endpoint listening");
+                    if let Err(e) = axum::serve(listener, metrics_router).await {
+                        tracing::error!(error = %e, "metrics server exited");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, addr = %addr, "failed to bind metrics endpoint");
+                }
+            }
+        });
+    } else {
+        tracing::info!(
+            "secureprompt-worker metrics endpoint disabled (SECUREPROMPT_WORKER_METRICS_ENABLED=false)"
+        );
+    }
+
     let ch_client = clickhouse::Client::default()
         .with_url(&config.clickhouse.url)
         .with_database(&config.clickhouse.database)
@@ -82,18 +132,26 @@ async fn main() -> anyhow::Result<()> {
     // "0 0 2 * * *" = every day at 02:00:00
     let sched = JobScheduler::new().await?;
     let ch_optimize = ch_client.clone();
+    let metrics_optimize = metrics.clone();
 
     sched.add(
         Job::new_async("0 0 2 * * *", move |_uuid, _l| {
             let ch = ch_optimize.clone();
+            let metrics = metrics_optimize.clone();
             Box::pin(async move {
+                let started = Instant::now();
+                let mut all_ok = true;
                 for table in &["request_events", "policy_events"] {
                     let sql = format!("OPTIMIZE TABLE {table} FINAL");
                     match ch.query(&sql).execute().await {
                         Ok(()) => tracing::info!(table, "OPTIMIZE FINAL completed"),
-                        Err(e) => tracing::error!(table, error = %e, "OPTIMIZE FINAL failed"),
+                        Err(e) => {
+                            all_ok = false;
+                            tracing::error!(table, error = %e, "OPTIMIZE FINAL failed");
+                        }
                     }
                 }
+                metrics.record_job("optimize_final", started.elapsed(), all_ok);
             })
         })
         .context("Failed to create OPTIMIZE FINAL job")?,
@@ -107,10 +165,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Worker: failed to connect to Postgres for rotation cleanup")?;
 
+    let metrics_rotation = metrics.clone();
     sched.add(
         Job::new_async("0 0 3 * * *", move |_uuid, _l| {
             let pool = pg_pool_cleanup.clone();
+            let metrics = metrics_rotation.clone();
             Box::pin(async move {
+                let started = Instant::now();
                 let result = sqlx::query(
                     "UPDATE api_keys
                      SET status = 'revoked', revoked_at = NOW()
@@ -119,10 +180,12 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .execute(&pool)
                 .await;
+                let ok = result.is_ok();
                 match result {
                     Ok(r) => tracing::info!(rows_affected = r.rows_affected(), "rotation cleanup complete"),
                     Err(e) => tracing::error!(error = %e, "rotation cleanup failed"),
                 }
+                metrics.record_job("rotation_cleanup", started.elapsed(), ok);
             })
         })
         .context("Failed to create rotation cleanup job")?,
@@ -154,8 +217,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "http://secureprompt-ml:8080".into());
     let ml_http = reqwest::Client::new();
 
+    let metrics_drain = metrics.clone();
     tokio::spawn(async move {
-        run_queue_drain(redis_pool_drain, qdrant, ml_http, ml_sidecar_url).await;
+        run_queue_drain(redis_pool_drain, qdrant, ml_http, ml_sidecar_url, metrics_drain).await;
     });
 
     tracing::info!("Task queue drain loop started");
@@ -175,12 +239,14 @@ async fn run_queue_drain(
     qdrant: std::sync::Arc<qdrant_client::Qdrant>,
     ml_client: reqwest::Client,
     ml_sidecar_url: String,
+    metrics: Arc<WorkerMetrics>,
 ) {
     loop {
         let mut conn = match redis_pool.get().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "redis checkout failed in drain loop");
+                metrics.record_drain_error();
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -198,7 +264,7 @@ async fn run_queue_drain(
         if let Some((_queue_name, json)) = result {
             match serde_json::from_str::<TaskEnvelope>(&json) {
                 Ok(task) => {
-                    dispatch_task(task, &qdrant, &ml_client, &ml_sidecar_url).await;
+                    dispatch_task(task, &qdrant, &ml_client, &ml_sidecar_url, &metrics).await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -206,6 +272,7 @@ async fn run_queue_drain(
                         body_preview = %&json[..json.len().min(200)],
                         "invalid task envelope — dropping"
                     );
+                    metrics.record_drain_error();
                 }
             }
         }
@@ -219,6 +286,7 @@ async fn dispatch_task(
     qdrant: &qdrant_client::Qdrant,
     ml_client: &reqwest::Client,
     ml_sidecar_url: &str,
+    metrics: &WorkerMetrics,
 ) {
     use secureprompt_common::tasks::task_types;
 
@@ -232,27 +300,39 @@ async fn dispatch_task(
     match task.task_type.as_str() {
         task_types::ANALYTICS_FLUSH => {
             tracing::debug!("analytics.flush — no-op stub (Phase 7 implementation)");
+            metrics.record_task(task_types::ANALYTICS_FLUSH, "stub");
         }
         task_types::AUDIT_EXPORT => {
             tracing::debug!("audit.export — no-op stub (Phase 7 implementation)");
+            metrics.record_task(task_types::AUDIT_EXPORT, "stub");
         }
         task_types::RETENTION_PURGE => {
             tracing::debug!("retention.purge — no-op stub (Phase 7 implementation)");
+            metrics.record_task(task_types::RETENTION_PURGE, "stub");
         }
         task_types::API_KEY_ROTATION_CLEANUP => {
             tracing::debug!("api_key.rotation_cleanup — handled by cron in Plan 06-01");
+            metrics.record_task(task_types::API_KEY_ROTATION_CLEANUP, "stub");
         }
         task_types::INDEX_POLICY_RULE => {
-            tasks::index_policy_rule::handle_index_policy_rule(
+            let ok = tasks::index_policy_rule::handle_index_policy_rule(
                 &task,
                 ml_client,
                 qdrant,
                 ml_sidecar_url,
             )
             .await;
+            metrics.record_task(
+                task_types::INDEX_POLICY_RULE,
+                if ok { "ok" } else { "error" },
+            );
         }
         unknown => {
             tracing::warn!(task_type = %unknown, "unknown task type — dropping");
+            // Fixed label, never the raw `unknown` string — task_type is
+            // attacker/bug-controlled free text and would blow up label
+            // cardinality if used directly.
+            metrics.record_task("unknown", "unknown");
         }
     }
 }

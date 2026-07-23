@@ -1,0 +1,51 @@
+# Alertmanager config for SecurePrompt (KPI-2 monitoring).
+#
+# As shipped, every alert is grouped and routed to the "null" receiver (a
+# no-op) so the stack is valid and quiet out of the box. Uncomment and fill
+# in the email/Slack/PagerDuty blocks below to wire up real notifications,
+# then move the matching `routes:` entry under `route.routes` and point its
+# `receiver:` at the receiver name you configured.
+
+route:
+  group_by: ["alertname", "job"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: "null"
+
+  # Example sub-route for critical alerts once a real receiver exists.
+  # Uncomment and change `receiver:` to e.g. "pagerduty" or "slack".
+  # routes:
+  #   - matchers:
+  #       - severity = "critical"
+  #     receiver: "null"
+  #     continue: false
+
+receivers:
+  - name: "null"
+
+  # --- Email -----------------------------------------------------------
+  # - name: "email"
+  #   email_configs:
+  #     - to: "oncall@example.com"
+  #       from: "alertmanager@example.com"
+  #       smarthost: "smtp.example.com:587"
+  #       auth_username: "alertmanager@example.com"
+  #       auth_password: "changeme"
+  #       send_resolved: true
+
+  # --- Slack (incoming webhook) -----------------------------------------
+  # - name: "slack"
+  #   slack_configs:
+  #     - api_url: "https://slack.example.invalid/replace-with-your-webhook-url"
+  #       channel: "#secureprompt-alerts"
+  #       send_resolved: true
+  #       title: '{{ .CommonAnnotations.summary }}'
+  #       text: '{{ .CommonAnnotations.description }}'
+
+  # --- PagerDuty ---------------------------------------------------------
+  # - name: "pagerduty"
+  #   pagerduty_configs:
+  #     - service_key: "changeme-pagerduty-integration-key"
+  #       send_resolved: true
+  #       description: '{{ .CommonAnnotations.summary }}'

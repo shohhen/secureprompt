@@ -1,0 +1,92 @@
+# Alert + recording rules for SecurePrompt (KPI-2 monitoring).
+#
+# Metric names below MUST match the exposition emitted by:
+#   - secureprompt-api    (secureprompt-api/src/observability/metrics.rs,
+#                           secureprompt-api/src/ml_sidecar/client.rs)
+#   - secureprompt-worker (secureprompt-worker/src/metrics.rs)
+#   - secureprompt-ml     (secureprompt-ml/app/metrics.py)
+# Do not rename a metric here without updating the emitter — promtool only
+# validates syntax, not that a name exists.
+
+groups:
+  - name: secureprompt-alerts
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is down"
+          description: "Prometheus target {{ $labels.instance }} (job {{ $labels.job }}) has been unreachable (up == 0) for more than 2 minutes."
+
+      - alert: HighRequestErrorRate
+        expr: rate(secureprompt_request_failures_total[5m]) / clamp_min(rate(secureprompt_requests_total[5m]), 1) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated request failure rate on {{ $labels.job }}"
+          description: "The request failure rate has been above 5% for 10 minutes (current value: {{ $value | printf \"%.2f\" }})."
+
+      - alert: RequestLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(secureprompt_request_duration_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 request latency is high"
+          description: "P95 request latency has been above 5s for 10 minutes (current value: {{ $value | printf \"%.2f\" }}s)."
+
+      - alert: ClickHouseInsertFailures
+        expr: rate(secureprompt_clickhouse_insert_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse inserts are failing"
+          description: "secureprompt_clickhouse_insert_failures_total has been increasing for 5 minutes (current rate: {{ $value | printf \"%.4f\" }}/s). Analytics events may be getting dropped."
+
+      - alert: MLSidecarCircuitOpen
+        expr: increase(secureprompt_ml_sidecar_circuit_open_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ML sidecar circuit breaker has opened"
+          description: "The gateway's circuit breaker to the ML sidecar opened {{ $value | printf \"%.0f\" }} time(s) in the last 5 minutes; requests are failing open to regex-only detection."
+
+      - alert: BudgetRedisFailure
+        expr: increase(secureprompt_budget_redis_failure_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Budget/rate-limit Redis calls are failing"
+          description: "secureprompt_budget_redis_failure_total increased by {{ $value | printf \"%.0f\" }} in the last 10 minutes. Budget enforcement may be degraded."
+
+      - alert: PolicyViolationSpike
+        expr: sum(rate(secureprompt_policy_violations_total{action="block"}[5m])) > 3 * sum(rate(secureprompt_policy_violations_total{action="block"}[1h] offset 1h))
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in blocked policy violations"
+          description: "The rate of blocked policy violations ({{ $value | printf \"%.4f\" }}/s) is more than 3x the rate seen 1 hour ago, sustained for 10 minutes."
+
+      - alert: MLSidecarNotReady
+        expr: secureprompt_ml_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ML sidecar is not ready"
+          description: "secureprompt_ml_ready has been 0 for 5 minutes on {{ $labels.instance }} — the NER/detection model is not loaded and the gateway is failing open to regex-only detection."
+
+  - name: secureprompt-recording-rules
+    rules:
+      # Shared p95 request-latency definition used by both this alert file
+      # (RequestLatencyHigh could be rewritten in terms of this) and Grafana
+      # dashboards, so the two never drift apart.
+      - record: secureprompt:request_latency:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(secureprompt_request_duration_seconds_bucket[5m])))

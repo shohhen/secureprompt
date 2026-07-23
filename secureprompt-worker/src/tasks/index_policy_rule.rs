@@ -17,20 +17,26 @@ struct EmbedResponse {
 }
 
 /// Public entry point — logs errors rather than propagating them so the
-/// drain loop stays alive even if a single task fails.
+/// drain loop stays alive even if a single task fails. Returns `true` on
+/// success / `false` on failure so callers can record a
+/// `tasks_processed_total{outcome="ok"|"error"}` metric.
 pub async fn handle_index_policy_rule(
     task: &TaskEnvelope,
     ml_client: &reqwest::Client,
     qdrant: &qdrant_client::Qdrant,
     ml_sidecar_url: &str,
-) {
-    if let Err(e) = index_policy_rule(task, ml_client, qdrant, ml_sidecar_url).await {
-        tracing::error!(
-            error = %e,
-            rule_id = ?task.payload.get("rule_id"),
-            workspace_id = %task.workspace_id,
-            "failed to index policy rule"
-        );
+) -> bool {
+    match index_policy_rule(task, ml_client, qdrant, ml_sidecar_url).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                rule_id = ?task.payload.get("rule_id"),
+                workspace_id = %task.workspace_id,
+                "failed to index policy rule"
+            );
+            false
+        }
     }
 }
 

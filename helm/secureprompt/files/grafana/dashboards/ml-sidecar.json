@@ -1,0 +1,161 @@
+{
+  "id": null,
+  "uid": "secureprompt-ml-sidecar",
+  "title": "SecurePrompt — ML Sidecar",
+  "description": "ML sidecar request throughput/latency, NER entity detection volume and confidence, and model readiness.",
+  "tags": ["secureprompt", "ml", "sidecar"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "ML Sidecar Ready",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secureprompt_ml_ready",
+          "legendFormat": "ready",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NOT READY", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "READY", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Active NER Model / Backend",
+      "gridPos": { "h": 4, "w": 18, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secureprompt_ml_model_info",
+          "legendFormat": "{{model}} / {{backend}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "ML Requests by Endpoint",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_ml_requests_total{endpoint,status}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (endpoint) (rate(secureprompt_ml_requests_total[5m]))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "ML Request Duration p95 by Endpoint",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_ml_request_duration_seconds_bucket{le,endpoint}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(secureprompt_ml_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "NER Entities Detected by Type",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_ml_ner_entities_detected_total{entity_type}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (entity_type) (rate(secureprompt_ml_ner_entities_detected_total[5m]))",
+          "legendFormat": "{{entity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "NER Confidence p50 / p90 by Entity Type",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_ml_ner_confidence_bucket{le,entity_type}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, entity_type) (rate(secureprompt_ml_ner_confidence_bucket[5m])))",
+          "legendFormat": "p50 {{entity_type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.90, sum by (le, entity_type) (rate(secureprompt_ml_ner_confidence_bucket[5m])))",
+          "legendFormat": "p90 {{entity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    }
+  ]
+}

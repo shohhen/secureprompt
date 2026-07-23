@@ -1,0 +1,36 @@
+# Prometheus config for SecurePrompt (KPI-2 monitoring).
+# Scrapes the API gateway, worker, and ML sidecar; loads alert/recording
+# rules from alerts.yml; ships firing alerts to Alertmanager.
+#
+# Docker Compose service name is `prometheus` (see docker-compose.yml) —
+# monitoring/grafana/provisioning/datasources/prometheus.yaml already points
+# at http://prometheus:9090, so keep that service name stable.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+scrape_configs:
+  - job_name: "secureprompt-api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+
+  - job_name: "secureprompt-worker"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9091"]
+
+  - job_name: "secureprompt-ml"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["secureprompt-ml:8080"]

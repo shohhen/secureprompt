@@ -1,0 +1,83 @@
+{{- if .Values.grafana.enabled }}
+# Grafana provisioning for SecurePrompt (KPI-2 monitoring): datasources +
+# dashboard-provider config are authored here directly (they need the chart's
+# in-cluster Service DNS names, unlike monitoring/grafana/provisioning/
+# datasources/clickhouse.yaml's docker-compose ${CLICKHOUSE_HOST} env-var
+# expansion). Dashboard JSON is pulled in unmodified via .Files.Glob.
+#
+# NOTE (.Files chart-root limitation): Helm's .Files API can only read files
+# inside the chart directory (helm/secureprompt/), not arbitrary repo paths.
+# monitoring/grafana/dashboards/*.json lives outside the chart, so it cannot
+# be read directly with `.Files.Glob "../../monitoring/grafana/dashboards/*.json"`.
+# The dashboard JSONs are copied into helm/secureprompt/files/grafana/dashboards/
+# (same pattern as the existing files/librechat.yaml) and read from there. This
+# also sidesteps a second problem: several of these dashboards contain literal
+# double-curly-brace Grafana template-variable/legend syntax (e.g. panel
+# legends), which would be misparsed as Helm template actions if pasted inline
+# into a .yaml template; .Files.Get/.Files.Glob return raw bytes, not
+# template-processed, so the dashboard JSON round-trips byte-for-byte.
+# Keep files/grafana/dashboards/*.json in sync with monitoring/grafana/dashboards/*.json
+# by copying, not hand-editing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana-datasources
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+  {{- if .Values.prometheus.enabled }}
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://{{ include "secureprompt.fullname" . }}-prometheus:9090
+        isDefault: true
+        editable: false
+  {{- end }}
+  clickhouse.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: ClickHouse
+        type: grafana-clickhouse-datasource
+        uid: clickhouse
+        access: proxy
+        editable: false
+        jsonData:
+          server: "{{ include "secureprompt.fullname" . }}-clickhouse"
+          port: 8123
+          username: {{ .Values.clickhouse.auth.user | quote }}
+          defaultDatabase: {{ .Values.clickhouse.auth.database | quote }}
+          tlsSkipVerify: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana-dashboard-provider
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-grafana-dashboards
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+{{- (.Files.Glob "files/grafana/dashboards/*.json").AsConfig | nindent 2 }}
+{{- end }}

@@ -24,3 +24,11 @@ services:
   worker:
     image: secureprompt/worker:${SP_VERSION:-0.1.0}
     pull_policy: never
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    pull_policy: never
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    pull_policy: never

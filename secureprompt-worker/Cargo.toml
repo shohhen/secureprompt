@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 secureprompt-common = { path = "../secureprompt-common" }
 tokio = { workspace = true }
+axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

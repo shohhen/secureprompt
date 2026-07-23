@@ -1,0 +1,161 @@
+{
+  "id": null,
+  "uid": "secureprompt-overview",
+  "title": "SecurePrompt — Overview",
+  "description": "Fleet-wide up/down status, firing alerts, and worker health.",
+  "tags": ["secureprompt", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Service Up/Down (up by job)",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: up{job}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up",
+          "legendFormat": "{{job}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Firing Alerts",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: ALERTS{alertstate=\"firing\"}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ALERTS{alertstate=\"firing\"}",
+          "legendFormat": "{{alertname}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Worker Up",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_worker_up.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secureprompt_worker_up",
+          "legendFormat": "worker",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Worker Scheduled Job Runs (rate) by Job",
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_worker_scheduled_job_runs_total{job}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (rate(secureprompt_worker_scheduled_job_runs_total[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Worker Scheduled Job Failures (rate) by Job",
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_worker_scheduled_job_failures_total{job}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (rate(secureprompt_worker_scheduled_job_failures_total[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 },
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Worker Tasks Processed (rate) by Task Type / Outcome",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt_worker_tasks_processed_total{task_type,outcome}.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task_type, outcome) (rate(secureprompt_worker_tasks_processed_total[5m]))",
+          "legendFormat": "{{task_type}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    }
+  ]
+}

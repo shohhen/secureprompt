@@ -1,0 +1,52 @@
+{{- if .Values.prometheus.enabled }}
+# In-cluster Prometheus config for SecurePrompt (KPI-2 monitoring).
+#
+# This is NOT a copy of monitoring/prometheus/prometheus.yml: that file's
+# scrape targets are docker-compose service names ("api:8080", "worker:9091",
+# "secureprompt-ml:8080"). Here the targets are the chart's in-cluster Service
+# DNS names (built from secureprompt.fullname), so they resolve on GKE/on-prem
+# K8s. alerts.yml IS a byte-for-byte copy (rules are target-independent) —
+# see files/prometheus/alerts.yml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secureprompt.fullname" . }}-prometheus-config
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: {{ .Values.prometheus.scrapeInterval }}
+      evaluation_interval: {{ .Values.prometheus.evaluationInterval }}
+
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - "{{ include "secureprompt.fullname" . }}-alertmanager:9093"
+
+    scrape_configs:
+      # api-service.yaml: Service is NodePort, port 80 -> targetPort 8080.
+      - job_name: "secureprompt-api"
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["{{ include "secureprompt.fullname" . }}-api:80"]
+
+      # worker-service.yaml exposes worker.metrics.port (default 9091)
+      # alongside the stale 8080 http port; the worker binds nothing on 8080.
+      - job_name: "secureprompt-worker"
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["{{ include "secureprompt.fullname" . }}-worker:{{ .Values.worker.metrics.port }}"]
+
+      # ml-deployment.yaml defines the Service inline (ClusterIP, port 8080).
+      - job_name: "secureprompt-ml"
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["{{ include "secureprompt.fullname" . }}-ml:8080"]
+  alerts.yml: |
+{{ .Files.Get "files/prometheus/alerts.yml" | indent 4 }}
+{{- end }}
