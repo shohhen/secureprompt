@@ -33,6 +33,7 @@ secureprompt-analytics/profiles.yml
 *.pyc
 .venv-pf/
 .venv-train/
+.venv-dvc/
 
 # Local model resources / runtime data
 # NOTE: "/*" (not a bare dir match) so DVC .dvc pointer files can be
