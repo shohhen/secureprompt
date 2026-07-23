@@ -1,6 +1,18 @@
 # syntax=docker/dockerfile:1.7
 #
 # ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DVC-TRACKED WEIGHTS — PULL BEFORE BUILDING                               ║
+# ║                                                                            ║
+# ║  The two model.safetensors.enc files COPYed below are DVC-tracked, not    ║
+# ║  committed to git (only tiny app/resources/*.dvc pointers are). On a      ║
+# ║  fresh checkout they do not exist in the working tree yet — fetch them    ║
+# ║  first:                                                                    ║
+# ║       make dvc-pull-models     # or: dvc pull secureprompt-ml/app/resources/multilingual_ner_v8_xlmr.dvc secureprompt-ml/app/resources/multilingual_ner_v7_xlmr.dvc ║
+# ║  before running `docker build`, or the COPY steps below will fail with    ║
+# ║  "file not found".                                                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  ENCRYPT THE WEIGHTS ON THE HOST BEFORE BUILDING                          ║
 # ║                                                                            ║
 # ║  This image ships ONLY the AES-256-GCM encrypted weights                  ║
