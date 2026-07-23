@@ -1,0 +1,122 @@
+{
+  "id": null,
+  "uid": "secureprompt-ner-drift",
+  "title": "SecurePrompt — NER Drift",
+  "description": "KPI-2 DRIFT-01: per-entity-type NER confidence and detection-rate trend vs. their 7-day-ago baseline, and which entity types are currently in drift.",
+  "tags": ["secureprompt", "ml", "drift", "kpi2"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "NER Confidence p50 by Entity Type — Current vs 7d-ago Baseline",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt:ner_confidence_p50:1h (recording rule over secureprompt_ml_ner_confidence_bucket{le,entity_type}). Dashed series is the same signal offset 7d, the DRIFT-01 baseline that NERConfidenceDrift compares against.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secureprompt:ner_confidence_p50:1h",
+          "legendFormat": "current {{entity_type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "secureprompt:ner_confidence_p50:1h offset 7d",
+          "legendFormat": "baseline (7d ago) {{entity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0,
+          "custom": { "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/^baseline.*/" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "NER Detection Rate by Entity Type",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Source: secureprompt:ner_detection_rate:1h (recording rule over secureprompt_ml_ner_entities_detected_total{entity_type}). Volume guard for the confidence-drift alert and the signal for NERDetectionVolumeDrift.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secureprompt:ner_detection_rate:1h",
+          "legendFormat": "current {{entity_type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "secureprompt:ner_detection_rate:1h offset 7d",
+          "legendFormat": "baseline (7d ago) {{entity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/^baseline.*/" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Entity Types Currently in Confidence Drift",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Same expression as the NERConfidenceDrift alert: 1h median confidence < 85% of its value 7 days ago, guarded by a minimum detection rate so low-traffic labels don't flap. A non-empty result here means the alert is (or is about to go) Pending/Firing for that entity_type.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(secureprompt:ner_confidence_p50:1h < 0.85 * (secureprompt:ner_confidence_p50:1h offset 7d)) and (secureprompt:ner_detection_rate:1h > 0.01)",
+          "legendFormat": "{{entity_type}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true
+      }
+    }
+  ]
+}

@@ -90,3 +90,38 @@ groups:
       # dashboards, so the two never drift apart.
       - record: secureprompt:request_latency:p95_5m
         expr: histogram_quantile(0.95, sum by (le) (rate(secureprompt_request_duration_seconds_bucket[5m])))
+
+      # KPI-2 DRIFT-01 — self-built rolling baseline for NER confidence
+      # drift. Recorded every evaluation_interval so the series accumulates
+      # history that the drift alerts below compare against via `offset 7d`.
+      # Source metric: secureprompt_ml_ner_confidence_bucket{le,entity_type}
+      # (secureprompt-ml/app/metrics.py).
+      - record: secureprompt:ner_confidence_p50:1h
+        expr: histogram_quantile(0.5, sum by (le, entity_type) (rate(secureprompt_ml_ner_confidence_bucket[1h])))
+
+      # Detection-rate companion series: volume guard for the confidence
+      # alert (avoids flapping on low-traffic entity types) and the signal
+      # for the volume-drift alert. Source metric:
+      # secureprompt_ml_ner_entities_detected_total{entity_type}.
+      - record: secureprompt:ner_detection_rate:1h
+        expr: sum by (entity_type) (rate(secureprompt_ml_ner_entities_detected_total[1h]))
+
+  - name: secureprompt-drift
+    rules:
+      - alert: NERConfidenceDrift
+        expr: (secureprompt:ner_confidence_p50:1h < 0.85 * (secureprompt:ner_confidence_p50:1h offset 7d)) and (secureprompt:ner_detection_rate:1h > 0.01)
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "NER confidence drift on entity type {{ $labels.entity_type }}"
+          description: "The 1h median NER confidence for entity type {{ $labels.entity_type }} is {{ $value | printf \"%.3f\" }}, more than 15% below its value 7 days ago, sustained for 6 hours. This may indicate data drift, model regression, or an upstream extraction change."
+
+      - alert: NERDetectionVolumeDrift
+        expr: (secureprompt:ner_detection_rate:1h > 3 * (secureprompt:ner_detection_rate:1h offset 7d) or secureprompt:ner_detection_rate:1h < (secureprompt:ner_detection_rate:1h offset 7d) / 3) and (secureprompt:ner_detection_rate:1h offset 7d > 0.01)
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "NER detection volume drift on entity type {{ $labels.entity_type }}"
+          description: "The 1h detection rate for entity type {{ $labels.entity_type }} is {{ $value | printf \"%.4f\" }}/s, more than 3x higher or lower than its value 7 days ago, sustained for 6 hours. This may indicate a distribution shift in what's being detected."
