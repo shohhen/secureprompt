@@ -101,3 +101,4 @@ scripts/v6_*.py
 # Local backup/restore test artifacts (encrypted dumps produced by
 # scripts/backup/*.sh against a running dev stack — not source)
 /backups/
+/data
