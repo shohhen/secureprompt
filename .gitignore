@@ -33,9 +33,15 @@ secureprompt-analytics/profiles.yml
 *.pyc
 .venv-pf/
 .venv-train/
+.venv-dvc/
 
 # Local model resources / runtime data
-secureprompt-ml/app/resources/
+# NOTE: "/*" (not a bare dir match) so DVC .dvc pointer files can be
+# re-included below — git cannot re-include a path whose parent dir is
+# excluded, so the trailing /* excludes CONTENTS rather than the dir itself.
+secureprompt-ml/app/resources/*
+!secureprompt-ml/app/resources/*.dvc
+!secureprompt-ml/app/resources/.gitignore
 data/
 out/
 
@@ -96,3 +102,4 @@ scripts/v6_*.py
 # Local backup/restore test artifacts (encrypted dumps produced by
 # scripts/backup/*.sh against a running dev stack — not source)
 /backups/
+/data
