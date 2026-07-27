@@ -100,6 +100,14 @@ pub struct MlSidecarClient {
     // under load, which must be observable in production, not folded into
     // the generic client-error path.
     saturated_total: Arc<AtomicU64>,
+    // WS1-5: shared secret sent as `Authorization: Bearer <token>` on every
+    // outbound call (`/detect/ner`, `/detect/injection`, `/v1/rag-check`).
+    // Sourced from `LicenseConfig::internal_token`
+    // (`ML_SIDECAR_INTERNAL_TOKEN`) — the same env var the sidecar itself
+    // reads to authenticate these calls. Empty by default so every existing
+    // 2-arg `MlSidecarClient::new(...)` call site (tests + any caller that
+    // hasn't opted in) keeps compiling unchanged; set via `with_token`.
+    token: String,
 }
 
 impl MlSidecarClient {
@@ -155,7 +163,19 @@ impl MlSidecarClient {
             failures_total: Arc::new(AtomicU64::new(0)),
             circuit_open_count: Arc::new(AtomicU64::new(0)),
             saturated_total: Arc::new(AtomicU64::new(0)),
+            token: String::new(),
         }
+    }
+
+    /// WS1-5: attach the shared secret sent as `Authorization: Bearer
+    /// <token>` on every outbound sidecar call. Builder-style so existing
+    /// `MlSidecarClient::new(url, timeout_ms)` call sites (main.rs and every
+    /// test in this workspace) keep compiling without a signature change;
+    /// only the gateway's real startup path needs to call this.
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = token.into();
+        self
     }
 
     /// Returns ML detections. Returns empty Vec when circuit is OPEN or sidecar disabled (D-13).
@@ -228,7 +248,13 @@ impl MlSidecarClient {
             text: chunk.to_owned(),
         };
 
-        match http.post(&url).json(&body).send().await {
+        match http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 // Finding 1 (whole-branch review): 429 = the sidecar's NER
                 // queue is full (transient saturation under load), NOT a
@@ -311,7 +337,13 @@ impl MlSidecarClient {
         let body = InjectionRequest {
             text: prompt.to_owned(),
         };
-        match http.post(&url).json(&body).send().await {
+        match http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(resp) => match resp.json::<InjectionResponse>().await {
                 Ok(out) => {
                     circuit.record_success();
@@ -359,7 +391,13 @@ impl MlSidecarClient {
             workspace_id: workspace_id.to_string(),
         };
 
-        match http.post(&url).json(&body).send().await {
+        match http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(resp) => match resp.json::<RagCheckResponse>().await {
                 Ok(r) => {
                     circuit.record_success();
@@ -894,5 +932,118 @@ mod tests {
         );
 
         server.join().expect("mock server thread panicked");
+    }
+
+    // --- WS1-5: every outbound sidecar call must carry
+    // `Authorization: Bearer <ML_SIDECAR_INTERNAL_TOKEN>`, matching the
+    // sidecar's new fail-closed auth gate on every route except
+    // /health, /ready, /metrics. Raw-TCP capture (same idiom as the 4xx/429
+    // tests above) so we can inspect the literal request bytes rather than
+    // trusting a mock crate to have wired the header through correctly. ---
+
+    /// Spawn a one-shot loopback listener that captures the first request's
+    /// raw bytes into `captured` and replies with `body` as a 200 OK JSON
+    /// response. Shared by the three "does this call attach the header"
+    /// tests below.
+    fn spawn_capturing_server(
+        body: &'static [u8],
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+            request
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_detect_if_available_attaches_authorization_header() {
+        let (addr, server) = spawn_capturing_server(b"{\"entities\":[]}");
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000)
+            .with_token("shared-secret-abc".to_owned());
+        let _ = client.detect_if_available("hello world").await;
+
+        let request = server
+            .join()
+            .expect("mock server thread panicked")
+            .to_lowercase();
+        assert!(
+            request.contains("authorization: bearer shared-secret-abc"),
+            "detect_if_available must send the Authorization header; got request:\n{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_injection_check_attaches_authorization_header() {
+        let (addr, server) = spawn_capturing_server(b"{\"is_injection\":false,\"score\":0.0}");
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000)
+            .with_token("shared-secret-abc".to_owned());
+        let _ = client.injection_check_if_available("hello world").await;
+
+        let request = server
+            .join()
+            .expect("mock server thread panicked")
+            .to_lowercase();
+        assert!(
+            request.contains("authorization: bearer shared-secret-abc"),
+            "injection_check_if_available must send the Authorization header; got request:\n{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rag_check_attaches_authorization_header() {
+        let (addr, server) = spawn_capturing_server(b"{\"matches\":[],\"is_match\":false}");
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000)
+            .with_token("shared-secret-abc".to_owned());
+        let _ = client
+            .rag_check_if_available("hello world", uuid::Uuid::new_v4())
+            .await;
+
+        let request = server
+            .join()
+            .expect("mock server thread panicked")
+            .to_lowercase();
+        assert!(
+            request.contains("authorization: bearer shared-secret-abc"),
+            "rag_check_if_available must send the Authorization header; got request:\n{request}"
+        );
+    }
+
+    /// Positive control for the three tests above: prove the capture
+    /// mechanism itself is live by asserting a DIFFERENT, well-known header
+    /// (Content-Type, always sent by reqwest's `.json()`) is present. Without
+    /// this, a broken capture (e.g. reading zero bytes) would make the
+    /// "header must be absent/wrong" style assertions vacuously pass.
+    #[tokio::test]
+    async fn test_capturing_server_actually_captures_request_headers() {
+        let (addr, server) = spawn_capturing_server(b"{\"entities\":[]}");
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        let _ = client.detect_if_available("hello world").await;
+
+        let request = server
+            .join()
+            .expect("mock server thread panicked")
+            .to_lowercase();
+        assert!(
+            request.contains("content-type: application/json"),
+            "capture mechanism must see real request headers; got:\n{request}"
+        );
     }
 }

@@ -7,7 +7,7 @@ import time as _time
 import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import quote
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Response
 from app import config
 from app import metrics
 from app.models import (
@@ -153,9 +153,58 @@ async def lifespan(app: FastAPI):
     metrics.set_ready(False)
 
 
+# WS1-5 fail-closed boot gate: refuse to start rather than silently serve
+# every detection/scan/secure-file route unauthenticated. Mirrors the
+# gateway's WS1-3 default-secret gate (secureprompt-common/src/config.rs
+# JwtConfig::from_env) — both raise at process/import startup, naming the
+# offending env var, instead of falling back to an insecure default.
+# Deliberately checked here (module import time, i.e. before `uvicorn
+# app.main:app` can ever serve a request) rather than only inside a route
+# handler, so a misconfigured deployment fails loudly at container start
+# instead of accepting traffic it can't actually authenticate.
+if not config.INTERNAL_TOKEN:
+    raise RuntimeError(
+        "ML_SIDECAR_INTERNAL_TOKEN is not set — refusing to start. Every "
+        "ML-sidecar route other than /health, /ready, and /metrics requires "
+        "this shared secret to authenticate the gateway. Set "
+        "ML_SIDECAR_INTERNAL_TOKEN before starting the sidecar (see "
+        "secureprompt-common's LicenseConfig::internal_token on the gateway "
+        "side, which must be set to the same value)."
+    )
+
+
+def _valid_internal_token(auth_header: str) -> bool:
+    """``hmac.compare_digest`` check against ``Bearer <ML_SIDECAR_INTERNAL_TOKEN>``.
+
+    Shared by every authenticated route (``/internal/model-key`` plus the
+    ``_require_internal_token`` dependency gating everything else) so the
+    two paths can never drift apart. Always ``False`` when ``INTERNAL_TOKEN``
+    is empty — never authenticate against an empty secret (belt-and-braces;
+    the module-level boot gate above already prevents that state at
+    startup).
+    """
+    expected = f"Bearer {config.INTERNAL_TOKEN}"
+    return bool(config.INTERNAL_TOKEN) and hmac.compare_digest(auth_header, expected)
+
+
+async def _require_internal_token(request: Request) -> None:
+    """FastAPI dependency: 401s any request without a valid bearer token.
+
+    Applied via ``dependencies=[Depends(_require_internal_token)]`` on every
+    route except ``/health``, ``/ready`` (container/k8s probes depend on
+    these staying open) and the ``/metrics`` Prometheus scrape mount
+    (monitoring/prometheus/prometheus.yml has no bearer_token configured for
+    this job, and /metrics exposes only aggregate counters — no request or
+    document content).
+    """
+    if not _valid_internal_token(request.headers.get("authorization", "")):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
 app = FastAPI(title="SecurePrompt ML Sidecar", lifespan=lifespan)
 
-# Prometheus scrape endpoint. Unauthenticated, matching the API's /metrics.
+# Prometheus scrape endpoint. Unauthenticated, matching the API's /metrics
+# (see _require_internal_token's docstring for why this stays exempt).
 app.mount("/metrics", metrics.metrics_asgi_app)
 
 
@@ -207,12 +256,10 @@ async def set_model_key(req: Request):
     can POST the key before the model has loaded (the whole point of the
     concurrent-load design).
     """
-    from app import config
     global _model_key
 
     auth = req.headers.get("authorization", "")
-    expected = f"Bearer {config.INTERNAL_TOKEN}"
-    if not config.INTERNAL_TOKEN or not hmac.compare_digest(auth, expected):
+    if not _valid_internal_token(auth):
         raise HTTPException(status_code=401, detail="unauthorized")
 
     body = await req.json()
@@ -242,7 +289,7 @@ async def ready():
     return {"status": "ok"}
 
 
-@app.post("/detect/ner", response_model=NerResponse)
+@app.post("/detect/ner", response_model=NerResponse, dependencies=[Depends(_require_internal_token)])
 async def detect_ner(req: NerRequest):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -258,7 +305,7 @@ async def detect_ner(req: NerRequest):
     return NerResponse(entities=entities)
 
 
-@app.post("/detect/injection", response_model=InjectionResponse)
+@app.post("/detect/injection", response_model=InjectionResponse, dependencies=[Depends(_require_internal_token)])
 async def detect_injection(req: InjectionRequest):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -266,7 +313,7 @@ async def detect_injection(req: InjectionRequest):
     return InjectionResponse(**result)
 
 
-@app.post("/embed", response_model=EmbedResponse)
+@app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(_require_internal_token)])
 async def embed_endpoint(req: EmbedRequest):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -274,7 +321,7 @@ async def embed_endpoint(req: EmbedRequest):
     return EmbedResponse(embedding=embedding)
 
 
-@app.post("/v1/rag-check", response_model=RagCheckResponse)
+@app.post("/v1/rag-check", response_model=RagCheckResponse, dependencies=[Depends(_require_internal_token)])
 async def rag_check_endpoint(req: RagCheckRequest):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -402,7 +449,7 @@ async def _scan_impl(raw: bytes) -> ScanFileResponse:
     )
 
 
-@app.post("/v1/scan-file", response_model=ScanFileResponse)
+@app.post("/v1/scan-file", response_model=ScanFileResponse, dependencies=[Depends(_require_internal_token)])
 async def scan_file_endpoint(file: UploadFile = File(...)):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -449,7 +496,7 @@ def _prune_scan_tasks() -> None:
         _scan_tasks.pop(tid, None)
 
 
-@app.post("/v1/scan-file/async", response_model=ScanTaskCreated, status_code=202)
+@app.post("/v1/scan-file/async", response_model=ScanTaskCreated, status_code=202, dependencies=[Depends(_require_internal_token)])
 async def scan_file_async(file: UploadFile = File(...)):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -483,7 +530,7 @@ async def scan_file_async(file: UploadFile = File(...)):
     return ScanTaskCreated(task_id=tid)
 
 
-@app.get("/v1/scan-file/tasks/{task_id}", response_model=ScanTaskStatus)
+@app.get("/v1/scan-file/tasks/{task_id}", response_model=ScanTaskStatus, dependencies=[Depends(_require_internal_token)])
 async def scan_file_task_status(task_id: str):
     t = _scan_tasks.get(task_id)
     if t is None:
@@ -534,7 +581,7 @@ def _file_response(secured) -> Response:
     )
 
 
-@app.post("/v1/secure-file")
+@app.post("/v1/secure-file", dependencies=[Depends(_require_internal_token)])
 async def secure_file_sync(file: UploadFile = File(...)):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -551,7 +598,7 @@ async def secure_file_sync(file: UploadFile = File(...)):
     return _file_response(secured)
 
 
-@app.post("/v1/secure-file/async", response_model=SecureTaskCreated, status_code=202)
+@app.post("/v1/secure-file/async", response_model=SecureTaskCreated, status_code=202, dependencies=[Depends(_require_internal_token)])
 async def secure_file_async(file: UploadFile = File(...)):
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail="loading")
@@ -565,7 +612,7 @@ async def secure_file_async(file: UploadFile = File(...)):
     return SecureTaskCreated(task_id=tid)
 
 
-@app.get("/v1/secure-file/tasks/{task_id}", response_model=SecureTaskStatus)
+@app.get("/v1/secure-file/tasks/{task_id}", response_model=SecureTaskStatus, dependencies=[Depends(_require_internal_token)])
 async def secure_file_status(task_id: str):
     t = _secure_store.get(task_id)
     if t is None:
@@ -577,7 +624,7 @@ async def secure_file_status(task_id: str):
     return SecureTaskStatus(status="running")
 
 
-@app.get("/v1/secure-file/tasks/{task_id}/download")
+@app.get("/v1/secure-file/tasks/{task_id}/download", dependencies=[Depends(_require_internal_token)])
 async def secure_file_download(task_id: str):
     t = _secure_store.get(task_id)
     if t is None:
