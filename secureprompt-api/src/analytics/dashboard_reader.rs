@@ -253,19 +253,23 @@ impl DashboardReader {
         )))
     }
 
-    /// Query `mart_cost_by_model` for the given date window.
+    /// Query `mart_cost_by_model` for one workspace in the given date window.
     ///
-    /// Note: `mart_cost_by_model` is aggregated across all workspaces (no
-    /// `workspace_id` column per the mart SQL). The IDOR guard is enforced at
-    /// the handler level; this method returns data filtered by date only.
+    /// WS1-2: this method previously filtered by date only, and the endpoint
+    /// relied on a handler-level guard that fired only when the caller
+    /// supplied an explicit `workspace_id` — so omitting the parameter
+    /// returned every tenant's costs. Tenancy is now enforced in the query
+    /// itself, which is the only layer every caller must pass through.
     ///
     /// # Errors
-    /// Returns `Ok(Vec::new())` when the mart table does not yet exist
-    /// (dbt not run); the dashboard renders an empty state. Returns
-    /// `ApiError::Internal` only for other `ClickHouse` errors.
+    /// Falls back to a workspace-scoped `request_events` aggregation when the
+    /// mart is missing, empty, or predates the `workspace_id` column (see
+    /// `is_stale_mart_err`). Returns `ApiError::Internal` for other
+    /// `ClickHouse` errors.
     pub async fn query_cost_by_model(
         &self,
         metrics: &MetricsRegistry,
+        ws: Uuid,
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Vec<CostByModelRow>, ApiError> {
@@ -277,8 +281,9 @@ impl DashboardReader {
                 "SELECT model, usage_date, daily_cost_usd, daily_request_count, \
                  rolling_7d_cost_usd, rolling_30d_cost_usd \
                  FROM mart_cost_by_model \
-                 WHERE usage_date >= ? AND usage_date <= ?",
+                 WHERE workspace_id = ? AND usage_date >= ? AND usage_date <= ?",
             )
+            .bind(ws)
             .bind(from)
             .bind(to)
             .fetch_all::<CostByModelRow>()
@@ -286,9 +291,9 @@ impl DashboardReader {
         metrics.record_mart_query_duration("mart_cost_by_model", start.elapsed());
         match result {
             Ok(rows) if !rows.is_empty() => Ok(rows),
-            Ok(_) => self.query_cost_by_model_raw_fallback(from, to).await,
-            Err(e) if is_missing_table_err(&e) => {
-                self.query_cost_by_model_raw_fallback(from, to).await
+            Ok(_) => self.query_cost_by_model_raw_fallback(ws, from, to).await,
+            Err(e) if is_stale_mart_err(&e) => {
+                self.query_cost_by_model_raw_fallback(ws, from, to).await
             }
             Err(e) => Err(ApiError::Internal(format!(
                 "ClickHouse query error on mart_cost_by_model: {e}"
@@ -302,6 +307,7 @@ impl DashboardReader {
     /// chart renders without 7d/30d trend lines until dbt runs.
     async fn query_cost_by_model_raw_fallback(
         &self,
+        ws: Uuid,
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) -> Result<Vec<CostByModelRow>, ApiError> {
@@ -311,10 +317,11 @@ impl DashboardReader {
              sum(cost_usd) AS rolling_7d_cost_usd, \
              sum(cost_usd) AS rolling_30d_cost_usd \
              FROM request_events \
-             WHERE toDate(created_at) >= ? AND toDate(created_at) <= ? \
+             WHERE workspace_id = ? \
+               AND toDate(created_at) >= ? AND toDate(created_at) <= ? \
              GROUP BY model, usage_date \
              ORDER BY usage_date, model";
-        self.client.query(sql).bind(from).bind(to)
+        self.client.query(sql).bind(ws).bind(from).bind(to)
             .fetch_all::<CostByModelRow>().await
             .map_err(|e| ApiError::Internal(format!(
                 "ClickHouse fallback query error on request_events: {e}"
@@ -610,6 +617,31 @@ fn validate_date_range(from: chrono::NaiveDate, to: chrono::NaiveDate) -> Result
 /// metric, so operators can see that dbt hasn't been run.
 /// Detect "table doesn't exist" / "unknown table" error variants so the
 /// caller can transparently fall back to a raw-table aggregation.
+/// True when a mart query failed because the mart is absent *or* predates a
+/// column the query now requires.
+///
+/// WS1-2 added `workspace_id` to `mart_cost_by_model`. A deployment that has
+/// not re-run dbt still has the old, workspace-less table, and querying the
+/// new column yields `UNKNOWN_IDENTIFIER` rather than `UNKNOWN_TABLE`. Both
+/// mean "this mart cannot answer the question", and both must degrade to the
+/// workspace-scoped raw fallback — never to an unfiltered read.
+///
+/// Deliberately separate from `is_missing_table_err` so widening the
+/// stale-schema case cannot change behaviour for the other mart endpoints.
+fn is_stale_mart_err(e: &clickhouse::error::Error) -> bool {
+    if is_missing_table_err(e) {
+        return true;
+    }
+    if let clickhouse::error::Error::BadResponse(msg) = e {
+        msg.contains("UNKNOWN_IDENTIFIER")
+            || msg.contains("Unknown expression identifier")
+            || msg.contains("There's no column")
+            || msg.contains("Missing columns")
+    } else {
+        false
+    }
+}
+
 fn is_missing_table_err(e: &clickhouse::error::Error) -> bool {
     if let clickhouse::error::Error::BadResponse(msg) = e {
         msg.contains("doesn't exist")

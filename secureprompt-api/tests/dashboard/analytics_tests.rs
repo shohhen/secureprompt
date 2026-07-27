@@ -451,6 +451,96 @@ async fn prometheus_counters_incremented(pool: PgPool) {
     }
 }
 
+// ── WS1-2: cost-by-model must be workspace-scoped ────────────────────────────
+
+/// Insert one `request_events` row directly into ClickHouse.
+///
+/// Deliberately panics rather than skipping when ClickHouse is unreachable.
+/// A tenancy test that silently passes because its fixture never landed is
+/// the exact failure mode WS1-4 exists to eliminate — see
+/// `rls_matrix.rs::is_safe`.
+async fn seed_request_event(workspace_id: Uuid, model: &str) {
+    let sql = format!(
+        "INSERT INTO {db}.request_events \
+         (request_id, workspace_id, provider, model, final_action, cost_usd, \
+          estimated_usage, created_at) \
+         VALUES ('{rid}', '{ws}', 'openai', '{model}', 'allow', 1.25, false, now())",
+        db = clickhouse_db(),
+        rid = Uuid::new_v4(),
+        ws = workspace_id,
+    );
+
+    let resp = reqwest::Client::new()
+        .post(clickhouse_url())
+        .body(sql)
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "ClickHouse unreachable at {} — this test requires a seeded \
+                 ClickHouse and must not be skipped: {e}",
+                clickhouse_url()
+            )
+        });
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "ClickHouse insert failed ({status}): {body}");
+}
+
+/// WS1-2 — `GET /v1/analytics/cost-by-model` **without** a `workspace_id`
+/// query parameter must still be scoped to the caller's workspace.
+///
+/// The handler's IDOR guard only fires when `workspace_id` is supplied
+/// (`analytics.rs`), and neither the mart query nor its raw fallback carries a
+/// workspace filter (`dashboard_reader.rs`). Omitting the parameter therefore
+/// bypasses tenancy entirely.
+///
+/// The canary model name is unique per run, so a match cannot be coincidental:
+/// if it appears in workspace A's response, workspace B's data leaked.
+#[sqlx::test]
+async fn cost_by_model_without_workspace_id_does_not_leak_other_tenants(pool: PgPool) {
+    let ws_a = Uuid::new_v4();
+    let ws_b = Uuid::new_v4();
+    let canary = format!("canary-model-{}", Uuid::new_v4().simple());
+
+    seed_request_event(ws_b, &canary).await;
+
+    let token_a = make_jwt(ws_a, "admin");
+    let (_state, app) = build_app(pool);
+
+    let today = chrono::Utc::now().date_naive();
+    let from = today - chrono::Duration::days(1);
+    let to = today + chrono::Duration::days(1);
+
+    // No `workspace_id` parameter — the path that skips the guard.
+    let req = Request::builder()
+        .uri(format!(
+            "/v1/analytics/cost-by-model?from={from}&to={to}"
+        ))
+        .header("Authorization", format!("Bearer {token_a}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("read body");
+    let body = String::from_utf8_lossy(&bytes).to_string();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cost-by-model should succeed for the caller's own workspace; body: {body}"
+    );
+    assert!(
+        !body.contains(&canary),
+        "CROSS-TENANT LEAK: workspace A received workspace B's model \
+         '{canary}' from cost-by-model. body: {body}"
+    );
+}
+
 // ── CI gate: mart_only_gate ───────────────────────────────────────────────────
 
 #[test]
