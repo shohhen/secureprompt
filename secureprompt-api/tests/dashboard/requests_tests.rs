@@ -37,6 +37,93 @@ fn no_leak() {
     );
 }
 
+// ── WS1-1: the `model` filter must not be SQL-injectable ─────────────────────
+
+/// WS1-1 — `GET /v1/requests?model=…` interpolates the caller's string into a
+/// ClickHouse query, escaping only `'` by doubling it. ClickHouse string
+/// literals also honour backslash escapes, so a trailing `\` escapes the
+/// closing quote and the remainder of the filter is parsed as SQL.
+///
+/// Reachable by the lowest-privilege roles: the same handler builds a
+/// `user_scope_clause` specifically for Employee/Viewer.
+///
+/// The control assertion is load-bearing. Without proving the filter matches
+/// something, "the payloads returned no rows" would be satisfied by an
+/// endpoint that returns nothing at all — the WS1-4 failure mode.
+#[sqlx::test]
+async fn model_filter_is_not_sql_injectable(pool: sqlx::PgPool) {
+    use super::analytics::{build_app, make_jwt, seed_request_event};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    async fn list(app: &Router, token: &str, model_qs: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .uri(format!("/v1/requests?model={model_qs}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
+        let val = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, val)
+    }
+
+    fn item_count(body: &serde_json::Value) -> usize {
+        body.get("items")
+            .and_then(|v| v.as_array())
+            .map_or(0, Vec::len)
+    }
+
+    let ws = Uuid::new_v4();
+    let control_model = format!("control-model-{}", Uuid::new_v4().simple());
+    seed_request_event(ws, &control_model).await;
+
+    let token = make_jwt(ws, "admin");
+    let (_state, app) = build_app(pool);
+
+    // Control — the filter really does match, so a later empty result is
+    // evidence rather than an artefact.
+    let (status, body) = list(&app, &token, &control_model).await;
+    assert_eq!(status, StatusCode::OK, "control request failed: {body}");
+    assert_eq!(
+        item_count(&body),
+        1,
+        "control model should match exactly one seeded row: {body}"
+    );
+
+    // Each payload must be treated as an ordinary (non-matching) model name:
+    // HTTP 200, zero rows. A 5xx means the parser saw SQL, not data.
+    for (label, encoded) in [
+        // `x\` — trailing backslash escapes the closing quote.
+        ("trailing-backslash", "x%5C"),
+        // `x\' OR 1=1 --` — breaks out and disjoins the WHERE clause. Because
+        // OR binds looser than AND, a successful injection turns the whole
+        // predicate into a tautology.
+        ("tautology", "x%5C%27%20OR%201%3D1%20--"),
+        // `x' OR 1=1 --` — plain quote, the case the doubling does handle.
+        ("plain-quote", "x%27%20OR%201%3D1%20--"),
+    ] {
+        let (status, body) = list(&app, &token, encoded).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "payload '{label}' must be treated as data, not SQL — got {status}: {body}"
+        );
+        assert_eq!(
+            item_count(&body),
+            0,
+            "payload '{label}' must match no rows; a non-empty result means the \
+             filter was defeated: {body}"
+        );
+    }
+}
+
 // ── cursor encoding unit tests ────────────────────────────────────────────────
 
 #[test]

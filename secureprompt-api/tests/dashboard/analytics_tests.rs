@@ -37,11 +37,11 @@ fn redis_url() -> String {
     std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into())
 }
 
-fn clickhouse_url() -> String {
+pub fn clickhouse_url() -> String {
     std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".into())
 }
 
-fn clickhouse_db() -> String {
+pub fn clickhouse_db() -> String {
     std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "sp_analytics".into())
 }
 
@@ -80,7 +80,7 @@ fn test_config() -> AppConfig {
     }
 }
 
-fn build_app(pool: PgPool) -> (AppState, Router) {
+pub fn build_app(pool: PgPool) -> (AppState, Router) {
     let config = test_config();
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));
     let state = AppState::new(
@@ -94,7 +94,7 @@ fn build_app(pool: PgPool) -> (AppState, Router) {
 }
 
 /// Issue a JWT for the given `workspace_id` using the test secret.
-fn make_jwt(workspace_id: Uuid, role: &str) -> String {
+pub fn make_jwt(workspace_id: Uuid, role: &str) -> String {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use secureprompt_api::http::middleware::jwt_auth::Claims;
     let claims = Claims {
@@ -459,7 +459,7 @@ async fn prometheus_counters_incremented(pool: PgPool) {
 /// A tenancy test that silently passes because its fixture never landed is
 /// the exact failure mode WS1-4 exists to eliminate — see
 /// `rls_matrix.rs::is_safe`.
-async fn seed_request_event(workspace_id: Uuid, model: &str) {
+pub async fn seed_request_event(workspace_id: Uuid, model: &str) {
     let sql = format!(
         "INSERT INTO {db}.request_events \
          (request_id, workspace_id, provider, model, final_action, cost_usd, \

@@ -275,6 +275,47 @@ pub struct JwtConfig {
     pub refresh_ttl_secs: u64,
 }
 
+/// Sentinel values shipped in `.env.example` and comparable templates.
+///
+/// WS1-3: booting with one of these means the deployment is running on a
+/// secret that is public knowledge — `.env.example` sets
+/// `SECUREPROMPT_JWT_SECRET=CHANGEME`, and an operator who copies it to
+/// `.env` and forgets to edit gets a gateway whose tokens anyone can forge.
+/// Compared case-insensitively after trimming.
+const PLACEHOLDER_SECRETS: &[&str] = &[
+    "changeme",
+    "change_me",
+    "change-me",
+    "changethis",
+    "change_this",
+    "change-this",
+    "secret",
+    "password",
+    "placeholder",
+    "todo",
+    "xxx",
+    "your-secret-here",
+    "your_secret_here",
+    "replaceme",
+    "replace_me",
+];
+
+/// Reject a known-placeholder secret, naming the variable so the operator can
+/// act on the message without reading source.
+///
+/// # Errors
+/// Returns a human-readable error when `value` is a known placeholder.
+fn reject_placeholder_secret(var: &str, value: &str) -> Result<(), String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if PLACEHOLDER_SECRETS.contains(&normalized.as_str()) {
+        return Err(format!(
+            "{var} is set to the placeholder value {value:?} — refusing to boot. \
+             Generate a real secret (for example `openssl rand -hex 32`) and set {var}."
+        ));
+    }
+    Ok(())
+}
+
 impl JwtConfig {
     pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
     pub const DEFAULT_REFRESH_TTL_SECS: u64 = 2_592_000;
@@ -292,7 +333,11 @@ impl JwtConfig {
         if secret.trim().is_empty() {
             return Err("SECUREPROMPT_JWT_SECRET must not be empty".into());
         }
+        reject_placeholder_secret("SECUREPROMPT_JWT_SECRET", &secret)?;
         if let Ok(provider_key) = std::env::var("SECUREPROMPT_PROVIDER_KEY") {
+            if !provider_key.is_empty() {
+                reject_placeholder_secret("SECUREPROMPT_PROVIDER_KEY", &provider_key)?;
+            }
             if !provider_key.is_empty() && provider_key == secret {
                 return Err(
                     "SECUREPROMPT_JWT_SECRET must differ from SECUREPROMPT_PROVIDER_KEY".into(),
@@ -322,8 +367,16 @@ mod tests {
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// Recover from poisoning rather than propagating it. These tests mutate
+    /// process-global env vars, so the guard exists only for mutual exclusion
+    /// — it protects no invariant that a panicking test could corrupt.
+    /// Unwrapping here turned a single genuine failure into six, hiding which
+    /// test actually broke.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+        ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn clear_jwt_env() {
@@ -350,6 +403,69 @@ mod tests {
         let result = JwtConfig::from_env();
         clear_jwt_env();
         assert!(result.is_err(), "aliased keys must error");
+    }
+
+    // ── WS1-3: refuse to boot on known-default secrets ───────────────────────
+
+    #[test]
+    fn rejects_placeholder_jwt_secret_naming_the_variable() {
+        let _g = env_lock();
+        for placeholder in [
+            "CHANGEME",
+            "changeme",
+            "ChangeMe",
+            "  CHANGEME  ",
+            "change_me",
+            "CHANGE_ME",
+            "changethis",
+            "secret",
+            "password",
+            "your-secret-here",
+        ] {
+            clear_jwt_env();
+            std::env::set_var("SECUREPROMPT_JWT_SECRET", placeholder);
+            let result = JwtConfig::from_env();
+            clear_jwt_env();
+
+            let err = result.expect_err(&format!(
+                "placeholder secret {placeholder:?} must be rejected at boot"
+            ));
+            assert!(
+                err.contains("SECUREPROMPT_JWT_SECRET"),
+                "error must name the offending variable so the operator can fix \
+                 it; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_placeholder_provider_key_naming_the_variable() {
+        let _g = env_lock();
+        clear_jwt_env();
+        std::env::set_var("SECUREPROMPT_JWT_SECRET", "a-genuinely-distinct-secret");
+        std::env::set_var("SECUREPROMPT_PROVIDER_KEY", "CHANGEME");
+        let result = JwtConfig::from_env();
+        clear_jwt_env();
+
+        let err = result.expect_err("placeholder provider key must be rejected");
+        assert!(
+            err.contains("SECUREPROMPT_PROVIDER_KEY"),
+            "error must name the offending variable; got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_real_secret() {
+        let _g = env_lock();
+        clear_jwt_env();
+        // Guards against an over-broad placeholder rule rejecting real values.
+        std::env::set_var(
+            "SECUREPROMPT_JWT_SECRET",
+            "7f3c1b9a4e2d8f06b5a1c7e93d4082fa61bc5d0e9a3f7148",
+        );
+        let result = JwtConfig::from_env();
+        clear_jwt_env();
+        assert!(result.is_ok(), "a real secret must boot: {result:?}");
     }
 
     #[test]

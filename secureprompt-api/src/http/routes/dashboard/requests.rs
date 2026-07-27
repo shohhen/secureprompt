@@ -276,9 +276,22 @@ async fn list_requests(
         )
     });
 
-    let model_clause = params.model.as_ref().map_or_else(String::new, |m| {
-        format!("AND re.model = '{}'", m.replace('\'', "''"))
-    });
+    // WS1-1: bound parameter, never interpolated.
+    //
+    // This previously read `format!("AND re.model = '{}'", m.replace('\'', "''"))`.
+    // Doubling `'` is insufficient for ClickHouse, whose string literals also
+    // honour backslash escapes: a trailing `\` escapes the closing quote and
+    // the rest of the query is parsed as part of the literal (or as SQL).
+    // Reachable by Employee/Viewer — see `user_scope_clause` below.
+    //
+    // Every other interpolation in this query is a typed value (Uuid, i64,
+    // u64) or a fixed &str, so `model` is the only bound parameter and the
+    // single `?` below is unambiguous.
+    let model_clause = if params.model.is_some() {
+        "AND re.model = ?"
+    } else {
+        ""
+    };
 
     // Employee/Viewer roles can only see their own requests. Owner +
     // Developer (and legacy Admin) see the full workspace.
@@ -336,10 +349,12 @@ async fn list_requests(
         fetch_limit = fetch_limit,
     );
 
-    let rows = state
-        .dashboard_reader
-        .client()
-        .query(&query)
+    let mut ch_query = state.dashboard_reader.client().query(&query);
+    if let Some(model) = params.model.as_ref() {
+        ch_query = ch_query.bind(model);
+    }
+
+    let rows = ch_query
         .fetch_all::<RequestEventRow>()
         .await
         .map_err(|e| {
