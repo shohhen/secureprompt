@@ -223,9 +223,7 @@ fn matrix_cases() -> Vec<Case> {
     .into_iter()
     .map(|path| Case {
         method: "GET",
-        path_template: Box::leak(
-            format!("{path}?{range}&workspace_id={{B}}").into_boxed_str(),
-        ),
+        path_template: Box::leak(format!("{path}?{range}&workspace_id={{B}}").into_boxed_str()),
         body_fn: None,
         expect: Expect::ForbiddenOrEmpty,
     })
