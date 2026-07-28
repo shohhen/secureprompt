@@ -26,9 +26,13 @@
 --   * that array is still a SUPERSET of the original nine defaults, so a rule
 --     an admin deliberately NARROWED is left alone (an admin who removed
 --     CREDIT_CARD meant it, and we do not second-guess that);
---   * PINFL is not already present, which makes the statement idempotent.
+--   * at least one of the six new classes is missing, which makes the
+--     statement idempotent.
 -- An admin who ADDED classes still gets the back-fill, since a superset test
 -- passes for them.
+--
+-- Only the classes actually MISSING are appended, so an admin who had already
+-- added, say, STIR by hand does not end up with a duplicate entry.
 --
 -- Workspaces whose rule was narrowed, renamed, or replaced are intentionally
 -- untouched and must be updated by the operator from the policy UI.
@@ -37,14 +41,19 @@ UPDATE policy_rules
 SET conditions = jsonb_set(
         conditions,
         '{0,value}',
-        (conditions -> 0 -> 'value') || '[
-            "PINFL",
-            "STIR",
-            "MFO",
-            "PASSPORT_NUMBER",
-            "UZCARD",
-            "HUMO"
-        ]'::jsonb
+        (conditions -> 0 -> 'value') || (
+            SELECT COALESCE(jsonb_agg(candidate.class), '[]'::jsonb)
+            FROM jsonb_array_elements('[
+                     "PINFL",
+                     "STIR",
+                     "MFO",
+                     "PASSPORT_NUMBER",
+                     "UZCARD",
+                     "HUMO"
+                 ]'::jsonb) AS candidate(class)
+            WHERE NOT (policy_rules.conditions -> 0 -> 'value')
+                      @> jsonb_build_array(candidate.class)
+        )
     ),
     updated_at = NOW()
 WHERE name = 'Redact common PII'
@@ -64,4 +73,11 @@ WHERE name = 'Redact common PII'
         "GCP_KEY",
         "AZURE_KEY"
       ]'::jsonb
-  AND NOT (conditions -> 0 -> 'value' @> '["PINFL"]'::jsonb);
+  AND NOT (conditions -> 0 -> 'value' @> '[
+        "PINFL",
+        "STIR",
+        "MFO",
+        "PASSPORT_NUMBER",
+        "UZCARD",
+        "HUMO"
+      ]'::jsonb);

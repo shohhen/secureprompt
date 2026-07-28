@@ -241,6 +241,25 @@ mod migration_backfill_tests {
         );
     }
 
+    /// Round-2 review: an admin who had already added one of the new classes
+    /// by hand must not end up with a duplicate entry.
+    #[sqlx::test]
+    async fn backfill_does_not_duplicate_a_class_the_admin_already_added(pool: PgPool) {
+        let with_stir = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY","STIR"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", with_stir).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        assert_eq!(
+            classes.iter().filter(|c| *c == "STIR").count(),
+            1,
+            "STIR must appear exactly once: {classes:?}"
+        );
+        assert!(classes.contains(&"PINFL".to_owned()), "{classes:?}");
+        assert!(classes.contains(&"HUMO".to_owned()), "{classes:?}");
+    }
+
     #[sqlx::test]
     async fn does_not_touch_an_unrelated_rule(pool: PgPool) {
         let rule_id = seed_legacy_rule(&pool, "Block secrets", LEGACY_CLASSES).await;
