@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 /// Every column `RequestEventRow` writes. Kept in lock-step with that struct
 /// (and therefore with `clickhouse/migrations/*`) — the probe below reports
 /// any that the live table is missing.
-const REQUEST_EVENTS_COLUMNS: &[&str] = &[
+pub const REQUEST_EVENTS_COLUMNS: &[&str] = &[
     "request_id",
     "workspace_id",
     "provider",
@@ -42,15 +42,16 @@ struct ColumnNameRow {
 }
 
 /// One-shot startup check that the live `request_events` table has every
-/// column the writer serialises. Logs an alert-keyed error and bumps
-/// `secureprompt_clickhouse_schema_mismatch_total` when it does not.
+/// column the writer serialises. Logs an alert-keyed error and raises the
+/// `secureprompt_clickhouse_schema_mismatch` gauge when it does not; the
+/// gauge is lowered again by the first commit that actually inserts rows.
 ///
 /// Deliberately non-fatal: a ClickHouse that is merely slow to come up must
 /// not take the gateway down with it, and the analytics path is best-effort
 /// by design. The point is that "analytics silently dropping 100% of events
 /// because the worker has not run its migrations" becomes a visible,
 /// alertable condition rather than an inference from an empty dashboard.
-async fn verify_request_events_schema(client: &Client, metrics: &Arc<MetricsRegistry>) {
+pub async fn verify_request_events_schema(client: &Client, metrics: &Arc<MetricsRegistry>) {
     let found = match client
         .query(
             "SELECT name FROM system.columns \
@@ -142,23 +143,35 @@ impl AnalyticsHandle {
             // Probe once, loudly, and expose it as a counter so an alert can
             // fire instead of an operator noticing an empty audit log a week
             // later.
-            // Bounded: the probe runs AHEAD of the consumer loop, so a hung
-            // or blackholed ClickHouse would block the receiver forever, the
-            // 256-slot channel would fill, and `enqueue`'s `try_send` would
-            // then drop every event — the same total analytics loss this
-            // probe exists to make visible, with a wider trigger. A refused
-            // connection errors immediately; a hung one needs this.
-            if tokio::time::timeout(
-                Duration::from_secs(SCHEMA_PROBE_TIMEOUT_SECS),
-                verify_request_events_schema(&ch_client, &metrics_task),
-            )
-            .await
-            .is_err()
+            // The probe must never sit between this task starting and the
+            // `recv()` loop below. Awaited inline - even with a timeout - a
+            // hung or blackholed ClickHouse stalls the receiver for the whole
+            // timeout, the 256-slot channel fills, and `enqueue`'s `try_send`
+            // drops events: at more than ~26 events/s a 10s stall alone loses
+            // traffic. That is the same total-analytics-loss the probe exists
+            // to surface.
+            //
+            // So: spawned, not awaited. The consumer loop starts draining
+            // immediately and the probe reports whenever it finishes. The
+            // timeout stays so a blackholed connection cannot leak the task
+            // forever.
             {
-                tracing::warn!(
-                    timeout_secs = SCHEMA_PROBE_TIMEOUT_SECS,
-                    "ClickHouse schema probe timed out; continuing without it"
-                );
+                let probe_client = ch_client.clone();
+                let probe_metrics = Arc::clone(&metrics_task);
+                tokio::spawn(async move {
+                    if tokio::time::timeout(
+                        Duration::from_secs(SCHEMA_PROBE_TIMEOUT_SECS),
+                        verify_request_events_schema(&probe_client, &probe_metrics),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            timeout_secs = SCHEMA_PROBE_TIMEOUT_SECS,
+                            "ClickHouse schema probe timed out; continuing without it"
+                        );
+                    }
+                });
             }
 
             let mut req_inserter = ch_client
@@ -198,6 +211,10 @@ impl AnalyticsHandle {
                 .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
 
             while let Some(event) = receiver.recv().await {
+                // Counted BEFORE any ClickHouse work: this is the signal that
+                // the receive loop is running, independent of whether
+                // ClickHouse is healthy, slow or unreachable.
+                metrics_task.record_analytics_consumed();
                 let now = chrono::Utc::now();
                 let req_row = RequestEventRow::from_event(&event, now);
 
@@ -221,13 +238,6 @@ impl AnalyticsHandle {
                         continue;
                     }
                 }
-
-                // The startup probe latches a schema-mismatch flag. A write
-                // that actually lands proves the schema is now good (the
-                // worker migrated, or the probe raced startup), so clear it —
-                // otherwise `ClickHouseSchemaStale` would keep firing after
-                // the system had self-healed, until someone restarted the API.
-                metrics_task.clear_clickhouse_schema_mismatch();
 
                 for pe in &event.policy_events {
                     let pol_row = PolicyEventRow::from_policy_event(
@@ -263,9 +273,34 @@ impl AnalyticsHandle {
                     metrics_task.record_clickhouse_insert_failure();
                 }
 
-                if let Err(e) = req_inserter.commit().await {
-                    tracing::error!(error = %e, "request_events inserter commit error");
-                    metrics_task.record_clickhouse_insert_failure();
+                // Schema-staleness gauge, settled HERE and nowhere else.
+                //
+                // `Inserter::write` only serialises into a local buffer
+                // (clickhouse 0.15 `do_write` is synchronous, no server
+                // round-trip), so the server never sees a stale schema until
+                // a commit actually ships rows. Clearing the gauge on `write`
+                // - as this code did briefly - cleared it for the first
+                // ENQUEUED event regardless of schema state, and a failing
+                // commit never re-set it, so `ClickHouseSchemaStale` could
+                // not fire on any gateway carrying traffic. Stuck-clear is
+                // strictly worse than the latch it replaced.
+                //
+                // `commit()` returns `Quantities::ZERO` when the batch limits
+                // are not yet reached (nothing was sent), so `rows > 0` is
+                // the only proof that ClickHouse accepted our row layout.
+                match req_inserter.commit().await {
+                    Ok(quantities) if quantities.rows > 0 => {
+                        metrics_task.clear_clickhouse_schema_mismatch();
+                    }
+                    Ok(_) => { /* buffered only; proves nothing either way */ }
+                    Err(e) => {
+                        tracing::error!(error = %e, "request_events inserter commit error");
+                        metrics_task.record_clickhouse_insert_failure();
+                        // A rejected commit is the symptom of a stale schema,
+                        // so re-raise the gauge even if a probe never ran or
+                        // an earlier commit had cleared it.
+                        metrics_task.record_clickhouse_schema_mismatch();
+                    }
                 }
                 if let Err(e) = pol_inserter.commit().await {
                     tracing::error!(error = %e, "policy_events inserter commit error");
@@ -295,159 +330,5 @@ impl AnalyticsHandle {
             metrics.record_analytics_drop();
             tracing::warn!("analytics buffer full; dropping request event");
         }
-    }
-}
-
-#[cfg(test)]
-mod schema_probe_tests {
-    use super::{build_clickhouse_client, verify_request_events_schema, REQUEST_EVENTS_COLUMNS};
-    use crate::observability::metrics::MetricsRegistry;
-    use std::sync::Arc;
-
-    fn ch_url() -> String {
-        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_owned())
-    }
-
-    /// Raw HTTP so the fixture setup does not depend on the very client the
-    /// probe uses.
-    async fn exec(sql: &str) {
-        let response = reqwest::Client::new()
-            .post(format!("{}/", ch_url()))
-            .body(sql.to_owned())
-            .send()
-            .await
-            .expect("ClickHouse must be reachable — see CLICKHOUSE_URL in the task env");
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        assert!(status.is_success(), "clickhouse ddl failed ({status}): {body}\nsql: {sql}");
-    }
-
-    /// The probe must flag a table that is missing a column the writer
-    /// serialises — that is the state in which EVERY analytics event is
-    /// dropped wholesale because the worker has not run its migrations.
-    ///
-    /// Positive control is the second half: the SAME probe against a table
-    /// that has every column must leave the gauge at 0. Without it, "the
-    /// gauge is 1" would be satisfied by a probe that flags unconditionally.
-    #[tokio::test]
-    async fn probe_flags_a_stale_schema_and_passes_a_complete_one() {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let stale_db = format!("sp_probe_stale_{suffix}");
-        let good_db = format!("sp_probe_good_{suffix}");
-
-        // A complete table, and a copy with one required column removed.
-        let all_columns = REQUEST_EVENTS_COLUMNS
-            .iter()
-            .map(|c| format!("{c} String"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let missing_floor_only = REQUEST_EVENTS_COLUMNS
-            .iter()
-            .filter(|c| **c != "floor_only")
-            .map(|c| format!("{c} String"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        for (db, cols) in [(&good_db, &all_columns), (&stale_db, &missing_floor_only)] {
-            exec(&format!("CREATE DATABASE IF NOT EXISTS {db}")).await;
-            exec(&format!(
-                "CREATE TABLE IF NOT EXISTS {db}.request_events ({cols}) \
-                 ENGINE = MergeTree ORDER BY tuple()"
-            ))
-            .await;
-        }
-
-        // Stale schema -> flagged.
-        let stale_metrics = Arc::new(MetricsRegistry::default());
-        assert_eq!(
-            stale_metrics.clickhouse_schema_mismatch_count(),
-            0,
-            "premise: a fresh registry starts clean"
-        );
-        verify_request_events_schema(
-            &build_clickhouse_client(&ch_url(), &stale_db),
-            &stale_metrics,
-        )
-        .await;
-        assert_eq!(
-            stale_metrics.clickhouse_schema_mismatch_count(),
-            1,
-            "a table missing floor_only must be flagged"
-        );
-
-        // POSITIVE CONTROL: complete schema -> not flagged.
-        let good_metrics = Arc::new(MetricsRegistry::default());
-        verify_request_events_schema(&build_clickhouse_client(&ch_url(), &good_db), &good_metrics)
-            .await;
-        assert_eq!(
-            good_metrics.clickhouse_schema_mismatch_count(),
-            0,
-            "a table with every required column must NOT be flagged"
-        );
-
-        // The gauge clears when an insert proves the schema is fine.
-        stale_metrics.clear_clickhouse_schema_mismatch();
-        assert_eq!(stale_metrics.clickhouse_schema_mismatch_count(), 0);
-
-        for db in [&stale_db, &good_db] {
-            exec(&format!("DROP DATABASE IF EXISTS {db}")).await;
-        }
-    }
-
-    /// A missing table is the "migrations never ran at all" case.
-    #[tokio::test]
-    async fn probe_flags_a_missing_table() {
-        let db = format!("sp_probe_empty_{}", uuid::Uuid::new_v4().simple());
-        exec(&format!("CREATE DATABASE IF NOT EXISTS {db}")).await;
-
-        let metrics = Arc::new(MetricsRegistry::default());
-        verify_request_events_schema(&build_clickhouse_client(&ch_url(), &db), &metrics).await;
-        assert_eq!(
-            metrics.clickhouse_schema_mismatch_count(),
-            1,
-            "no request_events table at all must be flagged"
-        );
-
-        exec(&format!("DROP DATABASE IF EXISTS {db}")).await;
-    }
-
-    /// The probe is bounded. It runs AHEAD of the consumer loop, so an
-    /// unbounded await against a hung ClickHouse blocks the receiver, fills
-    /// the 256-slot channel and makes `enqueue` drop every event — the exact
-    /// total-analytics-loss the probe exists to surface.
-    ///
-    /// Driven against a listener that accepts and then never replies, with a
-    /// short timeout so the test itself stays fast.
-    #[tokio::test]
-    async fn probe_is_bounded_against_a_hung_clickhouse() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        // Accept and hold the connection open, answering nothing.
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept() {
-                held.push(stream);
-            }
-        });
-
-        let metrics = Arc::new(MetricsRegistry::default());
-        let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            verify_request_events_schema(
-                &build_clickhouse_client(&format!("http://{addr}"), "default"),
-                &metrics,
-            ),
-        )
-        .await;
-
-        assert!(
-            outcome.is_err(),
-            "premise: this ClickHouse really does hang (probe returned in {:?})",
-            started.elapsed()
-        );
-        // The production call site wraps the same future in a
-        // `tokio::time::timeout`, so a hang there is bounded exactly as it is
-        // bounded here rather than stalling the analytics consumer forever.
     }
 }

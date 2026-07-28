@@ -514,3 +514,199 @@ mod coverage_classification_tests {
         );
     }
 }
+
+/// Fix round 3, BLOCKER 2 — the audit-row redaction on the fail-closed path
+/// reuses detections computed over the prompt AFTER `preload_file_vault`
+/// strips `[[sp:v=…]]` markers. The span arithmetic must strip the same
+/// thing, or every offset shifts by the marker length and the wrong bytes get
+/// redacted with no error raised.
+#[cfg(test)]
+mod fail_closed_audit_redaction_tests {
+    use crate::pipeline::service::{last_user_message_span, redact_last_user_message_with};
+    use secureprompt_common::types::{Detection, Message};
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_owned(),
+            content: content.to_owned(),
+        }
+    }
+
+    /// Detection over the joined+stripped prompt, exactly as the pipeline
+    /// produces them: find `value` in that string and record its byte span.
+    fn detection_over(joined_stripped: &str, value: &str) -> Detection {
+        let start = joined_stripped
+            .find(value)
+            .expect("test fixture: value must appear in the scanned prompt");
+        Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.9,
+            span: Some((start, start + value.len())),
+            value: value.to_owned(),
+        }
+    }
+
+    /// POSITIVE CONTROL: no markers anywhere. Redaction must actually happen,
+    /// otherwise every "wrong bytes" assertion below could pass simply
+    /// because nothing is ever redacted.
+    #[test]
+    fn redacts_the_right_bytes_without_markers() {
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Contract for Anvar Karimov please"),
+        ];
+        let joined = "You are helpful.\nContract for Anvar Karimov please";
+        let detections = vec![detection_over(joined, "Anvar Karimov")];
+
+        let out = redact_last_user_message_with(&messages, &detections);
+        assert!(
+            !out.contains("Anvar Karimov"),
+            "the synthetic name must be redacted; got {out:?}"
+        );
+        assert!(
+            out.starts_with("Contract for ") && out.ends_with(" please"),
+            "only the detected span may be replaced; got {out:?}"
+        );
+    }
+
+    /// THE BUG: a file-vault marker in an EARLIER message shifts every span in
+    /// the stripped prompt. Measuring against the raw messages redacted bytes
+    /// that were `marker.len()` too far right — silently, because
+    /// `apply_redaction` never checks the span's bytes against the value.
+    #[test]
+    fn marker_in_an_earlier_message_does_not_shift_the_redaction() {
+        let messages = vec![
+            msg("user", "Here is the file [[sp:v=abc123]] attached"),
+            msg("user", "Contract for Anvar Karimov please"),
+        ];
+        // What detection actually sees: joined, then markers stripped.
+        let joined_stripped = "Here is the file  attached\nContract for Anvar Karimov please";
+        let detections = vec![detection_over(joined_stripped, "Anvar Karimov")];
+
+        let out = redact_last_user_message_with(&messages, &detections);
+        assert!(
+            !out.contains("Anvar Karimov"),
+            "the name must still be redacted when an earlier message carried a \
+             marker; got {out:?}"
+        );
+        assert!(
+            out.starts_with("Contract for ") && out.ends_with(" please"),
+            "the surrounding text must be untouched - a shifted span would eat \
+             neighbouring bytes; got {out:?}"
+        );
+    }
+
+    /// A marker inside the audited message itself: the returned text is the
+    /// STRIPPED message (markers are opaque internal refs, never user
+    /// content, and are already absent from what was scanned).
+    #[test]
+    fn marker_inside_the_audited_message_is_stripped_and_offsets_hold() {
+        let messages = vec![msg(
+            "user",
+            "[[sp:v=zz]]Contract for Anvar Karimov please",
+        )];
+        let joined_stripped = "Contract for Anvar Karimov please";
+        let detections = vec![detection_over(joined_stripped, "Anvar Karimov")];
+
+        let out = redact_last_user_message_with(&messages, &detections);
+        assert!(!out.contains("[[sp:v="), "markers must not survive into the audit row");
+        assert!(!out.contains("Anvar Karimov"));
+        assert!(out.starts_with("Contract for "));
+    }
+
+    /// The belt-and-braces guard: a span whose bytes do not match the
+    /// detection's recorded value is DROPPED, not applied. This is what makes
+    /// any future prompt transform fail safe instead of corrupting.
+    #[test]
+    fn a_span_whose_bytes_do_not_match_the_value_is_dropped() {
+        let messages = vec![msg("user", "Contract for Anvar Karimov please")];
+        let bogus = Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.9,
+            // Correct length, wrong place.
+            span: Some((0, "Anvar Karimov".len())),
+            value: "Anvar Karimov".to_owned(),
+        };
+
+        let out = redact_last_user_message_with(&messages, &[bogus]);
+        assert_eq!(
+            out, "Contract for Anvar Karimov please",
+            "a span that does not contain its own value must be ignored, not applied"
+        );
+    }
+
+    /// A detection straddling the message boundary is dropped rather than
+    /// clamped — one fewer redaction than the old re-scanning path produced,
+    /// and the safe direction.
+    ///
+    /// BOTH halves of the bounds check are exercised deliberately. The first
+    /// version of this test only covered `s < start`; a mutation that clamped
+    /// `e` to `end` left it green, because the span it used was already
+    /// rejected by the start check. A test that exercises one half of a
+    /// condition while claiming to cover both is the vacuity pattern this
+    /// project keeps hitting.
+    #[test]
+    fn a_detection_straddling_the_boundary_is_dropped() {
+        // (a) starts BEFORE the audited message: rejected by `s < start`.
+        let trailing = vec![msg("user", "alpha"), msg("user", "beta")];
+        let joined = "alpha\nbeta";
+        let starts_early = Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.9,
+            span: Some((3, 8)), // "ha\nbe" - crosses the separator
+            value: joined[3..8].to_owned(),
+        };
+        assert_eq!(
+            redact_last_user_message_with(&trailing, &[starts_early]),
+            "beta",
+            "a span starting before the audited message must not be applied"
+        );
+
+        // (b) starts INSIDE the audited message and runs past its end:
+        // rejected by `e > end`. The audited message is the last USER message,
+        // so an assistant turn after it gives the span somewhere to overrun.
+        let with_reply = vec![msg("user", "alpha"), msg("assistant", "beta")];
+        let runs_over = Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.9,
+            span: Some((3, 8)), // starts in "alpha", ends inside "beta"
+            value: joined[3..8].to_owned(),
+        };
+        assert_eq!(
+            redact_last_user_message_with(&with_reply, &[runs_over]),
+            "alpha",
+            "a span overrunning the audited message must be dropped, not clamped"
+        );
+    }
+
+    /// Span arithmetic itself, including the marker-stripping, at the
+    /// boundaries the reviewer checked by hand.
+    #[test]
+    fn span_arithmetic_accounts_for_stripped_markers() {
+        // Single message: (0, len).
+        let single = vec![msg("user", "hello")];
+        assert_eq!(
+            last_user_message_span(&single),
+            Some((0, 5, "hello".to_owned()))
+        );
+
+        // Empty slice: None before any arithmetic.
+        assert_eq!(last_user_message_span(&[]), None);
+
+        // Preceding message shrinks by exactly the marker's byte length.
+        let with_marker = vec![msg("user", "ab[[sp:v=q]]cd"), msg("user", "xyz")];
+        // "abcd" (4) + separator (1) = 5.
+        assert_eq!(
+            last_user_message_span(&with_marker),
+            Some((5, 8, "xyz".to_owned()))
+        );
+
+        // Multi-byte content: byte arithmetic end to end, no char/byte mix.
+        let cyrillic = vec![msg("user", "Привет"), msg("user", "мир")];
+        let head_len = "Привет".len(); // 12 bytes
+        assert_eq!(
+            last_user_message_span(&cyrillic),
+            Some((head_len + 1, head_len + 1 + "мир".len(), "мир".to_owned()))
+        );
+    }
+}

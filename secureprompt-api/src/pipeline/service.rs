@@ -1412,32 +1412,36 @@ fn policy_violation_label(action: &str) -> Option<&'static str> {
 /// PII back into the model's response, while the marker — a bare ref, no PII — is
 /// removed before the prompt reaches detection / redaction / the provider.
 /// Best-effort: a missing or expired ref just leaves its tokens unrestored.
-async fn preload_file_vault(
-    prompt: &mut String,
-    vault: &mut secureprompt_common::types::TokenVault,
-    redis_pool: &deadpool_redis::Pool,
-) {
-    const OPEN: &str = "[[sp:v=";
-    const CLOSE: &str = "]]";
-    if !prompt.contains(OPEN) {
-        return;
-    }
+const FILE_VAULT_MARKER_OPEN: &str = "[[sp:v=";
+const FILE_VAULT_MARKER_CLOSE: &str = "]]";
+
+/// Remove `[[sp:v=<ref>]]` file-vault markers, returning the cleaned text and
+/// the refs found, in order.
+///
+/// Extracted from `preload_file_vault` so that the span arithmetic in
+/// `last_user_message_span` strips EXACTLY what the request path strips.
+/// `preload_file_vault` mutates the prompt before detection runs, so
+/// detection offsets are relative to the cleaned text; measuring message
+/// lengths against the raw text instead shifts every span by each preceding
+/// marker's byte length. Two copies of this loop would be one refactor away
+/// from silently disagreeing again.
+fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
-    let mut cleaned = String::with_capacity(prompt.len());
-    let mut rest = prompt.as_str();
-    while let Some(idx) = rest.find(OPEN) {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(FILE_VAULT_MARKER_OPEN) {
         cleaned.push_str(&rest[..idx]);
-        let after = &rest[idx + OPEN.len()..];
-        match after.find(CLOSE) {
+        let after = &rest[idx + FILE_VAULT_MARKER_OPEN.len()..];
+        match after.find(FILE_VAULT_MARKER_CLOSE) {
             Some(end) => {
                 let vref = &after[..end];
                 if !vref.is_empty() {
                     refs.push(vref.to_owned());
                 }
-                rest = &after[end + CLOSE.len()..];
+                rest = &after[end + FILE_VAULT_MARKER_CLOSE.len()..];
             }
             None => {
-                // Unterminated marker — keep the remaining text verbatim.
+                // Unterminated marker - keep the remaining text verbatim.
                 cleaned.push_str(rest);
                 rest = "";
                 break;
@@ -1445,6 +1449,18 @@ async fn preload_file_vault(
         }
     }
     cleaned.push_str(rest);
+    (cleaned, refs)
+}
+
+async fn preload_file_vault(
+    prompt: &mut String,
+    vault: &mut secureprompt_common::types::TokenVault,
+    redis_pool: &deadpool_redis::Pool,
+) {
+    if !prompt.contains(FILE_VAULT_MARKER_OPEN) {
+        return;
+    }
+    let (cleaned, refs) = strip_file_vault_markers(prompt);
     *prompt = cleaned;
 
     for vref in refs {
@@ -1792,23 +1808,32 @@ async fn redact_last_user_message(
 }
 
 /// Byte range of the message `last_user_message_raw` reports, inside the
-/// `prompt_from_messages` join (messages joined with a single `\n`).
+/// prompt DETECTION ACTUALLY RAN OVER, plus that message's cleaned text.
 ///
-/// Detections produced over the joined prompt carry whole-prompt byte
-/// offsets. Reusing them to redact a SINGLE message requires knowing where
-/// that message starts, or the spans land on the wrong bytes.
-fn last_user_message_span(messages: &[Message]) -> Option<(usize, usize)> {
+/// Two transforms sit between `request.messages` and the string detection
+/// sees: `prompt_from_messages` joins with a single `\n`, and
+/// `preload_file_vault` then strips `[[sp:v=…]]` markers. Detections carry
+/// offsets into the result of BOTH. Measuring against the raw messages — as
+/// this did before — shifts every span by the byte length of each marker at
+/// or before the audited message, and `apply_redaction` does not verify that
+/// a span's bytes match the detection's value, so the wrong bytes get
+/// redacted with no error. Audit-record only, but silent and
+/// plausible-looking, which is the failure mode this whole change exists to
+/// remove.
+pub(crate) fn last_user_message_span(messages: &[Message]) -> Option<(usize, usize, String)> {
     let idx = messages
         .iter()
         .rposition(|m| m.role.eq_ignore_ascii_case("user"))
         .or_else(|| messages.len().checked_sub(1))?;
     let mut offset = 0usize;
     for (i, message) in messages.iter().enumerate() {
+        let cleaned = strip_file_vault_markers(&message.content).0;
         if i == idx {
-            return Some((offset, offset + message.content.len()));
+            let end = offset + cleaned.len();
+            return Some((offset, end, cleaned));
         }
         // +1 for the "\n" separator `prompt_from_messages` inserts.
-        offset += message.content.len() + 1;
+        offset += cleaned.len() + 1;
     }
     None
 }
@@ -1826,43 +1851,51 @@ fn last_user_message_span(messages: &[Message]) -> Option<(usize, usize)> {
 /// Detections outside the audited message are dropped and the rest rebased to
 /// message-local offsets, so the result is the same shape the success paths
 /// produce.
-fn redact_last_user_message_with(
+pub(crate) fn redact_last_user_message_with(
     messages: &[Message],
     detections: &[secureprompt_common::types::Detection],
 ) -> String {
-    let Some(message) = messages
-        .iter()
-        .rev()
-        .find(|m| m.role.eq_ignore_ascii_case("user"))
-        .or_else(|| messages.last())
-    else {
+    let Some((start, end, content)) = last_user_message_span(messages) else {
         return String::new();
     };
-    let content = message.content.as_str();
     if content.is_empty() {
         return String::new();
     }
-    let Some((start, end)) = last_user_message_span(messages) else {
-        return content.to_owned();
-    };
 
     let scoped: Vec<secureprompt_common::types::Detection> = detections
         .iter()
         .filter_map(|detection| {
             let (s, e) = detection.span?;
-            (s >= start && e <= end).then(|| secureprompt_common::types::Detection {
-                span: Some((s - start, e - start)),
+            // Fully inside the audited message. One straddling the boundary
+            // is dropped rather than clamped: a partial span would redact an
+            // arbitrary fragment. That is one fewer redaction than the
+            // scanning path produced, and the safe direction.
+            if s < start || e > end {
+                return None;
+            }
+            let (local_start, local_end) = (s - start, e - start);
+            // Belt and braces. `apply_redaction` trusts spans blindly, so
+            // verify the bytes still say what the detection says they say.
+            // If any future transform shifts the prompt between detection and
+            // here, this drops the detection instead of redacting the wrong
+            // bytes. Detections whose `value` is empty are not checkable and
+            // are dropped for the same reason.
+            let bytes_match = content
+                .get(local_start..local_end)
+                .is_some_and(|actual| !actual.is_empty() && actual == detection.value);
+            bytes_match.then(|| secureprompt_common::types::Detection {
+                span: Some((local_start, local_end)),
                 ..detection.clone()
             })
         })
         .collect();
     if scoped.is_empty() {
-        return content.to_owned();
+        return content;
     }
 
     let mut vault = secureprompt_common::types::TokenVault::default();
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    crate::vault::apply_redaction(content, &scoped, &mut vault, &mut map)
+    crate::vault::apply_redaction(&content, &scoped, &mut vault, &mut map)
 }
 
 /// Decrypt a stored provider credential via the configured KMS backend.

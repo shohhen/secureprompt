@@ -144,6 +144,15 @@ pub struct MetricsRegistry {
     requests_total: AtomicU64,
     request_failures_total: AtomicU64,
     analytics_dropped_total: AtomicU64,
+    /// `secureprompt_analytics_consumed_total` — events taken off the
+    /// analytics channel by the writer task, counted the moment `recv()`
+    /// yields one and BEFORE any ClickHouse work.
+    ///
+    /// Pairs with `analytics_dropped_total`: dropped/(dropped+consumed) is the
+    /// analytics loss rate. It is also the only externally visible proof that
+    /// the writer's receive loop is running at all, which is what the startup
+    /// schema probe must not be allowed to delay.
+    analytics_consumed_total: AtomicU64,
     analytics_failures_total: AtomicU64,
     clickhouse_insert_failures_total: AtomicU64,
     clickhouse_insert_retries_total: AtomicU64,
@@ -208,6 +217,18 @@ impl MetricsRegistry {
         if !success {
             self.request_failures_total.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// One event taken off the channel by the writer task.
+    pub fn record_analytics_consumed(&self) {
+        self.analytics_consumed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Events consumed so far. Read by `tests/clickhouse_schema_probe.rs`.
+    #[must_use]
+    pub fn analytics_consumed_count(&self) -> u64 {
+        self.analytics_consumed_total.load(Ordering::Relaxed)
     }
 
     pub fn record_analytics_drop(&self) {
@@ -464,7 +485,21 @@ impl MetricsRegistry {
         self.clickhouse_schema_mismatch.store(0, Ordering::Relaxed);
     }
 
+    /// Number of events dropped because the analytics channel was full.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs` to prove the writer keeps
+    /// draining while ClickHouse is unresponsive; exported as
+    /// `secureprompt_analytics_dropped_total`.
+    #[must_use]
+    pub fn analytics_dropped_count(&self) -> u64 {
+        self.analytics_dropped_total.load(Ordering::Relaxed)
+    }
+
     /// 1 when the schema is known-stale, 0 otherwise.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs`; the gauge is also exported
+    /// through `render_prometheus` as
+    /// `secureprompt_clickhouse_schema_mismatch`.
     #[must_use]
     pub fn clickhouse_schema_mismatch_count(&self) -> u64 {
         self.clickhouse_schema_mismatch.load(Ordering::Relaxed)
@@ -544,6 +579,8 @@ impl MetricsRegistry {
                 "secureprompt_request_failures_total {}\n",
                 "# TYPE secureprompt_analytics_dropped_total counter\n",
                 "secureprompt_analytics_dropped_total {}\n",
+                "# TYPE secureprompt_analytics_consumed_total counter\n",
+                "secureprompt_analytics_consumed_total {}\n",
                 "# TYPE secureprompt_analytics_failures_total counter\n",
                 "secureprompt_analytics_failures_total {}\n",
                 "# TYPE secureprompt_clickhouse_insert_failures_total counter\n",
@@ -554,6 +591,7 @@ impl MetricsRegistry {
             self.requests_total.load(Ordering::Relaxed),
             self.request_failures_total.load(Ordering::Relaxed),
             self.analytics_dropped_total.load(Ordering::Relaxed),
+            self.analytics_consumed_total.load(Ordering::Relaxed),
             self.analytics_failures_total.load(Ordering::Relaxed),
             self.clickhouse_insert_failures_total.load(Ordering::Relaxed),
             self.clickhouse_insert_retries_total.load(Ordering::Relaxed),
