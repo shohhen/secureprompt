@@ -765,6 +765,7 @@ async fn block_policy_rejects_partially_scanned_long_prompt(pool: PgPool) -> sql
     let sidecar = MockSidecar::spawn_with(1, false);
     let app = support::router_with(pool.clone(), &sidecar.url(), "default");
     let response = app
+        .clone()
         .oneshot(long_chat_request(None))
         .await
         .expect("router should respond");
@@ -774,10 +775,25 @@ async fn block_policy_rejects_partially_scanned_long_prompt(pool: PgPool) -> sql
         StatusCode::SERVICE_UNAVAILABLE,
         "a block workspace must not forward chunks the sidecar never scanned"
     );
+
+    // Fix round 2 — 503 alone does NOT discriminate: `block` returns it for
+    // Partial AND for AllCallsFailed, so a regression that stopped counting
+    // the first chunk as covered would leave this test green while the
+    // scenario under test had silently changed (exactly what happened to the
+    // degrade twin before its mock was fixed). The metric label is the
+    // discriminator. `!ner_requests().is_empty()` is not enough either — it
+    // proves the mock RECEIVED a request, not that the client counted it
+    // covered.
+    let metrics = scrape_metrics(app).await;
     assert!(
-        !sidecar.ner_requests().is_empty(),
-        "premise: the sidecar must have answered at least one chunk, otherwise \
-         this is just the total-outage case already covered above"
+        metrics.contains(
+            "secureprompt_sidecar_unavailable_total{reason=\"partial_coverage\",action=\"block\"}"
+        ),
+        "the 503 must be attributed to PARTIAL coverage; got:\n{metrics}"
+    );
+    assert!(
+        !metrics.contains("reason=\"all_calls_failed\""),
+        "the first chunk WAS scanned, so this must not be a total outage; got:\n{metrics}"
     );
     Ok(())
 }

@@ -190,11 +190,16 @@ pub struct MetricsRegistry {
     /// (`block`/`degrade_with_alert`). This is the alert signal for a
     /// gateway running with no ML detection coverage.
     sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
-    /// Counter `secureprompt_clickhouse_schema_mismatch_total`. Bumped once
-    /// at startup when the live `request_events` table is missing columns the
-    /// writer serialises — i.e. the worker's ClickHouse migrations have not
-    /// run and every analytics event is being dropped.
-    clickhouse_schema_mismatch_total: AtomicU64,
+    /// GAUGE `secureprompt_clickhouse_schema_mismatch` — 1 when the live
+    /// `request_events` table is missing columns the writer serialises (the
+    /// worker's ClickHouse migrations have not run, and every analytics event
+    /// is being dropped), 0 otherwise.
+    ///
+    /// A gauge, not a counter, because it describes a STATE that can heal:
+    /// the startup probe sets it, and the first insert that actually lands
+    /// clears it. As a monotonic counter the alert would keep firing after
+    /// the worker migrated and inserts recovered, until an API restart.
+    clickhouse_schema_mismatch: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -448,16 +453,21 @@ impl MetricsRegistry {
         }
     }
 
-    /// Record that the live ClickHouse schema is behind the writer.
+    /// Flag that the live ClickHouse schema is behind the writer.
     pub fn record_clickhouse_schema_mismatch(&self) {
-        self.clickhouse_schema_mismatch_total
-            .fetch_add(1, Ordering::Relaxed);
+        self.clickhouse_schema_mismatch.store(1, Ordering::Relaxed);
     }
 
-    /// Used by tests to assert the startup schema probe fired.
+    /// Clear the flag — called when an insert actually lands, which proves
+    /// the schema is now compatible.
+    pub fn clear_clickhouse_schema_mismatch(&self) {
+        self.clickhouse_schema_mismatch.store(0, Ordering::Relaxed);
+    }
+
+    /// 1 when the schema is known-stale, 0 otherwise.
     #[must_use]
     pub fn clickhouse_schema_mismatch_count(&self) -> u64 {
-        self.clickhouse_schema_mismatch_total.load(Ordering::Relaxed)
+        self.clickhouse_schema_mismatch.load(Ordering::Relaxed)
     }
 
     /// WS2-3 — record one request for which the ML sidecar produced no
@@ -672,11 +682,11 @@ impl MetricsRegistry {
             }
         }
 
-        out.push_str("# TYPE secureprompt_clickhouse_schema_mismatch_total counter\n");
+        out.push_str("# TYPE secureprompt_clickhouse_schema_mismatch gauge\n");
         let _ = writeln!(
             out,
-            "secureprompt_clickhouse_schema_mismatch_total {}",
-            self.clickhouse_schema_mismatch_total.load(Ordering::Relaxed)
+            "secureprompt_clickhouse_schema_mismatch {}",
+            self.clickhouse_schema_mismatch.load(Ordering::Relaxed)
         );
 
         // WS2-3 — ML sidecar coverage-loss counter.

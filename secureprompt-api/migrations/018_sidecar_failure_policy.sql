@@ -31,23 +31,12 @@
 --      reading this table needs.
 --
 -- NO ROW-LEVEL SECURITY, matching `workspace_secure_mode` (007) and unlike
--- `workspace_budgets` (003).
---
--- CORRECTION (fix round 1): an earlier version of this comment said RLS was
--- not achievable here. That was half right. FORCE RLS *alone* would make
--- every read return zero rows, because the policy keys off
--- `current_setting('app.current_workspace_id')` and this repository does not
--- set it — every workspace would then silently revert to 'block' regardless
--- of what it chose. But the codebase's actual pattern is RLS *plus* a
--- `set_config` on the same connection (see `db/budget_repo.rs`), which is a
--- few lines of work, not impossible.
---
--- It is still omitted here, deliberately and for a weaker reason than
--- claimed: both repository methods bind the authenticated workspace_id
--- explicitly, so there is no cross-tenant read to prevent, and matching 007
--- keeps the two per-workspace settings tables consistent. Adding RLS to both
--- of them together is a reasonable follow-up; adding it to only this one
--- would be inconsistency for its own sake.
+-- `workspace_budgets` (003). The RLS policy used elsewhere keys off
+-- `current_setting('app.current_workspace_id')`, which the pooled gateway
+-- connection does not set on the request path; adding FORCE RLS here would
+-- make every read return zero rows, i.e. every workspace would silently
+-- revert to 'block' regardless of what it chose. Both the repository read
+-- and write are parameterised by the authenticated workspace_id.
 
 CREATE TABLE workspace_sidecar_policy (
     workspace_id UUID PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,

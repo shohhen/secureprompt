@@ -248,6 +248,7 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request_id: RequestId,
         reason: CoverageLoss,
+        detections: &[secureprompt_common::types::Detection],
         start: Instant,
     ) -> ApiError {
         alert_sidecar_unavailable(
@@ -285,11 +286,12 @@ impl PipelineService {
         event.ip_address = request.client_ip.clone();
         event.user_agent = request.user_agent.clone();
         event.raw_prompt = last_user_message_raw(&request.messages);
-        // Best-effort: this re-runs detection with the same broken sidecar,
-        // so it shows what the deterministic floor alone would have caught —
-        // which is precisely the evidence a reviewer wants for "why was this
-        // not safe to forward".
-        event.redacted_prompt = Some(redact_last_user_message(&self.state, &request.messages).await);
+        // Reuses the detections this request already produced — NO second
+        // sidecar call on a path that is failing precisely because detection
+        // is unavailable or over budget. Shows what was actually caught
+        // (deterministic floor, plus whatever partial ML coverage there was),
+        // which is the evidence for "why was this not safe to forward".
+        event.redacted_prompt = Some(redact_last_user_message_with(&request.messages, detections));
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -373,12 +375,21 @@ impl PipelineService {
                 );
                 SidecarUnavailablePolicy::default()
             });
+        // Merged BEFORE the gate so the fail-closed path can reuse these for
+        // the audit row instead of paying for a second scan.
+        let merged_detections = merge_detections(regex_detections, ml_outcome.detections);
         let mut degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
             SidecarGate::Proceed => None,
             SidecarGate::Block(reason) => {
                 return Err(self
                     .fail_closed_on_coverage_loss(
-                        auth, request, resolved, request_id, reason, start,
+                        auth,
+                        request,
+                        resolved,
+                        request_id,
+                        reason,
+                        &merged_detections,
+                        start,
                     )
                     .await);
             }
@@ -394,7 +405,7 @@ impl PipelineService {
             }
         };
 
-        pipeline_state.detections = merge_detections(regex_detections, ml_outcome.detections);
+        pipeline_state.detections = merged_detections;
 
         let rag_result = self
             .state
@@ -483,7 +494,13 @@ impl PipelineService {
                     SidecarGate::Block(reason) => {
                         return Err(self
                             .fail_closed_on_coverage_loss(
-                                auth, request, resolved, request_id, reason, start,
+                                auth,
+                                request,
+                                resolved,
+                                request_id,
+                                reason,
+                                &pipeline_state.detections,
+                                start,
                             )
                             .await);
                     }
@@ -1772,6 +1789,80 @@ async fn redact_last_user_message(
     let mut audit_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     crate::vault::apply_redaction(content, &detections, &mut audit_vault, &mut audit_map)
+}
+
+/// Byte range of the message `last_user_message_raw` reports, inside the
+/// `prompt_from_messages` join (messages joined with a single `\n`).
+///
+/// Detections produced over the joined prompt carry whole-prompt byte
+/// offsets. Reusing them to redact a SINGLE message requires knowing where
+/// that message starts, or the spans land on the wrong bytes.
+fn last_user_message_span(messages: &[Message]) -> Option<(usize, usize)> {
+    let idx = messages
+        .iter()
+        .rposition(|m| m.role.eq_ignore_ascii_case("user"))
+        .or_else(|| messages.len().checked_sub(1))?;
+    let mut offset = 0usize;
+    for (i, message) in messages.iter().enumerate() {
+        if i == idx {
+            return Some((offset, offset + message.content.len()));
+        }
+        // +1 for the "\n" separator `prompt_from_messages` inserts.
+        offset += message.content.len() + 1;
+    }
+    None
+}
+
+/// Redact the latest user message using detections ALREADY computed over the
+/// joined prompt — no second sidecar call.
+///
+/// `redact_last_user_message` re-runs a full scan, which is right on the
+/// success paths (it wants message-scoped placeholder numbering) but wrong on
+/// the fail-closed path: that path is already failing because detection is
+/// unavailable or over budget, and a second scan there can pay another full
+/// `ner_total_budget` before the 503, or — on the injection gate, where NER
+/// is healthy — double sidecar load exactly when the sidecar is struggling.
+///
+/// Detections outside the audited message are dropped and the rest rebased to
+/// message-local offsets, so the result is the same shape the success paths
+/// produce.
+fn redact_last_user_message_with(
+    messages: &[Message],
+    detections: &[secureprompt_common::types::Detection],
+) -> String {
+    let Some(message) = messages
+        .iter()
+        .rev()
+        .find(|m| m.role.eq_ignore_ascii_case("user"))
+        .or_else(|| messages.last())
+    else {
+        return String::new();
+    };
+    let content = message.content.as_str();
+    if content.is_empty() {
+        return String::new();
+    }
+    let Some((start, end)) = last_user_message_span(messages) else {
+        return content.to_owned();
+    };
+
+    let scoped: Vec<secureprompt_common::types::Detection> = detections
+        .iter()
+        .filter_map(|detection| {
+            let (s, e) = detection.span?;
+            (s >= start && e <= end).then(|| secureprompt_common::types::Detection {
+                span: Some((s - start, e - start)),
+                ..detection.clone()
+            })
+        })
+        .collect();
+    if scoped.is_empty() {
+        return content.to_owned();
+    }
+
+    let mut vault = secureprompt_common::types::TokenVault::default();
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    crate::vault::apply_redaction(content, &scoped, &mut vault, &mut map)
 }
 
 /// Decrypt a stored provider credential via the configured KMS backend.

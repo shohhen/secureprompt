@@ -198,6 +198,16 @@ impl AppConfig {
     /// default (we'd rather over-redact a brand-new workspace than leak
     /// PII because the admin hasn't built rules yet).
     #[must_use]
+    pub fn redact_when_no_rules_from_env() -> bool {
+        match std::env::var("SECUREPROMPT_REDACT_WHEN_NO_RULES")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+        {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "no") => false,
+            _ => true,
+        }
+    }
+
     /// Parse `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT` from the environment.
     ///
     /// Only the exact value `degrade_with_alert` opts a deployment out of
@@ -215,21 +225,12 @@ impl AppConfig {
             Some(other) if !other.is_empty() && other != "block" => {
                 tracing::warn!(
                     value = %other,
-                    "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT is not a recognised value;                      falling back to 'block'"
+                    "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT is not a recognised value; \
+                     falling back to 'block'"
                 );
                 "block".to_owned()
             }
             _ => "block".to_owned(),
-        }
-    }
-
-    pub fn redact_when_no_rules_from_env() -> bool {
-        match std::env::var("SECUREPROMPT_REDACT_WHEN_NO_RULES")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-        {
-            Some(v) if matches!(v.as_str(), "0" | "false" | "no") => false,
-            _ => true,
         }
     }
 }

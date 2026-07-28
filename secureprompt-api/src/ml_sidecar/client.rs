@@ -6,7 +6,8 @@ use reqwest::Client;
 
 use crate::ml_sidecar::types::{
     InjectionOutcome, InjectionRequest, InjectionResponse, MlDetection, MlDetectionOutcome,
-    NerRequest, NerResponse, RagCheckRequest, RagCheckResponse, SidecarOutage,
+    NerRequest, NerResponse, RagCheckRequest, RagCheckResponse, SidecarCoverage,
+    SidecarOutage,
 };
 
 const FAILURE_THRESHOLD: u32 = 5;
@@ -267,32 +268,13 @@ impl MlSidecarClient {
             }
         }
 
-        // Fix round 1 — classification, in strict order.
-        //
-        // `attempted == 0` means the loop broke at its very first top-of-loop
-        // check. The budget check cannot fire on iteration 0 (it is guarded by
-        // `chunks_done > 0`), so the only way here is the breaker opening
-        // BETWEEN the pre-loop check above and the first iteration — another
-        // task's failures tripping it. Zero chunks were looked at; this used
-        // to fall through to `complete(vec![])`, handing out a clean bill of
-        // health for text nothing had read.
-        if attempted == 0 {
-            return MlDetectionOutcome::absent(SidecarOutage::CircuitOpen);
+        match classify_coverage(attempted, covered, chunks_total) {
+            SidecarCoverage::Complete => MlDetectionOutcome::complete(all),
+            SidecarCoverage::Partial { .. } => {
+                MlDetectionOutcome::partial(all, covered, chunks_total)
+            }
+            SidecarCoverage::Absent(reason) => MlDetectionOutcome::absent(reason),
         }
-        if covered == 0 {
-            return MlDetectionOutcome::absent(SidecarOutage::AllCallsFailed);
-        }
-        // Some chunks scanned, some not — either individual chunk calls
-        // failed (`covered < attempted`) or the loop stopped early and never
-        // issued the rest (`attempted < chunks_total`, from the breaker
-        // opening mid-loop or the aggregate budget expiring). Either way the
-        // remaining text was never scanned, and any prompt over
-        // `ner_chunk_chars` tiles into several chunks, so this is the common
-        // case for long documents rather than an edge case.
-        if covered < chunks_total {
-            return MlDetectionOutcome::partial(all, covered, chunks_total);
-        }
-        MlDetectionOutcome::complete(all)
     }
 
     /// Query `/detect/ner` for a single chunk (already ≤ `ner_chunk_chars`
@@ -568,6 +550,45 @@ impl MlSidecarClient {
     }
 }
 
+/// Classify what the chunk loop achieved, from counts alone.
+///
+/// Pure and total, so every case — including ones the loop can only reach
+/// through a timing race — is directly testable. `detect_if_available` calls
+/// this and does nothing else with the counts.
+///
+/// * `attempted` — chunks for which a request was issued.
+/// * `covered` — chunks the sidecar actually scanned (`attempted` minus the
+///   ones that errored, 4xx'd or 429'd).
+/// * `chunks_total` — chunks the prompt tiled into.
+///
+/// `attempted == 0` deserves its own arm. The loop breaks there only when the
+/// breaker opens BETWEEN `detect_if_available`'s pre-loop `is_open()` check
+/// and the first top-of-loop check — another task's failures tripping it
+/// mid-call. The budget check cannot cause it (guarded by `chunks_done > 0`).
+/// Zero chunks were read, so reporting `Complete` (which is what the code did
+/// before this arm existed) hands out a clean bill of health for text nothing
+/// looked at.
+fn classify_coverage(attempted: usize, covered: usize, chunks_total: usize) -> SidecarCoverage {
+    if attempted == 0 {
+        return SidecarCoverage::Absent(SidecarOutage::CircuitOpen);
+    }
+    if covered == 0 {
+        return SidecarCoverage::Absent(SidecarOutage::AllCallsFailed);
+    }
+    // Some scanned, some not: either chunk calls failed (`covered <
+    // attempted`) or the loop stopped early and never issued the rest
+    // (`attempted < chunks_total` — breaker opening mid-loop, or the
+    // aggregate budget expiring). Comparing against `chunks_total` rather
+    // than `attempted` is what catches the second case.
+    if covered < chunks_total {
+        return SidecarCoverage::Partial {
+            chunks_covered: covered,
+            chunks_total,
+        };
+    }
+    SidecarCoverage::Complete
+}
+
 /// Rebase a detection span from chunk-local byte offsets to whole-prompt
 /// byte offsets by adding the chunk's starting byte offset. Pure arithmetic,
 /// factored out of `detect_if_available` so it's unit-testable without a
@@ -618,7 +639,6 @@ pub(crate) fn split_for_ner(text: &str, max_chars: usize) -> Vec<(usize, String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml_sidecar::types::SidecarCoverage;
 
     /// ML-05a: Disabled client (empty URL) returns empty detections.
     #[tokio::test]
@@ -1420,19 +1440,97 @@ mod tests {
         );
     }
 
-    /// Fix round 1, IMPORTANT: the breaker can open BETWEEN the pre-loop
-    /// check and the first loop-top check (another task's failures trip it).
-    /// The loop then breaks with zero chunks attempted, which used to fall
-    /// through to `complete(vec![])` — a clean bill of health for text that
-    /// was never looked at. Simulated directly by opening the breaker while
-    /// the pre-loop check has already been passed, which is what
-    /// `attempted == 0` means at the classification site.
+    // --- Fix round 2: `classify_coverage`, directly ---------------------
+    //
+    // The previous test for the `attempted == 0` branch was VACUOUS. It drove
+    // the breaker open and called `detect_if_available`, which returns at the
+    // PRE-LOOP `is_open()` check with the identical `Absent(CircuitOpen)` —
+    // so deleting the branch left the test passing. Verified by deleting the
+    // branch and re-running (see the report). The branch is now a case in the
+    // pure `classify_coverage`, which is reachable from a test without
+    // needing to win a race inside the chunk loop.
+
+    /// Every (attempted, covered, chunks_total) shape the loop can produce.
+    /// Written out as literal triples rather than generated from the
+    /// function's own thresholds, so a change to those thresholds shows up
+    /// here as a failure instead of being absorbed.
+    #[test]
+    fn classify_coverage_covers_every_shape() {
+        // Zero chunks attempted: the breaker opened between the pre-loop
+        // check and the first iteration. THIS is the case the old test
+        // claimed but did not cover.
+        assert_eq!(
+            classify_coverage(0, 0, 3),
+            SidecarCoverage::Absent(SidecarOutage::CircuitOpen)
+        );
+        assert_eq!(
+            classify_coverage(0, 0, 1),
+            SidecarCoverage::Absent(SidecarOutage::CircuitOpen)
+        );
+
+        // Attempted, nothing covered.
+        assert_eq!(
+            classify_coverage(1, 0, 1),
+            SidecarCoverage::Absent(SidecarOutage::AllCallsFailed)
+        );
+        assert_eq!(
+            classify_coverage(3, 0, 3),
+            SidecarCoverage::Absent(SidecarOutage::AllCallsFailed),
+            "a multi-chunk prompt where every chunk failed is a total outage, \
+             not partial coverage"
+        );
+
+        // Partial: some chunks failed.
+        assert_eq!(
+            classify_coverage(3, 2, 3),
+            SidecarCoverage::Partial {
+                chunks_covered: 2,
+                chunks_total: 3
+            }
+        );
+        // Partial: loop stopped early, remaining chunks never issued. This is
+        // the case `covered < attempted` alone would MISS.
+        assert_eq!(
+            classify_coverage(1, 1, 5),
+            SidecarCoverage::Partial {
+                chunks_covered: 1,
+                chunks_total: 5
+            },
+            "budget-truncated loops never issue the rest; that text is unscanned"
+        );
+
+        // Complete, single and multi chunk.
+        assert_eq!(classify_coverage(1, 1, 1), SidecarCoverage::Complete);
+        assert_eq!(classify_coverage(4, 4, 4), SidecarCoverage::Complete);
+    }
+
+    /// Mutation guard: each arm must be individually load-bearing. If any two
+    /// of these collapsed to the same value, `classify_coverage` would be
+    /// passing the table above by accident.
+    #[test]
+    fn classify_coverage_arms_are_distinct() {
+        let outcomes = [
+            classify_coverage(0, 0, 3),
+            classify_coverage(3, 0, 3),
+            classify_coverage(3, 2, 3),
+            classify_coverage(3, 3, 3),
+        ];
+        for (i, a) in outcomes.iter().enumerate() {
+            for b in outcomes.iter().skip(i + 1) {
+                assert_ne!(a, b, "two classification arms produced the same result");
+            }
+        }
+    }
+
+    /// The PRE-LOOP breaker check (a different code path from the branch
+    /// above — this one never enters the chunk loop at all). Renamed from
+    /// `test_zero_chunks_attempted_reports_circuit_open`, which claimed to
+    /// cover the mid-loop race and did not.
     #[tokio::test]
-    async fn test_zero_chunks_attempted_reports_circuit_open() {
+    async fn test_open_breaker_short_circuits_before_the_chunk_loop() {
         let client = MlSidecarClient::new("http://127.0.0.1:19999".to_owned(), 50);
         let circuit = client.circuit.as_ref().expect("circuit").clone();
 
-        // Drive the breaker OPEN.
         let mut opened = false;
         for _ in 0..20 {
             let _ = client.detect_if_available("x").await;

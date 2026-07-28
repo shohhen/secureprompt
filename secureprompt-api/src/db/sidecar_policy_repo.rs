@@ -7,6 +7,25 @@
 //! Read/write shape deliberately mirrors
 //! [`crate::db::secure_mode_repo::SecureModeRepository`]: `get` returns the
 //! default when no row exists, `upsert` writes one row per workspace.
+//!
+//! ## Why `workspace_sidecar_policy` has no row-level security
+//!
+//! Migration 018's header says FORCE RLS alone would make every read return
+//! zero rows — true, because the RLS policy this codebase uses keys off
+//! `current_setting('app.current_workspace_id')` and neither method here sets
+//! it. But that is only half the picture, and the correction belongs
+//! somewhere it can be revised without changing a migration's checksum, so it
+//! lives here rather than in the .sql:
+//!
+//! The codebase's actual pattern is RLS **plus** a `set_config` on the same
+//! connection (see [`crate::db::budget_repo`]), which is a few lines of work,
+//! not impossible. RLS is omitted here for a weaker reason than the migration
+//! implies: both methods below bind the authenticated `workspace_id`
+//! explicitly, so there is no cross-tenant read to prevent, and matching
+//! `workspace_secure_mode` (007, also un-RLS'd) keeps the two per-workspace
+//! settings tables consistent. Adding RLS to both together is a reasonable
+//! follow-up; adding it to only this one would be inconsistency for its own
+//! sake.
 
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use sqlx::{PgPool, Row};
