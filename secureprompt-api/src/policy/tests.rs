@@ -481,6 +481,133 @@ mod condition_tests {
     }
 }
 
+/// WS1-8: a compound condition (multiple conditions ANDed on the same rule)
+/// must be satisfied by a SINGLE detection, not by different detections each
+/// covering one condition. Unlike `condition_tests` above (which simulates
+/// engine logic inline because the helpers were private), these tests call
+/// the real `rule_matches` directly — `rule_matches` was made
+/// `pub(crate)` for exactly this purpose, so the bug is exercised through
+/// production code, not a re-implementation of it.
+#[cfg(test)]
+mod compound_condition_tests {
+    use crate::db::PolicyRuleRow;
+    use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+    use chrono::Utc;
+    use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+    use uuid::Uuid;
+
+    fn compound_rule(conditions: serde_json::Value) -> PolicyRuleRow {
+        PolicyRuleRow {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "compound-test-rule".to_owned(),
+            priority: 100,
+            conditions,
+            action: "redact".to_owned(),
+            action_params: serde_json::json!({}),
+            enabled: true,
+            dry_run: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn detection(class: &str, confidence: f32) -> Detection {
+        Detection {
+            class: class.to_owned(),
+            confidence,
+            span: None,
+            value: "synthetic-value".to_owned(),
+        }
+    }
+
+    fn eval_input<'a>(detections: &'a [Detection]) -> PolicyEvaluationInput<'a> {
+        PolicyEvaluationInput {
+            request_id: RequestId::new(),
+            workspace_id: WorkspaceId::new(),
+            provider_name: "test-provider",
+            model: "test-model",
+            content: "irrelevant content — no content_regex condition in these rules",
+            detections,
+        }
+    }
+
+    /// The exact defect from the brief: a rule reading
+    /// `detection_class == EMAIL_ADDRESS AND confidence_gte >= 0.9` must
+    /// match only when ONE detection is both an EMAIL_ADDRESS and >= 0.9
+    /// confidence. Here the class is satisfied by one detection and the
+    /// confidence threshold by a completely different one — the rule must
+    /// NOT fire.
+    #[test]
+    fn compound_condition_does_not_match_when_two_different_detections_split_the_conditions() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]));
+
+        let detections = vec![
+            detection("EMAIL_ADDRESS", 0.5), // satisfies class only
+            detection("PHONE_NUMBER", 0.95), // satisfies confidence only
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            !rule_matches(&rule, &input),
+            "rule must NOT match when the class test and the confidence test \
+             are satisfied by two different detections rather than one"
+        );
+    }
+
+    /// Same rule, but one detection now satisfies both conditions at once —
+    /// this is the case the rule is actually meant to catch, and it must
+    /// still fire. Paired with the test above as a positive control: same
+    /// rule shape, different detection composition, opposite expected
+    /// outcome.
+    #[test]
+    fn compound_condition_matches_when_one_detection_satisfies_both() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]));
+
+        let detections = vec![
+            detection("EMAIL_ADDRESS", 0.95), // satisfies both at once
+            detection("PHONE_NUMBER", 0.5),   // unrelated, must be ignored
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            rule_matches(&rule, &input),
+            "rule must match when a single detection satisfies every \
+             condition in the rule"
+        );
+    }
+
+    /// Regression guard mirroring the workspace default rule seeded by
+    /// `db/workspace_repo.rs` (`detection_class in [...]`, a single
+    /// condition). A single detection-scoped condition is trivially
+    /// "per-detection" already — it must keep matching via ANY qualifying
+    /// detection, exactly as before this task.
+    #[test]
+    fn single_detection_class_in_condition_still_matches_via_any_qualifying_detection() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "in", "value": ["EMAIL_ADDRESS", "PERSON"] }
+        ]));
+
+        let detections = vec![
+            detection("PINFL", 0.99),         // not in the list
+            detection("EMAIL_ADDRESS", 0.10), // in the list; no confidence condition present
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            rule_matches(&rule, &input),
+            "a lone detection_class-in condition must still match via any \
+             qualifying detection"
+        );
+    }
+}
+
 #[cfg(test)]
 mod events_tests {
     use crate::db::PolicyRuleRow;
