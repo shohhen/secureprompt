@@ -257,6 +257,8 @@ fn tokenize_detections(
 mod tokenize_detection_tests {
     use super::tokenize_detections;
     use crate::ml_sidecar::types::MlDetection;
+    use secureprompt_common::types::TokenVault;
+    use std::collections::HashMap;
 
     fn ml(class: &str, start: usize, end: usize, value: &str) -> MlDetection {
         MlDetection {
@@ -297,9 +299,43 @@ mod tokenize_detection_tests {
         assert!(classes.contains(&"PINFL"), "got: {classes:?}");
     }
 
+    /// Round-1 review: adding the regex floor to this endpoint also made it
+    /// inherit `merge_detections`' "regex wins on overlap" rule.
+    ///
+    /// When a short regex span sits INSIDE a longer ML span, dropping the ML
+    /// detection redacts only the inner fragment and forwards the rest of the
+    /// entity — a partial leak that is worse than either layer alone, and one
+    /// that only appeared once this endpoint gained a regex layer.
+    #[test]
+    fn ml_span_containing_a_regex_span_is_fully_redacted() {
+        let text = "Manzil: Toshkent shahri, AA1234567 blok, 5-uy";
+        let address_start = text.find("Toshkent").expect("fixture");
+        let address = &text[address_start..];
+
+        let detections = tokenize_detections(
+            text,
+            vec![ml("ADDRESS", address_start, text.len(), address)],
+            None,
+        );
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let redacted = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        assert!(
+            !redacted.contains("Toshkent"),
+            "the ML address was dropped because a regex span sat inside it, \
+             so only the inner fragment got redacted: {redacted:?}"
+        );
+        assert!(
+            !redacted.contains("AA1234567"),
+            "passport leaked: {redacted:?}"
+        );
+    }
+
     #[test]
     fn entity_label_filter_still_applies_to_floor_detections() {
-        let text = "PINFL 50101901234567 va STIR 313133128";
+        let text = "PINFL 50101901234567 va STIR 300111222";
         let allowed = vec!["STIR".to_owned()];
         let detections = tokenize_detections(text, vec![], Some(&allowed));
         assert!(
