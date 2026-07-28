@@ -21,6 +21,17 @@ use crate::db::user_repo::UserRow;
 /// `crate::detection::merge::normalize_class` before they reach policy
 /// evaluation, so these MUST match the post-normalization spelling
 /// (e.g. `EMAIL_ADDRESS`, not `EMAIL`).
+///
+/// WS2-1: the Uzbek / CIS identifier classes emitted by the deterministic
+/// detection floor are listed here too. Detecting an identifier is not the
+/// same as redacting it — this seeded rule makes `rules_evaluated == 1`,
+/// which suppresses the `redact_when_no_rules` safety net in
+/// `pipeline/service.rs`, and `policy/engine.rs::matching_detections` then
+/// redacts only the classes named here whenever ANY listed class is present.
+/// Omitting them meant a prompt containing both an email and a PINFL
+/// redacted the email and forwarded the PINFL. Migration
+/// `017_uzbek_identifier_policy_classes.sql` back-fills workspaces that were
+/// already seeded with the narrower list.
 pub const DEFAULT_POLICY_CLASSES: &[&str] = &[
     "PERSON",
     "EMAIL_ADDRESS",
@@ -31,6 +42,12 @@ pub const DEFAULT_POLICY_CLASSES: &[&str] = &[
     "AWS_ACCESS_KEY",
     "GCP_KEY",
     "AZURE_KEY",
+    "PINFL",
+    "STIR",
+    "MFO",
+    "PASSPORT_NUMBER",
+    "UZCARD",
+    "HUMO",
 ];
 
 #[derive(Debug, Clone)]

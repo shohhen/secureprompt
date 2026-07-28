@@ -1,3 +1,261 @@
+/// WS2-1 round-1 review: the flagship claim, verified through the POLICY
+/// path rather than by calling `apply_redaction` directly.
+///
+/// A new workspace is seeded with a `detection_class in DEFAULT_POLICY_CLASSES`
+/// redact rule (`db/workspace_repo.rs`). That makes `rules_evaluated == 1`,
+/// which suppresses the `redact_when_no_rules` safety net in
+/// `pipeline/service.rs`, and `policy/engine.rs` then redacts only the
+/// detections `matching_detections` returns. `matching_detections` falls back
+/// to "all detections" ONLY when the class filter matches nothing — so a
+/// prompt mixing a covered class (an email) with an uncovered one (a PINFL)
+/// redacts the email and forwards the PINFL. Detecting an identifier is not
+/// the same as redacting it, and only a test through `evaluate` can tell the
+/// difference.
+#[cfg(test)]
+mod default_policy_path_tests {
+    use crate::db::{PolicyRepository, WorkspaceRepository};
+    use crate::detection::{detect_content, merge::merge_detections};
+    use crate::policy::engine::{evaluate, PolicyEvaluationInput};
+    use secureprompt_common::types::{RequestId, TokenVault, WorkspaceId};
+    use sqlx::PgPool;
+    use std::collections::HashMap;
+
+    /// A realistic requisites prompt. The email is load-bearing: without a
+    /// detection whose class IS in the seeded list, `matching_detections`
+    /// would fall back to redacting everything and hide the bug.
+    const REQUISITES_PROMPT: &str = "Ali Aliev, ali@example.com, \
+         PINFL 50101901234567, STIR 300111222, МФО 00014, \
+         pasport AA1234567, karta 8600 1234 5678 9012";
+
+    async fn redact_through_policy(pool: &PgPool, content: &str) -> String {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner("Policy Path Co", "policy-path@example.com", &hash)
+            .await
+            .expect("workspace + seeded rule must be created");
+
+        // Empty ML vector — the whole point is that the deterministic floor
+        // survives with the sidecar absent.
+        let detections = merge_detections(detect_content(content), vec![]);
+        assert!(
+            !detections.is_empty(),
+            "precondition: the floor must detect something"
+        );
+
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace.id),
+                provider_name: "none",
+                model: "none",
+                content,
+                detections: &detections,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "the seeded rule must be the one and only rule — if this is 0 the \
+             redact_when_no_rules safety net would mask the bug under test"
+        );
+        assert_eq!(outcome.result.final_action, "redact");
+        outcome.content
+    }
+
+    #[sqlx::test]
+    async fn seeded_default_rule_redacts_uzbek_identifiers(pool: PgPool) {
+        let redacted = redact_through_policy(&pool, REQUISITES_PROMPT).await;
+
+        for leaked in [
+            "50101901234567",
+            "300111222",
+            "00014",
+            "AA1234567",
+            "8600 1234 5678 9012",
+        ] {
+            assert!(
+                !redacted.contains(leaked),
+                "{leaked} was detected but forwarded unredacted by the default \
+                 policy: {redacted:?}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn seeded_default_rule_still_redacts_the_pre_existing_classes(pool: PgPool) {
+        // Regression guard: widening the class list must not drop anything.
+        let redacted = redact_through_policy(&pool, REQUISITES_PROMPT).await;
+        assert!(
+            !redacted.contains("ali@example.com"),
+            "email regressed: {redacted:?}"
+        );
+    }
+}
+
+/// WS2-1 round-1 review: migration `017` back-fills workspaces that were
+/// already seeded with the pre-Uzbek class list.
+///
+/// `#[sqlx::test]` runs every migration before the test body, so the seeded
+/// rule a test creates is already new-shaped. To prove the migration itself
+/// does anything, these tests write a LEGACY-shaped rule and then execute the
+/// migration file's own SQL against it.
+#[cfg(test)]
+mod migration_backfill_tests {
+    use crate::db::WorkspaceRepository;
+    use sqlx::{PgPool, Row};
+    use uuid::Uuid;
+
+    const MIGRATION_SQL: &str =
+        include_str!("../../migrations/017_uzbek_identifier_policy_classes.sql");
+
+    const LEGACY_CLASSES: &str = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY"]"#;
+
+    /// Create a workspace, delete its (already-migrated) seeded rule, and
+    /// insert one shaped exactly as it looked before this change.
+    async fn seed_legacy_rule(pool: &PgPool, name: &str, classes: &str) -> Uuid {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Legacy Co",
+                &format!("legacy-{}@example.com", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let rule_id = Uuid::new_v4();
+        let conditions: serde_json::Value = serde_json::from_str(&format!(
+            r#"[{{"field":"detection_class","op":"in","value":{classes}}}]"#
+        ))
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, $3, 100, $4, 'redact', '{}'::jsonb, true, false, NOW(), NOW())",
+        )
+        .bind(rule_id)
+        .bind(workspace.id)
+        .bind(name)
+        .bind(&conditions)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        rule_id
+    }
+
+    async fn classes_of(pool: &PgPool, rule_id: Uuid) -> Vec<String> {
+        let row = sqlx::query("SELECT conditions FROM policy_rules WHERE id = $1")
+            .bind(rule_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let conditions: serde_json::Value = row.get("conditions");
+        conditions[0]["value"]
+            .as_array()
+            .expect("value array")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    #[sqlx::test]
+    async fn backfills_a_legacy_seeded_rule(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", LEGACY_CLASSES).await;
+        assert!(!classes_of(&pool, rule_id)
+            .await
+            .contains(&"PINFL".to_owned()));
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        for expected in ["PINFL", "STIR", "MFO", "PASSPORT_NUMBER", "UZCARD", "HUMO"] {
+            assert!(
+                classes.contains(&expected.to_owned()),
+                "{expected} missing after back-fill: {classes:?}"
+            );
+        }
+        // Nothing may be dropped.
+        assert!(classes.contains(&"PERSON".to_owned()), "{classes:?}");
+        assert!(classes.contains(&"CREDIT_CARD".to_owned()), "{classes:?}");
+    }
+
+    #[sqlx::test]
+    async fn backfill_is_idempotent(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", LEGACY_CLASSES).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let once = classes_of(&pool, rule_id).await;
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let twice = classes_of(&pool, rule_id).await;
+
+        assert_eq!(once, twice, "re-running the migration must not duplicate");
+    }
+
+    #[sqlx::test]
+    async fn does_not_touch_a_rule_an_admin_narrowed(pool: PgPool) {
+        // An admin who removed CREDIT_CARD meant it. Widening their rule
+        // behind their back would be a policy change we were never asked to
+        // make; these workspaces are the documented operator action.
+        let narrowed = r#"["PERSON","EMAIL_ADDRESS"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", narrowed).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            classes_of(&pool, rule_id).await,
+            vec!["PERSON".to_owned(), "EMAIL_ADDRESS".to_owned()],
+            "a narrowed rule must be left exactly as the admin left it"
+        );
+    }
+
+    #[sqlx::test]
+    async fn backfills_a_rule_an_admin_widened(pool: PgPool) {
+        // Superset of the defaults — the admin added to the seed rather than
+        // replacing it, so the back-fill still applies.
+        let widened = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY","LOCATION"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", widened).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        assert!(classes.contains(&"PINFL".to_owned()), "{classes:?}");
+        assert!(
+            classes.contains(&"LOCATION".to_owned()),
+            "the admin's own addition must survive: {classes:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn does_not_touch_an_unrelated_rule(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Block secrets", LEGACY_CLASSES).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert!(
+            !classes_of(&pool, rule_id)
+                .await
+                .contains(&"PINFL".to_owned()),
+            "only the seeded 'Redact common PII' rule may be back-filled"
+        );
+    }
+}
+
 /// Tests for the policy engine: rule ordering, condition evaluation, dry-run semantics.
 ///
 /// These tests verify:
