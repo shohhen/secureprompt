@@ -3313,6 +3313,7 @@
           "block_on_pii_detection",
           "block_on_injection_detection",
           "redact_pii_in_responses",
+          "sidecar_unavailable",
           "updated_at"
         ],
         "properties": {
@@ -3335,6 +3336,14 @@
           },
           "redact_pii_in_responses": {
             "type": "boolean"
+          },
+          "sidecar_unavailable": {
+            "type": "string",
+            "enum": [
+              "block",
+              "degrade_with_alert"
+            ],
+            "description": "WS2-3. What to do when the ML sidecar produces no detection coverage for a request. `block` (the default for any workspace that has not chosen) rejects the request with 503 rather than forward a prompt the PII detector never saw; `degrade_with_alert` proceeds on the deterministic detection floor, emits an alert, sets the `x-secureprompt-sidecar-degraded` response header, and marks the audit row `floor_only = true`."
           },
           "updated_at": {
             "type": "string",
@@ -3364,6 +3373,13 @@
           },
           "redact_pii_in_responses": {
             "type": "boolean"
+          },
+          "sidecar_unavailable": {
+            "type": "string",
+            "enum": [
+              "block",
+              "degrade_with_alert"
+            ]
           }
         }
       },

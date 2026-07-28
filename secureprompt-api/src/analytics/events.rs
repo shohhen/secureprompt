@@ -41,6 +41,13 @@ pub struct RequestEvent {
     /// `restored_response` so reviewers can see exactly what the model
     /// emitted (placeholders intact) vs what the client received.
     pub raw_response: Option<String>,
+    /// WS2-3 — this answer was produced with the deterministic Rust floor
+    /// alone: the ML sidecar produced no detection coverage for the request
+    /// and the workspace's `sidecar_unavailable` policy is
+    /// `degrade_with_alert`. `false` on every normally-served request, so a
+    /// reviewer can scope an incident to exactly the traffic that ran without
+    /// NER rather than guessing from sidecar uptime.
+    pub floor_only: bool,
 }
 
 impl RequestEvent {
@@ -81,6 +88,7 @@ impl RequestEvent {
             restored_response: None,
             raw_prompt: None,
             raw_response: None,
+            floor_only: false,
         }
     }
 }
@@ -122,6 +130,10 @@ pub struct RequestEventRow {
     // ── Migration 005: raw input + raw upstream output ─────────────────────
     pub raw_prompt: Option<String>,
     pub raw_response: Option<String>,
+    // ── Migration 006 (WS2-3): deterministic-floor-only answer ─────────────
+    // Column order MUST match the ALTER TABLE order; ClickHouse appends
+    // ADD COLUMN at the end of the row, so this field stays last.
+    pub floor_only: bool,
 }
 
 impl RequestEventRow {
@@ -149,6 +161,7 @@ impl RequestEventRow {
             restored_response: e.restored_response.clone(),
             raw_prompt: e.raw_prompt.clone(),
             raw_response: e.raw_response.clone(),
+            floor_only: e.floor_only,
         }
     }
 }

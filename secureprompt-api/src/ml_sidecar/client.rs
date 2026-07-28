@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 
 use crate::ml_sidecar::types::{
-    InjectionRequest, InjectionResponse, MlDetection, NerRequest, NerResponse, RagCheckRequest,
-    RagCheckResponse,
+    InjectionRequest, InjectionResponse, MlDetection, MlDetectionOutcome, NerRequest, NerResponse,
+    RagCheckRequest, RagCheckResponse, SidecarOutage,
 };
 
 const FAILURE_THRESHOLD: u32 = 5;
@@ -178,7 +178,17 @@ impl MlSidecarClient {
         self
     }
 
-    /// Returns ML detections. Returns empty Vec when circuit is OPEN or sidecar disabled (D-13).
+    /// Returns ML detections **plus whether the sidecar actually covered the
+    /// input** (WS2-3).
+    ///
+    /// This used to return a bare `Vec<MlDetection>`, which made an outage
+    /// indistinguishable from "there is no PII here": unconfigured client,
+    /// disabled client, and an OPEN circuit breaker all returned the same
+    /// empty vector as a healthy sidecar scanning clean text, so a sidecar
+    /// outage silently degraded every request to the deterministic floor and
+    /// still answered 200. `MlDetectionOutcome::coverage` makes the
+    /// difference explicit so the caller can apply the workspace's
+    /// `sidecar_unavailable` policy (block vs degrade_with_alert).
     ///
     /// P0-4: the sidecar 422-rejects any single request whose `text` exceeds
     /// 32,768 chars. Before this fix, a >32k prompt got a 4xx which was
@@ -188,17 +198,35 @@ impl MlSidecarClient {
     /// oversized ones. Now: the prompt is tiled into `ner_chunk_chars`-sized
     /// chunks (full coverage) and a 4xx response is treated as "our request
     /// was malformed", never as a sidecar-health signal (see `detect_chunk`).
-    pub async fn detect_if_available(&self, prompt: &str) -> Vec<MlDetection> {
+    pub async fn detect_if_available(&self, prompt: &str) -> MlDetectionOutcome {
         let (http, circuit) = match (&self.http, &self.circuit) {
             (Some(h), Some(c)) if self.enabled => (h, c),
-            _ => return Vec::new(),
+            // Two distinct fail-open paths share this arm. `base_url` is the
+            // discriminator: empty means ML detection was never configured;
+            // non-empty means an operator DID configure it and the client
+            // refused the URL (invalid scheme, T-03-05b), which is a
+            // misconfiguration they need to hear about.
+            _ => {
+                return MlDetectionOutcome::absent(if self.base_url.is_empty() {
+                    SidecarOutage::Unconfigured
+                } else {
+                    SidecarOutage::Disabled
+                })
+            }
         };
 
         if circuit.is_open() {
-            return Vec::new();
+            return MlDetectionOutcome::absent(SidecarOutage::CircuitOpen);
         }
 
         let mut all = Vec::new();
+        // Chunk-level coverage bookkeeping. `covered == 0` with at least one
+        // attempt means this call produced NO PII coverage at all even though
+        // the client was configured, enabled and the breaker was closed — the
+        // fourth way an empty `Vec` used to be indistinguishable from "clean
+        // text". WS2-6 turns `covered < attempted` into `Partial`.
+        let mut attempted = 0usize;
+        let mut covered = 0usize;
         let chunks = split_for_ner(prompt, self.ner_chunk_chars);
         let chunks_total = chunks.len();
         let started = std::time::Instant::now();
@@ -223,13 +251,31 @@ impl MlSidecarClient {
                 );
                 break;
             }
-            let mut dets = self.detect_chunk(http, circuit, &chunk).await;
-            for det in &mut dets {
-                det.span = rebase_span(det.span, offset);
+            attempted += 1;
+            match self.detect_chunk(http, circuit, &chunk).await {
+                Some(mut dets) => {
+                    covered += 1;
+                    for det in &mut dets {
+                        det.span = rebase_span(det.span, offset);
+                    }
+                    all.extend(dets);
+                }
+                None => {
+                    // This chunk got zero PII coverage. Already counted in
+                    // `attempted`, deliberately not in `covered`.
+                }
             }
-            all.extend(dets);
         }
-        all
+
+        if attempted > 0 && covered == 0 {
+            return MlDetectionOutcome::absent(SidecarOutage::AllCallsFailed);
+        }
+        // NOTE (WS2-6): `covered < attempted`, or `attempted < chunks_total`
+        // after the aggregate-budget break above, is partial coverage. It is
+        // reported as `Complete` today — unchanged from the pre-WS2-3
+        // behaviour — and is exactly what WS2-6 will split out into
+        // `SidecarCoverage::Partial`.
+        MlDetectionOutcome::complete(all)
     }
 
     /// Query `/detect/ner` for a single chunk (already ≤ `ner_chunk_chars`
@@ -237,12 +283,23 @@ impl MlSidecarClient {
     /// START of `chunk` — the caller (`detect_if_available`) rebases them to
     /// whole-prompt byte offsets.
     ///
+    /// WS2-3: returns `Some(dets)` when the sidecar actually scanned this
+    /// chunk — `Some(vec![])` legitimately means "scanned, nothing found" —
+    /// and `None` when the chunk got NO coverage (transport error,
+    /// unparseable body, 4xx rejection, 429 saturation). The caller needs
+    /// that distinction to tell an outage apart from clean text.
+    ///
     /// Breaker semantics (unchanged from the pre-chunking single-request
     /// code, for every arm EXCEPT the new 4xx one): success -> record_success
     /// + calls_total++; parse failure or transport failure -> record_failure
     /// + failures_total++ (+ circuit_open_count++ if that failure just
     /// tripped the breaker OPEN).
-    async fn detect_chunk(&self, http: &Client, circuit: &AtomicCircuit, chunk: &str) -> Vec<MlDetection> {
+    async fn detect_chunk(
+        &self,
+        http: &Client,
+        circuit: &AtomicCircuit,
+        chunk: &str,
+    ) -> Option<Vec<MlDetection>> {
         let url = format!("{}/detect/ner", self.base_url);
         let body = NerRequest {
             text: chunk.to_owned(),
@@ -271,7 +328,7 @@ impl MlSidecarClient {
                     "ml sidecar saturated (queue full) — chunk skipped, NO PII coverage"
                 );
                 self.saturated_total.fetch_add(1, Ordering::Relaxed);
-                Vec::new()
+                None
             }
             Ok(resp) if resp.status().is_client_error() => {
                 // 4xx (excluding 429, handled above) = OUR request was
@@ -279,29 +336,31 @@ impl MlSidecarClient {
                 // a sidecar health signal — do NOT feed the circuit breaker,
                 // or long prompts fail-open ALL traffic (P0-4).
                 tracing::warn!(status = %resp.status(), "ml sidecar rejected NER request");
-                Vec::new()
+                None
             }
             Ok(resp) => match resp.json::<NerResponse>().await {
                 Ok(ner) => {
                     circuit.record_success();
                     self.calls_total.fetch_add(1, Ordering::Relaxed);
-                    ner.entities
-                        .into_iter()
-                        .map(|e| MlDetection {
-                            class: e.entity_type,
-                            confidence: e.score,
-                            span: Some((e.start, e.end)),
-                            value: e.text,
-                            compliance_categories: e.compliance_categories,
-                        })
-                        .collect()
+                    Some(
+                        ner.entities
+                            .into_iter()
+                            .map(|e| MlDetection {
+                                class: e.entity_type,
+                                confidence: e.score,
+                                span: Some((e.start, e.end)),
+                                value: e.text,
+                                compliance_categories: e.compliance_categories,
+                            })
+                            .collect(),
+                    )
                 }
                 Err(_) => {
                     if circuit.record_failure() {
                         self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
                     }
                     self.failures_total.fetch_add(1, Ordering::Relaxed);
-                    Vec::new()
+                    None
                 }
             },
             Err(_) => {
@@ -309,7 +368,7 @@ impl MlSidecarClient {
                     self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
                 }
                 self.failures_total.fetch_add(1, Ordering::Relaxed);
-                Vec::new()
+                None
             }
         }
     }
@@ -533,13 +592,17 @@ pub(crate) fn split_for_ner(text: &str, max_chars: usize) -> Vec<(usize, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ml_sidecar::types::SidecarCoverage;
 
     /// ML-05a: Disabled client (empty URL) returns empty detections.
     #[tokio::test]
     async fn test_circuit_open_returns_empty() {
         let client = MlSidecarClient::new(String::new(), 200);
         let result = client.detect_if_available("some prompt with PII").await;
-        assert!(result.is_empty(), "disabled client must return empty Vec");
+        assert!(
+            result.detections.is_empty(),
+            "disabled client must return no detections"
+        );
     }
 
     /// ML-05a: Unreachable sidecar returns empty (fail-open).
@@ -547,7 +610,10 @@ mod tests {
     async fn test_unreachable_sidecar_returns_empty() {
         let client = MlSidecarClient::new("http://127.0.0.1:19999".to_owned(), 50);
         let result = client.detect_if_available("test").await;
-        assert!(result.is_empty(), "unreachable sidecar must return empty Vec");
+        assert!(
+            result.detections.is_empty(),
+            "unreachable sidecar must return no detections"
+        );
     }
 
     /// ML-05a: Circuit OPEN after 5 consecutive failures.
@@ -732,7 +798,7 @@ mod tests {
         let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
         for _ in 0..FAILURE_THRESHOLD {
             let result = client.detect_if_available("some prompt").await;
-            assert!(result.is_empty(), "4xx yields no detections");
+            assert!(result.detections.is_empty(), "4xx yields no detections");
         }
 
         assert_eq!(
@@ -792,7 +858,7 @@ mod tests {
         let mut client = MlSidecarClient::new(format!("http://{addr}"), 3000);
         client.ner_chunk_chars = 50;
 
-        let dets = client.detect_if_available(&prompt).await;
+        let dets = client.detect_if_available(&prompt).await.detections;
         assert_eq!(dets.len(), n_chunks, "one detection per chunk");
         for (det, (off, _)) in dets.iter().zip(expected_chunks.iter()) {
             assert_eq!(
@@ -842,7 +908,7 @@ mod tests {
         let result = client.detect_if_available("some prompt").await;
 
         assert!(
-            result.is_empty(),
+            result.detections.is_empty(),
             "429 yields no detections (fail-open — still zero PII coverage for this chunk)"
         );
         assert_eq!(
@@ -907,7 +973,7 @@ mod tests {
         client.ner_chunk_chars = 50;
         client.ner_total_budget = Duration::ZERO;
 
-        let dets = client.detect_if_available(&prompt).await;
+        let dets = client.detect_if_available(&prompt).await.detections;
         assert_eq!(
             dets.len(),
             1,
@@ -1022,6 +1088,177 @@ mod tests {
         assert!(
             request.contains("authorization: bearer shared-secret-abc"),
             "rag_check_if_available must send the Authorization header; got request:\n{request}"
+        );
+    }
+
+    // --- WS2-3: coverage reporting -------------------------------------
+    //
+    // `detect_if_available` used to return a bare `Vec<MlDetection>`, so an
+    // EMPTY vector meant either "the sidecar ran and found no PII" or "the
+    // sidecar never ran at all". The caller could not tell the two apart, so
+    // an outage silently degraded the gateway to the deterministic floor with
+    // a 200 response. These tests pin the distinction.
+
+    /// POSITIVE CONTROL for the whole coverage block below: with a REACHABLE
+    /// sidecar that answers with a real entity, the outcome must carry that
+    /// detection AND report `Complete`. Without this, every "coverage is
+    /// Absent" assertion below could pass simply because the client never
+    /// talks to anything.
+    #[tokio::test]
+    async fn test_healthy_sidecar_reports_complete_coverage() {
+        let (addr, server) = spawn_capturing_server(
+            b"{\"entities\":[{\"entity_type\":\"PERSON\",\"start\":0,\"end\":5,\"score\":0.99,\"text\":\"Anvar\",\"compliance_categories\":[]}]}",
+        );
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        let outcome = client.detect_if_available("Anvar keldi").await;
+
+        let request = server.join().expect("mock server thread panicked");
+        assert!(
+            request.to_lowercase().contains("post /detect/ner"),
+            "the sidecar must actually have been reached; got request:\n{request}"
+        );
+        assert_eq!(
+            outcome.detections.len(),
+            1,
+            "a healthy sidecar must yield its detections"
+        );
+        assert_eq!(outcome.detections[0].class, "PERSON");
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Complete,
+            "a healthy sidecar must report Complete coverage"
+        );
+    }
+
+    /// Fail-open path 1 of 3: no `ML_SIDECAR_URL` at all.
+    #[tokio::test]
+    async fn test_unconfigured_client_reports_absent_unconfigured() {
+        let client = MlSidecarClient::new(String::new(), 200);
+        let outcome = client.detect_if_available("Anvar keldi").await;
+        assert!(outcome.detections.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Absent(SidecarOutage::Unconfigured)
+        );
+    }
+
+    /// Fail-open path 2 of 3: a URL is set but the client is disabled
+    /// (invalid scheme — T-03-05b's SSRF guard). Distinct from "never
+    /// configured": an operator who set a URL believes ML detection is ON.
+    #[tokio::test]
+    async fn test_invalid_scheme_client_reports_absent_disabled() {
+        let client = MlSidecarClient::new("ftp://evil.example.com/ner".to_owned(), 200);
+        let outcome = client.detect_if_available("Anvar keldi").await;
+        assert!(outcome.detections.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Absent(SidecarOutage::Disabled)
+        );
+    }
+
+    /// Fail-open path 3 of 3: the circuit breaker is OPEN.
+    ///
+    /// The loop drives real transport failures against a closed loopback port
+    /// until the breaker actually reports OPEN (bounded, and asserted — the
+    /// iteration count is NOT derived from `FAILURE_THRESHOLD`, so a change to
+    /// that constant surfaces here as a loud failure rather than a silently
+    /// re-tuned test). Every pre-open call reports `AllCallsFailed` — zero
+    /// chunks covered — which is itself a distinct fail-open path from
+    /// `CircuitOpen` and must not be conflated with it.
+    #[tokio::test]
+    async fn test_open_circuit_reports_absent_circuit_open() {
+        let client = MlSidecarClient::new("http://127.0.0.1:19999".to_owned(), 50);
+
+        let mut opened = false;
+        for _ in 0..20 {
+            let outcome = client.detect_if_available("Anvar keldi").await;
+            assert!(outcome.detections.is_empty());
+            assert_eq!(
+                outcome.coverage,
+                SidecarCoverage::Absent(SidecarOutage::AllCallsFailed),
+                "before the breaker opens, a dead sidecar reports AllCallsFailed"
+            );
+            if client.circuit.as_ref().expect("circuit").is_open() {
+                opened = true;
+                break;
+            }
+        }
+        assert!(opened, "consecutive transport failures must open the breaker");
+
+        let outcome = client.detect_if_available("Anvar keldi").await;
+        assert!(outcome.detections.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Absent(SidecarOutage::CircuitOpen),
+            "once the breaker is OPEN the outcome must say so, not AllCallsFailed"
+        );
+    }
+
+    /// A 4xx rejection covers ZERO chunks even though the socket was fine —
+    /// the returned detections are empty for the same reason an outage is
+    /// empty, so it must report Absent too (and, per P0-4, still must not
+    /// touch the breaker).
+    #[tokio::test]
+    async fn test_4xx_reports_absent_all_calls_failed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = b"{\"detail\":\"text exceeds 32768 chars\"}";
+            let resp = format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        let outcome = client.detect_if_available("Anvar keldi").await;
+
+        assert!(outcome.detections.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Absent(SidecarOutage::AllCallsFailed)
+        );
+        assert_eq!(
+            client.circuit_open_count.load(Ordering::Relaxed),
+            0,
+            "4xx still must not trip the breaker (P0-4)"
+        );
+
+        server.join().expect("mock server thread panicked");
+    }
+
+    /// A healthy sidecar that genuinely finds nothing is NOT an outage: empty
+    /// detections + `Complete`. This is the case the old `Vec` return type
+    /// made indistinguishable from every test above.
+    #[tokio::test]
+    async fn test_healthy_sidecar_with_no_entities_is_not_an_outage() {
+        let (addr, server) = spawn_capturing_server(b"{\"entities\":[]}");
+
+        let client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        let outcome = client.detect_if_available("nothing sensitive here").await;
+
+        let request = server.join().expect("mock server thread panicked");
+        assert!(
+            request.to_lowercase().contains("post /detect/ner"),
+            "the sidecar must actually have been reached; got request:\n{request}"
+        );
+        assert!(outcome.detections.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Complete,
+            "empty detections from a LIVE sidecar means 'no PII', not 'no coverage'"
         );
     }
 

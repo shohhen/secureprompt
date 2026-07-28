@@ -14,6 +14,7 @@ use crate::{
     },
     pipeline::service::{
         ChatStreamItem, GatewayRequest, PipelineExecution, PipelineService, RequestKind,
+        StreamExecution, SIDECAR_DEGRADED_HEADER,
     },
 };
 use axum::{
@@ -157,9 +158,13 @@ pub async fn chat_completions(
             .execute_stream(&auth, &resolved, gateway_request, estimated_input)
             .await
         {
-            Ok(stream) => {
-                with_budget_warning(stream_chat_response_live(stream, request.model), budget_gate)
-            }
+            Ok(StreamExecution {
+                items,
+                degraded_reason,
+            }) => with_sidecar_degraded(
+                with_budget_warning(stream_chat_response_live(items, request.model), budget_gate),
+                degraded_reason,
+            ),
             Err(error) => api_error_response(error),
         };
     }
@@ -170,7 +175,11 @@ pub async fn chat_completions(
         Ok(execution) if request.stream => {
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
                 .await;
-            with_budget_warning(stream_chat_response(execution), budget_gate)
+            let degraded = execution.degraded_reason;
+            with_sidecar_degraded(
+                with_budget_warning(stream_chat_response(execution), budget_gate),
+                degraded,
+            )
         }
         Ok(execution) => {
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
@@ -191,7 +200,10 @@ pub async fn chat_completions(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_budget_warning(body, budget_gate)
+            with_sidecar_degraded(
+                with_budget_warning(body, budget_gate),
+                execution.degraded_reason,
+            )
         }
         Err(error) => api_error_response(error),
     }
@@ -268,7 +280,11 @@ pub async fn completions(
         Ok(execution) if request.stream => {
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
                 .await;
-            with_budget_warning(stream_completion_response(execution), budget_gate)
+            let degraded = execution.degraded_reason;
+            with_sidecar_degraded(
+                with_budget_warning(stream_completion_response(execution), budget_gate),
+                degraded,
+            )
         }
         Ok(execution) => {
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
@@ -286,7 +302,10 @@ pub async fn completions(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_budget_warning(body, budget_gate)
+            with_sidecar_degraded(
+                with_budget_warning(body, budget_gate),
+                execution.degraded_reason,
+            )
         }
         Err(error) => api_error_response(error),
     }
@@ -365,7 +384,10 @@ pub async fn embeddings(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_budget_warning(body, budget_gate)
+            with_sidecar_degraded(
+                with_budget_warning(body, budget_gate),
+                execution.degraded_reason,
+            )
         }
         Err(error) => api_error_response(error),
     }
@@ -412,6 +434,27 @@ fn with_budget_warning(mut response: Response, gate: BudgetGate) -> Response {
                 .headers_mut()
                 .insert("x-secureprompt-budget-warning", value);
         }
+    }
+    response
+}
+
+/// WS2-3 — attach `x-secureprompt-sidecar-degraded: <reason>` when the
+/// request was answered with deterministic-floor detection only because the
+/// ML sidecar produced no coverage and the workspace's `sidecar_unavailable`
+/// policy is `degrade_with_alert`.
+///
+/// A client that cares (a compliance UI, a batch job, LibreChat) can then
+/// decide whether to trust the redaction on this particular answer. Absent on
+/// every normally-served request.
+fn with_sidecar_degraded(
+    mut response: Response,
+    reason: Option<crate::ml_sidecar::types::SidecarOutage>,
+) -> Response {
+    if let Some(reason) = reason {
+        response.headers_mut().insert(
+            SIDECAR_DEGRADED_HEADER,
+            HeaderValue::from_static(reason.as_str()),
+        );
     }
     response
 }
@@ -691,6 +734,7 @@ mod response_shape_tests {
             cache_write_tokens: Some(0),
         };
         PipelineExecution {
+            degraded_reason: None,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: model.to_owned(),
@@ -724,6 +768,7 @@ mod response_shape_tests {
             cache_write_tokens: Some(0),
         };
         PipelineExecution {
+            degraded_reason: None,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: model.to_owned(),

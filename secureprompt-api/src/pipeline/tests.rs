@@ -244,6 +244,7 @@ mod pipeline_contract_tests {
 
         // Build a representative PipelineExecution and verify fields exist
         let exec = PipelineExecution {
+            degraded_reason: None,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: "gpt-4o".to_owned(),
@@ -284,5 +285,135 @@ mod pipeline_contract_tests {
         assert_eq!(exec.stream_chunks.len(), 2);
         assert!(!exec.estimated_usage);
         assert_eq!(exec.finish_reason.as_deref(), Some("stop"));
+    }
+}
+
+/// WS2-3 — the per-workspace `sidecar_unavailable` decision.
+///
+/// `sidecar_gate` is the single place that turns "how much did the ML sidecar
+/// actually cover?" plus "what did this workspace ask for?" into an
+/// enforcement action, so it is worth testing exhaustively and in isolation
+/// from Postgres, HTTP and the provider chain.
+#[cfg(test)]
+mod sidecar_gate_tests {
+    use crate::db::sidecar_policy_repo::SidecarUnavailablePolicy;
+    use crate::ml_sidecar::types::{SidecarCoverage, SidecarOutage};
+    use crate::pipeline::service::{sidecar_gate, SidecarGate};
+
+    /// Compile-time exhaustiveness guard for the literal outage list used by
+    /// the tests below. The table in each test is written out by hand ON
+    /// PURPOSE — deriving it from a slice defined in production code would
+    /// mean the tests can never notice a case production forgot. This match
+    /// is the safety net: add a `SidecarOutage` variant and this stops
+    /// compiling until the tables below are extended too.
+    #[allow(dead_code)]
+    fn assert_outage_list_is_exhaustive(outage: SidecarOutage) {
+        match outage {
+            SidecarOutage::Unconfigured
+            | SidecarOutage::Disabled
+            | SidecarOutage::CircuitOpen
+            | SidecarOutage::AllCallsFailed => {}
+        }
+    }
+
+    /// POSITIVE CONTROL: a sidecar that actually ran must never be gated,
+    /// under EITHER policy. Without this, "Absent blocks" could pass in a
+    /// world where the gate blocks unconditionally.
+    #[test]
+    fn complete_coverage_always_proceeds() {
+        for policy in [
+            SidecarUnavailablePolicy::Block,
+            SidecarUnavailablePolicy::DegradeWithAlert,
+        ] {
+            assert_eq!(
+                sidecar_gate(&SidecarCoverage::Complete, policy),
+                SidecarGate::Proceed,
+                "complete coverage must proceed under {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_policy_blocks_every_absent_reason() {
+        for outage in [
+            SidecarOutage::Unconfigured,
+            SidecarOutage::Disabled,
+            SidecarOutage::CircuitOpen,
+            SidecarOutage::AllCallsFailed,
+        ] {
+            assert_eq!(
+                sidecar_gate(
+                    &SidecarCoverage::Absent(outage),
+                    SidecarUnavailablePolicy::Block
+                ),
+                SidecarGate::Block(outage),
+                "block policy must fail closed on {outage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degrade_policy_degrades_every_absent_reason() {
+        for outage in [
+            SidecarOutage::Unconfigured,
+            SidecarOutage::Disabled,
+            SidecarOutage::CircuitOpen,
+            SidecarOutage::AllCallsFailed,
+        ] {
+            assert_eq!(
+                sidecar_gate(
+                    &SidecarCoverage::Absent(outage),
+                    SidecarUnavailablePolicy::DegradeWithAlert
+                ),
+                SidecarGate::Degrade(outage),
+                "degrade policy must proceed-with-alert on {outage:?}"
+            );
+        }
+    }
+}
+
+/// WS2-3 — parsing the stored `sidecar_unavailable` value.
+#[cfg(test)]
+mod sidecar_policy_parse_tests {
+    use crate::db::sidecar_policy_repo::SidecarUnavailablePolicy;
+
+    #[test]
+    fn default_is_block() {
+        assert_eq!(
+            SidecarUnavailablePolicy::default(),
+            SidecarUnavailablePolicy::Block,
+            "a workspace that has never chosen must fail closed"
+        );
+    }
+
+    #[test]
+    fn known_values_round_trip() {
+        assert_eq!(
+            SidecarUnavailablePolicy::from_db("block"),
+            SidecarUnavailablePolicy::Block
+        );
+        assert_eq!(
+            SidecarUnavailablePolicy::from_db("degrade_with_alert"),
+            SidecarUnavailablePolicy::DegradeWithAlert
+        );
+        assert_eq!(SidecarUnavailablePolicy::Block.as_str(), "block");
+        assert_eq!(
+            SidecarUnavailablePolicy::DegradeWithAlert.as_str(),
+            "degrade_with_alert"
+        );
+    }
+
+    /// A value the CHECK constraint should have prevented (or one written by
+    /// a newer node during a rolling upgrade) must fail CLOSED, not open.
+    #[test]
+    fn unknown_value_falls_back_to_block() {
+        assert_eq!(
+            SidecarUnavailablePolicy::from_db("degrade"),
+            SidecarUnavailablePolicy::Block
+        );
+        assert_eq!(
+            SidecarUnavailablePolicy::from_db(""),
+            SidecarUnavailablePolicy::Block
+        );
     }
 }

@@ -56,6 +56,15 @@ groups:
           summary: "ML sidecar circuit breaker has opened"
           description: "The gateway's circuit breaker to the ML sidecar opened {{ $value | printf \"%.0f\" }} time(s) in the last 5 minutes; requests are failing open to regex-only detection."
 
+      - alert: MLSidecarCoverageLost
+        expr: increase(secureprompt_sidecar_unavailable_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway served requests with no ML PII coverage ({{ $labels.reason }} / {{ $labels.action }})"
+          description: "secureprompt_sidecar_unavailable_total increased by {{ $value | printf \"%.0f\" }} in the last 5 minutes with reason={{ $labels.reason }}. action=degrade_with_alert means requests were answered using the deterministic Rust detection floor ONLY (audit rows carry floor_only = true); action=block means those requests were rejected with 503. Either way the ML sidecar is producing no detection coverage."
+
       - alert: BudgetRedisFailure
         expr: increase(secureprompt_budget_redis_failure_total[10m]) > 0
         for: 5m

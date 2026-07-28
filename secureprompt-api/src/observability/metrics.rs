@@ -181,6 +181,15 @@ pub struct MetricsRegistry {
     /// bounded label — one of `block`/`redact`/`flag`/`warn` — never a
     /// free-text rule name or id.
     policy_violations: Mutex<Vec<(String, u64)>>,
+
+    // ── WS2-3 ─ ML sidecar coverage loss ────────────────────────────────
+    /// Counter `secureprompt_sidecar_unavailable_total{reason,action}`.
+    /// `reason` is a bounded `SidecarOutage` label
+    /// (`unconfigured`/`disabled`/`circuit_open`/`all_calls_failed`) and
+    /// `action` is the workspace policy that was applied
+    /// (`block`/`degrade_with_alert`). This is the alert signal for a
+    /// gateway running with no ML detection coverage.
+    sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
 }
 
 impl MetricsRegistry {
@@ -434,6 +443,46 @@ impl MetricsRegistry {
         }
     }
 
+    /// WS2-3 — record one request for which the ML sidecar produced no
+    /// detection coverage. Both labels are bounded: `reason` is
+    /// [`crate::ml_sidecar::types::SidecarOutage::as_str`], `action` is the
+    /// workspace's `sidecar_unavailable` policy. Never a workspace id.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn record_sidecar_unavailable(&self, reason: &str, action: &str) {
+        let mut guard = self
+            .sidecar_unavailable
+            .lock()
+            .expect("sidecar_unavailable mutex");
+        if let Some(row) = guard
+            .iter_mut()
+            .find(|(r, a, _)| r == reason && a == action)
+        {
+            row.2 += 1;
+        } else {
+            guard.push((reason.to_owned(), action.to_owned(), 1));
+        }
+    }
+
+    /// Return the sidecar-coverage-loss count for a `(reason, action)` pair.
+    ///
+    /// Used by tests to assert the counter was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn sidecar_unavailable_count(&self, reason: &str, action: &str) -> u64 {
+        let guard = self
+            .sidecar_unavailable
+            .lock()
+            .expect("sidecar_unavailable mutex");
+        guard
+            .iter()
+            .find(|(r, a, _)| r == reason && a == action)
+            .map_or(0, |(_, _, count)| *count)
+    }
+
     /// Return the policy-violation count for a given `action`.
     ///
     /// Used by tests to assert the counter was touched.
@@ -601,6 +650,23 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_policy_violations_total{{action=\"{action}\"}} {value}"
+                    );
+                }
+            }
+        }
+
+        // WS2-3 — ML sidecar coverage-loss counter.
+        {
+            let guard = self
+                .sidecar_unavailable
+                .lock()
+                .expect("sidecar_unavailable mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_sidecar_unavailable_total counter\n");
+                for (reason, action, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_sidecar_unavailable_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
                     );
                 }
             }

@@ -95,7 +95,7 @@ pub async fn redact(
         .map_err(api_error_response)?;
 
     let regex_detections = detect_content(&body.text);
-    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await;
+    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await.detections;
     let detections = merge_detections(regex_detections, ml_detections);
 
     let mut vault = TokenVault::default();
@@ -195,7 +195,7 @@ pub async fn policy_check(
         .map_err(api_error_response)?;
 
     let regex_detections = detect_content(&body.text);
-    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await;
+    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await.detections;
     let detections = merge_detections(regex_detections, ml_detections);
 
     let request_id = RequestId::new();

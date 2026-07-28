@@ -60,6 +60,26 @@ pub fn router(pool: PgPool) -> Router {
     ))
 }
 
+/// Router whose ML sidecar points at `sidecar_url` and whose analytics writer
+/// targets `clickhouse_db`.
+///
+/// WS2-3 needs both knobs: the sidecar URL to drive the healthy / dead /
+/// misconfigured cases the `sidecar_unavailable` policy branches on, and a
+/// real ClickHouse database so the `floor_only` audit column can be asserted
+/// end-to-end rather than inferred.
+#[allow(dead_code)]
+pub fn router_with(pool: PgPool, sidecar_url: &str, clickhouse_db: &str) -> Router {
+    let ml_sidecar = Arc::new(MlSidecarClient::new(sidecar_url.to_owned(), 500));
+    let mut config = test_config();
+    config.clickhouse.database = clickhouse_db.to_owned();
+    build_router(AppState::new(
+        pool,
+        config,
+        ml_sidecar,
+        std::sync::Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    ))
+}
+
 pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO workspaces (id, name, created_at, updated_at)

@@ -2,12 +2,14 @@ use crate::{
     analytics::events::RequestEvent,
     app_state::AppState,
     db::secure_mode_repo::{SecureModeRepository, SecureModeRow},
+    db::sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
     detection::{detect_content, merge::merge_detections},
     http::{
         middleware::{api_key_auth::AuthContext, rate_limit::adjust_workspace_tokens},
         model_router::{ModelTarget, ResolvedModel},
         streaming::{placeholder_safe_chunks, settled_prefix_len, PlaceholderStreamer},
     },
+    ml_sidecar::types::{SidecarCoverage, SidecarOutage},
     observability::tracing::{log_request_finish, log_request_start},
     policy::engine::{evaluate, PolicyEvaluationInput, PolicyEvaluationOutcome},
     providers::{
@@ -31,6 +33,92 @@ pub enum RequestKind {
     Chat,
     Completion,
     Embedding,
+}
+
+/// WS2-3 — what the workspace's `sidecar_unavailable` policy says to do about
+/// one `detect_if_available` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarGate {
+    /// The sidecar covered the input; carry on normally.
+    Proceed,
+    /// Fail closed — the prompt must not reach the provider.
+    Block(SidecarOutage),
+    /// Proceed on the deterministic floor, loudly: alert + response header +
+    /// `floor_only = true` on the analytics row.
+    Degrade(SidecarOutage),
+}
+
+/// WS2-3 — the single decision point for "the ML sidecar produced no
+/// coverage".
+///
+/// Kept as a free function over plain values (no `AppState`, no database, no
+/// HTTP) so the full cross-product of coverage × policy is unit-testable.
+///
+/// The `match` on `SidecarCoverage` is deliberately exhaustive with no `_`
+/// arm: when WS2-6 adds `SidecarCoverage::Partial { .. }` for "the sidecar
+/// ran but abandoned chunks when the budget expired", this function stops
+/// compiling until someone decides what a partially-covered prompt should do
+/// under each policy — which is exactly the decision that must not be made by
+/// accident.
+#[must_use]
+pub fn sidecar_gate(coverage: &SidecarCoverage, policy: SidecarUnavailablePolicy) -> SidecarGate {
+    match coverage {
+        SidecarCoverage::Complete => SidecarGate::Proceed,
+        SidecarCoverage::Absent(reason) => match policy {
+            SidecarUnavailablePolicy::Block => SidecarGate::Block(*reason),
+            SidecarUnavailablePolicy::DegradeWithAlert => SidecarGate::Degrade(*reason),
+        },
+    }
+}
+
+/// Response header set on any request that was answered with deterministic-
+/// floor detection only, because the ML sidecar produced no coverage and the
+/// workspace policy is `degrade_with_alert`. Value is the bounded
+/// [`SidecarOutage::as_str`] reason so a client can tell a never-deployed
+/// sidecar apart from one that just fell over.
+pub const SIDECAR_DEGRADED_HEADER: &str = "x-secureprompt-sidecar-degraded";
+
+/// Metric/log `action` label for a prompt-side outage in a workspace whose
+/// policy is `block`: the request was rejected before reaching the provider.
+const ACTION_BLOCK: &str = "block";
+/// Prompt-side outage in a `degrade_with_alert` workspace: the request was
+/// answered on the deterministic floor.
+const ACTION_DEGRADE: &str = "degrade_with_alert";
+/// Coverage lost on the RESPONSE side, after the upstream call. Deliberately
+/// distinct from [`ACTION_DEGRADE`]: it does NOT mean the workspace chose to
+/// degrade. `block` cannot be honoured this late — the prompt is already
+/// forwarded and, on the streaming path, the SSE status line is already
+/// committed — so the request is marked and alerted instead. An operator
+/// seeing this label is looking at a sidecar that died mid-request, not at a
+/// workspace configuration.
+const ACTION_DEGRADE_RESPONSE_SIDE: &str = "degrade_response_side";
+
+/// Emit the operator-facing alert for a sidecar outage.
+///
+/// "Alert" here means the two things this deployment can actually route: a
+/// `tracing::error!` carrying a stable `alert=` key for log-based alerting,
+/// and a Prometheus counter (`secureprompt_sidecar_unavailable_total`) that
+/// `monitoring/prometheus/alerts.yml` fires `MLSidecarCoverageLost` on. Both
+/// labels are bounded — outage reason and one of the three `ACTION_*`
+/// constants above, never workspace ids or free text.
+fn alert_sidecar_unavailable(
+    state: &AppState,
+    request_id: RequestId,
+    workspace_id: secureprompt_common::types::WorkspaceId,
+    reason: SidecarOutage,
+    action: &'static str,
+) {
+    tracing::error!(
+        alert = "ml_sidecar_coverage_lost",
+        %request_id,
+        %workspace_id,
+        reason = reason.as_str(),
+        action,
+        "ML sidecar produced no detection coverage for this request"
+    );
+    state
+        .metrics
+        .record_sidecar_unavailable(reason.as_str(), action);
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +147,25 @@ pub struct PipelineExecution {
     pub stream_chunks: Vec<String>,
     pub finish_reason: Option<String>,
     pub pipeline_output: PipelineOutput,
+    /// WS2-3 — `Some(reason)` when this request was answered with
+    /// deterministic-floor detection only because the ML sidecar produced no
+    /// coverage. Drives the `x-secureprompt-sidecar-degraded` response header
+    /// and mirrors the analytics row's `floor_only`.
+    pub degraded_reason: Option<SidecarOutage>,
+}
+
+/// WS2-3 — return value of [`PipelineService::execute_stream`].
+///
+/// The streaming path answers with an SSE response whose status line and
+/// headers are committed before the first token, so the degradation flag has
+/// to travel out-of-band alongside the stream rather than inside it.
+pub struct StreamExecution {
+    pub items: Pin<Box<dyn Stream<Item = ChatStreamItem> + Send>>,
+    /// Same meaning as [`PipelineExecution::degraded_reason`], determined at
+    /// `prepare` time. A sidecar that dies mid-stream cannot retroactively
+    /// add a header; that case still alerts and still marks the analytics
+    /// row (see the response-side scrub in `execute_stream`).
+    pub degraded_reason: Option<SidecarOutage>,
 }
 
 /// One item emitted by the streaming pipeline path (`execute_stream`).
@@ -107,6 +214,12 @@ struct Prepared {
     /// (which still times only the upstream call, for `latency_ms` /
     /// `event.latency_ms` — unchanged by this).
     start: Instant,
+    /// WS2-3 — `Some(reason)` when the ML sidecar produced no coverage for
+    /// this prompt and the workspace's `sidecar_unavailable` policy is
+    /// `degrade_with_alert`, so the request proceeded on the deterministic
+    /// Rust floor alone. `None` under normal operation; a `block` workspace
+    /// never reaches here (`prepare` returns 503 instead).
+    degraded_reason: Option<SidecarOutage>,
 }
 
 impl PipelineService {
@@ -149,8 +262,61 @@ impl PipelineService {
         )
         .await;
         let regex_detections = detect_content(&prompt);
-        let ml_detections = self.state.ml_sidecar.detect_if_available(&prompt).await;
-        pipeline_state.detections = merge_detections(regex_detections, ml_detections);
+        let ml_outcome = self.state.ml_sidecar.detect_if_available(&prompt).await;
+
+        // WS2-3 — the workspace's `sidecar_unavailable` policy.
+        //
+        // This is THE gate: it runs before policy evaluation, before the
+        // secure-mode injection check, and — critically — before any provider
+        // is invoked, which is what makes `block` mean "the prompt is never
+        // forwarded" rather than "we billed you and then apologised".
+        //
+        // A failed read fails CLOSED: `SidecarUnavailablePolicy::default()`
+        // is `Block`, so a Postgres outage cannot turn into permission to
+        // forward unscanned prompts.
+        let sidecar_policy = SidecarPolicyRepository::new(self.state.db.clone())
+            .get(auth.workspace_id)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    workspace_id = %auth.workspace_id,
+                    error = %err,
+                    "sidecar_unavailable policy read failed; failing closed to 'block'"
+                );
+                SidecarUnavailablePolicy::default()
+            });
+        let degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
+            SidecarGate::Proceed => None,
+            SidecarGate::Block(reason) => {
+                alert_sidecar_unavailable(
+                    &self.state,
+                    request_id,
+                    auth.workspace_id,
+                    reason,
+                    ACTION_BLOCK,
+                );
+                self.state
+                    .metrics
+                    .observe_request_duration("unknown", start.elapsed());
+                self.state.metrics.record_request(false);
+                return Err(ApiError::ServiceUnavailable(
+                    "PII detection is unavailable and this workspace is configured to fail closed"
+                        .to_owned(),
+                ));
+            }
+            SidecarGate::Degrade(reason) => {
+                alert_sidecar_unavailable(
+                    &self.state,
+                    request_id,
+                    auth.workspace_id,
+                    reason,
+                    ACTION_DEGRADE,
+                );
+                Some(reason)
+            }
+        };
+
+        pipeline_state.detections = merge_detections(regex_detections, ml_outcome.detections);
 
         let rag_result = self
             .state
@@ -338,6 +504,7 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         })
     }
 
@@ -357,7 +524,13 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         } = self.prepare(auth, resolved, &request).await?;
+        // WS2-3 — may be upgraded below if the RESPONSE-side detection pass
+        // also loses coverage (a sidecar that fell over during the upstream
+        // call). Prompt-side reason wins when both fire; it is the one the
+        // header already committed to.
+        let mut degraded_reason = degraded_reason;
 
         let t0 = Instant::now();
         let (chosen_target, provider_output) = if self.state.config.chat_debug_mode {
@@ -426,8 +599,26 @@ impl PipelineService {
             match restored_content.as_deref() {
                 Some(text) => {
                     let regex = detect_content(text);
-                    let ml = self.state.ml_sidecar.detect_if_available(text).await;
-                    let merged = merge_detections(regex, ml);
+                    // WS2-3 — the response-side pass is a SECOND chance to
+                    // lose coverage: the sidecar may have been healthy when
+                    // the prompt was scanned and dead by the time the reply
+                    // came back. `block` is not enforced here — the prompt
+                    // has already been forwarded and the tokens already
+                    // spent, so the only honest option left is to make the
+                    // degradation visible — but the request is marked and
+                    // alerted exactly as the prompt-side path would.
+                    let ml_out = self.state.ml_sidecar.detect_if_available(text).await;
+                    if let SidecarCoverage::Absent(reason) = ml_out.coverage {
+                        alert_sidecar_unavailable(
+                            &self.state,
+                            request_id,
+                            auth.workspace_id,
+                            reason,
+                            ACTION_DEGRADE_RESPONSE_SIDE,
+                        );
+                        degraded_reason = degraded_reason.or(Some(reason));
+                    }
+                    let merged = merge_detections(regex, ml_out.detections);
                     let detections =
                         filter_response_side_detections(&merged, &client_originals);
                     let scrubbed = if detections.is_empty() {
@@ -552,6 +743,9 @@ impl PipelineService {
         // restoration. Storing the post-restore version keeps the
         // panel labels semantically honest.
         event.restored_response = restored_content.clone();
+        // WS2-3 — the audit/analytics row records that this answer was
+        // produced with the deterministic floor alone.
+        event.floor_only = degraded_reason.is_some();
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -588,6 +782,7 @@ impl PipelineService {
             stream_chunks,
             finish_reason: provider_output.finish_reason.clone(),
             pipeline_output,
+            degraded_reason,
         })
     }
 
@@ -613,7 +808,7 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request: GatewayRequest,
         estimated_input: u64,
-    ) -> Result<Pin<Box<dyn Stream<Item = ChatStreamItem> + Send>>, ApiError> {
+    ) -> Result<StreamExecution, ApiError> {
         let Prepared {
             request_id,
             pipeline_state,
@@ -621,6 +816,7 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         } = self.prepare(auth, resolved, &request).await?;
 
         let kind = match request.request_kind {
@@ -670,6 +866,9 @@ impl PipelineService {
             let mut finish_reason: Option<String> = None;
             let mut ttft_ms: Option<u32> = None;
             let mut stream_ok = true;
+            // WS2-3 — prompt-side determination, possibly upgraded by a
+            // mid-stream response-side coverage loss below.
+            let mut stream_degraded = degraded_reason;
             let t0 = Instant::now();
 
             // Scan a completed (restored) segment for PII and re-redact it
@@ -679,8 +878,23 @@ impl PipelineService {
                     let restored: String = $restored;
                     restored_full.push_str(&restored);
                     let regex = detect_content(&restored);
-                    let ml = state.ml_sidecar.detect_if_available(&restored).await;
-                    let merged = merge_detections(regex, ml);
+                    // WS2-3 — same second-chance coverage loss as the
+                    // buffered path's response-side pass. `block` cannot be
+                    // honoured here: the SSE status line was committed
+                    // before the first token, so the request is marked and
+                    // alerted instead.
+                    let ml_out = state.ml_sidecar.detect_if_available(&restored).await;
+                    if let SidecarCoverage::Absent(reason) = ml_out.coverage {
+                        alert_sidecar_unavailable(
+                            &state,
+                            request_id,
+                            workspace_id,
+                            reason,
+                            ACTION_DEGRADE_RESPONSE_SIDE,
+                        );
+                        stream_degraded = stream_degraded.or(Some(reason));
+                    }
+                    let merged = merge_detections(regex, ml_out.detections);
                     let detections =
                         filter_response_side_detections(&merged, &client_originals);
                     if detections.is_empty() {
@@ -796,6 +1010,9 @@ impl PipelineService {
             event.raw_response = if raw_full.is_empty() { None } else { Some(raw_full.clone()) };
             event.restored_response =
                 if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
+            // WS2-3 — floor-only for the whole stream: set at prepare time,
+            // or upgraded by a mid-stream response-side coverage loss.
+            event.floor_only = stream_degraded.is_some();
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
             // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`,
             // captured outside this generator and moved in) times this
@@ -827,7 +1044,10 @@ impl PipelineService {
             };
         };
 
-        Ok(Box::pin(stream))
+        Ok(StreamExecution {
+            items: Box::pin(stream),
+            degraded_reason,
+        })
     }
 
     /// Open an incremental provider event stream, walking the failover chain
@@ -1410,7 +1630,11 @@ async fn redact_last_user_message(
 
     // Detection scoped to this single message — no transcript bleed.
     let regex = detect_content(content);
-    let ml = state.ml_sidecar.detect_if_available(content).await;
+    let ml = state
+        .ml_sidecar
+        .detect_if_available(content)
+        .await
+        .detections;
     let detections = merge_detections(regex, ml);
     if detections.is_empty() {
         return content.to_owned();

@@ -24,7 +24,11 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    db::{secure_mode_repo::SecureModeRepository, token_vault_repo::TokenVaultRepository},
+    db::{
+        secure_mode_repo::SecureModeRepository,
+        sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
+        token_vault_repo::TokenVaultRepository,
+    },
     detection::{detect_content, merge::merge_detections},
     http::{
         api_error_response,
@@ -38,6 +42,9 @@ use crate::{
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
 const VALID_LEVELS: &[&str] = &["permissive", "standard", "strict"];
+/// WS2-3 — accepted values for `sidecar_unavailable`. Kept next to
+/// `VALID_LEVELS` because both are validated by the same PUT handler.
+const VALID_SIDECAR_POLICIES: &[&str] = &["block", "degrade_with_alert"];
 
 #[derive(Debug, Serialize)]
 pub struct SecureModeResponse {
@@ -47,6 +54,11 @@ pub struct SecureModeResponse {
     pub block_on_pii_detection: bool,
     pub block_on_injection_detection: bool,
     pub redact_pii_in_responses: bool,
+    /// WS2-3 — `block` (default) or `degrade_with_alert`. Stored in its own
+    /// table (`workspace_sidecar_policy`, migration 018) but surfaced here
+    /// because it is part of the same per-workspace security posture an
+    /// admin configures on one screen.
+    pub sidecar_unavailable: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -57,6 +69,7 @@ pub struct PutSecureModeRequest {
     pub block_on_pii_detection: Option<bool>,
     pub block_on_injection_detection: Option<bool>,
     pub redact_pii_in_responses: Option<bool>,
+    pub sidecar_unavailable: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +183,12 @@ async fn get_secure_mode(
         .get(ctx.workspace_id)
         .await
         .map_err(api_error_response)?;
+    // WS2-3 — returns `block` when the workspace has no row, matching the
+    // fail-closed default the pipeline applies.
+    let sidecar_unavailable = SidecarPolicyRepository::new(state.db.clone())
+        .get(ctx.workspace_id)
+        .await
+        .map_err(api_error_response)?;
 
     Ok(Json(SecureModeResponse {
         workspace_id: row.workspace_id,
@@ -178,6 +197,7 @@ async fn get_secure_mode(
         block_on_pii_detection: row.block_on_pii_detection,
         block_on_injection_detection: row.block_on_injection_detection,
         redact_pii_in_responses: row.redact_pii_in_responses,
+        sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
         updated_at: row.updated_at,
     }))
 }
@@ -198,6 +218,27 @@ async fn put_secure_mode(
             ))));
         }
     }
+
+    if let Some(ref value) = body.sidecar_unavailable {
+        if !VALID_SIDECAR_POLICIES.contains(&value.as_str()) {
+            return Err(api_error_response(ApiError::BadRequest(format!(
+                "sidecar_unavailable must be one of: {}",
+                VALID_SIDECAR_POLICIES.join(", ")
+            ))));
+        }
+    }
+
+    let sidecar_repo = SidecarPolicyRepository::new(state.db.clone());
+    let sidecar_unavailable = match body.sidecar_unavailable.as_deref() {
+        Some(value) => sidecar_repo
+            .upsert(ctx.workspace_id, SidecarUnavailablePolicy::from_db(value))
+            .await
+            .map_err(api_error_response)?,
+        None => sidecar_repo
+            .get(ctx.workspace_id)
+            .await
+            .map_err(api_error_response)?,
+    };
 
     let repo = SecureModeRepository::new(state.db.clone());
     let row = repo
@@ -221,6 +262,7 @@ async fn put_secure_mode(
             block_on_pii_detection: row.block_on_pii_detection,
             block_on_injection_detection: row.block_on_injection_detection,
             redact_pii_in_responses: row.redact_pii_in_responses,
+            sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
             updated_at: row.updated_at,
         }),
     ))
@@ -447,7 +489,7 @@ async fn tokenize(
         )));
     }
 
-    let raw = state.ml_sidecar.detect_if_available(&body.text).await;
+    let raw = state.ml_sidecar.detect_if_available(&body.text).await.detections;
 
     let allowed: Option<Vec<String>> = body
         .entity_labels
