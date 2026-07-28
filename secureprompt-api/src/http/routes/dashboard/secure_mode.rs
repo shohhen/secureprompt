@@ -333,6 +333,48 @@ mod tokenize_detection_tests {
         );
     }
 
+    /// Round-2 review: the end-to-end form of the containment regression.
+    /// An ML span that covers one regex detection but only PART of another
+    /// must not leave the tail of the second one in the output.
+    #[test]
+    fn no_byte_of_a_regex_identifier_survives_a_partly_covering_ml_span() {
+        let text = "Manzil: Toshkent, AA1234567 blok, STIR 300111222 raqami";
+        let address_start = text.find("Toshkent").expect("fixture");
+        // Deliberately ends mid-STIR: covers the passport in full and the
+        // STIR only partly.
+        let address_end = text.find("300111222").expect("fixture") + 4;
+
+        let detections = tokenize_detections(
+            text,
+            vec![ml(
+                "ADDRESS",
+                address_start,
+                address_end,
+                &text[address_start..address_end],
+            )],
+            None,
+        );
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let redacted = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        assert!(
+            !redacted.contains("300111222"),
+            "STIR leaked whole: {redacted:?}"
+        );
+        for tail in ["1222", "222", "22"] {
+            assert!(
+                !redacted.contains(tail),
+                "a tail fragment of the STIR was forwarded: {redacted:?}"
+            );
+        }
+        assert!(
+            !redacted.contains("AA1234567"),
+            "passport leaked: {redacted:?}"
+        );
+    }
+
     #[test]
     fn entity_label_filter_still_applies_to_floor_detections() {
         let text = "PINFL 50101901234567 va STIR 300111222";
