@@ -36,6 +36,54 @@ interface RefreshTokenResponse {
   refresh_expires_at: number;
 }
 
+/** The token/session fields the NextAuth `session` callback copies onto the
+ * client-visible session object (everything except the `user.*` merge,
+ * which needs the live NextAuth `session.user` default and stays in
+ * `auth.ts`).
+ *
+ * Deliberately has NO `refreshToken` field — see `buildClientSessionFields`
+ * doc below. */
+export interface ClientSessionFields {
+  workspaceId: string;
+  role: AppRole;
+  accessToken: string;
+  accessExpiresAt: number;
+  refreshExpiresAt: number;
+  error?: "RefreshAccessTokenError";
+}
+
+/**
+ * Shapes the server-side `AppJWT` into the fields the `session` callback
+ * puts on the session object returned to the browser.
+ *
+ * SECURITY (WS1-9): `refreshToken` MUST NOT be included here. The NextAuth
+ * `session` object is exactly what `useSession()` (client components) and
+ * `getSession()` return — it is serialized to the browser and readable by
+ * any script running on the page (XSS, a compromised npm dependency, a
+ * malicious browser extension). The refresh token is long-lived
+ * (`refreshExpiresAt` is typically days out, far past `accessExpiresAt`),
+ * so if it ever reached client-side JS, that script could mint fresh
+ * access tokens indefinitely — long after the current access token, or
+ * even the user's actual browser session, should have stopped working.
+ *
+ * The refresh token still has to live somewhere the SERVER can reach it:
+ * it stays only in the encrypted NextAuth JWT cookie (the `AppJWT` this
+ * function takes as input) and is read exclusively by
+ * `refreshAccessTokenIfNeeded` inside the server-side `jwt` callback
+ * (`src/lib/auth.ts`), which never runs in the browser. Silent refresh
+ * keeps working; it just never surfaces the token used to do it.
+ */
+export function buildClientSessionFields(token: AppJWT): ClientSessionFields {
+  return {
+    workspaceId: token.workspaceId,
+    role: token.role,
+    accessToken: token.accessToken,
+    accessExpiresAt: token.accessExpiresAt,
+    refreshExpiresAt: token.refreshExpiresAt,
+    error: token.error,
+  };
+}
+
 function apiBaseUrl(): string {
   // `refreshAccessTokenIfNeeded` runs inside the NextAuth `jwt` callback, which
   // executes SERVER-SIDE (in the web container). It must reach the API over the
