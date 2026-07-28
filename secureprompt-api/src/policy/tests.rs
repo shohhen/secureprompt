@@ -393,14 +393,58 @@ mod condition_tests {
         );
     }
 
+    /// WS1-8 fix-round-1 review, MINOR 3: this used to assert
+    /// `json!([]).as_array().is_empty()` — a fact about `serde_json`, not
+    /// about this crate's `rule_matches`, and the only test covering the
+    /// empty-conditions case. `rule_matches` is now `pub(crate)` (made so
+    /// for the WS1-8 compound-condition tests), which unblocks calling the
+    /// real function here instead. Checked both with and without
+    /// detections present, since the empty-conditions short-circuit
+    /// (`detection_conditions.is_empty() || ...`) and the vacuous-`.all()`
+    /// path it replaces behave differently depending on which is present.
     #[test]
     fn empty_conditions_matches_all_requests() {
-        // A rule with empty conditions array matches every request (AND of zero = true)
-        // This is verified by the rule_matches logic: conditions.is_empty() -> true
+        use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+        use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+
         let rule = make_rule(10, serde_json::json!([]), "flag", false);
-        // Empty conditions JSON array means "match all"
-        let conditions = rule.conditions.as_array().unwrap();
-        assert!(conditions.is_empty(), "Empty conditions array must match all");
+
+        let no_detections: Vec<Detection> = Vec::new();
+        assert!(
+            rule_matches(
+                &rule,
+                &PolicyEvaluationInput {
+                    request_id: RequestId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    provider_name: "test-provider",
+                    model: "test-model",
+                    content: "irrelevant — the rule has no conditions to check",
+                    detections: &no_detections,
+                }
+            ),
+            "empty conditions must match even when there are no detections"
+        );
+
+        let some_detections = vec![Detection {
+            class: "EMAIL_ADDRESS".to_owned(),
+            confidence: 0.42,
+            span: None,
+            value: "synthetic-value".to_owned(),
+        }];
+        assert!(
+            rule_matches(
+                &rule,
+                &PolicyEvaluationInput {
+                    request_id: RequestId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    provider_name: "test-provider",
+                    model: "test-model",
+                    content: "irrelevant — the rule has no conditions to check",
+                    detections: &some_detections,
+                }
+            ),
+            "empty conditions must match regardless of which detections are present"
+        );
     }
 
     #[test]
@@ -481,7 +525,7 @@ mod condition_tests {
     }
 }
 
-/// WS1-8: a compound condition (multiple conditions ANDed on the same rule)
+/// WS1-8: a compound condition (multiple conditions combined with AND on the same rule)
 /// must be satisfied by a SINGLE detection, not by different detections each
 /// covering one condition. Unlike `condition_tests` above (which simulates
 /// engine logic inline because the helpers were private), these tests call
@@ -521,7 +565,7 @@ mod compound_condition_tests {
         }
     }
 
-    fn eval_input<'a>(detections: &'a [Detection]) -> PolicyEvaluationInput<'a> {
+    fn eval_input(detections: &[Detection]) -> PolicyEvaluationInput<'_> {
         PolicyEvaluationInput {
             request_id: RequestId::new(),
             workspace_id: WorkspaceId::new(),
@@ -534,7 +578,7 @@ mod compound_condition_tests {
 
     /// The exact defect from the brief: a rule reading
     /// `detection_class == EMAIL_ADDRESS AND confidence_gte >= 0.9` must
-    /// match only when ONE detection is both an EMAIL_ADDRESS and >= 0.9
+    /// match only when ONE detection is both an `EMAIL_ADDRESS` and >= 0.9
     /// confidence. Here the class is satisfied by one detection and the
     /// confidence threshold by a completely different one — the rule must
     /// NOT fire.
@@ -604,6 +648,144 @@ mod compound_condition_tests {
             rule_matches(&rule, &input),
             "a lone detection_class-in condition must still match via any \
              qualifying detection"
+        );
+    }
+}
+
+/// WS1-8 fix-round-1 review, IMPORTANT 1: pins the second-order effect of
+/// the fix through the real `evaluate()` path (not just `rule_matches`
+/// directly). See `task-5-report.md` for the operator-facing writeup.
+///
+/// Pre-fix: a compound rule (`detection_class == X AND confidence_gte >=
+/// Y`) that fired only because the class test and the confidence test were
+/// satisfied by two DIFFERENT detections (the bug WS1-8 fixes) still
+/// reached `matching_detections`. There, `class_filters = [X]` and
+/// `confidence_gte = Y` are checked against EACH detection individually —
+/// neither detection satisfied both at once, so the filtered set came back
+/// empty, which hit the `detections.to_vec()` fallback at the bottom of
+/// `matching_detections`. Pre-fix, that fallback redacted EVERY detection
+/// in the request, including ones with nothing to do with the rule's
+/// condition. Over-redaction, not a leak.
+///
+/// Post-fix: the rule correctly does not fire, so it redacts NOTHING. If
+/// this compound rule were a workspace's only enabled rule (as it is here),
+/// upgrading silently converts "redacts too much" into "redacts nothing"
+/// for that workspace. `redact_when_no_rules` (`pipeline/service.rs:546`)
+/// cannot rescue it — that gate only engages when `rules_evaluated == 0`
+/// (`engine.rs:43`), and here `rules_evaluated == 1`. The new behaviour is
+/// correct for what the rule's condition actually says — but it is a real,
+/// silent coverage change for any existing workspace whose only rule looks
+/// like this, and is worth a release note.
+#[cfg(test)]
+mod second_order_effect_tests {
+    use crate::db::{PolicyRepository, WorkspaceRepository};
+    use crate::policy::engine::{evaluate, PolicyEvaluationInput};
+    use secureprompt_common::types::{Detection, RequestId, TokenVault, WorkspaceId};
+    use sqlx::PgPool;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[sqlx::test]
+    async fn compound_rule_matched_via_split_detections_now_redacts_nothing_instead_of_everything(
+        pool: PgPool,
+    ) {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Second Order Co",
+                &format!("second-order-{}@example.com", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        // Replace the seeded default rule with ONLY the compound rule
+        // under test, so there is exactly one enabled rule and the whole
+        // effect is observable in `outcome` without another rule's action
+        // interfering.
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let conditions = serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]);
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, 'High-confidence email rule', 100, $3, 'redact', '{}'::jsonb,
+                     true, false, NOW(), NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace.id)
+        .bind(&conditions)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let content = "Contact ali@example.com or +998901234567 for details";
+        let email = "ali@example.com";
+        let phone = "+998901234567";
+        let email_start = content.find(email).unwrap();
+        let phone_start = content.find(phone).unwrap();
+
+        // SPLIT: the email detection satisfies the class test but not the
+        // confidence test; the phone detection satisfies the confidence
+        // test but is the wrong class. No single detection satisfies both.
+        let detections = vec![
+            Detection {
+                class: "EMAIL_ADDRESS".to_owned(),
+                confidence: 0.5,
+                span: Some((email_start, email_start + email.len())),
+                value: email.to_owned(),
+            },
+            Detection {
+                class: "PHONE_NUMBER".to_owned(),
+                confidence: 0.95,
+                span: Some((phone_start, phone_start + phone.len())),
+                value: phone.to_owned(),
+            },
+        ];
+
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace.id),
+                provider_name: "none",
+                model: "none",
+                content,
+                detections: &detections,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "the compound rule must be the only enabled rule for this to be observable"
+        );
+        assert_eq!(
+            outcome.result.final_action, "allow",
+            "the compound rule must not fire — its class test and its \
+             confidence test are satisfied by two different detections, \
+             not one"
+        );
+        assert_eq!(
+            outcome.content, content,
+            "post-fix, a rule that does not fire must redact NOTHING — \
+             pre-fix, this same request was redacted in full (both the \
+             email AND the phone number) via matching_detections' \
+             empty-filter fallback, even though neither detection alone \
+             satisfied the rule's condition"
         );
     }
 }

@@ -133,6 +133,20 @@ pub(crate) fn rule_matches(rule: &PolicyRuleRow, input: &PolicyEvaluationInput<'
     // `.any()` is what enforces that; evaluating each condition against
     // "any detection" independently (the previous behavior) is exactly the
     // bug this replaces.
+    //
+    // KNOWN DIVERGENCE (pre-existing, widened by this change — not fixed
+    // here, see WS1-8 fix-round-1 review): a rule with TWO OR MORE
+    // `detection_class` conditions (e.g. two `eq` conditions, or `eq` +
+    // `in`) requires ONE detection whose class satisfies ALL of them
+    // simultaneously here — which no single detection's `class: String`
+    // field ever can, since a detection has exactly one class. Such a rule
+    // now never fires. `matching_detections` below still combines
+    // (with OR) multiple `detection_class` filters into one
+    // `class_filters` list, which is a different, looser semantics. This
+    // is safe (fails closed — the rule simply stops matching rather than
+    // matching too broadly) but the two functions now disagree on what a
+    // multi-`detection_class`-condition rule means; don't assume they
+    // agree if you touch either.
     detection_conditions.is_empty()
         || input.detections.iter().any(|detection| {
             detection_conditions
@@ -220,6 +234,19 @@ fn matches_condition(condition: &Value, input: &PolicyEvaluationInput<'_>) -> bo
     }
 }
 
+/// NOTE on divergence from `rule_matches`: multiple `detection_class`
+/// conditions on the same rule are combined with OR into a single
+/// `class_filters` list below — a detection is included if its class is in
+/// ANY of them. `rule_matches` (see the comment at its detection-scoped
+/// check) requires ONE detection to satisfy ALL `detection_class`
+/// conditions simultaneously, which an ordinary single-valued `class`
+/// field can only do if the rule has at most one such condition. So a rule
+/// with two or more `detection_class` conditions never reaches this
+/// function at all (it fails to match up front) — this OR-union path is
+/// effectively dead for that shape of rule, though it still applies
+/// normally to `confidence_gte` bounds and to the single-condition case
+/// (including the `in` operator, which is one condition listing several
+/// classes, not multiple conditions).
 fn matching_detections(rule: &PolicyRuleRow, detections: &[Detection]) -> Vec<Detection> {
     let mut class_filters = Vec::new();
     let mut confidence_gte = None;
