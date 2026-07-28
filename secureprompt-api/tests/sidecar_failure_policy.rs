@@ -50,17 +50,52 @@ impl MockSidecar {
     /// whatever text is sent. The span values do not have to be exact for
     /// these tests — what matters is that a live sidecar returns coverage.
     fn spawn() -> Self {
+        Self::spawn_with(usize::MAX, false)
+    }
+
+    /// `max_connections`: stop accepting after this many, so later calls hit
+    /// connection-refused — how a sidecar that dies part-way through a
+    /// multi-chunk prompt is simulated.
+    ///
+    /// `fail_injection`: answer `/detect/injection` with a 500 while keeping
+    /// `/detect/ner` healthy — the independent-failure case that made the
+    /// "same client, same request" exclusion wrong.
+    fn spawn_with(max_connections: usize, fail_injection: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&requests);
 
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut buf = [0u8; 16384];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut served = 0usize;
+            loop {
+                if served >= max_connections {
+                    // Stop accepting: dropping the listener makes every later
+                    // connect fail with connection-refused, which is how a
+                    // sidecar dying part-way through a multi-chunk prompt is
+                    // simulated.
+                    drop(listener);
+                    return;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                served += 1;
+                let Some(request) = read_http_request(&mut stream) else {
+                    continue;
+                };
+
+                if fail_injection && request.contains("/detect/injection") {
+                    let body = b"upstream classifier unavailable";
+                    let head = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                    sink.lock().expect("request sink mutex").push(request);
+                    continue;
+                }
 
                 let body: &[u8] = if request.contains("/detect/ner") {
                     br#"{"entities":[{"entity_type":"PERSON","start":0,"end":13,"score":0.97,"text":"Anvar Karimov","compliance_categories":[]}]}"#
@@ -98,6 +133,53 @@ impl MockSidecar {
             .cloned()
             .collect()
     }
+}
+
+/// Read one complete HTTP request: headers, then exactly `Content-Length`
+/// bytes of body.
+///
+/// A single fixed-size `read` is not good enough here. A `/detect/ner` chunk
+/// can carry ~24 KB of JSON, so a server that replies and closes after
+/// reading only the first buffer-full leaves the client still writing — the
+/// client then sees a broken pipe and records the call as FAILED. That turned
+/// a "one chunk scanned, one refused" scenario into "no chunks scanned",
+/// which silently changed what the test was exercising.
+fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    // Headers.
+    let header_end = loop {
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    };
+
+    let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+
+    // Body, in full.
+    while raw.len() < header_end + content_length {
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    Some(String::from_utf8_lossy(&raw).to_string())
 }
 
 /// An address nothing is listening on: bind an ephemeral port, record it,
@@ -534,16 +616,27 @@ async fn ch_query(sql: &str) -> String {
 /// "skip if the column is missing" guard — a missing column must surface as a
 /// real failure, never as a quietly-passing test.
 async fn ensure_floor_only_column() {
-    ch_query("ALTER TABLE request_events ADD COLUMN IF NOT EXISTS floor_only Bool DEFAULT false")
-        .await;
+    // Read the real migration rather than restating its DDL, so this cannot
+    // drift from what the worker actually applies at startup.
+    const MIGRATION: &str = include_str!("../clickhouse/migrations/006_floor_only.sql");
+    let sql: String = MIGRATION
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for statement in sql.split(';') {
+        if !statement.trim().is_empty() {
+            ch_query(statement.trim()).await;
+        }
+    }
 }
 
-/// Poll for the request's audit row — the analytics writer batches on a 1s
-/// period, so the row is not visible synchronously.
-async fn await_floor_only(request_id_prefix: &str) -> String {
+/// Poll for one column of the request's audit row — the analytics writer
+/// batches on a 1s period, so the row is not visible synchronously.
+async fn await_column(column: &str, marker: &str) -> String {
     for _ in 0..40 {
         let out = ch_query(&format!(
-            "SELECT floor_only FROM request_events WHERE user_agent = '{request_id_prefix}' \
+            "SELECT {column} FROM request_events WHERE user_agent = '{marker}' \
              ORDER BY created_at DESC LIMIT 1"
         ))
         .await;
@@ -552,7 +645,11 @@ async fn await_floor_only(request_id_prefix: &str) -> String {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    panic!("no request_events row appeared for marker {request_id_prefix}");
+    panic!("no request_events row appeared for marker {marker}");
+}
+
+async fn await_floor_only(marker: &str) -> String {
+    await_column("floor_only", marker).await
 }
 
 fn tagged_chat_request(marker: &str) -> Request<axum::body::Body> {
@@ -615,6 +712,404 @@ async fn degraded_request_marks_floor_only_in_the_audit_row(pool: PgPool) -> sql
         await_floor_only(&degraded_marker).await,
         "true",
         "a degraded request must be marked floor_only in the audit row"
+    );
+    Ok(())
+}
+
+// ── Fix round 1 ───────────────────────────────────────────────────────────
+
+/// Long prompt: > `DEFAULT_NER_CHUNK_CHARS` (24,000) so the gateway tiles it
+/// into more than one `/detect/ner` call. Synthetic filler plus one synthetic
+/// name.
+fn long_chat_request(marker: Option<&str>) -> Request<axum::body::Body> {
+    let filler = "lorem ipsum dolor sit amet ".repeat(1_400); // ~37,800 chars
+    let mut request = support::authorized_request(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions"),
+        API_KEY,
+        json!({
+            "model": "claude-3-haiku",
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": format!("{filler} contract for {SYNTHETIC_NAME}"),
+            }],
+        }),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
+    if let Some(marker) = marker {
+        request.headers_mut().insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_str(marker).expect("valid header"),
+        );
+    }
+    request
+}
+
+/// CRITICAL 1 — a prompt long enough to tile into several chunks, with a
+/// sidecar that answers the first chunk and then dies. The remaining chunks
+/// are never scanned, so a `block` workspace must NOT forward the prompt.
+///
+/// Before the fix this returned 200 with no header and `floor_only = false`:
+/// unscanned text forwarded to the provider under a fail-closed policy.
+#[sqlx::test]
+async fn block_policy_rejects_partially_scanned_long_prompt(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    // Serve exactly one connection, then refuse.
+    let sidecar = MockSidecar::spawn_with(1, false);
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(long_chat_request(None))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a block workspace must not forward chunks the sidecar never scanned"
+    );
+    assert!(
+        !sidecar.ner_requests().is_empty(),
+        "premise: the sidecar must have answered at least one chunk, otherwise \
+         this is just the total-outage case already covered above"
+    );
+    Ok(())
+}
+
+/// POSITIVE CONTROL for the test above, and the regression guard that matters
+/// most: a long prompt whose chunks are ALL scanned must still succeed. If
+/// `Partial` were over-applied, every document over 24k chars would 503 on a
+/// bank profile — a worse outage than the bug being fixed.
+#[sqlx::test]
+async fn block_policy_allows_fully_scanned_long_prompt(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let sidecar = MockSidecar::spawn();
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(long_chat_request(None))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a multi-chunk prompt that was fully scanned is not degraded"
+    );
+    assert!(
+        response.headers().get(DEGRADED_HEADER).is_none(),
+        "full coverage across several chunks must not be reported as degraded"
+    );
+    assert!(
+        sidecar.ner_requests().len() > 1,
+        "premise: the prompt must actually have tiled into >1 chunk; got {}",
+        sidecar.ner_requests().len()
+    );
+    Ok(())
+}
+
+/// CRITICAL 1, degrade side — partial coverage reports its own distinct
+/// reason, so an operator can tell "prompt outran the budget / sidecar died
+/// mid-prompt" from "sidecar is gone".
+#[sqlx::test]
+async fn degrade_policy_reports_partial_coverage_reason(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    let sidecar = MockSidecar::spawn_with(1, false);
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(long_chat_request(None))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(DEGRADED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("partial_coverage"),
+        "partial coverage is its own reason, not an outage reason"
+    );
+    Ok(())
+}
+
+/// IMPORTANT — `/detect/injection` fails independently of `/detect/ner`.
+/// With NER healthy (coverage Complete) and the injection classifier
+/// 500-ing, `block_on_injection_detection` was silently bypassed: the request
+/// sailed through with no 503, no header and no alert.
+#[sqlx::test]
+async fn block_policy_rejects_when_injection_check_fails_alone(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+    sqlx::query(
+        "INSERT INTO workspace_secure_mode
+            (workspace_id, enabled, level, block_on_injection_detection)
+         VALUES ($1, true, 'standard', true)",
+    )
+    .bind(workspace_id)
+    .execute(&pool)
+    .await?;
+
+    let sidecar = MockSidecar::spawn_with(usize::MAX, true);
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an injection gate the workspace enforces must fail closed when the \
+         classifier cannot answer"
+    );
+    assert!(
+        !sidecar.ner_requests().is_empty(),
+        "premise: NER must have been healthy, so this 503 is about the \
+         injection check alone"
+    );
+    Ok(())
+}
+
+/// POSITIVE CONTROL / scope guard: the SAME broken injection classifier must
+/// NOT 503 a workspace that does not enforce an injection gate. Fail-closed
+/// has to be proportionate — costing every workspace a 503 for a control they
+/// never enabled would be its own outage.
+#[sqlx::test]
+async fn injection_failure_does_not_block_when_gate_is_off(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+    sqlx::query(
+        "INSERT INTO workspace_secure_mode
+            (workspace_id, enabled, level, block_on_injection_detection)
+         VALUES ($1, true, 'standard', false)",
+    )
+    .bind(workspace_id)
+    .execute(&pool)
+    .await?;
+
+    let sidecar = MockSidecar::spawn_with(usize::MAX, true);
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the injection result is never read when the gate is off, so losing \
+         it has no security consequence and must not cost a 503"
+    );
+    Ok(())
+}
+
+/// IMPORTANT — a fail-closed rejection must be visible in the audit trail,
+/// not just the logs. Its policy-deny twin has always written a row.
+#[sqlx::test]
+async fn blocked_request_writes_an_audit_row(pool: PgPool) -> sqlx::Result<()> {
+    ensure_floor_only_column().await;
+
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let marker = format!("ws2-3-blocked-{}", Uuid::new_v4());
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB);
+    let response = app
+        .oneshot(tagged_chat_request(&marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let action = await_column("final_action", &marker).await;
+    assert_eq!(
+        action, "block_sidecar_unavailable",
+        "a 503 from the coverage gate must be auditable, and distinguishable \
+         from a policy deny"
+    );
+    assert_eq!(
+        await_column("floor_only", &marker).await,
+        "false",
+        "a blocked request was never answered, so it was not answered on the floor"
+    );
+    Ok(())
+}
+
+/// The four `block_*` reason paths each get their own falsifier: the metric
+/// label, which distinguishes `unconfigured` from `disabled` (both of which
+/// merely produced a 503 before, so any one of them could have been broken
+/// invisibly).
+#[sqlx::test]
+async fn block_reasons_are_reported_distinctly(pool: PgPool) -> sqlx::Result<()> {
+    for (sidecar_url, expected_reason) in
+        [("", "unconfigured"), ("ftp://ml.internal:9000", "disabled")]
+    {
+        let workspace_id = Uuid::new_v4();
+        let api_key = format!("{API_KEY}_{expected_reason}");
+        support::seed_workspace(&pool, workspace_id, &api_key).await?;
+        support::seed_provider_and_model(
+            &pool,
+            workspace_id,
+            Uuid::new_v4(),
+            "anthropic-primary",
+            "anthropic",
+            None,
+            "claude-3-haiku",
+        )
+        .await?;
+        set_policy(&pool, workspace_id, "block").await?;
+
+        let app = support::router_with(pool.clone(), sidecar_url, "default");
+        let response = app
+            .clone()
+            .oneshot(chat_request(&api_key, false))
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let metrics = scrape_metrics(app).await;
+        assert!(
+            metrics.contains(&format!(
+                "secureprompt_sidecar_unavailable_total{{reason=\"{expected_reason}\",action=\"block\"}}"
+            )),
+            "expected reason={expected_reason}; got:\n{metrics}"
+        );
+    }
+    Ok(())
+}
+
+/// End-to-end coverage for the breaker path, which previously had none: drive
+/// enough failed requests to trip it, then assert the reason flips from
+/// `all_calls_failed` to `circuit_open`.
+#[sqlx::test]
+async fn degrade_policy_reports_circuit_open_after_repeated_failures(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+
+    let mut reasons = Vec::new();
+    for _ in 0..8 {
+        let response = app
+            .clone()
+            .oneshot(chat_request(API_KEY, false))
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        reasons.push(
+            response
+                .headers()
+                .get(DEGRADED_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+
+    assert_eq!(
+        reasons.first().map(String::as_str),
+        Some("all_calls_failed"),
+        "the first failures are transport failures, not an open breaker"
+    );
+    assert!(
+        reasons.iter().any(|r| r == "circuit_open"),
+        "sustained failures must eventually report circuit_open; got {reasons:?}"
+    );
+    Ok(())
+}
+
+// ── Operator off-switch: deployment-level default ─────────────────────────
+
+/// `block` is only a safe default if an operator can reach the off-switch.
+/// `docker-compose.simple.yml` ships no ML sidecar at all, so without a
+/// deployment-level override it would 503 every request out of the box with
+/// no recourse except an admin-JWT PUT per workspace.
+#[sqlx::test]
+async fn deployment_default_applies_when_workspace_has_no_row(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_sidecar_policy WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        rows, 0,
+        "test premise: the workspace must have no policy row"
+    );
+
+    let app = support::router_with_default(
+        pool.clone(),
+        &dead_sidecar_url(),
+        "default",
+        "degrade_with_alert",
+    );
+    let response = app
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the deployment default must apply to a workspace that never chose"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(DEGRADED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("all_calls_failed"),
+        "degrading via the deployment default is still a degradation and must \
+         be reported exactly like an explicit one"
+    );
+    Ok(())
+}
+
+/// The escape hatch must not become a back door: a workspace that explicitly
+/// chose `block` keeps failing closed even on a deployment whose default is
+/// `degrade_with_alert`.
+#[sqlx::test]
+async fn workspace_choice_overrides_a_permissive_deployment_default(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let app = support::router_with_default(
+        pool.clone(),
+        &dead_sidecar_url(),
+        "default",
+        "degrade_with_alert",
+    );
+    let response = app
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an explicit workspace choice must win over the deployment default"
     );
     Ok(())
 }

@@ -130,12 +130,32 @@ paths:
               schema:
                 type: string
                 description: "SSE stream of data: {...} chunks"
+          headers:
+            x-secureprompt-sidecar-degraded:
+              description: >-
+                WS2-3. Present only when this answer was produced with the
+                deterministic detection floor alone, because the ML sidecar
+                produced no (or incomplete) coverage and the workspace's
+                `sidecar_unavailable` policy is `degrade_with_alert`. The
+                value is the reason — one of `unconfigured`, `disabled`,
+                `circuit_open`, `all_calls_failed`, `partial_coverage`. The
+                matching audit row carries `floor_only = true`.
+              schema:
+                type: string
+                enum:
+                  - unconfigured
+                  - disabled
+                  - circuit_open
+                  - all_calls_failed
+                  - partial_coverage
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/BudgetExceeded"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/SidecarUnavailable"
 
   /v1/completions:
     post:
@@ -1196,6 +1216,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/BudgetExceededError"
+    SidecarUnavailable:
+      description: >-
+        WS2-3. PII detection coverage was unavailable for this request — the
+        ML sidecar produced no detections, or scanned only part of a long
+        prompt — and the workspace's `sidecar_unavailable` policy is `block`,
+        so the prompt was NOT forwarded to the provider. Retry once the
+        sidecar is healthy, or set `sidecar_unavailable` to
+        `degrade_with_alert` (via `PUT /v1/secure-mode`) to accept answers
+        produced with the deterministic detection floor only.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
 
   schemas:
     # ── Auth ────────────────────────────────────────────────────────────────────

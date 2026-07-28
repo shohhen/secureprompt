@@ -71,20 +71,20 @@ impl SidecarPolicyRepository {
         Self { pool }
     }
 
-    /// Read the workspace's policy, or the fail-closed default when the
-    /// workspace has never chosen one.
+    /// Read the workspace's stored choice, if it has ever made one.
     ///
-    /// Migration 018 deliberately does not backfill existing workspaces, so
-    /// "no row" is the normal state for every workspace that predates WS2-3
-    /// and for every workspace created after it. See the migration header.
+    /// `None` means no row — the normal state for every workspace that
+    /// predates WS2-3 and for every workspace created after it, because
+    /// migration 018 deliberately does not backfill. Resolve `None` against
+    /// the deployment default with [`Self::get_effective`]; do not treat it
+    /// as a policy in its own right.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the query fails. Callers on the
-    /// request path treat that as [`SidecarUnavailablePolicy::Block`].
+    /// Returns `ApiError::Database` when the query fails.
     pub async fn get(
         &self,
         workspace_id: WorkspaceId,
-    ) -> Result<SidecarUnavailablePolicy, ApiError> {
+    ) -> Result<Option<SidecarUnavailablePolicy>, ApiError> {
         let row = sqlx::query(
             "SELECT sidecar_unavailable
              FROM workspace_sidecar_policy
@@ -95,9 +95,24 @@ impl SidecarPolicyRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        Ok(row.map_or_else(SidecarUnavailablePolicy::default, |r| {
-            SidecarUnavailablePolicy::from_db(&r.get::<String, _>("sidecar_unavailable"))
-        }))
+        Ok(row
+            .map(|r| SidecarUnavailablePolicy::from_db(&r.get::<String, _>("sidecar_unavailable"))))
+    }
+
+    /// The policy that actually applies to this workspace: its stored choice
+    /// if it has one, otherwise the deployment default from
+    /// `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT` (itself `block` unless an
+    /// operator opted out).
+    ///
+    /// # Errors
+    /// Returns `ApiError::Database` when the query fails. Callers on the
+    /// request path treat that as [`SidecarUnavailablePolicy::Block`].
+    pub async fn get_effective(
+        &self,
+        workspace_id: WorkspaceId,
+        deployment_default: SidecarUnavailablePolicy,
+    ) -> Result<SidecarUnavailablePolicy, ApiError> {
+        Ok(self.get(workspace_id).await?.unwrap_or(deployment_default))
     }
 
     /// Upsert the workspace's policy.

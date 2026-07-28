@@ -448,7 +448,7 @@ fn with_budget_warning(mut response: Response, gate: BudgetGate) -> Response {
 /// every normally-served request.
 fn with_sidecar_degraded(
     mut response: Response,
-    reason: Option<crate::ml_sidecar::types::SidecarOutage>,
+    reason: Option<crate::ml_sidecar::types::CoverageLoss>,
 ) -> Response {
     if let Some(reason) = reason {
         response.headers_mut().insert(

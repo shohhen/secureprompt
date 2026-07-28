@@ -297,7 +297,7 @@ mod pipeline_contract_tests {
 #[cfg(test)]
 mod sidecar_gate_tests {
     use crate::db::sidecar_policy_repo::SidecarUnavailablePolicy;
-    use crate::ml_sidecar::types::{SidecarCoverage, SidecarOutage};
+    use crate::ml_sidecar::types::{CoverageLoss, SidecarCoverage, SidecarOutage};
     use crate::pipeline::service::{sidecar_gate, SidecarGate};
 
     /// Compile-time exhaustiveness guard for the literal outage list used by
@@ -346,7 +346,7 @@ mod sidecar_gate_tests {
                     &SidecarCoverage::Absent(outage),
                     SidecarUnavailablePolicy::Block
                 ),
-                SidecarGate::Block(outage),
+                SidecarGate::Block(CoverageLoss::Outage(outage)),
                 "block policy must fail closed on {outage:?}"
             );
         }
@@ -365,7 +365,7 @@ mod sidecar_gate_tests {
                     &SidecarCoverage::Absent(outage),
                     SidecarUnavailablePolicy::DegradeWithAlert
                 ),
-                SidecarGate::Degrade(outage),
+                SidecarGate::Degrade(CoverageLoss::Outage(outage)),
                 "degrade policy must proceed-with-alert on {outage:?}"
             );
         }
@@ -414,6 +414,103 @@ mod sidecar_policy_parse_tests {
         assert_eq!(
             SidecarUnavailablePolicy::from_db(""),
             SidecarUnavailablePolicy::Block
+        );
+    }
+}
+
+/// Fix round 1, CRITICAL 1 — partial coverage must be gated exactly like a
+/// full outage. Text in the unscanned chunks has had NO detection run over
+/// it; a `block` workspace forwarding it to a provider is the same leak the
+/// feature exists to prevent.
+#[cfg(test)]
+mod sidecar_partial_coverage_gate_tests {
+    use crate::db::sidecar_policy_repo::SidecarUnavailablePolicy;
+    use crate::ml_sidecar::types::{CoverageLoss, SidecarCoverage, SidecarOutage};
+    use crate::pipeline::service::{sidecar_gate, SidecarGate};
+
+    fn partial() -> SidecarCoverage {
+        SidecarCoverage::Partial {
+            chunks_covered: 1,
+            chunks_total: 3,
+        }
+    }
+
+    #[test]
+    fn block_policy_blocks_partial_coverage() {
+        assert_eq!(
+            sidecar_gate(&partial(), SidecarUnavailablePolicy::Block),
+            SidecarGate::Block(CoverageLoss::Partial),
+            "a block workspace must not forward text that was never scanned"
+        );
+    }
+
+    #[test]
+    fn degrade_policy_degrades_partial_coverage() {
+        assert_eq!(
+            sidecar_gate(&partial(), SidecarUnavailablePolicy::DegradeWithAlert),
+            SidecarGate::Degrade(CoverageLoss::Partial),
+        );
+    }
+
+    /// The bounded label a partial scan reports, distinct from every outage
+    /// reason so an operator can tell "sidecar gone" from "prompt too long
+    /// for the budget".
+    #[test]
+    fn partial_has_its_own_bounded_label() {
+        assert_eq!(CoverageLoss::Partial.as_str(), "partial_coverage");
+        for outage in [
+            SidecarOutage::Unconfigured,
+            SidecarOutage::Disabled,
+            SidecarOutage::CircuitOpen,
+            SidecarOutage::AllCallsFailed,
+        ] {
+            assert_ne!(
+                CoverageLoss::Outage(outage).as_str(),
+                CoverageLoss::Partial.as_str()
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL: `Complete` still proceeds under the strictest
+    /// policy, so "Partial blocks" is not just "everything blocks".
+    #[test]
+    fn complete_coverage_still_proceeds() {
+        assert_eq!(
+            sidecar_gate(&SidecarCoverage::Complete, SidecarUnavailablePolicy::Block),
+            SidecarGate::Proceed
+        );
+    }
+}
+
+/// Fix round 1, CRITICAL 2 — the compile-time net.
+///
+/// The report previously claimed three exhaustive matches would break the
+/// build when a coverage variant is added. Two of them were `if let`, which
+/// compiles unchanged and silently treats a new variant as covered. There is
+/// now exactly ONE classification point — `CoverageLoss::from_coverage` — and
+/// every decision site consumes it, so a new variant breaks that one function
+/// and the classification it produces propagates everywhere consistently.
+#[cfg(test)]
+mod coverage_classification_tests {
+    use crate::ml_sidecar::types::{CoverageLoss, SidecarCoverage, SidecarOutage};
+
+    #[test]
+    fn complete_is_not_a_loss() {
+        assert_eq!(CoverageLoss::from_coverage(&SidecarCoverage::Complete), None);
+    }
+
+    #[test]
+    fn absent_and_partial_are_losses() {
+        assert_eq!(
+            CoverageLoss::from_coverage(&SidecarCoverage::Absent(SidecarOutage::CircuitOpen)),
+            Some(CoverageLoss::Outage(SidecarOutage::CircuitOpen))
+        );
+        assert_eq!(
+            CoverageLoss::from_coverage(&SidecarCoverage::Partial {
+                chunks_covered: 2,
+                chunks_total: 9
+            }),
+            Some(CoverageLoss::Partial)
         );
     }
 }

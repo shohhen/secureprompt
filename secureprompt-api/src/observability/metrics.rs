@@ -190,6 +190,11 @@ pub struct MetricsRegistry {
     /// (`block`/`degrade_with_alert`). This is the alert signal for a
     /// gateway running with no ML detection coverage.
     sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
+    /// Counter `secureprompt_clickhouse_schema_mismatch_total`. Bumped once
+    /// at startup when the live `request_events` table is missing columns the
+    /// writer serialises — i.e. the worker's ClickHouse migrations have not
+    /// run and every analytics event is being dropped.
+    clickhouse_schema_mismatch_total: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -443,6 +448,18 @@ impl MetricsRegistry {
         }
     }
 
+    /// Record that the live ClickHouse schema is behind the writer.
+    pub fn record_clickhouse_schema_mismatch(&self) {
+        self.clickhouse_schema_mismatch_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Used by tests to assert the startup schema probe fired.
+    #[must_use]
+    pub fn clickhouse_schema_mismatch_count(&self) -> u64 {
+        self.clickhouse_schema_mismatch_total.load(Ordering::Relaxed)
+    }
+
     /// WS2-3 — record one request for which the ML sidecar produced no
     /// detection coverage. Both labels are bounded: `reason` is
     /// [`crate::ml_sidecar::types::SidecarOutage::as_str`], `action` is the
@@ -654,6 +671,13 @@ impl MetricsRegistry {
                 }
             }
         }
+
+        out.push_str("# TYPE secureprompt_clickhouse_schema_mismatch_total counter\n");
+        let _ = writeln!(
+            out,
+            "secureprompt_clickhouse_schema_mismatch_total {}",
+            self.clickhouse_schema_mismatch_total.load(Ordering::Relaxed)
+        );
 
         // WS2-3 — ML sidecar coverage-loss counter.
         {

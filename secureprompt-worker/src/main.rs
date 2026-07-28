@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         // gateway request path, but AppConfig is shared so the field has
         // to be set. Defer to the env var so worker + API agree.
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
+        sidecar_unavailable_default: AppConfig::sidecar_unavailable_default_from_env(),
         // The worker never verifies licenses (no gateway request path), so the
         // empty/disabled default is correct here — no pubkey/token reads matter.
         license: LicenseConfig::default(),

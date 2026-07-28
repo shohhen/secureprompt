@@ -23,6 +23,23 @@ services:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: debug
+      # WS2-3. This profile deliberately ships NO ML sidecar, so the gateway
+      # has no NER coverage for any request. The product default is
+      # `block` (fail closed, 503) and that is correct for a real
+      # deployment — but here it would 503 every request out of the box with
+      # no way back except an admin-JWT PUT /v1/secure-mode per workspace.
+      #
+      # This profile is for local evaluation, not production. It opts into
+      # degraded operation explicitly and visibly: requests are answered
+      # using the deterministic Rust detection floor only (PINFL, STIR, MFO,
+      # passport, Uzcard, Humo, cards, emails, addresses — no NER), every
+      # response carries `x-secureprompt-sidecar-degraded`, and every audit
+      # row is marked `floor_only = true`.
+      #
+      # DO NOT copy this line into a production compose/Helm values file.
+      # The full `docker-compose.yml` runs the ML sidecar and leaves the
+      # fail-closed default in place.
+      SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT: degrade_with_alert
     ports:
       - "8080:8080"
     depends_on:

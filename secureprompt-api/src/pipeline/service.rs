@@ -9,7 +9,7 @@ use crate::{
         model_router::{ModelTarget, ResolvedModel},
         streaming::{placeholder_safe_chunks, settled_prefix_len, PlaceholderStreamer},
     },
-    ml_sidecar::types::{SidecarCoverage, SidecarOutage},
+    ml_sidecar::types::{CoverageLoss, SidecarCoverage},
     observability::tracing::{log_request_finish, log_request_start},
     policy::engine::{evaluate, PolicyEvaluationInput, PolicyEvaluationOutcome},
     providers::{
@@ -42,10 +42,10 @@ pub enum SidecarGate {
     /// The sidecar covered the input; carry on normally.
     Proceed,
     /// Fail closed — the prompt must not reach the provider.
-    Block(SidecarOutage),
+    Block(CoverageLoss),
     /// Proceed on the deterministic floor, loudly: alert + response header +
     /// `floor_only = true` on the analytics row.
-    Degrade(SidecarOutage),
+    Degrade(CoverageLoss),
 }
 
 /// WS2-3 — the single decision point for "the ML sidecar produced no
@@ -54,19 +54,17 @@ pub enum SidecarGate {
 /// Kept as a free function over plain values (no `AppState`, no database, no
 /// HTTP) so the full cross-product of coverage × policy is unit-testable.
 ///
-/// The `match` on `SidecarCoverage` is deliberately exhaustive with no `_`
-/// arm: when WS2-6 adds `SidecarCoverage::Partial { .. }` for "the sidecar
-/// ran but abandoned chunks when the budget expired", this function stops
-/// compiling until someone decides what a partially-covered prompt should do
-/// under each policy — which is exactly the decision that must not be made by
-/// accident.
+/// Classification is delegated to [`CoverageLoss::from_coverage`] — the one
+/// exhaustive match over `SidecarCoverage` in the codebase — so this function
+/// only decides policy, and a new coverage variant cannot reach here
+/// unclassified.
 #[must_use]
 pub fn sidecar_gate(coverage: &SidecarCoverage, policy: SidecarUnavailablePolicy) -> SidecarGate {
-    match coverage {
-        SidecarCoverage::Complete => SidecarGate::Proceed,
-        SidecarCoverage::Absent(reason) => match policy {
-            SidecarUnavailablePolicy::Block => SidecarGate::Block(*reason),
-            SidecarUnavailablePolicy::DegradeWithAlert => SidecarGate::Degrade(*reason),
+    match CoverageLoss::from_coverage(coverage) {
+        None => SidecarGate::Proceed,
+        Some(loss) => match policy {
+            SidecarUnavailablePolicy::Block => SidecarGate::Block(loss),
+            SidecarUnavailablePolicy::DegradeWithAlert => SidecarGate::Degrade(loss),
         },
     }
 }
@@ -105,7 +103,7 @@ fn alert_sidecar_unavailable(
     state: &AppState,
     request_id: RequestId,
     workspace_id: secureprompt_common::types::WorkspaceId,
-    reason: SidecarOutage,
+    reason: CoverageLoss,
     action: &'static str,
 ) {
     tracing::error!(
@@ -151,7 +149,7 @@ pub struct PipelineExecution {
     /// deterministic-floor detection only because the ML sidecar produced no
     /// coverage. Drives the `x-secureprompt-sidecar-degraded` response header
     /// and mirrors the analytics row's `floor_only`.
-    pub degraded_reason: Option<SidecarOutage>,
+    pub degraded_reason: Option<CoverageLoss>,
 }
 
 /// WS2-3 — return value of [`PipelineService::execute_stream`].
@@ -165,7 +163,7 @@ pub struct StreamExecution {
     /// `prepare` time. A sidecar that dies mid-stream cannot retroactively
     /// add a header; that case still alerts and still marks the analytics
     /// row (see the response-side scrub in `execute_stream`).
-    pub degraded_reason: Option<SidecarOutage>,
+    pub degraded_reason: Option<CoverageLoss>,
 }
 
 /// One item emitted by the streaming pipeline path (`execute_stream`).
@@ -219,13 +217,100 @@ struct Prepared {
     /// `degrade_with_alert`, so the request proceeded on the deterministic
     /// Rust floor alone. `None` under normal operation; a `block` workspace
     /// never reaches here (`prepare` returns 503 instead).
-    degraded_reason: Option<SidecarOutage>,
+    degraded_reason: Option<CoverageLoss>,
 }
 
 impl PipelineService {
     #[must_use]
     pub fn new(state: AppState) -> Self {
         Self { state }
+    }
+
+    /// WS2-3 fix round 1 — reject a request whose ML coverage was lost, in a
+    /// `block` workspace.
+    ///
+    /// Alerts, records the failure metrics, **enqueues an audit row**, and
+    /// returns the 503. The audit row is the fix for a real hole: the first
+    /// version returned 503 straight from the gate, so a fail-closed
+    /// workspace's rejected traffic existed only in logs — invisible in
+    /// `request_events` and therefore in the audit UI. Its policy-deny twin
+    /// has always written a row, and on a governance product "we blocked it"
+    /// has to be as auditable as "we allowed it".
+    ///
+    /// `final_action` is `block_sidecar_unavailable` — deliberately distinct
+    /// from a policy `deny` so an operator can separate "your rules rejected
+    /// this" from "our detector was down". `floor_only` stays false: the
+    /// request was never answered, so it was not answered on the floor.
+    async fn fail_closed_on_coverage_loss(
+        &self,
+        auth: &AuthContext,
+        request: &GatewayRequest,
+        resolved: &ResolvedModel,
+        request_id: RequestId,
+        reason: CoverageLoss,
+        start: Instant,
+    ) -> ApiError {
+        alert_sidecar_unavailable(
+            &self.state,
+            request_id,
+            auth.workspace_id,
+            reason,
+            ACTION_BLOCK,
+        );
+
+        let provider_name = resolved
+            .targets
+            .first()
+            .map_or("unconfigured", |t| t.provider_name.as_str())
+            .to_owned();
+        let usage = TokenUsage::default();
+        let cost_usd = self
+            .state
+            .pricing
+            .compute_cost(&request.public_model, &usage);
+        let mut event = RequestEvent::new(
+            request_id,
+            auth.workspace_id,
+            provider_name,
+            request.public_model.clone(),
+            "block_sidecar_unavailable".to_owned(),
+            &usage,
+            false,
+            cost_usd,
+            Vec::new(),
+        );
+        event.user_id = auth.user_id;
+        event.api_key_id = Some(auth.api_key_id);
+        event.api_key_name = Some(auth.api_key_name.clone());
+        event.ip_address = request.client_ip.clone();
+        event.user_agent = request.user_agent.clone();
+        event.raw_prompt = last_user_message_raw(&request.messages);
+        // Best-effort: this re-runs detection with the same broken sidecar,
+        // so it shows what the deterministic floor alone would have caught —
+        // which is precisely the evidence a reviewer wants for "why was this
+        // not safe to forward".
+        event.redacted_prompt = Some(redact_last_user_message(&self.state, &request.messages).await);
+        self.state
+            .analytics
+            .enqueue(event, self.state.metrics.as_ref())
+            .await;
+
+        self.state
+            .metrics
+            .observe_request_duration("unknown", start.elapsed());
+        self.state.metrics.record_request(false);
+        log_request_finish(
+            request_id,
+            auth.workspace_id,
+            "block_sidecar_unavailable",
+            false,
+        );
+
+        ApiError::ServiceUnavailable(
+            "PII detection coverage is unavailable for this request and the workspace is \
+             configured to fail closed"
+                .to_owned(),
+        )
     }
 
     /// Run all input-side processing up to (but not including) the upstream
@@ -275,7 +360,10 @@ impl PipelineService {
         // is `Block`, so a Postgres outage cannot turn into permission to
         // forward unscanned prompts.
         let sidecar_policy = SidecarPolicyRepository::new(self.state.db.clone())
-            .get(auth.workspace_id)
+            .get_effective(
+                auth.workspace_id,
+                SidecarUnavailablePolicy::from_db(&self.state.config.sidecar_unavailable_default),
+            )
             .await
             .unwrap_or_else(|err| {
                 tracing::warn!(
@@ -285,24 +373,14 @@ impl PipelineService {
                 );
                 SidecarUnavailablePolicy::default()
             });
-        let degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
+        let mut degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
             SidecarGate::Proceed => None,
             SidecarGate::Block(reason) => {
-                alert_sidecar_unavailable(
-                    &self.state,
-                    request_id,
-                    auth.workspace_id,
-                    reason,
-                    ACTION_BLOCK,
-                );
-                self.state
-                    .metrics
-                    .observe_request_duration("unknown", start.elapsed());
-                self.state.metrics.record_request(false);
-                return Err(ApiError::ServiceUnavailable(
-                    "PII detection is unavailable and this workspace is configured to fail closed"
-                        .to_owned(),
-                ));
+                return Err(self
+                    .fail_closed_on_coverage_loss(
+                        auth, request, resolved, request_id, reason, start,
+                    )
+                    .await);
             }
             SidecarGate::Degrade(reason) => {
                 alert_sidecar_unavailable(
@@ -378,11 +456,50 @@ impl PipelineService {
                 row
             });
         if secure_mode.enabled {
-            let injection = self
+            let injection_outcome = self
                 .state
                 .ml_sidecar
                 .injection_check_if_available(&prompt)
                 .await;
+
+            // Fix round 1 — `/detect/injection` fails INDEPENDENTLY of
+            // `/detect/ner`: a 5xx or unparseable body yields
+            // `is_injection = false`, which is what a clean prompt also looks
+            // like. With NER coverage `Complete` the gate above proceeds, so
+            // the workspace's injection block was being silently bypassed
+            // with no 503, no header, no alert and no `floor_only`.
+            //
+            // Gated only where the answer actually changes enforcement:
+            // `apply_secure_mode_override` consults `injection` at
+            // `level = strict` and at `level = standard` with
+            // `block_on_injection_detection`. At `permissive` it is never
+            // read, so a missing answer there has no security consequence and
+            // must not cost the operator a 503.
+            let injection_enforced = secure_mode.level == "strict"
+                || (secure_mode.level != "permissive" && secure_mode.block_on_injection_detection);
+            if injection_enforced {
+                match sidecar_gate(&injection_outcome.coverage, sidecar_policy) {
+                    SidecarGate::Proceed => {}
+                    SidecarGate::Block(reason) => {
+                        return Err(self
+                            .fail_closed_on_coverage_loss(
+                                auth, request, resolved, request_id, reason, start,
+                            )
+                            .await);
+                    }
+                    SidecarGate::Degrade(reason) => {
+                        alert_sidecar_unavailable(
+                            &self.state,
+                            request_id,
+                            auth.workspace_id,
+                            reason,
+                            ACTION_DEGRADE,
+                        );
+                        degraded_reason = degraded_reason.or(Some(reason));
+                    }
+                }
+            }
+            let injection = injection_outcome.response;
             // Clone detections so we can borrow `pipeline_state` mutably for
             // the redaction step inside the override. Detections are
             // typically <10 items per request; the clone is cheap relative
@@ -608,7 +725,12 @@ impl PipelineService {
                     // degradation visible — but the request is marked and
                     // alerted exactly as the prompt-side path would.
                     let ml_out = self.state.ml_sidecar.detect_if_available(text).await;
-                    if let SidecarCoverage::Absent(reason) = ml_out.coverage {
+                    // Fix round 1 (CRITICAL 2): this was `if let
+                    // SidecarCoverage::Absent(..)`, which compiles unchanged
+                    // when a coverage variant is added and silently treats it
+                    // as covered — the compile-time net claimed for this site
+                    // did not exist. Routed through the single classifier now.
+                    if let Some(reason) = CoverageLoss::from_coverage(&ml_out.coverage) {
                         alert_sidecar_unavailable(
                             &self.state,
                             request_id,
@@ -884,7 +1006,10 @@ impl PipelineService {
                     // before the first token, so the request is marked and
                     // alerted instead.
                     let ml_out = state.ml_sidecar.detect_if_available(&restored).await;
-                    if let SidecarCoverage::Absent(reason) = ml_out.coverage {
+                    // Fix round 1 (CRITICAL 2): see the buffered path above —
+                    // was an `if let` on one variant, now the single
+                    // classifier.
+                    if let Some(reason) = CoverageLoss::from_coverage(&ml_out.coverage) {
                         alert_sidecar_unavailable(
                             &state,
                             request_id,

@@ -183,10 +183,15 @@ async fn get_secure_mode(
         .get(ctx.workspace_id)
         .await
         .map_err(api_error_response)?;
-    // WS2-3 — returns `block` when the workspace has no row, matching the
-    // fail-closed default the pipeline applies.
+    // WS2-3 — the EFFECTIVE policy: the workspace's stored choice, or the
+    // deployment default when it has never chosen. Reporting the stored value
+    // alone would make this endpoint lie on any deployment that set
+    // SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT.
     let sidecar_unavailable = SidecarPolicyRepository::new(state.db.clone())
-        .get(ctx.workspace_id)
+        .get_effective(
+            ctx.workspace_id,
+            SidecarUnavailablePolicy::from_db(&state.config.sidecar_unavailable_default),
+        )
         .await
         .map_err(api_error_response)?;
 
@@ -229,17 +234,16 @@ async fn put_secure_mode(
     }
 
     let sidecar_repo = SidecarPolicyRepository::new(state.db.clone());
-    let sidecar_unavailable = match body.sidecar_unavailable.as_deref() {
-        Some(value) => sidecar_repo
-            .upsert(ctx.workspace_id, SidecarUnavailablePolicy::from_db(value))
-            .await
-            .map_err(api_error_response)?,
-        None => sidecar_repo
-            .get(ctx.workspace_id)
-            .await
-            .map_err(api_error_response)?,
-    };
+    let deployment_default =
+        SidecarUnavailablePolicy::from_db(&state.config.sidecar_unavailable_default);
 
+    // The secure-mode row is written FIRST so a failure there cannot leave a
+    // changed sidecar policy behind. The two live in different tables and are
+    // still not written in one transaction — a partial write remains possible
+    // in the other direction (secure mode applied, sidecar policy not) — but
+    // that direction fails safe: the sidecar policy keeps its previous, more
+    // conservative-or-equal value rather than being loosened by a request
+    // that then errored.
     let repo = SecureModeRepository::new(state.db.clone());
     let row = repo
         .upsert(
@@ -252,6 +256,17 @@ async fn put_secure_mode(
         )
         .await
         .map_err(api_error_response)?;
+
+    let sidecar_unavailable = match body.sidecar_unavailable.as_deref() {
+        Some(value) => sidecar_repo
+            .upsert(ctx.workspace_id, SidecarUnavailablePolicy::from_db(value))
+            .await
+            .map_err(api_error_response)?,
+        None => sidecar_repo
+            .get_effective(ctx.workspace_id, deployment_default)
+            .await
+            .map_err(api_error_response)?,
+    };
 
     Ok((
         StatusCode::OK,

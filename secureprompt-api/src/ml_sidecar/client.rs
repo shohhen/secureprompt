@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 
 use crate::ml_sidecar::types::{
-    InjectionRequest, InjectionResponse, MlDetection, MlDetectionOutcome, NerRequest, NerResponse,
-    RagCheckRequest, RagCheckResponse, SidecarOutage,
+    InjectionOutcome, InjectionRequest, InjectionResponse, MlDetection, MlDetectionOutcome,
+    NerRequest, NerResponse, RagCheckRequest, RagCheckResponse, SidecarOutage,
 };
 
 const FAILURE_THRESHOLD: u32 = 5;
@@ -267,14 +267,31 @@ impl MlSidecarClient {
             }
         }
 
-        if attempted > 0 && covered == 0 {
+        // Fix round 1 — classification, in strict order.
+        //
+        // `attempted == 0` means the loop broke at its very first top-of-loop
+        // check. The budget check cannot fire on iteration 0 (it is guarded by
+        // `chunks_done > 0`), so the only way here is the breaker opening
+        // BETWEEN the pre-loop check above and the first iteration — another
+        // task's failures tripping it. Zero chunks were looked at; this used
+        // to fall through to `complete(vec![])`, handing out a clean bill of
+        // health for text nothing had read.
+        if attempted == 0 {
+            return MlDetectionOutcome::absent(SidecarOutage::CircuitOpen);
+        }
+        if covered == 0 {
             return MlDetectionOutcome::absent(SidecarOutage::AllCallsFailed);
         }
-        // NOTE (WS2-6): `covered < attempted`, or `attempted < chunks_total`
-        // after the aggregate-budget break above, is partial coverage. It is
-        // reported as `Complete` today — unchanged from the pre-WS2-3
-        // behaviour — and is exactly what WS2-6 will split out into
-        // `SidecarCoverage::Partial`.
+        // Some chunks scanned, some not — either individual chunk calls
+        // failed (`covered < attempted`) or the loop stopped early and never
+        // issued the rest (`attempted < chunks_total`, from the breaker
+        // opening mid-loop or the aggregate budget expiring). Either way the
+        // remaining text was never scanned, and any prompt over
+        // `ner_chunk_chars` tiles into several chunks, so this is the common
+        // case for long documents rather than an edge case.
+        if covered < chunks_total {
+            return MlDetectionOutcome::partial(all, covered, chunks_total);
+        }
         MlDetectionOutcome::complete(all)
     }
 
@@ -380,17 +397,19 @@ impl MlSidecarClient {
     /// the sidecar is disabled or the circuit is open — same fail-open
     /// contract as `detect_if_available` (D-13). Used by `secure_mode`
     /// enforcement when `block_on_injection_detection=true`.
-    pub async fn injection_check_if_available(&self, prompt: &str) -> InjectionResponse {
-        let empty = InjectionResponse {
-            is_injection: false,
-            score: 0.0,
-        };
+    pub async fn injection_check_if_available(&self, prompt: &str) -> InjectionOutcome {
         let (http, circuit) = match (&self.http, &self.circuit) {
             (Some(h), Some(c)) if self.enabled => (h, c),
-            _ => return empty,
+            _ => {
+                return InjectionOutcome::absent(if self.base_url.is_empty() {
+                    SidecarOutage::Unconfigured
+                } else {
+                    SidecarOutage::Disabled
+                })
+            }
         };
         if circuit.is_open() {
-            return empty;
+            return InjectionOutcome::absent(SidecarOutage::CircuitOpen);
         }
         let url = format!("{}/detect/injection", self.base_url);
         let body = InjectionRequest {
@@ -403,18 +422,25 @@ impl MlSidecarClient {
             .send()
             .await
         {
+            Ok(resp) if resp.status().is_client_error() || resp.status().is_server_error() => {
+                // Fix round 1: a non-2xx here used to be parsed as JSON and,
+                // on failure, collapse to `is_injection = false` — the same
+                // value a clean prompt produces. Report it as no coverage.
+                tracing::warn!(status = %resp.status(), "ml sidecar rejected injection request");
+                InjectionOutcome::absent(SidecarOutage::AllCallsFailed)
+            }
             Ok(resp) => match resp.json::<InjectionResponse>().await {
                 Ok(out) => {
                     circuit.record_success();
                     self.calls_total.fetch_add(1, Ordering::Relaxed);
-                    out
+                    InjectionOutcome::complete(out)
                 }
                 Err(_) => {
                     if circuit.record_failure() {
                         self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
                     }
                     self.failures_total.fetch_add(1, Ordering::Relaxed);
-                    empty
+                    InjectionOutcome::absent(SidecarOutage::AllCallsFailed)
                 }
             },
             Err(_) => {
@@ -422,7 +448,7 @@ impl MlSidecarClient {
                     self.circuit_open_count.fetch_add(1, Ordering::Relaxed);
                 }
                 self.failures_total.fetch_add(1, Ordering::Relaxed);
-                empty
+                InjectionOutcome::absent(SidecarOutage::AllCallsFailed)
             }
         }
     }
@@ -1259,6 +1285,169 @@ mod tests {
             outcome.coverage,
             SidecarCoverage::Complete,
             "empty detections from a LIVE sidecar means 'no PII', not 'no coverage'"
+        );
+    }
+
+    // --- Fix round 1, CRITICAL 1: partial coverage is NOT complete ------
+    //
+    // A prompt longer than `ner_chunk_chars` tiles into several chunks. If
+    // some chunks are scanned and others are not, the unscanned remainder has
+    // had NO PII detection run over it. Reporting that as `Complete` lets a
+    // `block` workspace forward unscanned text to the provider, which is the
+    // exact failure this whole feature exists to prevent — just above 24k
+    // chars instead of at zero.
+
+    /// Chunk 1 answered, chunk 2 refused (server stops accepting): coverage is
+    /// PARTIAL, and the surviving detection is still returned.
+    #[tokio::test]
+    async fn test_some_chunks_uncovered_reports_partial() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let prompt = "word ".repeat(24); // 120 chars
+        let expected = split_for_ner(&prompt, 50);
+        assert_eq!(expected.len(), 3, "test setup: prompt must tile into 3 chunks");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        // Serve exactly ONE chunk, then drop the listener so every later
+        // chunk hits connection-refused.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = b"{\"entities\":[{\"entity_type\":\"PERSON\",\"start\":0,\"end\":4,\"score\":0.99,\"text\":\"word\",\"compliance_categories\":[]}]}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+            drop(listener);
+        });
+
+        let mut client = MlSidecarClient::new(format!("http://{addr}"), 200);
+        client.ner_chunk_chars = 50;
+        let outcome = client.detect_if_available(&prompt).await;
+
+        server.join().expect("mock server thread panicked");
+        assert_eq!(
+            outcome.detections.len(),
+            1,
+            "the chunk that WAS scanned still contributes its detection"
+        );
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Partial {
+                chunks_covered: 1,
+                chunks_total: 3
+            },
+            "1 of 3 chunks scanned is PARTIAL coverage, not Complete"
+        );
+    }
+
+    /// The aggregate wall-clock budget abandons the remaining chunks. Those
+    /// chunks were never even attempted, so the text they cover was never
+    /// scanned — also partial, not complete.
+    #[tokio::test]
+    async fn test_budget_truncated_loop_reports_partial() {
+        let (addr, server) = spawn_capturing_server(
+            b"{\"entities\":[{\"entity_type\":\"PERSON\",\"start\":0,\"end\":4,\"score\":0.99,\"text\":\"word\",\"compliance_categories\":[]}]}",
+        );
+
+        let prompt = "word ".repeat(24); // 120 chars -> 3 chunks at 50
+        let mut client = MlSidecarClient::new(format!("http://{addr}"), 200);
+        client.ner_chunk_chars = 50;
+        client.ner_total_budget = Duration::ZERO;
+
+        let outcome = client.detect_if_available(&prompt).await;
+        let _ = server.join();
+
+        assert_eq!(outcome.detections.len(), 1);
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Partial {
+                chunks_covered: 1,
+                chunks_total: 3
+            },
+            "chunks skipped by the aggregate budget are unscanned text"
+        );
+    }
+
+    /// POSITIVE CONTROL for the two tests above: when EVERY chunk of a
+    /// multi-chunk prompt is scanned, coverage is Complete. Without this,
+    /// "multi-chunk means Partial" could pass by classifying all tiled
+    /// prompts as partial, which would make `block` reject healthy traffic.
+    #[tokio::test]
+    async fn test_all_chunks_covered_reports_complete() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let prompt = "word ".repeat(24);
+        let expected = split_for_ner(&prompt, 50);
+        let n = expected.len();
+        assert_eq!(n, 3, "test setup: prompt must tile into 3 chunks");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            for _ in 0..n {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"{\"entities\":[]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let mut client = MlSidecarClient::new(format!("http://{addr}"), 3000);
+        client.ner_chunk_chars = 50;
+        let outcome = client.detect_if_available(&prompt).await;
+        server.join().expect("mock server thread panicked");
+
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Complete,
+            "every chunk scanned is Complete, even across several chunks"
+        );
+    }
+
+    /// Fix round 1, IMPORTANT: the breaker can open BETWEEN the pre-loop
+    /// check and the first loop-top check (another task's failures trip it).
+    /// The loop then breaks with zero chunks attempted, which used to fall
+    /// through to `complete(vec![])` — a clean bill of health for text that
+    /// was never looked at. Simulated directly by opening the breaker while
+    /// the pre-loop check has already been passed, which is what
+    /// `attempted == 0` means at the classification site.
+    #[tokio::test]
+    async fn test_zero_chunks_attempted_reports_circuit_open() {
+        let client = MlSidecarClient::new("http://127.0.0.1:19999".to_owned(), 50);
+        let circuit = client.circuit.as_ref().expect("circuit").clone();
+
+        // Drive the breaker OPEN.
+        let mut opened = false;
+        for _ in 0..20 {
+            let _ = client.detect_if_available("x").await;
+            if circuit.is_open() {
+                opened = true;
+                break;
+            }
+        }
+        assert!(opened, "test premise: the breaker must be OPEN");
+
+        let outcome = client.detect_if_available("x").await;
+        assert_eq!(
+            outcome.coverage,
+            SidecarCoverage::Absent(SidecarOutage::CircuitOpen),
+            "an OPEN breaker must never classify as covered"
         );
     }
 

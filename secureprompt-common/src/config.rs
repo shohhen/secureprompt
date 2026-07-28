@@ -139,6 +139,22 @@ pub struct AppConfig {
     /// `true` — the safe behavior.
     #[serde(default = "default_redact_when_no_rules")]
     pub redact_when_no_rules: bool,
+    /// WS2-3 — deployment-level default for a workspace's
+    /// `sidecar_unavailable` policy: what to do when the ML sidecar produces
+    /// no detection coverage for a request. One of `block` (fail closed,
+    /// 503) or `degrade_with_alert` (answer on the deterministic detection
+    /// floor, loudly). A workspace row in `workspace_sidecar_policy`
+    /// overrides this; this is what applies when the workspace has never
+    /// chosen.
+    ///
+    /// Populated from `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT`. Defaults to
+    /// `block` — the fail-closed posture. It exists because `block` is only a
+    /// safe default if there is a reachable off-switch: a deployment with no
+    /// ML sidecar at all (the `docker-compose.simple.yml` profile) would
+    /// otherwise 503 every gateway request with no recourse except an
+    /// admin-JWT `PUT /v1/secure-mode` per workspace.
+    #[serde(default = "default_sidecar_unavailable")]
+    pub sidecar_unavailable_default: String,
     /// Plan 3 — gateway license verification (fail-open). Loaded from env;
     /// not serde-deserialized because the public key must not come from a
     /// config file.
@@ -148,6 +164,10 @@ pub struct AppConfig {
 
 fn default_redact_when_no_rules() -> bool {
     true
+}
+
+fn default_sidecar_unavailable() -> String {
+    "block".to_owned()
 }
 
 impl AppConfig {
@@ -178,6 +198,31 @@ impl AppConfig {
     /// default (we'd rather over-redact a brand-new workspace than leak
     /// PII because the admin hasn't built rules yet).
     #[must_use]
+    /// Parse `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT` from the environment.
+    ///
+    /// Only the exact value `degrade_with_alert` opts a deployment out of
+    /// fail-closed. Anything else — unset, misspelled, empty — yields
+    /// `block`, because a PII gateway must not fail open because someone
+    /// fat-fingered an env var.
+    #[must_use]
+    pub fn sidecar_unavailable_default_from_env() -> String {
+        match std::env::var("SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("degrade_with_alert") => "degrade_with_alert".to_owned(),
+            Some(other) if !other.is_empty() && other != "block" => {
+                tracing::warn!(
+                    value = %other,
+                    "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT is not a recognised value;                      falling back to 'block'"
+                );
+                "block".to_owned()
+            }
+            _ => "block".to_owned(),
+        }
+    }
+
     pub fn redact_when_no_rules_from_env() -> bool {
         match std::env::var("SECUREPROMPT_REDACT_WHEN_NO_RULES")
             .ok()
@@ -549,5 +594,52 @@ mod tests {
         assert_eq!(cfg.license_token, "");
 
         clear_license_env();
+    }
+}
+
+#[cfg(test)]
+mod sidecar_unavailable_default_tests {
+    use super::AppConfig;
+
+    /// WS2-3 — the deployment-level escape hatch must open for exactly one
+    /// spelling and stay shut for everything else. A PII gateway must not
+    /// fail open because an operator mistyped an env var.
+    ///
+    /// Single test, sequential asserts on purpose: these mutate process-wide
+    /// environment, so splitting them into separate `#[test]`s would let the
+    /// harness run them concurrently and race.
+    #[test]
+    fn only_the_exact_opt_out_value_disables_fail_closed() {
+        const VAR: &str = "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT";
+
+        std::env::remove_var(VAR);
+        assert_eq!(
+            AppConfig::sidecar_unavailable_default_from_env(),
+            "block",
+            "unset must fail closed"
+        );
+
+        for opt_out in ["degrade_with_alert", "  Degrade_With_Alert  "] {
+            std::env::set_var(VAR, opt_out);
+            assert_eq!(
+                AppConfig::sidecar_unavailable_default_from_env(),
+                "degrade_with_alert",
+                "{opt_out:?} must opt out (trimmed, case-insensitive)"
+            );
+        }
+
+        // Near-misses, a plausible typo, and an unrelated value.
+        for bad in ["degrade", "DEGRADE_WITH_ALERTS", "true", "", "   ", "off"] {
+            std::env::set_var(VAR, bad);
+            assert_eq!(
+                AppConfig::sidecar_unavailable_default_from_env(),
+                "block",
+                "{bad:?} must NOT open the gate"
+            );
+        }
+
+        std::env::set_var(VAR, "block");
+        assert_eq!(AppConfig::sidecar_unavailable_default_from_env(), "block");
+        std::env::remove_var(VAR);
     }
 }

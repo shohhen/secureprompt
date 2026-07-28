@@ -77,6 +77,7 @@ fn build_app_with_keys(pool: PgPool, sk: &SigningKey) -> (AppState, Router) {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig {
             pubkey_b64: vk_b64,
             license_token: String::new(),
@@ -138,6 +139,7 @@ fn build_app_with_sidecar(
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig {
             pubkey_b64: vk_b64,
             license_token: String::new(),

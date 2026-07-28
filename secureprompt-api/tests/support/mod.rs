@@ -46,6 +46,7 @@ pub fn test_config() -> AppConfig {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig::default(),
     }
 }
@@ -69,9 +70,24 @@ pub fn router(pool: PgPool) -> Router {
 /// end-to-end rather than inferred.
 #[allow(dead_code)]
 pub fn router_with(pool: PgPool, sidecar_url: &str, clickhouse_db: &str) -> Router {
+    router_with_default(pool, sidecar_url, clickhouse_db, "block")
+}
+
+/// As `router_with`, but also sets the deployment-level
+/// `sidecar_unavailable_default` (normally from
+/// `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT`) — the operator-facing
+/// off-switch for the fail-closed default.
+#[allow(dead_code)]
+pub fn router_with_default(
+    pool: PgPool,
+    sidecar_url: &str,
+    clickhouse_db: &str,
+    sidecar_unavailable_default: &str,
+) -> Router {
     let ml_sidecar = Arc::new(MlSidecarClient::new(sidecar_url.to_owned(), 500));
     let mut config = test_config();
     config.clickhouse.database = clickhouse_db.to_owned();
+    config.sidecar_unavailable_default = sidecar_unavailable_default.to_owned();
     build_router(AppState::new(
         pool,
         config,

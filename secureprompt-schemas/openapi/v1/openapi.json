@@ -236,6 +236,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/SidecarUnavailable"
           }
         }
       }
@@ -1956,6 +1959,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/BudgetExceededError"
+            }
+          }
+        }
+      },
+      "SidecarUnavailable": {
+        "description": "WS2-3. PII detection coverage was unavailable for this request - the ML sidecar produced no detections, or scanned only part of a long prompt - and the workspace's `sidecar_unavailable` policy is `block`, so the prompt was NOT forwarded to the provider. Retry once the sidecar is healthy, or set `sidecar_unavailable` to `degrade_with_alert` (via `PUT /v1/secure-mode`) to accept answers produced with the deterministic detection floor only.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
             }
           }
         }

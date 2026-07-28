@@ -65,6 +65,15 @@ groups:
           summary: "Gateway served requests with no ML PII coverage ({{ $labels.reason }} / {{ $labels.action }})"
           description: "secureprompt_sidecar_unavailable_total increased by {{ $value | printf \"%.0f\" }} in the last 5 minutes with reason={{ $labels.reason }}. action=degrade_with_alert means requests were answered using the deterministic Rust detection floor ONLY (audit rows carry floor_only = true); action=block means those requests were rejected with 503. Either way the ML sidecar is producing no detection coverage."
 
+      - alert: ClickHouseSchemaStale
+        expr: secureprompt_clickhouse_schema_mismatch_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse schema is behind the API writer on {{ $labels.instance }}"
+          description: "The API's startup schema probe found request_events missing columns it serialises, so EVERY analytics event is being dropped wholesale (all four tables, not just the one with the missing column). ClickHouse migrations are applied by secureprompt-worker at startup — check that the worker is running and has been upgraded to the same version as the API, then restart the API."
+
       - alert: BudgetRedisFailure
         expr: increase(secureprompt_budget_redis_failure_total[10m]) > 0
         for: 5m
