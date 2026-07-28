@@ -13,6 +13,43 @@ ML_SIDECAR_PORT: int = int(os.getenv("ML_SIDECAR_PORT", "8080"))
 INTERNAL_TOKEN: str = os.getenv("ML_SIDECAR_INTERNAL_TOKEN", "")
 MODEL_KEY_REQUIRED: bool = os.getenv("SECUREPROMPT_MODEL_KEY_REQUIRED", "false").lower() in ("1", "true", "yes")
 
+# WS1-5 fix-round: known placeholder/default values that must never be
+# accepted as a real ML_SIDECAR_INTERNAL_TOKEN. Mirrors
+# secureprompt-common/src/config.rs's PLACEHOLDER_SECRETS list (WS1-3's
+# gateway boot gate) so both sides of the internal-token handshake reject
+# the same known-bad values, not just an empty string. Also includes
+# `dev-sidecar-token-change-me`, the literal default docker-compose.yml
+# shipped for ML_SIDECAR_INTERNAL_TOKEN — that value is public knowledge
+# (it's in the repo), so booting on it is exactly as unsafe as the
+# JWT-secret CHANGEME case WS1-3 already guards against. Compared
+# case-insensitively after trimming (see main.py's boot gate).
+PLACEHOLDER_SECRETS = frozenset({
+    "changeme",
+    "change_me",
+    "change-me",
+    "changethis",
+    "change_this",
+    "change-this",
+    "secret",
+    "password",
+    "placeholder",
+    "todo",
+    "xxx",
+    "your-secret-here",
+    "your_secret_here",
+    "replaceme",
+    "replace_me",
+    "dev-sidecar-token-change-me",
+})
+
+# WS1-5 fix-round: gate FastAPI's own /docs, /redoc, /openapi.json routes
+# behind an explicit opt-in. Off (routes not registered at all -> 404) by
+# default; the sidecar's route-enumeration auth test treats these as
+# "FastAPI built-ins, exempt if present" -- with this flag off in
+# production they are simply absent, closing that exposure rather than
+# leaving it open-and-undocumented. Set true only for local/dev exploration.
+ML_SIDECAR_DEBUG: bool = os.getenv("ML_SIDECAR_DEBUG", "false").lower() in ("1", "true", "yes")
+
 # Which fine-tuned NER checkpoint(s) under app/resources/*_ner*/ to load.
 #
 # Several v2/v3/v4 checkpoints ship in the image, but loading all of them runs

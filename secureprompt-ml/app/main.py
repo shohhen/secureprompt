@@ -172,6 +172,21 @@ if not config.INTERNAL_TOKEN:
         "side, which must be set to the same value)."
     )
 
+# Fix-round finding: docker-compose.yml defaulted ML_SIDECAR_INTERNAL_TOKEN
+# to the published placeholder `dev-sidecar-token-change-me`, which sails
+# straight through the "unset/empty" check above and silently defeats the
+# boot gate on a value anyone can read in the repo. Reject known
+# placeholders too — same rationale and (mostly) the same list as the
+# gateway's WS1-3 JwtConfig::PLACEHOLDER_SECRETS.
+if config.INTERNAL_TOKEN.strip().lower() in config.PLACEHOLDER_SECRETS:
+    raise RuntimeError(
+        f"ML_SIDECAR_INTERNAL_TOKEN is set to the placeholder value "
+        f"{config.INTERNAL_TOKEN!r} — refusing to start. Generate a real "
+        "secret (e.g. `openssl rand -hex 32`) and set "
+        "ML_SIDECAR_INTERNAL_TOKEN to it on both the sidecar and the "
+        "gateway (secureprompt-common's LicenseConfig::internal_token)."
+    )
+
 
 def _valid_internal_token(auth_header: str) -> bool:
     """``hmac.compare_digest`` check against ``Bearer <ML_SIDECAR_INTERNAL_TOKEN>``.
@@ -201,7 +216,18 @@ async def _require_internal_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-app = FastAPI(title="SecurePrompt ML Sidecar", lifespan=lifespan)
+# MINOR fix-round finding: FastAPI's own /docs, /redoc, /openapi.json were
+# reachable unauthenticated by default (never explicitly disabled). Gate
+# them behind ML_SIDECAR_DEBUG rather than leaving the exposure accepted —
+# off by default means these routes are never registered at all (404, not
+# just "open"); set ML_SIDECAR_DEBUG=true for local/dev exploration only.
+app = FastAPI(
+    title="SecurePrompt ML Sidecar",
+    lifespan=lifespan,
+    docs_url="/docs" if config.ML_SIDECAR_DEBUG else None,
+    redoc_url="/redoc" if config.ML_SIDECAR_DEBUG else None,
+    openapi_url="/openapi.json" if config.ML_SIDECAR_DEBUG else None,
+)
 
 # Prometheus scrape endpoint. Unauthenticated, matching the API's /metrics
 # (see _require_internal_token's docstring for why this stays exempt).

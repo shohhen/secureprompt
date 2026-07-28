@@ -8,6 +8,15 @@ import { auth } from "@/lib/auth";
 const ML_BASE =
   process.env.ML_SIDECAR_URL?.replace(/\/+$/, "") ?? "http://secureprompt-ml:8080";
 
+// WS1-5 fix-round: the ML sidecar authenticates every route it serves
+// (except /health, /ready, /metrics) via Authorization: Bearer
+// <ML_SIDECAR_INTERNAL_TOKEN>. This proxy is the ONLY thing standing
+// between the browser and the sidecar (browsers can't reach the
+// compose-network hostname directly), so it must attach that shared
+// secret on every forwarded request. Same env var the sidecar itself
+// reads, surfaced on the gateway via LicenseConfig::internal_token.
+const ML_INTERNAL_TOKEN = process.env.ML_SIDECAR_INTERNAL_TOKEN ?? "";
+
 const HOP_BY_HOP = new Set([
   "connection",
   "keep-alive",
@@ -40,9 +49,15 @@ async function forward(
 
   const search = req.nextUrl.search ?? "";
   const target = `${ML_BASE}/${pathParts.join("/")}${search}`;
+  const headers = filterHeaders(req.headers);
+  // Overwrite (never forward) whatever Authorization the browser session
+  // sent — the sidecar only accepts its own shared secret, and passing the
+  // dashboard session's header through would either be ignored or, worse,
+  // leak session material to the sidecar.
+  headers.set("authorization", `Bearer ${ML_INTERNAL_TOKEN}`);
   const init: RequestInit = {
     method: req.method,
-    headers: filterHeaders(req.headers),
+    headers,
     redirect: "manual",
   };
   if (req.method !== "GET" && req.method !== "HEAD") {
