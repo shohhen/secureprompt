@@ -375,6 +375,46 @@ mod tokenize_detection_tests {
         );
     }
 
+    /// Round-3 review: the tokenize → detokenize round-trip must survive
+    /// the overlapping-window fix. `detokenize` restores from the stored
+    /// mapping, so a placeholder whose recorded original does not match the
+    /// bytes it replaced would corrupt the caller's text.
+    #[test]
+    fn tokenize_detokenize_round_trips_over_overlapping_windows() {
+        let text = "ИНН 12345 6789 01234 (ИНН), karta 8600 1234 5678 9012";
+        let detections = tokenize_detections(text, vec![], None);
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let tokenized = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        // Placeholder counters contain digits; strip the `{{...}}` tokens
+        // before checking that no identifier digit survived.
+        let mut visible = tokenized.clone();
+        while let (Some(open), Some(close)) = (visible.find("{{"), visible.find("}}")) {
+            if close < open {
+                break;
+            }
+            visible.replace_range(open..close + 2, "");
+        }
+        assert!(
+            !visible.chars().any(|character| character.is_ascii_digit()),
+            "a digit survived tokenize: {tokenized:?}"
+        );
+
+        // Exactly what the detokenize handler does: rebuild a vault from the
+        // persisted mapping, then restore.
+        let mut restored_vault = TokenVault::default();
+        for (placeholder, original) in mapping {
+            restored_vault.insert(placeholder, original);
+        }
+        assert_eq!(
+            super::restore_content(&tokenized, &restored_vault),
+            text,
+            "detokenize did not reproduce the original text"
+        );
+    }
+
     #[test]
     fn entity_label_filter_still_applies_to_floor_detections() {
         let text = "PINFL 50101901234567 va STIR 300111222";
