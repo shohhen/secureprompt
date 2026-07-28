@@ -25,11 +25,13 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{secure_mode_repo::SecureModeRepository, token_vault_repo::TokenVaultRepository},
+    detection::{detect_content, merge::merge_detections},
     http::{
         api_error_response,
         middleware::jwt_auth::{JwtAuthContext, UserRole},
         routes::dashboard::role::require_role,
     },
+    ml_sidecar::types::MlDetection,
     vault::{apply_redaction, restore_content},
 };
 
@@ -224,10 +226,93 @@ async fn put_secure_mode(
     ))
 }
 
-/// `POST /v1/secure-mode/tokenize` — redact PII in `text` via the ML sidecar
-/// and persist the placeholder→original mapping so the caller can later
-/// detokenize. Returns an empty `tokenized_text` + warning if the sidecar is
-/// unavailable (circuit open / disabled).
+/// Assemble the detection set backing `/tokenize`, then apply the caller's
+/// optional `entity_labels` filter.
+///
+/// The deterministic regex floor runs first and unconditionally. This
+/// endpoint used to source detections from the ML sidecar alone, so a
+/// disabled sidecar, an unreachable one, or an open circuit breaker all
+/// produced the same result: an empty detection set, nothing for
+/// `apply_redaction` to replace, and a cheerful "no PII found" response
+/// carrying the caller's PII back verbatim. Every other detection path
+/// (chat completions, `/v1/redact`, `/v1/policy-check`) already merged the
+/// regex floor in; this one was the outlier.
+fn tokenize_detections(
+    text: &str,
+    ml: Vec<MlDetection>,
+    allowed: Option<&[String]>,
+) -> Vec<Detection> {
+    merge_detections(detect_content(text), ml)
+        .into_iter()
+        .filter(|detection| {
+            allowed.is_none_or(|list| {
+                list.iter()
+                    .any(|label| label.eq_ignore_ascii_case(&detection.class))
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tokenize_detection_tests {
+    use super::tokenize_detections;
+    use crate::ml_sidecar::types::MlDetection;
+
+    fn ml(class: &str, start: usize, end: usize, value: &str) -> MlDetection {
+        MlDetection {
+            class: class.to_owned(),
+            confidence: 0.9,
+            span: Some((start, end)),
+            value: value.to_owned(),
+            compliance_categories: vec![],
+        }
+    }
+
+    /// The leak this guards: `/tokenize` used to build its detection set from
+    /// the ML sidecar ALONE. With the sidecar disabled, unreachable, or its
+    /// circuit breaker open, `detect_if_available` returns an empty vector,
+    /// `apply_redaction` has nothing to replace, and the endpoint answers
+    /// "no PII found" while echoing the caller's PII back verbatim.
+    #[test]
+    fn regex_floor_applies_when_sidecar_returns_nothing() {
+        let detections = tokenize_detections("PINFL 50101901234567", vec![], None);
+        assert!(
+            detections
+                .iter()
+                .any(|detection| detection.class == "PINFL"),
+            "expected the deterministic floor to find the PINFL with no ML \
+             detections, got: {detections:?}"
+        );
+    }
+
+    #[test]
+    fn regex_floor_and_ml_detections_are_merged() {
+        let text = "Ali Aliev, PINFL 50101901234567";
+        let detections = tokenize_detections(text, vec![ml("PERSON", 0, 9, "Ali Aliev")], None);
+        let classes: Vec<_> = detections
+            .iter()
+            .map(|detection| detection.class.as_str())
+            .collect();
+        assert!(classes.contains(&"PERSON"), "got: {classes:?}");
+        assert!(classes.contains(&"PINFL"), "got: {classes:?}");
+    }
+
+    #[test]
+    fn entity_label_filter_still_applies_to_floor_detections() {
+        let text = "PINFL 50101901234567 va STIR 313133128";
+        let allowed = vec!["STIR".to_owned()];
+        let detections = tokenize_detections(text, vec![], Some(&allowed));
+        assert!(
+            detections.iter().all(|detection| detection.class == "STIR"),
+            "filter must apply to regex detections too, got: {detections:?}"
+        );
+        assert_eq!(detections.len(), 1, "got: {detections:?}");
+    }
+}
+
+/// `POST /v1/secure-mode/tokenize` — redact PII in `text` using the
+/// deterministic regex floor merged with the ML sidecar, and persist the
+/// placeholder→original mapping so the caller can later detokenize.
 async fn tokenize(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
@@ -250,19 +335,7 @@ async fn tokenize(
         .entity_labels
         .map(|labels| labels.into_iter().map(|l| l.to_uppercase()).collect());
 
-    let detections: Vec<Detection> = raw
-        .into_iter()
-        .filter(|d| match &allowed {
-            Some(list) => list.iter().any(|l| l.eq_ignore_ascii_case(&d.class)),
-            None => true,
-        })
-        .map(|d| Detection {
-            class: d.class,
-            confidence: d.confidence,
-            span: d.span,
-            value: d.value,
-        })
-        .collect();
+    let detections = tokenize_detections(&body.text, raw, allowed.as_deref());
 
     let mut vault = TokenVault::default();
     let mut mapping: HashMap<String, String> = HashMap::new();
