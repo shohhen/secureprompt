@@ -1,7 +1,5 @@
 use crate::{
-    analytics::events::{
-        LatencySampleRow, PolicyEventRow, RequestEvent, RequestEventRow, TokenUsageRow,
-    },
+    analytics::events::{LatencySampleRow, PolicyEventRow, RequestEvent, RequestEventRow, TokenUsageRow},
     observability::metrics::MetricsRegistry,
 };
 use clickhouse::{Client, Row};
@@ -49,9 +47,11 @@ struct ColumnNameRow {
 /// Runs in a SPAWNED task, concurrently with the consumer loop — never ahead
 /// of it. It is an early-warning that costs nothing on the request path, not
 /// the primary detector: it compares column NAMES only, so a type-level drift
-/// passes it and is caught at `write` instead. Logs an alert-keyed error and raises the
-/// `secureprompt_clickhouse_schema_mismatch` gauge when it does not; the
-/// gauge is lowered again by the first commit that actually inserts rows.
+/// passes it and is caught at `write` instead. Logs an alert-keyed error and
+/// raises the `secureprompt_clickhouse_schema_mismatch` gauge when a column is
+/// missing; the gauge is lowered again by the first `write` the server
+/// validates and accepts — NOT by the commit path, which deliberately does no
+/// schema diagnosis (see the commit site).
 ///
 /// Deliberately non-fatal: a ClickHouse that is merely slow to come up must
 /// not take the gateway down with it, and the analytics path is best-effort
@@ -300,6 +300,18 @@ impl AnalyticsHandle {
                         }
                         // The retry succeeded: whatever it was, we are writing
                         // again, so the schema is compatible.
+                        //
+                        // NOT COVERED BY ANY TEST, deliberately recorded here
+                        // rather than claimed. Every path that reaches this
+                        // line also reaches the write-success arm above on the
+                        // NEXT event, which clears the gauge identically, so
+                        // deleting this line reddens nothing. Reaching it in a
+                        // test needs the table to become compatible inside the
+                        // 500ms retry window — a race, and a flaky test is
+                        // worse than an honest gap. It is kept because without
+                        // it a gateway whose traffic stops right after a
+                        // recovered retry would hold the gauge raised
+                        // indefinitely.
                         metrics_task.clear_clickhouse_schema_mismatch();
                     }
                 }
@@ -338,15 +350,27 @@ impl AnalyticsHandle {
                     metrics_task.record_clickhouse_insert_failure();
                 }
 
-                // Commit failures are counted, not diagnosed. A commit error
-                // is far more often a timeout / reset / overload than a schema
-                // problem, and the schema signal is now taken from the write
-                // path where `SchemaMismatch` is actually distinguishable.
-                // Raising a CRITICAL "run your migrations" alert from here
-                // would page an operator for a transient blip.
+                // Commit failures are counted, never DIAGNOSED. A commit
+                // error is far more often a timeout / reset / overload than a
+                // schema problem, and diagnosing schema here is what produced
+                // a CRITICAL "run your migrations" page for a transient blip.
+                //
+                // But it must not be a dead end either. `InsertMetadata` is
+                // fetched once and only invalidated on `SchemaMismatch`, so a
+                // table that drifts AFTER a write has already succeeded keeps
+                // validating against the warm cache: no `SchemaMismatch` is
+                // ever raised, the failure lands here, and the gauge stays
+                // clear while 100% of rows are lost.
+                //
+                // Dropping the cached metadata reclassifies the problem
+                // instead of classifying it here: the next `write` re-DESCRIBEs
+                // the table and, if the layout really is incompatible, fails
+                // with `SchemaMismatch` on the path that already handles it.
+                // A transient error costs one extra DESCRIBE and nothing else.
                 if let Err(e) = req_inserter.commit().await {
                     tracing::error!(error = %e, "request_events inserter commit error");
                     metrics_task.record_clickhouse_insert_failure();
+                    ch_client.clear_cached_metadata().await;
                 }
                 if let Err(e) = pol_inserter.commit().await {
                     tracing::error!(error = %e, "policy_events inserter commit error");

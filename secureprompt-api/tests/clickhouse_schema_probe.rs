@@ -42,6 +42,23 @@ async fn exec_in(database: &str, sql: &str) {
     );
 }
 
+/// Run a query against `database` and return its body.
+async fn query_in(database: &str, sql: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("{}/?database={database}", ch_url()))
+        .body(sql.to_owned())
+        .send()
+        .await
+        .expect("ClickHouse must be reachable — set CLICKHOUSE_URL (see the task env)");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "clickhouse query failed ({status}): {body}\nsql: {sql}"
+    );
+    body
+}
+
 /// Scratch database that drops itself even if the test panics.
 ///
 /// Without this, a panic between CREATE and DROP leaks `sp_probe_*` databases
@@ -57,11 +74,18 @@ impl ScratchDb {
         Self { name }
     }
 
-    /// Clone the REAL production table, so RowBinary inserts actually
+    /// Clone the REAL production tables, so RowBinary inserts actually
     /// succeed. A hand-rolled all-`String` table cannot accept the typed
     /// values `RequestEventRow` serialises (UUID, u32, DateTime), so a commit
     /// against one always fails and could never demonstrate the gauge
     /// clearing.
+    ///
+    /// ALL FOUR analytics tables are cloned, not just `request_events`. The
+    /// writer also writes `token_usage` on every event, so a scratch database
+    /// containing only `request_events` produces one unrelated insert failure
+    /// per event — which silently poisons any premise assertion about writes
+    /// succeeding. (Found exactly that way: `healthy_schema_leaves_the_gauge_clear`
+    /// reported 4 failures for 4 events against an otherwise perfect table.)
     async fn create_request_events_like_production(&self) {
         // Apply ClickHouse migration 006 first: the source table needs
         // `floor_only` or the clone inherits a stale schema. Idempotent, and
@@ -77,11 +101,18 @@ impl ScratchDb {
                 exec_in("sp_analytics", statement.trim()).await;
             }
         }
-        exec(&format!(
-            "CREATE TABLE IF NOT EXISTS {}.request_events AS sp_analytics.request_events",
-            self.name
-        ))
-        .await;
+        for table in [
+            "request_events",
+            "policy_events",
+            "latency_samples",
+            "token_usage",
+        ] {
+            exec(&format!(
+                "CREATE TABLE IF NOT EXISTS {}.{table} AS sp_analytics.{table}",
+                self.name
+            ))
+            .await;
+        }
     }
 
     /// Production shape, minus one column. Everything else keeps its real
@@ -95,6 +126,19 @@ impl ScratchDb {
             &format!("ALTER TABLE request_events DROP COLUMN IF EXISTS {column}"),
         )
         .await;
+    }
+
+    /// Poll until at least `min` rows are visible in `request_events`. The
+    /// inserter batches (100 rows / 1s), so rows are not visible immediately.
+    async fn await_row_count(&self, min: u64) -> bool {
+        for _ in 0..60 {
+            let out = query_in(&self.name, "SELECT count() FROM request_events").await;
+            if out.trim().parse::<u64>().unwrap_or(0) >= min {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
     }
 
     async fn create_request_events(&self, columns: &[&str]) {
@@ -405,11 +449,36 @@ async fn healthy_schema_leaves_the_gauge_clear() {
 
     let metrics = Arc::new(MetricsRegistry::default());
     let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
+    // The inserter batches at 100 rows / 1s, and `commit()` only runs inside a
+    // loop iteration — so a burst of 4 events buffers and never lands. Drive
+    // past the batch period and then send more, so a commit actually fires.
     for _ in 0..4 {
         handle.enqueue(sample_event(), metrics.as_ref()).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    for _ in 0..2 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
 
+    // PREMISE, added after this test was found vacuous: "the gauge is 0" is
+    // also true of a writer that never touched ClickHouse at all, so without
+    // this the test cannot tell "healthy" from "completely broken" and no
+    // mutation of the schema logic reddens it.
+    assert!(
+        metrics.analytics_consumed_count() >= 1,
+        "premise: the writer must have consumed events, or a clear gauge \
+         proves nothing"
+    );
+    assert_eq!(
+        metrics.clickhouse_insert_failure_count(),
+        0,
+        "premise: no insert may fail against a production-shaped schema"
+    );
+    assert!(
+        db.await_row_count(1).await,
+        "premise: rows must actually have landed in request_events"
+    );
     assert_eq!(
         metrics.clickhouse_schema_mismatch_count(),
         0,
@@ -504,5 +573,71 @@ async fn writer_recovers_after_the_schema_is_migrated() {
         cleared,
         "the writer must notice the migrated schema without an API restart; \
          cached InsertMetadata has to be invalidated"
+    );
+}
+
+/// Fix round 5 — schema drift AFTER the metadata cache is warm.
+///
+/// `InsertMetadata` is fetched once per table and, before this round, dropped
+/// only on `SchemaMismatch`. So a table that becomes incompatible AFTER a
+/// write has already succeeded kept validating against the warm cache: no
+/// `SchemaMismatch` was ever raised, the failure surfaced at `commit()` —
+/// where this task deliberately does no schema diagnosis — and the gauge
+/// stayed clear while 100% of rows were lost.
+///
+/// The fix is not to diagnose at commit (that produced a false CRITICAL page
+/// for transient blips) but to INVALIDATE the cache there, so the next write
+/// re-DESCRIBEs and reclassifies through the path that already works.
+///
+/// Deletion check: removing `ch_client.clear_cached_metadata().await` from the
+/// commit-error arm turns this red.
+#[tokio::test]
+async fn drift_after_a_warm_cache_still_raises_the_gauge() {
+    let db = ScratchDb::create("sp_probe_drift").await;
+    db.create_request_events_like_production().await;
+
+    let metrics = Arc::new(MetricsRegistry::default());
+    let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
+
+    // Warm the cache with traffic that genuinely succeeds.
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        metrics.analytics_consumed_count() >= 1,
+        "premise: the writer must be running"
+    );
+    assert_eq!(
+        metrics.clickhouse_schema_mismatch_count(),
+        0,
+        "premise: the schema is good and the cache is warm"
+    );
+
+    // The table drifts underneath us.
+    exec_in(
+        &db.name,
+        "ALTER TABLE request_events DROP COLUMN floor_only",
+    )
+    .await;
+
+    for _ in 0..12 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    let mut raised = false;
+    for _ in 0..60 {
+        if metrics.clickhouse_schema_mismatch_count() == 1 {
+            raised = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        raised,
+        "drift after the cache is warm must still surface as a schema signal; \
+         insert_failures={}",
+        metrics.clickhouse_insert_failure_count()
     );
 }

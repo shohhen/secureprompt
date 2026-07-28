@@ -72,7 +72,7 @@ groups:
           severity: critical
         annotations:
           summary: "ClickHouse schema is behind the API writer on {{ $labels.instance }}"
-          description: "The API's startup schema probe found request_events missing columns it serialises, so EVERY analytics event is being dropped wholesale (all four tables, not just the one with the missing column). ClickHouse migrations are applied by secureprompt-worker at startup — check that the worker is running and has been upgraded to the same version as the API. This is a gauge and clears itself as soon as an insert lands, so no restart is needed once the worker has migrated."
+          description: "request_events does not match the row layout the API writes, so EVERY analytics event is being dropped wholesale (all four tables, not just the one with the missing column). Raised either by the startup schema probe (missing columns) or by a write the server rejected with SchemaMismatch (which also catches type-level drift the probe cannot see). ClickHouse migrations are applied by secureprompt-worker at startup — check that the worker is running and has been upgraded to the same version as the API. This is a gauge: it clears itself as soon as a write is validated and accepted, so no restart is needed once the worker has migrated."
 
       - alert: BudgetRedisFailure
         expr: increase(secureprompt_budget_redis_failure_total[10m]) > 0
