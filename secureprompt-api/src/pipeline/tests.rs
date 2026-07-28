@@ -710,3 +710,54 @@ mod fail_closed_audit_redaction_tests {
         );
     }
 }
+
+/// Fix round 4 — PRE-EXISTING bug (byte-identical at 62dcc33, not introduced
+/// by WS2-3, but it corrupts what reaches the provider so it is fixed here).
+///
+/// On an unterminated `[[sp:v=` marker, `strip_file_vault_markers` had already
+/// pushed `rest[..idx]` and then pushed the whole of `rest` again, duplicating
+/// the text before the marker. `preload_file_vault` mutates the prompt sent to
+/// detection AND forwarded upstream, so a user typing a bare `[[sp:v=`
+/// duplicated part of their own prompt to the provider.
+#[cfg(test)]
+mod file_vault_marker_tests {
+    use crate::pipeline::service::strip_file_vault_markers;
+
+    /// THE BUG: measured before the fix as
+    /// `"hello hello [[sp:v=abc"`.
+    #[test]
+    fn unterminated_marker_keeps_the_text_verbatim() {
+        let (cleaned, refs) = strip_file_vault_markers("hello [[sp:v=abc");
+        assert_eq!(
+            cleaned, "hello [[sp:v=abc",
+            "an unterminated marker must be preserved verbatim, not duplicated"
+        );
+        assert!(refs.is_empty(), "an unterminated marker yields no ref");
+    }
+
+    /// POSITIVE CONTROL that must differ: a well-formed marker IS removed and
+    /// its ref collected. Without this, "cleaned == input" would be satisfied
+    /// by a stripper that does nothing at all.
+    #[test]
+    fn terminated_marker_is_stripped_and_its_ref_collected() {
+        let (cleaned, refs) = strip_file_vault_markers("hello [[sp:v=abc]] world");
+        assert_eq!(cleaned, "hello  world");
+        assert_eq!(refs, vec!["abc".to_owned()]);
+    }
+
+    /// Text after a well-formed marker but before an unterminated one must
+    /// survive exactly once — the duplication bug compounds across iterations.
+    #[test]
+    fn mixed_markers_do_not_duplicate_the_tail() {
+        let (cleaned, refs) = strip_file_vault_markers("a[[sp:v=1]]b[[sp:v=2c");
+        assert_eq!(cleaned, "ab[[sp:v=2c");
+        assert_eq!(refs, vec!["1".to_owned()]);
+    }
+
+    #[test]
+    fn no_marker_is_a_passthrough() {
+        let (cleaned, refs) = strip_file_vault_markers("nothing to see here");
+        assert_eq!(cleaned, "nothing to see here");
+        assert!(refs.is_empty());
+    }
+}

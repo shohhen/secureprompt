@@ -495,6 +495,16 @@ impl MetricsRegistry {
         self.analytics_dropped_total.load(Ordering::Relaxed)
     }
 
+    /// ClickHouse insert failures so far.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs` to assert the premise that
+    /// writes really are failing before concluding anything about WHY.
+    #[must_use]
+    pub fn clickhouse_insert_failure_count(&self) -> u64 {
+        self.clickhouse_insert_failures_total
+            .load(Ordering::Relaxed)
+    }
+
     /// 1 when the schema is known-stale, 0 otherwise.
     ///
     /// Read by `tests/clickhouse_schema_probe.rs`; the gauge is also exported

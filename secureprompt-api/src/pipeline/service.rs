@@ -1419,13 +1419,25 @@ const FILE_VAULT_MARKER_CLOSE: &str = "]]";
 /// the refs found, in order.
 ///
 /// Extracted from `preload_file_vault` so that the span arithmetic in
-/// `last_user_message_span` strips EXACTLY what the request path strips.
-/// `preload_file_vault` mutates the prompt before detection runs, so
+/// `last_user_message_span` applies the same stripping rules as the request
+/// path. `preload_file_vault` mutates the prompt before detection runs, so
 /// detection offsets are relative to the cleaned text; measuring message
 /// lengths against the raw text instead shifts every span by each preceding
 /// marker's byte length. Two copies of this loop would be one refactor away
 /// from silently disagreeing again.
-fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
+///
+/// NOT a perfect equivalence, and the difference is deliberate to state:
+/// `preload_file_vault` strips the JOINED prompt, while
+/// `last_user_message_span` strips PER MESSAGE. A marker split across the
+/// `\n` join (`"…[[sp:v="` ending one message, `"ref]]"` opening the next) is
+/// therefore stripped by the join-path and NOT by the per-message path, so
+/// the two disagree on offsets for that input. It fails safe: the value guard
+/// in `redact_last_user_message_with` sees mismatched bytes and drops the
+/// detection, so the audit row's `redacted_prompt` shows that text unredacted
+/// rather than redacting the wrong bytes. `raw_prompt` stores the message raw
+/// regardless, so this is not an incremental disclosure — but it IS one fewer
+/// redaction in the audit view for a genuinely pathological input.
+pub(crate) fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
     let mut cleaned = String::with_capacity(text.len());
     let mut rest = text;
@@ -1441,8 +1453,14 @@ fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
                 rest = &after[end + FILE_VAULT_MARKER_CLOSE.len()..];
             }
             None => {
-                // Unterminated marker - keep the remaining text verbatim.
-                cleaned.push_str(rest);
+                // Unterminated marker: keep the remainder verbatim, starting
+                // at the marker. `rest[..idx]` was already pushed above, so
+                // pushing all of `rest` here duplicated the text before the
+                // marker — and since `preload_file_vault` mutates the prompt
+                // that is both scanned AND forwarded upstream, a user typing a
+                // bare `[[sp:v=` duplicated part of their own prompt to the
+                // provider.
+                cleaned.push_str(&rest[idx..]);
                 rest = "";
                 break;
             }

@@ -84,6 +84,19 @@ impl ScratchDb {
         .await;
     }
 
+    /// Production shape, minus one column. Everything else keeps its real
+    /// type, so `ALTER TABLE ... ADD COLUMN` genuinely repairs the layout —
+    /// unlike the all-`String` fixture, where adding `floor_only` leaves every
+    /// other column still mistyped and `to_row` still failing.
+    async fn create_request_events_missing(&self, column: &str) {
+        self.create_request_events_like_production().await;
+        exec_in(
+            &self.name,
+            &format!("ALTER TABLE request_events DROP COLUMN IF EXISTS {column}"),
+        )
+        .await;
+    }
+
     async fn create_request_events(&self, columns: &[&str]) {
         let cols = columns
             .iter()
@@ -277,26 +290,25 @@ async fn writer_consumes_against_a_healthy_clickhouse() {
     );
 }
 
-/// Fix round 3, BLOCKER 1 — the schema gauge must be settled by `commit()`,
-/// never by `write()`.
+/// A gauge raised by the startup probe must be lowered once writes actually
+/// succeed — that is how the system self-heals without an API restart.
 ///
-/// `Inserter::write` only serialises into a local buffer (clickhouse 0.15
-/// `do_write` is synchronous, no server round-trip), so the server cannot
-/// have rejected a stale schema at that point. Clearing on `write` — which
-/// this code did briefly — cleared the gauge for the first ENQUEUED event
-/// regardless of schema state, leaving `ClickHouseSchemaStale` unable to fire
-/// on any gateway carrying traffic. Stuck-clear, which is worse than the
-/// latch it replaced.
+/// This replaces a round-3 test that asserted the opposite ("a buffered write
+/// proves nothing about the schema; the gauge must stay raised"). That
+/// assertion encoded the wrong model of the client: with validation enabled —
+/// which is our configuration — a successful `write` has already round-tripped
+/// a DESCRIBE and validated the row layout, so it proves precisely what the
+/// old test denied.
 ///
-/// Deletion check: reverting the match to `Ok(_) => {}` (clear-on-write
-/// behaviour restored) turns this red.
+/// Deletion check: removing the `clear_clickhouse_schema_mismatch()` on the
+/// write-success arm turns this red.
 #[tokio::test]
-async fn gauge_clears_only_after_a_commit_that_inserted_rows() {
+async fn a_successful_write_lowers_a_probe_raised_gauge() {
     let db = ScratchDb::create("sp_probe_gauge").await;
     db.create_request_events_like_production().await;
 
     let metrics = Arc::new(MetricsRegistry::default());
-    // Simulate the startup probe having found a stale schema.
+    // Simulate the startup probe having flagged a stale schema.
     metrics.record_clickhouse_schema_mismatch();
     assert_eq!(
         metrics.clickhouse_schema_mismatch_count(),
@@ -305,21 +317,9 @@ async fn gauge_clears_only_after_a_commit_that_inserted_rows() {
     );
 
     let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
-
-    // One event: buffered only. `commit()` returns Quantities::ZERO until the
-    // batch limits (100 rows / 1s) are reached, so nothing has been validated
-    // by the server yet.
-    handle.enqueue(sample_event(), metrics.as_ref()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    assert_eq!(
-        metrics.clickhouse_schema_mismatch_count(),
-        1,
-        "a buffered write proves nothing about the schema; the gauge must stay raised"
-    );
-
-    // Past the 1s batch period, the next loop iteration commits for real.
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    handle.enqueue(sample_event(), metrics.as_ref()).await;
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+    }
 
     let mut cleared = false;
     for _ in 0..40 {
@@ -331,7 +331,178 @@ async fn gauge_clears_only_after_a_commit_that_inserted_rows() {
     }
     assert!(
         cleared,
-        "a commit that actually inserted rows proves the schema is compatible \
-         and must lower the gauge"
+        "a write the server validated and accepted must lower the gauge"
+    );
+}
+
+// ── Fix round 4: where a stale schema actually surfaces ───────────────────
+//
+// Round 3 put the gauge logic on the commit path on the strength of reading
+// `Inserter::write` in the crate source and concluding it was buffer-only.
+// That reading ignored OUR configuration: `build_clickhouse_client` never
+// calls `.with_validation(false)` and clickhouse 0.15 defaults validation to
+// true, so `write` -> `init_insert` -> `insert_unescaped` -> a DESCRIBE
+// round-trip -> `to_row::<T>()` -> `Error::SchemaMismatch`. The stale schema
+// errors at WRITE, and the `continue` on the retry path skips the commit
+// block entirely, so the gauge was never touched.
+
+/// A stale table must raise the gauge, from the write path.
+///
+/// Deletion check: removing the `SchemaMismatch` arm turns this red.
+#[tokio::test]
+async fn stale_schema_raises_the_gauge_from_the_write_path() {
+    // All the right column NAMES, all the wrong TYPES. The startup probe only
+    // compares names, so it passes; `to_row::<RequestEventRow>()` still fails
+    // because UUID/u32/DateTime cannot be written into String columns.
+    //
+    // This isolation matters: with a missing-column table BOTH the probe and
+    // the write path raise the gauge, so the test would pass even with the
+    // write path doing nothing — which is precisely how the first draft of
+    // this test passed against the unfixed code.
+    let db = ScratchDb::create("sp_probe_writepath").await;
+    db.create_request_events(REQUEST_EVENTS_COLUMNS).await;
+
+    let metrics = Arc::new(MetricsRegistry::default());
+
+    // Premise: the PROBE is satisfied by this table, so anything the gauge
+    // reports afterwards came from the write path.
+    verify_request_events_schema(&build_clickhouse_client(&ch_url(), &db.name), &metrics).await;
+    assert_eq!(
+        metrics.clickhouse_schema_mismatch_count(),
+        0,
+        "premise: the name-based probe must NOT flag this table, so the write \
+         path is the only thing that can raise the gauge"
+    );
+
+    let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+    }
+
+    let mut raised = false;
+    for _ in 0..40 {
+        if metrics.clickhouse_schema_mismatch_count() == 1 {
+            raised = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        raised,
+        "a row layout the server rejects must raise the schema gauge; \
+         insert_failures={}",
+        metrics.clickhouse_insert_failure_count()
+    );
+}
+
+/// POSITIVE CONTROL that must differ: the same traffic against a
+/// production-shaped table must leave the gauge at 0. Without this, "the gauge
+/// is 1" would be satisfied by code that raises it on any write at all.
+#[tokio::test]
+async fn healthy_schema_leaves_the_gauge_clear() {
+    let db = ScratchDb::create("sp_probe_writepath_ok").await;
+    db.create_request_events_like_production().await;
+
+    let metrics = Arc::new(MetricsRegistry::default());
+    let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    assert_eq!(
+        metrics.clickhouse_schema_mismatch_count(),
+        0,
+        "a compatible schema must never raise the gauge"
+    );
+}
+
+/// A TRANSPORT failure is not a schema failure. Round 3 raised the gauge on
+/// any commit error, which would page an operator with a CRITICAL "run your
+/// migrations" alert for a 5s insert timeout or a connection reset.
+///
+/// Deletion check: removing the `SchemaMismatch` discrimination (raising on
+/// every write error) turns this red.
+#[tokio::test]
+async fn transport_failure_does_not_raise_the_schema_gauge() {
+    // Nothing listening.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let metrics = Arc::new(MetricsRegistry::default());
+    let handle = AnalyticsHandle::new(metrics.clone(), &format!("http://{addr}"), "default");
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    assert!(
+        metrics.clickhouse_insert_failure_count() > 0,
+        "premise: the writes must actually be failing, or this proves nothing"
+    );
+    assert_eq!(
+        metrics.clickhouse_schema_mismatch_count(),
+        0,
+        "an unreachable ClickHouse is a transport problem, not a stale schema; \
+         raising a CRITICAL migrations alert here is a false page"
+    );
+}
+
+/// The writer must recover once the worker runs the migration, without an API
+/// restart. `InsertMetadata` is cached per table, so without an explicit
+/// `clear_cached_metadata()` the client keeps validating against the schema it
+/// fetched at startup and can never notice the new column.
+///
+/// Deletion check: removing the `clear_cached_metadata().await` call turns
+/// this red.
+#[tokio::test]
+async fn writer_recovers_after_the_schema_is_migrated() {
+    let db = ScratchDb::create("sp_probe_recover").await;
+    db.create_request_events_missing("floor_only").await;
+
+    let metrics = Arc::new(MetricsRegistry::default());
+    let handle = AnalyticsHandle::new(metrics.clone(), &ch_url(), &db.name);
+
+    for _ in 0..4 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+    }
+    let mut raised = false;
+    for _ in 0..40 {
+        if metrics.clickhouse_schema_mismatch_count() == 1 {
+            raised = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        raised,
+        "premise: the gauge must be raised before recovery is meaningful"
+    );
+
+    // The worker runs its migration.
+    exec_in(
+        &db.name,
+        "ALTER TABLE request_events ADD COLUMN IF NOT EXISTS floor_only Bool DEFAULT false",
+    )
+    .await;
+
+    for _ in 0..8 {
+        handle.enqueue(sample_event(), metrics.as_ref()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    let mut cleared = false;
+    for _ in 0..60 {
+        if metrics.clickhouse_schema_mismatch_count() == 0 {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        cleared,
+        "the writer must notice the migrated schema without an API restart; \
+         cached InsertMetadata has to be invalidated"
     );
 }

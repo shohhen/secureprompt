@@ -1,5 +1,7 @@
 use crate::{
-    analytics::events::{LatencySampleRow, PolicyEventRow, RequestEvent, RequestEventRow, TokenUsageRow},
+    analytics::events::{
+        LatencySampleRow, PolicyEventRow, RequestEvent, RequestEventRow, TokenUsageRow,
+    },
     observability::metrics::MetricsRegistry,
 };
 use clickhouse::{Client, Row};
@@ -42,7 +44,12 @@ struct ColumnNameRow {
 }
 
 /// One-shot startup check that the live `request_events` table has every
-/// column the writer serialises. Logs an alert-keyed error and raises the
+/// column the writer serialises.
+///
+/// Runs in a SPAWNED task, concurrently with the consumer loop — never ahead
+/// of it. It is an early-warning that costs nothing on the request path, not
+/// the primary detector: it compares column NAMES only, so a type-level drift
+/// passes it and is caught at `write` instead. Logs an alert-keyed error and raises the
 /// `secureprompt_clickhouse_schema_mismatch` gauge when it does not; the
 /// gauge is lowered again by the first commit that actually inserts rows.
 ///
@@ -105,8 +112,11 @@ const BATCH_MAX_ROWS: u64 = 100;
 const BATCH_PERIOD_SECS: u64 = 1;
 const INSERT_TIMEOUT_SECS: u64 = 5;
 const INSERT_SEND_TIMEOUT_SECS: u64 = 20;
-/// Wall-clock bound on the one-shot startup schema probe. Must exist: the
-/// probe runs before the consumer loop starts draining the channel.
+/// Wall-clock bound on the one-shot startup schema probe.
+///
+/// The probe is spawned, not awaited, so it no longer gates the consumer
+/// loop. This bound remains so a blackholed ClickHouse cannot leak the probe
+/// task for the lifetime of the process.
 const SCHEMA_PROBE_TIMEOUT_SECS: u64 = 10;
 
 pub fn build_clickhouse_client(url: &str, database: &str) -> Client {
@@ -218,24 +228,79 @@ impl AnalyticsHandle {
                 let now = chrono::Utc::now();
                 let req_row = RequestEventRow::from_event(&event, now);
 
-                if let Err(e) = req_inserter.write(&req_row).await {
-                    tracing::warn!(error = %e, "request_events write error; retrying once");
+                // Schema-staleness gauge lives on THIS path, because this is
+                // where a stale schema actually surfaces.
+                //
+                // `build_clickhouse_client` does not call
+                // `.with_validation(false)`, and clickhouse 0.15 defaults
+                // validation to ON. So the first `write` of each batch runs
+                // `init_insert` -> `Client::insert_unescaped` ->
+                // `get_insert_metadata` (a DESCRIBE round-trip) ->
+                // `to_row::<T>()`, and a table whose layout does not match
+                // `RequestEventRow` fails HERE with `Error::SchemaMismatch` —
+                // never reaching the commit below, because the retry path
+                // `continue`s past it.
+                //
+                // If validation is ever disabled, this detection disappears
+                // silently: writes would buffer without contacting the server
+                // and the mismatch would only appear at commit. Keep the two
+                // together.
+                match req_inserter.write(&req_row).await {
+                    Ok(()) => {
+                        // With validation ON, a successful write means the
+                        // server described the table and our row layout was
+                        // accepted. That is the only positive proof of schema
+                        // compatibility available, so it is what lowers the
+                        // gauge (including one raised by the startup probe).
+                        metrics_task.clear_clickhouse_schema_mismatch();
+                    }
+                    Err(e) => {
+                        let schema_mismatch =
+                            matches!(e, clickhouse::error::Error::SchemaMismatch(_));
+                        if schema_mismatch {
+                            tracing::error!(
+                                alert = "clickhouse_schema_stale",
+                                table = "request_events",
+                                error = %e,
+                                "request_events rejected our row layout — run the ClickHouse \
+                                 migrations (secureprompt-worker applies them at startup); \
+                                 analytics events are being dropped until then"
+                            );
+                            metrics_task.record_clickhouse_schema_mismatch();
+                            // `InsertMetadata` is cached per table for the
+                            // lifetime of the client. Without this the writer
+                            // keeps validating against the schema it fetched
+                            // the first time and can NEVER notice the worker's
+                            // migration — the gauge, and the outage, would
+                            // persist until an API restart.
+                            ch_client.clear_cached_metadata().await;
+                        } else {
+                            // Transport error, timeout, ClickHouse overload.
+                            // Deliberately NOT a schema signal: raising the
+                            // CRITICAL "run your migrations" alert for a
+                            // connection reset is a false page.
+                            tracing::warn!(error = %e, "request_events write error; retrying once");
+                        }
 
-                    metrics_task.record_clickhouse_insert_retry();
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if let Err(e2) = req_inserter.write(&req_row).await {
-                        tracing::error!(error = %e2, "request_events write failed after retry; dropping");
-                        metrics_task.record_clickhouse_insert_failure();
-                        // Retry exhausted: this event (request_events row +
-                        // everything downstream in this loop iteration —
-                        // policy_events/latency_samples/token_usage — is
-                        // abandoned wholesale via `continue`. Distinct from
-                        // `record_analytics_drop()` (buffer-full backpressure
-                        // in `enqueue`, event never entered the channel):
-                        // this event WAS dequeued but a real, non-retryable
-                        // write failure abandoned it.
-                        metrics_task.record_analytics_failure();
-                        continue;
+                        metrics_task.record_clickhouse_insert_retry();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Err(e2) = req_inserter.write(&req_row).await {
+                            tracing::error!(error = %e2, "request_events write failed after retry; dropping");
+                            metrics_task.record_clickhouse_insert_failure();
+                            // Retry exhausted: this event (request_events row +
+                            // everything downstream in this loop iteration —
+                            // policy_events/latency_samples/token_usage — is
+                            // abandoned wholesale via `continue`. Distinct from
+                            // `record_analytics_drop()` (buffer-full backpressure
+                            // in `enqueue`, event never entered the channel):
+                            // this event WAS dequeued but a real, non-retryable
+                            // write failure abandoned it.
+                            metrics_task.record_analytics_failure();
+                            continue;
+                        }
+                        // The retry succeeded: whatever it was, we are writing
+                        // again, so the schema is compatible.
+                        metrics_task.clear_clickhouse_schema_mismatch();
                     }
                 }
 
@@ -273,34 +338,15 @@ impl AnalyticsHandle {
                     metrics_task.record_clickhouse_insert_failure();
                 }
 
-                // Schema-staleness gauge, settled HERE and nowhere else.
-                //
-                // `Inserter::write` only serialises into a local buffer
-                // (clickhouse 0.15 `do_write` is synchronous, no server
-                // round-trip), so the server never sees a stale schema until
-                // a commit actually ships rows. Clearing the gauge on `write`
-                // - as this code did briefly - cleared it for the first
-                // ENQUEUED event regardless of schema state, and a failing
-                // commit never re-set it, so `ClickHouseSchemaStale` could
-                // not fire on any gateway carrying traffic. Stuck-clear is
-                // strictly worse than the latch it replaced.
-                //
-                // `commit()` returns `Quantities::ZERO` when the batch limits
-                // are not yet reached (nothing was sent), so `rows > 0` is
-                // the only proof that ClickHouse accepted our row layout.
-                match req_inserter.commit().await {
-                    Ok(quantities) if quantities.rows > 0 => {
-                        metrics_task.clear_clickhouse_schema_mismatch();
-                    }
-                    Ok(_) => { /* buffered only; proves nothing either way */ }
-                    Err(e) => {
-                        tracing::error!(error = %e, "request_events inserter commit error");
-                        metrics_task.record_clickhouse_insert_failure();
-                        // A rejected commit is the symptom of a stale schema,
-                        // so re-raise the gauge even if a probe never ran or
-                        // an earlier commit had cleared it.
-                        metrics_task.record_clickhouse_schema_mismatch();
-                    }
+                // Commit failures are counted, not diagnosed. A commit error
+                // is far more often a timeout / reset / overload than a schema
+                // problem, and the schema signal is now taken from the write
+                // path where `SchemaMismatch` is actually distinguishable.
+                // Raising a CRITICAL "run your migrations" alert from here
+                // would page an operator for a transient blip.
+                if let Err(e) = req_inserter.commit().await {
+                    tracing::error!(error = %e, "request_events inserter commit error");
+                    metrics_task.record_clickhouse_insert_failure();
                 }
                 if let Err(e) = pol_inserter.commit().await {
                     tracing::error!(error = %e, "policy_events inserter commit error");
