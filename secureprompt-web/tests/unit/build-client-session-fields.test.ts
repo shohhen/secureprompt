@@ -6,16 +6,37 @@
  * token is long-lived (`refreshExpiresAt` can be days out); if it leaked to
  * the browser an attacker could mint fresh access tokens indefinitely.
  *
- * `buildClientSessionFields` (src/lib/auth-refresh.ts) is the pure function
- * the real NextAuth `session` callback (src/lib/auth.ts) delegates to for
- * shaping the JWT into what lands on the session. This test snapshots its
- * output and asserts no `refreshToken` key is present. It is deliberately
- * NOT a test of `auth.ts`'s `session` callback directly: importing
+ * SCOPE OF THIS FILE: this tests `buildClientSessionFields` in
+ * `src/lib/auth-refresh.ts` ONLY — the pure function that shapes an `AppJWT`
+ * into the fields the NextAuth `session` callback copies onto the session
+ * object. It asserts that function's output never carries a `refreshToken`
+ * key or value. It does NOT exercise the `session` callback itself (the
+ * wiring in `src/lib/auth.ts` that calls `buildClientSessionFields` and
+ * assigns its fields onto `session.*`) — see "what actually guards the
+ * callback" below for why, and what covers that gap instead.
+ *
+ * Why not test `auth.ts`'s `session` callback directly: importing
  * `@/lib/auth` under Vitest throws (`next-auth` pulls in `next/server`,
  * which Vitest's pure-Node-ESM resolver can't load) — confirmed by hand
- * before writing this file. `buildClientSessionFields` is next-auth-free by
- * design (same reason `auth-refresh.ts` exists at all — see its module
- * doc), so it is the only place this behavior can be unit tested directly.
+ * before writing this file, and the same constraint `tests/unit/auth.test.ts`
+ * works around by testing `auth-refresh.ts` exports instead of `auth.ts`
+ * directly. `buildClientSessionFields` is next-auth-free by design (same
+ * reason `auth-refresh.ts` exists at all — see its module doc), so it is the
+ * only place this behavior can be unit tested directly.
+ *
+ * What actually guards the callback wiring itself (i.e. what stops a future
+ * `session.refreshToken = appToken.refreshToken` from being re-added inside
+ * `auth.ts`'s `session` callback), since this file cannot:
+ *   1. The `Session` interface augmentation in `src/types/next-auth.d.ts`
+ *      (the `AppSessionShape` it extends) has no `refreshToken` field. TS
+ *      structurally rejects assigning that key to `session.*`.
+ *   2. CI's `frontend` job ("Frontend build + type check" in
+ *      `.github/workflows/ci.yml`) runs `pnpm exec tsc --noEmit` as its
+ *      "Type check" step. Re-introducing the assignment is therefore a
+ *      compile error caught in CI, not a silent runtime leak.
+ * A reviewer verified both of the above by hand. This test file provides
+ * defense in depth for the pure function; it is not what makes the callback
+ * itself safe, and a reader should not assume it is.
  */
 import { describe, it, expect } from "vitest";
 import { buildClientSessionFields, type AppJWT } from "@/lib/auth-refresh";
@@ -34,8 +55,8 @@ const makeToken = (overrides: Partial<AppJWT> = {}): AppJWT => ({
   ...overrides,
 });
 
-describe("buildClientSessionFields (session-payload leak guard)", () => {
-  it("never includes a refreshToken key in the client-visible session fields", () => {
+describe("buildClientSessionFields (pure-function leak guard; the session callback wiring itself is guarded separately — see file header)", () => {
+  it("never includes a refreshToken key in the fields it returns", () => {
     const fields = buildClientSessionFields(makeToken());
 
     expect(fields).not.toHaveProperty("refreshToken");
