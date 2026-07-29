@@ -1,0 +1,68 @@
+-- WS3-3 — token-vault originals become ciphertext at rest.
+--
+-- THE DEFECT THIS CLOSES
+--
+-- Migration 008 created `mapping JSONB NOT NULL` holding a
+-- {placeholder -> original_text} object: the un-redacted PII a caller handed
+-- to /v1/secure-mode/tokenize, stored in the clear in the product whose
+-- entire purpose is to stop exactly that. 008 shipped a comment admitting it:
+--
+--   "IMPORTANT: originals live in plain JSONB here. Production deployments
+--    should encrypt `mapping` via the configured KMS before inserting"
+--
+-- That is a plan, not a control, and nothing ever executed it. Verified
+-- before writing this migration: the RED run of
+-- tests/token_vault_encryption.rs read the row straight back out of Postgres
+-- and printed
+--   {"mapping": {"{{Person_1}}": "Anvar Karimov"}, ...}
+--
+-- WHY THE COLUMN IS REPLACED RATHER THAN CONVERTED IN PLACE
+--
+-- SQL cannot reach AppState.kms, so there is no way to encrypt the existing
+-- rows from inside a migration. That leaves exactly two options for data
+-- already on disk: leave it in plaintext (the defect) or delete it. This
+-- migration deletes it, which is safe here in a way it would not be for most
+-- tables:
+--
+--   * the rows are ephemeral BY DESIGN — 008 gives every entry a 24-hour
+--     `expires_at`, so the entire table is at most one day of data;
+--   * the data is reproducible — a caller who loses a mapping re-runs
+--     tokenize and gets a fresh one;
+--   * the failure mode is a clean one. `TokenVaultRepository::get` already
+--     answers `NotFound` for a missing or expired entry and
+--     /v1/secure-mode/detokenize already surfaces that, so a detokenize
+--     against a pre-migration vault id degrades to the SAME 404 it would
+--     have got 24 hours later anyway. It does not return a wrong answer.
+--
+-- Keeping the rows and adding a nullable ciphertext column beside them would
+-- have meant a "read plaintext when `encrypted` is false" branch — i.e.
+-- shipping the plaintext read path as a permanent, supported feature in the
+-- migration that is supposed to remove it. Deleting is the smaller lie.
+--
+-- WHY THE COLUMN IS RENAMED
+--
+-- `mapping` -> `mapping_ciphertext`. The name is load-bearing: anything that
+-- still selects `mapping` now fails loudly instead of quietly receiving
+-- ciphertext where it expected a JSON object. Checked at authoring time —
+-- `grep -rn token_vault_entries` finds reads only in
+-- src/db/token_vault_repo.rs (updated in the same commit); the dashboard
+-- request-detail route is forbidden from touching this table and
+-- tests/dashboard/requests_tests.rs enforces that.
+--
+-- WHAT IS STORED
+--
+-- Whatever `AppState.kms` produced for the serialised mapping object, as
+-- UTF-8. For the default FileKms that is base64url(nonce || AES-256-GCM
+-- ciphertext); for VaultKms it is a Vault Transit "vault:v1:..." string.
+-- Same convention as ClickHouse migration 007 for captured content, so both
+-- sensitive stores decode through the same backend.
+--
+-- NOT NULL is enforceable because the DELETE above empties the table first,
+-- and it matters: a nullable ciphertext column would let a future insert bug
+-- write a row with no payload and no error.
+
+DELETE FROM token_vault_entries;
+
+ALTER TABLE token_vault_entries DROP COLUMN mapping;
+
+ALTER TABLE token_vault_entries ADD COLUMN mapping_ciphertext TEXT NOT NULL;

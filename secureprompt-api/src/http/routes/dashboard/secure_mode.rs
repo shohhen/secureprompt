@@ -627,7 +627,11 @@ async fn tokenize(
     }
 
     let vault_id = Uuid::new_v4();
-    TokenVaultRepository::new(state.db.clone())
+    // WS3-3 — the originals in `mapping` are encrypted through the same
+    // `AppState.kms` that seals captured content before they reach Postgres.
+    // A KMS failure surfaces as an error here and fails the tokenize; it
+    // never falls back to storing the originals in the clear.
+    TokenVaultRepository::new(state.db.clone(), state.kms.clone())
         .insert(vault_id, ctx.workspace_id.0, &mapping)
         .await
         .map_err(api_error_response)?;
@@ -649,7 +653,7 @@ async fn detokenize(
     Extension(ctx): Extension<JwtAuthContext>,
     Json(body): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, axum::response::Response> {
-    let entry = TokenVaultRepository::new(state.db.clone())
+    let entry = TokenVaultRepository::new(state.db.clone(), state.kms.clone())
         .get(body.token_vault_id, ctx.workspace_id.0)
         .await
         .map_err(api_error_response)?;
