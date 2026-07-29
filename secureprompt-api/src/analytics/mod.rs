@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod clickhouse_writer;
 pub mod dashboard_reader;
 pub mod events;

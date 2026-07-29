@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
+        raw_capture_repo::{RawCaptureRepository, RawCaptureSettings},
         secure_mode_repo::SecureModeRepository,
         sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
         token_vault_repo::TokenVaultRepository,
@@ -59,6 +60,16 @@ pub struct SecureModeResponse {
     /// because it is part of the same per-workspace security posture an
     /// admin configures on one screen.
     pub sidecar_unavailable: String,
+    /// WS3-1 — whether this workspace retains RAW request content (the
+    /// un-redacted prompt, the un-restored upstream reply, and the reply with
+    /// PII restored). `false` for every workspace that has not explicitly
+    /// opted in, which on a fresh install is all of them. Stored in its own
+    /// table (`workspace_raw_capture`, migration 021).
+    pub capture_raw_content: bool,
+    /// WS3-2 — days captured content is retained. Default 30. Meaningless
+    /// while `capture_raw_content` is false, but round-tripped so an admin
+    /// can configure the window before switching capture on.
+    pub raw_capture_retention_days: i32,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -70,6 +81,13 @@ pub struct PutSecureModeRequest {
     pub block_on_injection_detection: Option<bool>,
     pub redact_pii_in_responses: Option<bool>,
     pub sidecar_unavailable: Option<String>,
+    /// WS3-1. Admin-only, like every other field on this PUT, and — unlike
+    /// every other field — the change is additionally written to the
+    /// append-only `raw_capture_audit` table in the same transaction.
+    pub capture_raw_content: Option<bool>,
+    /// WS3-2. Clamped to `[1, 3650]` days rather than rejected, matching the
+    /// CHECK constraint in migration 021.
+    pub raw_capture_retention_days: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +213,14 @@ async fn get_secure_mode(
         .await
         .map_err(api_error_response)?;
 
+    // WS3-1 — the EFFECTIVE capture settings: the workspace's stored choice,
+    // or "off, 30 days" when it has never chosen. There is deliberately no
+    // deployment-level default to consult here — see `raw_capture_repo`.
+    let capture = RawCaptureRepository::new(state.db.clone())
+        .get_effective(ctx.workspace_id)
+        .await
+        .map_err(api_error_response)?;
+
     Ok(Json(SecureModeResponse {
         workspace_id: row.workspace_id,
         enabled: row.enabled,
@@ -203,6 +229,8 @@ async fn get_secure_mode(
         block_on_injection_detection: row.block_on_injection_detection,
         redact_pii_in_responses: row.redact_pii_in_responses,
         sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
+        capture_raw_content: capture.enabled,
+        raw_capture_retention_days: capture.retention_days,
         updated_at: row.updated_at,
     }))
 }
@@ -268,6 +296,58 @@ async fn put_secure_mode(
             .map_err(api_error_response)?,
     };
 
+    // WS3-1 / WS3-2 — raw-content capture.
+    //
+    // `require_role(Admin)` above is the role half of the acceptance
+    // criterion; `upsert_audited` is the other half — it writes the settings
+    // row and the append-only `raw_capture_audit` row in ONE transaction, so
+    // "capture is on" and "somebody is on the hook for it" commit together.
+    //
+    // Written LAST, after every other field, so a validation failure or a
+    // failed secure-mode write can never leave capture switched on by a
+    // request that then errored.
+    let capture_repo = RawCaptureRepository::new(state.db.clone());
+    let capture = if body.capture_raw_content.is_some()
+        || body.raw_capture_retention_days.is_some()
+    {
+        let current = capture_repo
+            .get_effective(ctx.workspace_id)
+            .await
+            .map_err(api_error_response)?;
+        let desired = RawCaptureSettings {
+            enabled: body.capture_raw_content.unwrap_or(current.enabled),
+            retention_days: body
+                .raw_capture_retention_days
+                .unwrap_or(current.retention_days),
+        };
+        // Best-effort actor identity for the audit row. A failed lookup must
+        // not block the write — but it must not silently blank the actor
+        // either, which is why `actor_user_id` comes from the authenticated
+        // context rather than from this query.
+        let actor_email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND workspace_id = $2")
+                .bind(ctx.user_id)
+                .bind(ctx.workspace_id.0)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        capture_repo
+            .upsert_audited(
+                ctx.workspace_id,
+                desired,
+                Some(ctx.user_id),
+                actor_email.as_deref(),
+            )
+            .await
+            .map_err(api_error_response)?
+    } else {
+        capture_repo
+            .get_effective(ctx.workspace_id)
+            .await
+            .map_err(api_error_response)?
+    };
+
     Ok((
         StatusCode::OK,
         Json(SecureModeResponse {
@@ -278,6 +358,8 @@ async fn put_secure_mode(
             block_on_injection_detection: row.block_on_injection_detection,
             redact_pii_in_responses: row.redact_pii_in_responses,
             sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
+            capture_raw_content: capture.enabled,
+            raw_capture_retention_days: capture.retention_days,
             updated_at: row.updated_at,
         }),
     ))

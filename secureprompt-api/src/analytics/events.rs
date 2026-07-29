@@ -1,4 +1,8 @@
-use secureprompt_common::types::{PolicyEvent, RequestId, TokenUsage, WorkspaceId};
+use crate::analytics::capture::{seal, CaptureDecision, CapturedContent};
+use secureprompt_common::{
+    kms::KmsBackend,
+    types::{PolicyEvent, RequestId, TokenUsage, WorkspaceId},
+};
 
 #[derive(Debug, Clone)]
 pub struct RequestEvent {
@@ -28,19 +32,25 @@ pub struct RequestEvent {
     pub user_agent: Option<String>,
     /// Placeholder-safe prompt body — what was forwarded to the upstream
     /// after PII redaction. Required for the audit detail view.
+    ///
+    /// Deliberately NOT behind the WS3-1 capture gate: this is the
+    /// post-tokenization text, the same bytes that were forwarded upstream.
+    /// It is what makes the audit row exist at all for a request whose raw
+    /// content is not captured, and it is what the WS3-1 tests use as their
+    /// positive control that a plaintext search against ClickHouse works.
     pub redacted_prompt: Option<String>,
-    /// What we returned to the client after placeholder restoration.
-    /// Powers the "AI:" half of the audit log; `None` for denied/embedding
-    /// requests where no chat response exists.
-    pub restored_response: Option<String>,
-    /// Raw last user message before any redaction — paired with
-    /// `redacted_prompt` on the audit detail page so reviewers can see
-    /// what was inspected.
-    pub raw_prompt: Option<String>,
-    /// Raw upstream response before placeholder restoration. Paired with
-    /// `restored_response` so reviewers can see exactly what the model
-    /// emitted (placeholders intact) vs what the client received.
-    pub raw_response: Option<String>,
+    /// WS3-1 / WS3-2 — the raw user message, the raw upstream response and
+    /// the PII-restored response, encrypted, IF AND ONLY IF the workspace
+    /// opted in.
+    ///
+    /// PRIVATE ON PURPOSE. This replaced three `pub` fields
+    /// (`raw_prompt`, `raw_response`, `restored_response`) that seven call
+    /// sites in `pipeline/service.rs` assigned unconditionally. The only way
+    /// to populate it is [`Self::capture_content`], whose only route to a
+    /// `Some` is [`crate::analytics::capture::seal`] — so the gate cannot be
+    /// bypassed by a new call site, and forgetting it is a compile error
+    /// rather than a leak.
+    captured: Option<CapturedContent>,
     /// WS2-3 — this answer was produced with the deterministic Rust floor
     /// alone: the ML sidecar produced no detection coverage for the request
     /// and the workspace's `sidecar_unavailable` policy is
@@ -85,11 +95,38 @@ impl RequestEvent {
             ip_address: None,
             user_agent: None,
             redacted_prompt: None,
-            restored_response: None,
-            raw_prompt: None,
-            raw_response: None,
+            captured: None,
             floor_only: false,
         }
+    }
+
+    /// WS3-1 / WS3-2 — the ONLY way raw request content is ever attached to
+    /// an analytics event.
+    ///
+    /// Call it at every site that used to assign `event.raw_prompt`,
+    /// `event.raw_response` or `event.restored_response`. When `decision` is
+    /// not enabled — the state of every workspace that has not explicitly
+    /// opted in, which on a fresh install is all of them — this is a no-op
+    /// and the plaintext arguments are dropped without ever leaving the
+    /// process. When it IS enabled, the content is encrypted via `kms`
+    /// before it is stored, and a KMS failure drops the capture rather than
+    /// falling back to plaintext.
+    pub async fn capture_content(
+        &mut self,
+        decision: CaptureDecision,
+        kms: &dyn KmsBackend,
+        raw_prompt: Option<String>,
+        raw_response: Option<String>,
+        restored_response: Option<String>,
+    ) {
+        self.captured = seal(decision, kms, raw_prompt, raw_response, restored_response).await;
+    }
+
+    /// Read-only view of whatever survived the gate. Reading is not the leak;
+    /// writing is, which is why there is no corresponding setter.
+    #[must_use]
+    pub fn captured(&self) -> Option<&CapturedContent> {
+        self.captured.as_ref()
     }
 }
 
@@ -126,8 +163,17 @@ pub struct RequestEventRow {
     pub user_agent: Option<String>,
     pub redacted_prompt: Option<String>,
     // ── Migration 004: AI response capture for the audit log ───────────────
-    pub restored_response: Option<String>,
     // ── Migration 005: raw input + raw upstream output ─────────────────────
+    //
+    // WS3-1: these three columns are RETAINED so historical rows written
+    // before the capture gate stay readable, and so the row layout keeps
+    // matching the live table. The writer now sends NULL for all three,
+    // ALWAYS — `from_event` below has no path that populates them. Captured
+    // content, when a workspace has opted in, goes to
+    // `request_content_captures` as ciphertext instead. See
+    // `clickhouse/migrations/007_request_content_captures.sql` for why it
+    // cannot live here.
+    pub restored_response: Option<String>,
     pub raw_prompt: Option<String>,
     pub raw_response: Option<String>,
     // ── Migration 006 (WS2-3): deterministic-floor-only answer ─────────────
@@ -158,11 +204,67 @@ impl RequestEventRow {
             ip_address: e.ip_address.clone(),
             user_agent: e.user_agent.clone(),
             redacted_prompt: e.redacted_prompt.clone(),
-            restored_response: e.restored_response.clone(),
-            raw_prompt: e.raw_prompt.clone(),
-            raw_response: e.raw_response.clone(),
+            // WS3-1 — UNCONDITIONALLY NULL. `request_events` is the table the
+            // cost, latency and audit-list dashboards read; nothing raw goes
+            // into it again, whether or not the workspace opted in. The
+            // opted-in case is served by `RequestContentCaptureRow`.
+            restored_response: None,
+            raw_prompt: None,
+            raw_response: None,
             floor_only: e.floor_only,
         }
+    }
+}
+
+/// WS3-1 / WS3-2 — one row of captured content, in
+/// `request_content_captures` (ClickHouse migration 007).
+///
+/// Field order MUST match the CREATE TABLE column order.
+#[derive(Row, Serialize)]
+pub struct RequestContentCaptureRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub request_id: uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub workspace_id: uuid::Uuid,
+    #[serde(with = "clickhouse::serde::chrono::datetime")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `created_at + retention_days`. The table's `TTL expires_at DELETE`
+    /// drops the row after it, independently of the 90-day row TTL on
+    /// `request_events`.
+    #[serde(with = "clickhouse::serde::chrono::datetime")]
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub encrypted: bool,
+    pub raw_prompt: Option<String>,
+    pub raw_response: Option<String>,
+    pub restored_response: Option<String>,
+}
+
+impl RequestContentCaptureRow {
+    /// `None` when the event carries no captured content — i.e. whenever the
+    /// workspace has not opted in, which is the default.
+    ///
+    /// `created_at` is the SAME instant the writer stamps on the
+    /// `request_events` row, so `dateDiff('day', created_at, expires_at)`
+    /// equals the workspace's configured `retention_days` exactly rather than
+    /// drifting by the time between the two.
+    pub fn from_event(
+        e: &RequestEvent,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<Self> {
+        let captured = e.captured()?;
+        let expires_at = created_at
+            + chrono::Duration::try_days(i64::from(captured.retention_days))
+                .unwrap_or_else(|| chrono::Duration::days(30));
+        Some(Self {
+            request_id: e.request_id.0,
+            workspace_id: e.workspace_id.0,
+            created_at,
+            expires_at,
+            encrypted: captured.encrypted,
+            raw_prompt: captured.raw_prompt.clone(),
+            raw_response: captured.raw_response.clone(),
+            restored_response: captured.restored_response.clone(),
+        })
     }
 }
 

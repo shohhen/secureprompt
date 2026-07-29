@@ -1,6 +1,8 @@
 use crate::{
+    analytics::capture::CaptureDecision,
     analytics::events::RequestEvent,
     app_state::AppState,
+    db::raw_capture_repo::RawCaptureRepository,
     db::secure_mode_repo::{SecureModeRepository, SecureModeRow},
     db::sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
     detection::{detect_content, merge::merge_detections},
@@ -218,6 +220,11 @@ struct Prepared {
     /// Rust floor alone. `None` under normal operation; a `block` workspace
     /// never reaches here (`prepare` returns 503 instead).
     degraded_reason: Option<CoverageLoss>,
+    /// WS3-1 — whether this workspace opted in to raw-content capture, and
+    /// for how long. Read ONCE in `prepare` and carried, so the buffered and
+    /// streaming finalizers cannot disagree about it and neither pays a
+    /// second database round-trip.
+    capture: CaptureDecision,
 }
 
 impl PipelineService {
@@ -250,6 +257,7 @@ impl PipelineService {
         reason: CoverageLoss,
         detections: &[secureprompt_common::types::Detection],
         start: Instant,
+        capture: CaptureDecision,
     ) -> ApiError {
         alert_sidecar_unavailable(
             &self.state,
@@ -285,7 +293,18 @@ impl PipelineService {
         event.api_key_name = Some(auth.api_key_name.clone());
         event.ip_address = request.client_ip.clone();
         event.user_agent = request.user_agent.clone();
-        event.raw_prompt = last_user_message_raw(&request.messages);
+        // WS3-1 SITE 1/7 (was `event.raw_prompt = ...`). A fail-closed
+        // rejection is still a request whose raw prompt must not be retained
+        // unless the workspace asked for it.
+        event
+            .capture_content(
+                capture,
+                self.state.kms.as_ref(),
+                last_user_message_raw(&request.messages),
+                None,
+                None,
+            )
+            .await;
         // Reuses the detections this request already produced — NO second
         // sidecar call on a path that is failing precisely because detection
         // is unavailable or over budget. Shows what was actually caught
@@ -335,6 +354,25 @@ impl PipelineService {
         // than only the post-`prepare` upstream call.
         let start = Instant::now();
         let request_id = RequestId::new();
+        // WS3-1 — the workspace's raw-content capture opt-in, resolved once
+        // for the whole request (including the two fail-closed exits below,
+        // which each write an audit row).
+        //
+        // A failed read fails CLOSED: `CaptureDecision::default()` is
+        // `enabled: false`, so a Postgres outage cannot turn into permission
+        // to retain plaintext prompts.
+        let capture: CaptureDecision = RawCaptureRepository::new(self.state.db.clone())
+            .get_effective(auth.workspace_id)
+            .await
+            .map(CaptureDecision::from)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    workspace_id = %auth.workspace_id,
+                    error = %err,
+                    "raw-capture settings read failed; failing closed to capture disabled"
+                );
+                CaptureDecision::default()
+            });
         let mut prompt = prompt_from_messages(&request.messages);
         let mut pipeline_state = PipelineState::default();
         // Reversible file-scan: an uploaded file's `{{Type_N}}` → original-PII map
@@ -390,6 +428,7 @@ impl PipelineService {
                         reason,
                         &merged_detections,
                         start,
+                        capture,
                     )
                     .await);
             }
@@ -502,6 +541,7 @@ impl PipelineService {
                                 reason,
                                 &pipeline_state.detections,
                                 start,
+                                capture,
                             )
                             .await);
                     }
@@ -569,7 +609,19 @@ impl PipelineService {
             event.api_key_name = Some(auth.api_key_name.clone());
             event.ip_address = request.client_ip.clone();
             event.user_agent = request.user_agent.clone();
-            event.raw_prompt = last_user_message_raw(&request.messages);
+            // WS3-1 SITE 2/7 (was `event.raw_prompt = ...`). A policy DENY is
+            // exactly the request an investigator most wants the raw text
+            // for, and exactly the one a customer is least willing to have
+            // retained without asking. Same gate as every other site.
+            event
+                .capture_content(
+                    capture,
+                    self.state.kms.as_ref(),
+                    last_user_message_raw(&request.messages),
+                    None,
+                    None,
+                )
+                .await;
             event.redacted_prompt = Some(
                 redact_last_user_message(&self.state, &request.messages).await,
             );
@@ -615,6 +667,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            capture,
         })
     }
 
@@ -635,6 +688,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            capture,
         } = self.prepare(auth, resolved, &request).await?;
         // WS2-3 — may be upgraded below if the RESPONSE-side detection pass
         // also loses coverage (a sidecar that fell over during the upstream
@@ -837,27 +891,34 @@ impl PipelineService {
         // the relevant content under conversation history (especially
         // problematic for LibreChat which sends the entire prior thread
         // on each turn).
-        event.raw_prompt = last_user_message_raw(&request.messages);
         event.redacted_prompt =
             Some(redact_last_user_message(&self.state, &request.messages).await);
-        // Raw upstream output before vault restoration. Captured BEFORE
-        // any post-flight transformations (placeholder restore, response-
-        // side redaction) so reviewers can see what the model emitted
-        // verbatim. Empty for embedding requests.
-        event.raw_response = if provider_output.content.is_empty() {
-            None
-        } else {
-            Some(provider_output.content.clone())
-        };
-        // Audit log "Restored" panel: the upstream output post-vault
-        // restoration (placeholders → original PII), BEFORE any
-        // response-side redaction. The reviewer wants to see "what
-        // PII actually landed in the model's reply", which is what
-        // detokenization produces; the response-side redaction that
-        // may follow it is a delivery transform, not the canonical
-        // restoration. Storing the post-restore version keeps the
-        // panel labels semantically honest.
-        event.restored_response = restored_content.clone();
+        // WS3-1 SITES 3/7, 4/7 and 5/7 — the buffered path's three
+        // assignments, now one gated call:
+        //   * `raw_prompt`        — the un-redacted latest user message;
+        //   * `raw_response`      — the upstream output BEFORE vault
+        //     restoration, i.e. what the model emitted verbatim with
+        //     placeholders intact. Empty for embedding requests;
+        //   * `restored_response` — the upstream output AFTER placeholder
+        //     restoration and BEFORE any response-side redaction, i.e. what
+        //     PII actually landed in the model's reply.
+        //
+        // All three are plaintext PII. They are handed to `capture_content`
+        // rather than assigned, so on a workspace that has not opted in they
+        // are dropped here and never reach ClickHouse.
+        event
+            .capture_content(
+                capture,
+                self.state.kms.as_ref(),
+                last_user_message_raw(&request.messages),
+                if provider_output.content.is_empty() {
+                    None
+                } else {
+                    Some(provider_output.content.clone())
+                },
+                restored_content.clone(),
+            )
+            .await;
         // WS2-3 — the audit/analytics row records that this answer was
         // produced with the deterministic floor alone.
         event.floor_only = degraded_reason.is_some();
@@ -932,6 +993,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            capture,
         } = self.prepare(auth, resolved, &request).await?;
 
         let kind = match request.request_kind {
@@ -1122,12 +1184,30 @@ impl PipelineService {
             event.api_key_name = Some(api_key_name.clone());
             event.ip_address = request.client_ip.clone();
             event.user_agent = request.user_agent.clone();
-            event.raw_prompt = last_user_message_raw(&request.messages);
             event.redacted_prompt =
                 Some(redact_last_user_message(&state, &request.messages).await);
-            event.raw_response = if raw_full.is_empty() { None } else { Some(raw_full.clone()) };
-            event.restored_response =
-                if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
+            // WS3-1 SITES 6/7 and 7/7 — the streaming finalizer's three
+            // assignments (raw_prompt, raw_response, restored_response),
+            // now one gated call. `capture` was resolved in `prepare` and
+            // moved into this generator, so the streaming and buffered paths
+            // cannot disagree about whether a workspace opted in.
+            event
+                .capture_content(
+                    capture,
+                    state.kms.as_ref(),
+                    last_user_message_raw(&request.messages),
+                    if raw_full.is_empty() {
+                        None
+                    } else {
+                        Some(raw_full.clone())
+                    },
+                    if restored_full.is_empty() {
+                        None
+                    } else {
+                        Some(restored_full.clone())
+                    },
+                )
+                .await;
             // WS2-3 — floor-only for the whole stream: set at prepare time,
             // or upgraded by a mid-stream response-side coverage loss.
             event.floor_only = stream_degraded.is_some();

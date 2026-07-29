@@ -126,6 +126,17 @@ struct RequestDetailRow {
     pub raw_response: Option<String>,
 }
 
+/// WS3-1 / WS3-2 — one row from `request_content_captures`, the opt-in
+/// ciphertext store. Present only when the workspace enabled capture at the
+/// time the request was served; absent for every default install.
+#[derive(Debug, Clone, Row, Deserialize)]
+struct ContentCaptureRow {
+    pub encrypted: bool,
+    pub raw_prompt: Option<String>,
+    pub raw_response: Option<String>,
+    pub restored_response: Option<String>,
+}
+
 /// Raw row from `policy_events`.
 #[derive(Debug, Clone, Row, Deserialize)]
 struct PolicyEventRow {
@@ -533,6 +544,19 @@ async fn get_request_detail(
         (None, None, None, None, None)
     };
 
+    // WS3-1 / WS3-2 — captured raw content, if this workspace opted in.
+    //
+    // Two sources, in priority order:
+    //   * `request_content_captures` — the opt-in, encrypted store. Decrypted
+    //     here via `state.kms`, which is the SAME backend the pipeline
+    //     encrypted with.
+    //   * the legacy `request_events.raw_prompt` / `raw_response` /
+    //     `restored_response` columns — plaintext, written unconditionally
+    //     before WS3-1. Kept as a fallback so rows captured before the fix
+    //     stay readable in the audit UI. Nothing writes them any more.
+    let (raw_prompt, raw_response, restored_response) =
+        load_captured_content(&state, ws, request_id, &req_row).await;
+
     let source = classify_source(req_row.user_agent.as_deref());
 
     Ok(Json(RequestDetail {
@@ -557,15 +581,98 @@ async fn get_request_detail(
         ip_address: req_row.ip_address,
         user_agent: req_row.user_agent,
         redacted_prompt: req_row.redacted_prompt,
-        restored_response: req_row.restored_response,
-        raw_prompt: req_row.raw_prompt,
-        raw_response: req_row.raw_response,
+        restored_response,
+        raw_prompt,
+        raw_response,
         user_first_name,
         user_last_name,
         user_position,
         user_device_mac,
         source,
     }))
+}
+
+/// WS3-1 / WS3-2 — resolve `(raw_prompt, raw_response, restored_response)`
+/// for the audit detail page.
+///
+/// Returns the legacy plaintext columns from `request_events` when there is
+/// no capture row, so requests served before the capture gate landed stay
+/// readable. Returns `(None, None, None)` for the normal case: a workspace
+/// that never opted in has no capture row and, since WS3-1, no plaintext in
+/// `request_events` either.
+///
+/// A decrypt failure yields `None` for that field rather than the ciphertext.
+/// Rendering an undecryptable blob in the audit UI would be worse than an
+/// empty panel: it looks like the customer's prompt is being displayed when
+/// what is on screen is unreadable, and it puts ciphertext on a response path
+/// that has no business carrying it.
+async fn load_captured_content(
+    state: &AppState,
+    workspace_id: Uuid,
+    request_id: Uuid,
+    req_row: &RequestDetailRow,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let query = format!(
+        "SELECT encrypted, raw_prompt, raw_response, restored_response \
+         FROM request_content_captures \
+         WHERE workspace_id = toUUID('{workspace_id}') \
+           AND request_id = toUUID('{request_id}') \
+         LIMIT 1"
+    );
+
+    let rows = match state
+        .dashboard_reader
+        .client()
+        .query(&query)
+        .fetch_all::<ContentCaptureRow>()
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Non-fatal. A missing table (worker has not applied ClickHouse
+            // migration 007 yet) or a transient ClickHouse error must not
+            // fail the whole audit detail page.
+            tracing::warn!(
+                error = %e,
+                %request_id,
+                "request_content_captures read failed; falling back to legacy columns"
+            );
+            Vec::new()
+        }
+    };
+
+    let Some(row) = rows.into_iter().next() else {
+        return (
+            req_row.raw_prompt.clone(),
+            req_row.raw_response.clone(),
+            req_row.restored_response.clone(),
+        );
+    };
+
+    if !row.encrypted {
+        return (row.raw_prompt, row.raw_response, row.restored_response);
+    }
+
+    async fn open(state: &AppState, field: &'static str, value: Option<String>) -> Option<String> {
+        let value = value?;
+        match state.kms.decrypt(value.as_bytes()).await {
+            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    field,
+                    "captured content could not be decrypted; omitting it from the audit detail"
+                );
+                None
+            }
+        }
+    }
+
+    (
+        open(state, "raw_prompt", row.raw_prompt).await,
+        open(state, "raw_response", row.raw_response).await,
+        open(state, "restored_response", row.restored_response).await,
+    )
 }
 
 /// Classify a request's origin from its user-agent header.
