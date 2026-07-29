@@ -4,7 +4,6 @@
 # This list may only SHRINK. scripts/ci/fmt-gate.sh fails in both
 # directions: a new unformatted file, or a listed file that is now clean.
 #
-secureprompt-api/src/analytics/clickhouse_writer.rs
 secureprompt-api/src/analytics/dashboard_reader.rs
 secureprompt-api/src/app_state.rs
 secureprompt-api/src/auth/totp.rs

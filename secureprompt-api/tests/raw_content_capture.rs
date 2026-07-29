@@ -158,6 +158,28 @@ async fn ch_query(sql: &str) -> String {
     text.trim().to_owned()
 }
 
+/// Apply ClickHouse migration 007 the same way the worker does at startup.
+///
+/// Idempotent (`IF NOT EXISTS`), and deliberately NOT a "skip if the table is
+/// missing" guard: a missing table must surface as a real failure, never as a
+/// quietly-passing "no raw content found". The migration text is read from
+/// the real file rather than restated, so this cannot drift from what the
+/// worker applies.
+async fn ensure_capture_table() {
+    const MIGRATION: &str =
+        include_str!("../clickhouse/migrations/007_request_content_captures.sql");
+    let sql: String = MIGRATION
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for statement in sql.split(';') {
+        if !statement.trim().is_empty() {
+            ch_query(statement.trim()).await;
+        }
+    }
+}
+
 /// Poll for one expression evaluated over the request's audit row. The
 /// analytics writer batches on a 1s period, so nothing is visible
 /// synchronously. Panics rather than skipping when the row never lands — a
@@ -242,6 +264,7 @@ fn chat_request(marker: &str) -> Request<axum::body::Body> {
 /// Only then does the absence assertion mean anything.
 #[sqlx::test]
 async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
     let workspace_id = Uuid::new_v4();
     seed(&pool, workspace_id).await?;
 
@@ -319,6 +342,389 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
         leaked, "0",
         "the synthetic PII leaked into request_events on a workspace that \
          never opted in"
+    );
+
+    // ...and nothing went to the opt-in store either. This assertion is not
+    // redundant with the two above: since WS3-1 the writer sends NULL for the
+    // `request_events` raw columns UNCONDITIONALLY, so deleting the opt-in
+    // gate in `analytics::capture::seal` would move the plaintext into
+    // `request_content_captures` and leave every request_events assertion
+    // above still passing. Without this line the test would keep its name and
+    // stop testing the gate.
+    assert_eq!(
+        capture_rows_for(&marker).await,
+        0,
+        "a fresh install must write no row at all to request_content_captures"
+    );
+
+    Ok(())
+}
+
+// ── Fixtures for the opt-in half ──────────────────────────────────────────
+
+/// Opt a workspace in, straight into Postgres. The HTTP route that normally
+/// does this (`PUT /v1/secure-mode`, admin-only, audited) is covered by
+/// `tests/dashboard/secure_mode_tests.rs`; writing the row directly here
+/// keeps these pipeline assertions independent of the settings API.
+async fn enable_capture(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    retention_days: i32,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO workspace_raw_capture (workspace_id, enabled, retention_days, updated_at)
+         VALUES ($1, true, $2, NOW())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+            enabled = true, retention_days = EXCLUDED.retention_days",
+    )
+    .bind(workspace_id)
+    .bind(retention_days)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// An address nothing is listening on — the `AllCallsFailed` sidecar outage
+/// that drives `fail_closed_on_coverage_loss` (capture site 1/7).
+fn dead_sidecar_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+fn streaming_chat_request(marker: &str) -> Request<axum::body::Body> {
+    let mut request = support::authorized_request(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions"),
+        API_KEY,
+        json!({
+            "model": "claude-3-haiku",
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": format!("{PROMPT_PROSE} {SYNTHETIC_NAME}"),
+            }],
+        }),
+    );
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
+    request.headers_mut().insert(
+        axum::http::header::USER_AGENT,
+        axum::http::HeaderValue::from_str(marker).expect("marker is a valid header value"),
+    );
+    request
+}
+
+/// Drain an SSE response so the streaming finalizer (capture sites 6/7)
+/// actually runs — it is deferred until the upstream stream drains.
+async fn drain(response: axum::response::Response) {
+    use http_body_util::BodyExt;
+    let _ = response.into_body().collect().await;
+}
+
+/// Count capture rows for one request. `request_id` is not visible to the
+/// caller, so the marker is resolved through `request_events` first — which
+/// doubles as the premise that the request produced an audit row at all.
+async fn capture_rows_for(marker: &str) -> u32 {
+    let request_id = await_request_events("toString(request_id)", marker).await;
+    ch_query(&format!(
+        "SELECT count() FROM request_content_captures \
+         WHERE request_id = toUUID('{request_id}')"
+    ))
+    .await
+    .parse()
+    .expect("count() returns a number")
+}
+
+/// Poll for the capture row's columns, since the writer batches.
+async fn await_capture(expr: &str, marker: &str) -> String {
+    let request_id = await_request_events("toString(request_id)", marker).await;
+    for _ in 0..40 {
+        let out = ch_query(&format!(
+            "SELECT {expr} FROM request_content_captures \
+             WHERE request_id = toUUID('{request_id}') LIMIT 1"
+        ))
+        .await;
+        if !out.is_empty() {
+            return out;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("no request_content_captures row appeared for marker {marker}");
+}
+
+// ── WS3-1: every one of the seven write sites is gated ────────────────────
+
+/// The seven original assignments live on four distinct code paths. This
+/// drives ALL FOUR on a workspace that never opted in and asserts none of
+/// them produced a capture row.
+///
+/// PREMISE for every path: an audit row for that request exists in
+/// `request_events`. That is what makes "zero capture rows" mean "the gate
+/// held" rather than "the request never happened". Each path's expected HTTP
+/// status is asserted too, so a path that silently stopped exercising its
+/// branch fails instead of passing.
+#[sqlx::test]
+async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    // A rule that denies on any PERSON detection — drives capture site 2/7.
+    support::seed_policy_rule(
+        &pool,
+        workspace_id,
+        "deny person",
+        10,
+        json!([{ "field": "detection_class", "op": "eq", "value": "PERSON" }]),
+        "deny",
+        json!({}),
+        false,
+    )
+    .await?;
+
+    // Site 3/7, 4/7, 5/7 — buffered execute. Sidecar healthy, so the deny
+    // rule fires: run this workspace's buffered case on the DENY path and
+    // cover the success path on a second workspace below.
+    let deny_marker = format!("ws3-1-deny-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(chat_request(&deny_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "premise: the policy rule must actually deny, otherwise capture site \
+         2/7 is never reached"
+    );
+
+    // Site 1/7 — fail-closed on coverage loss. Default sidecar policy is
+    // `block`, so a dead sidecar rejects with 503 after writing an audit row.
+    let blocked_marker = format!("ws3-1-blocked-{}", Uuid::new_v4());
+    let response = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB)
+        .oneshot(chat_request(&blocked_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "premise: the fail-closed path must actually be taken"
+    );
+
+    // A second workspace with no deny rule, for the success paths.
+    let clean_ws = Uuid::new_v4();
+    support::seed_workspace(&pool, clean_ws, "sp_ws3_1_clean").await?;
+    support::seed_provider_and_model(
+        &pool,
+        clean_ws,
+        Uuid::new_v4(),
+        "anthropic-primary",
+        "anthropic",
+        None,
+        "claude-3-haiku",
+    )
+    .await?;
+
+    // Sites 6/7 and 7/7 — the streaming finalizer.
+    let stream_marker = format!("ws3-1-stream-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let mut request = streaming_chat_request(&stream_marker);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer sp_ws3_1_clean"),
+    );
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(request)
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "premise: the streaming path must actually be taken"
+    );
+    drain(response).await;
+
+    // Accumulate rather than assert-and-abort, so a deletion check sees
+    // EVERY site that regressed in one run instead of only the first.
+    let mut leaked: Vec<String> = Vec::new();
+    for (label, marker) in [
+        ("policy deny (site 2/7)", &deny_marker),
+        ("fail-closed (site 1/7)", &blocked_marker),
+        ("streaming (sites 6/7, 7/7)", &stream_marker),
+    ] {
+        let rows = capture_rows_for(marker).await;
+        if rows != 0 {
+            leaked.push(format!("{label}: {rows} capture row(s)"));
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "a workspace that never opted in must produce no capture row on any \
+         path; leaked on: {leaked:?}"
+    );
+
+    Ok(())
+}
+
+/// POSITIVE CONTROL for the whole file, and the WS3-2 acceptance criterion.
+///
+/// The SAME requests on a workspace that DID opt in must produce capture
+/// rows — and what is on disk must be ciphertext. Both halves are read
+/// straight out of ClickHouse; nothing here goes through the decrypt path,
+/// because a round-trip through our own decrypt would pass just as happily
+/// against plaintext.
+#[sqlx::test]
+async fn opted_in_workspace_stores_ciphertext_only(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    enable_capture(&pool, workspace_id, 30).await?;
+
+    let marker = format!("ws3-2-buffered-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(chat_request(&marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        sidecar
+            .ner_requests()
+            .iter()
+            .any(|r| r.contains(SYNTHETIC_NAME)),
+        "premise: the pipeline must have run over the real prompt"
+    );
+
+    // Premise: a capture row exists, is flagged encrypted, and carries a
+    // non-empty payload in all three fields. "No plaintext found" in an empty
+    // string is not a result.
+    let shape = await_capture(
+        "concat(toString(encrypted), ',', toString(length(coalesce(raw_prompt, ''))>0), \
+         ',', toString(length(coalesce(raw_response, ''))>0), ',', \
+         toString(length(coalesce(restored_response, ''))>0))",
+        &marker,
+    )
+    .await;
+    assert_eq!(
+        shape, "true,1,1,1",
+        "premise: an opted-in request must store a flagged-encrypted row with \
+         all three payloads present, got (encrypted,prompt,response,restored)={shape}"
+    );
+
+    let request_id = await_request_events("toString(request_id)", &marker).await;
+
+    // POSITIVE CONTROL for the search method itself: the same
+    // `position(... , '<needle>') > 0` test, over the SAME request, against a
+    // column that is deliberately NOT encrypted, must FIND the needle. If
+    // this reads 0 the assertions below prove nothing.
+    let control = ch_query(&format!(
+        "SELECT count() FROM request_events \
+         WHERE request_id = toUUID('{request_id}') \
+           AND position(coalesce(redacted_prompt, ''), '{PROMPT_PROSE}') > 0"
+    ))
+    .await;
+    assert_eq!(
+        control, "1",
+        "positive control: the plaintext prose must be findable in \
+         `redacted_prompt`, proving the substring search works"
+    );
+
+    // THE ASSERTION. Neither the prose nor the synthetic PII may appear
+    // anywhere in the stored capture.
+    for needle in [PROMPT_PROSE, SYNTHETIC_NAME] {
+        let hits = ch_query(&format!(
+            "SELECT count() FROM request_content_captures \
+             WHERE request_id = toUUID('{request_id}') AND (\
+                position(coalesce(raw_prompt, ''), '{needle}') > 0 OR \
+                position(coalesce(raw_response, ''), '{needle}') > 0 OR \
+                position(coalesce(restored_response, ''), '{needle}') > 0)"
+        ))
+        .await;
+        assert_eq!(
+            hits, "0",
+            "'{needle}' is stored in plaintext in request_content_captures"
+        );
+    }
+
+    // Defence in depth: even with capture ON, nothing raw goes into
+    // `request_events`. That table backs the cost and latency dashboards and
+    // has a fixed 90-day TTL nobody can shorten per workspace.
+    let nulls = await_request_events(
+        "concat(toString(isNull(raw_prompt)), ',', toString(isNull(raw_response)), \
+         ',', toString(isNull(restored_response)))",
+        &marker,
+    )
+    .await;
+    assert_eq!(
+        nulls, "1,1,1",
+        "capture must never repopulate the request_events columns, got {nulls}"
+    );
+
+    Ok(())
+}
+
+/// WS3-2 — retention is per workspace, and it is genuinely independent of
+/// `request_events`' fixed 90-day row TTL: one workspace gets a window
+/// SHORTER than 90 days and another gets one LONGER, and both are honoured.
+///
+/// Two workspaces with two different values is the positive control: a
+/// hard-coded `expires_at` would have to disagree with one of them.
+#[sqlx::test]
+async fn retention_window_is_per_workspace(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let short_ws = Uuid::new_v4();
+    seed(&pool, short_ws).await?;
+    enable_capture(&pool, short_ws, 7).await?;
+
+    let long_ws = Uuid::new_v4();
+    support::seed_workspace(&pool, long_ws, "sp_ws3_2_long").await?;
+    support::seed_provider_and_model(
+        &pool,
+        long_ws,
+        Uuid::new_v4(),
+        "anthropic-primary",
+        "anthropic",
+        None,
+        "claude-3-haiku",
+    )
+    .await?;
+    enable_capture(&pool, long_ws, 180).await?;
+
+    let short_marker = format!("ws3-2-short-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(chat_request(&short_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let long_marker = format!("ws3-2-long-{}", Uuid::new_v4());
+    let mut request = chat_request(&long_marker);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer sp_ws3_2_long"),
+    );
+    let sidecar = MockSidecar::spawn();
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(request)
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        await_capture("dateDiff('day', created_at, expires_at)", &short_marker).await,
+        "7",
+        "a 7-day workspace must expire its captured content after 7 days"
+    );
+    assert_eq!(
+        await_capture("dateDiff('day', created_at, expires_at)", &long_marker).await,
+        "180",
+        "a 180-day workspace must be able to retain LONGER than the 90-day \
+         row TTL on request_events — which is only possible because captured \
+         content lives in its own table"
     );
 
     Ok(())

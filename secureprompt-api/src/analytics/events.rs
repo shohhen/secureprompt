@@ -247,10 +247,7 @@ impl RequestContentCaptureRow {
     /// `request_events` row, so `dateDiff('day', created_at, expires_at)`
     /// equals the workspace's configured `retention_days` exactly rather than
     /// drifting by the time between the two.
-    pub fn from_event(
-        e: &RequestEvent,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> Option<Self> {
+    pub fn from_event(e: &RequestEvent, created_at: chrono::DateTime<chrono::Utc>) -> Option<Self> {
         let captured = e.captured()?;
         let expires_at = created_at
             + chrono::Duration::try_days(i64::from(captured.retention_days))

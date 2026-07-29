@@ -308,7 +308,10 @@ mod tests {
     fn retention_is_clamped_to_the_accepted_range() {
         assert_eq!(RawCaptureSettings::clamp_retention(0), MIN_RETENTION_DAYS);
         assert_eq!(RawCaptureSettings::clamp_retention(-5), MIN_RETENTION_DAYS);
-        assert_eq!(RawCaptureSettings::clamp_retention(9_999), MAX_RETENTION_DAYS);
+        assert_eq!(
+            RawCaptureSettings::clamp_retention(9_999),
+            MAX_RETENTION_DAYS
+        );
         // A value inside the range passes through untouched — without this
         // the two assertions above would also pass for a function that
         // always returned MIN.

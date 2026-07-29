@@ -44,9 +44,10 @@ CREATE TABLE workspace_raw_capture (
     retention_days INT  NOT NULL DEFAULT 30
         CHECK (retention_days >= 1 AND retention_days <= 3650),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Who last changed it. Nullable only because a user can be deleted after
-    -- the fact; the immutable trail is `raw_capture_audit` below.
-    updated_by     UUID REFERENCES users(id) ON DELETE SET NULL
+    -- Who last changed it. Deliberately NOT a foreign key to `users` — see
+    -- the note on `raw_capture_audit.actor_user_id` below. The immutable
+    -- trail is that table.
+    updated_by     UUID
 );
 
 CREATE INDEX idx_workspace_raw_capture ON workspace_raw_capture(workspace_id);
@@ -56,13 +57,20 @@ CREATE INDEX idx_workspace_raw_capture ON workspace_raw_capture(workspace_id);
 --
 -- Append-only. One row per accepted change, carrying both the before and the
 -- after state so a reviewer can reconstruct when capture was on without
--- diffing backups. `actor_email` is denormalised on purpose: the FK is
--- ON DELETE SET NULL, and an audit record that loses its actor when an
--- account is deleted is not an audit record.
+-- diffing backups.
+--
+-- NO FOREIGN KEY ON `actor_user_id`, AND `actor_email` IS DENORMALISED.
+-- Both are deliberate and they are the same decision. A referential
+-- constraint on an audit table lets history mutate: ON DELETE SET NULL
+-- erases the actor when the account is closed, and ON DELETE CASCADE erases
+-- the record entirely — in either case deleting a user rewrites the evidence
+-- that they switched plaintext prompt retention on. The actor is therefore
+-- recorded as an identifier PLUS the email as it read at the time, and
+-- neither is reachable from a later DELETE.
 CREATE TABLE raw_capture_audit (
     id                    UUID PRIMARY KEY,
     workspace_id          UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    actor_user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+    actor_user_id         UUID,
     actor_email           TEXT,
     enabled_before        BOOL NOT NULL,
     enabled_after         BOOL NOT NULL,
