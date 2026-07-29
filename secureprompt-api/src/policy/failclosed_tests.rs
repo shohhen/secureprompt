@@ -928,3 +928,119 @@ mod migration_019_tests {
         }
     }
 }
+
+/// DRIFT GUARD — the SQL back-fill list vs `DEFAULT_POLICY_CLASSES`.
+///
+/// The default class list is duplicated between Rust and the migrations
+/// because SQL cannot read a Rust `const`. That duplication has ALREADY
+/// drifted twice, both times silently:
+///
+///   1. `GCP_KEY` / `AZURE_KEY` sat in the Rust list as DEAD NAMES matching
+///      nothing the registry emits (it emits `google_api_key` and
+///      `azure_storage_connection_string`). Guarded by
+///      `default_policy_classes_contains_no_dead_names` above.
+///   2. The six Uzbek classes 017 introduced never reached 019's candidate
+///      list, so a database where 017 no-opped under RLS ended up with the
+///      original nine plus credentials and none of the six. That is the gap
+///      `020_reconcile_default_policy_classes.sql` closes, and it is the gap
+///      THIS module is here to stop reopening.
+///
+/// 020 is the reconciling migration: it carries the FULL default list rather
+/// than a delta, so equality with `DEFAULT_POLICY_CLASSES` is the right
+/// assertion. Add a class to the Rust const without adding it to 020 and this
+/// fails; add one to 020 that Rust does not seed and it fails the other way.
+#[cfg(test)]
+mod migration_class_list_drift_tests {
+    use crate::db::workspace_repo::DEFAULT_POLICY_CLASSES;
+    use std::collections::BTreeSet;
+
+    const MIGRATION_020: &str =
+        include_str!("../../migrations/020_reconcile_default_policy_classes.sql");
+
+    const LIST_BEGIN: &str = "-- >>> BACKFILL CLASS LIST";
+    const LIST_END: &str = "-- <<< END BACKFILL CLASS LIST";
+
+    /// Extract the quoted class names from the marker-delimited block in 020.
+    ///
+    /// The markers exist so this parse cannot drift with SQL formatting, and
+    /// so the list appears exactly ONCE in the migration — a second copy is
+    /// how 017 and 019 became inconsistent with each other in the first place.
+    fn migration_backfill_classes() -> BTreeSet<String> {
+        let start = MIGRATION_020
+            .find(LIST_BEGIN)
+            .expect("020 must carry the `-- >>> BACKFILL CLASS LIST` marker");
+        let end = MIGRATION_020[start..]
+            .find(LIST_END)
+            .expect("020 must carry the `-- <<< END BACKFILL CLASS LIST` marker")
+            + start;
+
+        let block = &MIGRATION_020[start..end];
+        let mut classes = BTreeSet::new();
+        let mut rest = block;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            classes.insert(after[..close].to_owned());
+            rest = &after[close + 1..];
+        }
+        classes
+    }
+
+    /// PREMISE: the parse must actually find a class list. An extraction that
+    /// silently returned an empty set would make the equality test below
+    /// compare nothing to nothing on one side and fail loudly on the other —
+    /// but a future refactor to a subset check would turn it vacuous, so the
+    /// shape is asserted explicitly.
+    #[test]
+    fn migration_class_list_parse_finds_the_expected_shape() {
+        let parsed = migration_backfill_classes();
+        assert!(
+            parsed.len() > 30,
+            "premise: the marker block in 020 must contain the real class \
+             list, parsed {} entries: {parsed:?}",
+            parsed.len()
+        );
+        for expected in ["PINFL", "BEARER_TOKEN", "EMAIL_ADDRESS"] {
+            assert!(
+                parsed.contains(expected),
+                "premise: parse must find {expected}: {parsed:?}"
+            );
+        }
+        // The parse must read the marker block ONLY. `GCP_KEY` / `AZURE_KEY`
+        // appear elsewhere in 020 (in the "is this still the untouched seed?"
+        // guard) and are deliberately NOT part of the back-fill list, so
+        // finding them here would mean the extraction over-reached.
+        assert!(
+            !parsed.contains("GCP_KEY"),
+            "premise: the parse leaked outside the marker block: {parsed:?}"
+        );
+    }
+
+    /// The audit that was never run for 019.
+    #[test]
+    fn migration_020_backfills_exactly_default_policy_classes() {
+        let listed: BTreeSet<String> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
+        let migration = migration_backfill_classes();
+
+        let missing_from_migration: Vec<&String> = listed.difference(&migration).collect();
+        let missing_from_rust: Vec<&String> = migration.difference(&listed).collect();
+
+        assert!(
+            missing_from_migration.is_empty(),
+            "these classes are in DEFAULT_POLICY_CLASSES but NOT in the \
+             back-fill list of 020, so every workspace created before the \
+             class was added detects them and then forwards them in the \
+             clear: {missing_from_migration:?}"
+        );
+        assert!(
+            missing_from_rust.is_empty(),
+            "these classes are back-filled by 020 but are NOT in \
+             DEFAULT_POLICY_CLASSES, so a NEW workspace would be seeded \
+             without them — existing workspaces would be better protected \
+             than new ones: {missing_from_rust:?}"
+        );
+    }
+}
