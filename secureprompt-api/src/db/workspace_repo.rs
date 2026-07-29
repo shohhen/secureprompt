@@ -32,22 +32,90 @@ use crate::db::user_repo::UserRow;
 /// redacted the email and forwarded the PINFL. Migration
 /// `017_uzbek_identifier_policy_classes.sql` back-fills workspaces that were
 /// already seeded with the narrower list.
+///
+/// FIX-WAVE: the same omission applied to EVERY CREDENTIAL CLASS. The list
+/// carried 15 entries while `detection/registry.rs` emits 37, and not one of
+/// the 15 was a credential — so a prompt containing an email AND a bearer
+/// token redacted the email and shipped the token, because populating
+/// `redaction_map` also suppressed the secure-mode catch-all. Five review
+/// rounds of credential-detection work therefore delivered nothing on the
+/// real chat path. Every credential class the registry emits is now listed,
+/// back-filled by `019_credential_policy_classes.sql`.
+///
+/// Two entries were also DEAD NAMES matching nothing the registry ever
+/// emits: `GCP_KEY` (registry emits `google_api_key` and
+/// `gcp_service_account_email`) and `AZURE_KEY` (registry emits
+/// `azure_storage_connection_string`). Both are replaced by the real
+/// spellings below. Migration 019 leaves the dead strings in place in
+/// existing rows — they match nothing, so removing them is churn, and the
+/// superset guard the back-fill relies on is keyed on them.
+///
+/// `SSN` / `IBAN` sit alongside `US_SSN` / `IBAN_CODE` on purpose. Both
+/// spellings are live: the Rust regex floor emits `ssn` and `iban`, which
+/// `normalize_class` only upper-cases, while the Python sidecar's
+/// `_map_label` emits Presidio's `US_SSN` and `IBAN_CODE`. Listing only the
+/// Presidio spelling left the floor's own SSN/IBAN detections unprotected
+/// whenever the sidecar was down or the class came from regex alone.
+///
+/// KEEP THIS IN SYNC WITH THE REGISTRY. It is checked by
+/// `default_policy_classes_cover_every_registry_class` below, which fails
+/// the build when a new detector class is added without a decision here.
+/// A rot in this list is no longer a silent leak either — `fail_closed` in
+/// `policy/engine.rs` makes a firing `redact` rule cover every detection in
+/// the request — but the explicit list is what protects deployments that
+/// have turned `SECUREPROMPT_REDACT_WHEN_NO_RULES` off.
 pub const DEFAULT_POLICY_CLASSES: &[&str] = &[
+    // ── People / contact PII (ML sidecar + floor) ──────────────────────
     "PERSON",
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
+    // ── Financial identifiers ──────────────────────────────────────────
     "CREDIT_CARD",
     "US_SSN",
+    "SSN",
     "IBAN_CODE",
-    "AWS_ACCESS_KEY",
-    "GCP_KEY",
-    "AZURE_KEY",
+    "IBAN",
+    // ── Uzbek / CIS identifiers (WS2-1) ────────────────────────────────
     "PINFL",
     "STIR",
     "MFO",
     "PASSPORT_NUMBER",
     "UZCARD",
     "HUMO",
+    // ── Cloud provider keys ────────────────────────────────────────────
+    "AWS_ACCESS_KEY",
+    "GOOGLE_API_KEY",
+    "GCP_SERVICE_ACCOUNT_EMAIL",
+    "AZURE_STORAGE_CONNECTION_STRING",
+    // ── Vendor API keys ────────────────────────────────────────────────
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_PUBLISHABLE_KEY",
+    // ── Source-control tokens ──────────────────────────────────────────
+    "GITHUB_PAT",
+    "GITHUB_FINE_GRAINED_PAT",
+    "GITHUB_OAUTH_TOKEN",
+    "GITHUB_REFRESH_TOKEN",
+    // ── Slack tokens ───────────────────────────────────────────────────
+    "SLACK_BOT_TOKEN",
+    "SLACK_USER_TOKEN",
+    "SLACK_APP_TOKEN",
+    // ── Private keys ───────────────────────────────────────────────────
+    "PRIVATE_KEY_PEM",
+    "RSA_PRIVATE_KEY",
+    "OPENSSH_PRIVATE_KEY",
+    // ── Connection strings / URIs ──────────────────────────────────────
+    "POSTGRESQL_URI",
+    "MONGODB_URI",
+    "WEBHOOK_URL",
+    // ── Generic credentials ────────────────────────────────────────────
+    "BEARER_TOKEN",
+    "BASIC_AUTH_HEADER",
+    "PASSWORD_ASSIGNMENT",
+    "OAUTH_CLIENT_SECRET",
+    "API_TOKEN_GENERIC",
+    "JWT",
 ];
 
 #[derive(Debug, Clone)]

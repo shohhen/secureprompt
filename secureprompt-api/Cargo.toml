@@ -50,6 +50,7 @@ gcp_auth = { workspace = true }
 totp-rs = { workspace = true }
 sp-license = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+regex = "1"
 
 [lints]
 workspace = true

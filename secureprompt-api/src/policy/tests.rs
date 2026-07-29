@@ -53,6 +53,7 @@ mod default_policy_path_tests {
                 model: "none",
                 content,
                 detections: &detections,
+                fail_closed: false,
             },
             &mut vault,
             &mut redaction_map,
@@ -420,6 +421,7 @@ mod condition_tests {
                     model: "test-model",
                     content: "irrelevant — the rule has no conditions to check",
                     detections: &no_detections,
+                    fail_closed: false,
                 }
             ),
             "empty conditions must match even when there are no detections"
@@ -441,6 +443,7 @@ mod condition_tests {
                     model: "test-model",
                     content: "irrelevant — the rule has no conditions to check",
                     detections: &some_detections,
+                    fail_closed: false,
                 }
             ),
             "empty conditions must match regardless of which detections are present"
@@ -573,6 +576,7 @@ mod compound_condition_tests {
             model: "test-model",
             content: "irrelevant content — no content_regex condition in these rules",
             detections,
+            fail_closed: false,
         }
     }
 
@@ -762,6 +766,7 @@ mod second_order_effect_tests {
                 model: "none",
                 content,
                 detections: &detections,
+                fail_closed: false,
             },
             &mut vault,
             &mut redaction_map,
