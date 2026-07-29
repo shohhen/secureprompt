@@ -439,6 +439,7 @@ impl PipelineService {
                 model: &request.public_model,
                 content: &prompt,
                 detections: &pipeline_state.detections,
+                fail_closed: self.state.config.redact_when_no_rules,
             },
             &mut pipeline_state.vault,
             &mut pipeline_state.redaction_map,
@@ -531,37 +532,12 @@ impl PipelineService {
             );
         }
 
-        // Default-redact safety net. Fires when EITHER:
-        //   (a) chat_debug_mode is on — operator wants to verify tokenization
-        //       without first authoring a "redact PII" rule. Original
-        //       Phase-1 behavior.
-        //   (b) the workspace has zero enabled policy rules AND
-        //       redact_when_no_rules is true. Production safety net so a
-        //       brand-new workspace doesn't leak PII while the admin is
-        //       still building policy. Distinct from "rules exist but chose
-        //       to allow" — that case is the admin's explicit choice and
-        //       must NOT be overridden.
-        let use_fallback_redact = self.state.config.chat_debug_mode
-            || (self.state.config.redact_when_no_rules
-                && policy_outcome.rules_evaluated == 0);
-        if use_fallback_redact
-            && pipeline_state.redaction_map.is_empty()
-            && !pipeline_state.detections.is_empty()
-        {
-            policy_outcome.content = crate::vault::apply_redaction(
-                &policy_outcome.content,
-                &pipeline_state.detections,
-                &mut pipeline_state.vault,
-                &mut pipeline_state.redaction_map,
-            );
-            // Surface the synthetic action in the request_event row so the
-            // audit detail page shows "redact" instead of "allow" when the
-            // fallback kicked in. Keep it distinguishable from a real
-            // policy-rule "redact" via the empty `policy_events` vec.
-            if policy_outcome.result.final_action == "allow" {
-                policy_outcome.result.final_action = "redact".to_owned();
-            }
-        }
+        apply_fallback_redaction(
+            self.state.config.chat_debug_mode,
+            self.state.config.redact_when_no_rules,
+            &mut policy_outcome,
+            &mut pipeline_state,
+        );
 
         // KPI-2 monitoring, Task 2 — the final enforcement action for this
         // request is now settled (policy rule, secure-mode override, and
@@ -1553,7 +1529,66 @@ fn record_secure_mode_event(
     });
 }
 
-fn apply_secure_mode_override(
+/// Default-redact safety net. Fires when EITHER:
+///   (a) `chat_debug_mode` is on — operator wants to verify tokenization
+///       without first authoring a "redact PII" rule. Original Phase-1
+///       behavior.
+///   (b) `redact_when_no_rules` is on AND policy did not protect the request.
+///
+/// Extracted from the inline block it used to be so the permissive-mode
+/// leak it guards against can be exercised by a test against the SAME code
+/// the request path runs, rather than a re-implementation of it.
+///
+/// FIX-WAVE (FIX 2 + FIX 3): (b) used to read
+/// `outcome.rules_evaluated == 0`, i.e. "the workspace has no rules at all".
+/// That counts rules the engine LOOKED AT, not rules that DECIDED anything,
+/// and the gap between the two is a live fail-open:
+///
+///   * an enabled rule whose condition does not match this request (WS1-6a);
+///   * an enabled rule that CANNOT match any request — two
+///     `detection_class` conditions on one rule (WS1-8);
+///   * an enabled rule with an unparseable `content_regex` (WS1-6b);
+///   * an enabled rule with an unrecognised `action` string.
+///
+/// In every one of those, `rules_evaluated == 1` held the net down while
+/// nothing had protected the request. At `secure_mode.level = permissive`,
+/// where `apply_secure_mode_override` is a no-op unless policy denied,
+/// the raw prompt then went to the provider — including on requests the
+/// pre-WS1-8 code redacted.
+///
+/// `outcome.unprotected` is the honest question: did any enabled,
+/// non-dry-run rule both match AND apply a recognised action? An explicit
+/// `allow` or `flag` that DID match still clears the flag, so an admin's
+/// deliberate "let this through" is preserved exactly as before.
+pub(crate) fn apply_fallback_redaction(
+    chat_debug_mode: bool,
+    redact_when_no_rules: bool,
+    outcome: &mut crate::policy::engine::PolicyEvaluationOutcome,
+    pipeline_state: &mut secureprompt_common::pipeline::PipelineState,
+) {
+    let use_fallback_redact =
+        chat_debug_mode || (redact_when_no_rules && outcome.unprotected);
+    if use_fallback_redact
+        && pipeline_state.redaction_map.is_empty()
+        && !pipeline_state.detections.is_empty()
+    {
+        outcome.content = crate::vault::apply_redaction(
+            &outcome.content,
+            &pipeline_state.detections,
+            &mut pipeline_state.vault,
+            &mut pipeline_state.redaction_map,
+        );
+        // Surface the synthetic action in the request_event row so the
+        // audit detail page shows "redact" instead of "allow" when the
+        // fallback kicked in. Keep it distinguishable from a real
+        // policy-rule "redact" via the empty `policy_events` vec.
+        if outcome.result.final_action == "allow" {
+            outcome.result.final_action = "redact".to_owned();
+        }
+    }
+}
+
+pub(crate) fn apply_secure_mode_override(
     config: &SecureModeRow,
     detections: &[secureprompt_common::types::Detection],
     injection: crate::ml_sidecar::types::InjectionResponse,

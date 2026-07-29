@@ -18,6 +18,18 @@ pub struct PolicyEvaluationInput<'a> {
     pub model: &'a str,
     pub content: &'a str,
     pub detections: &'a [Detection],
+    /// Fail-closed switch, wired from `config.redact_when_no_rules`.
+    ///
+    /// When a `redact` rule fires, `matching_detections` narrows the set to
+    /// the classes the rule's own condition names — and every OTHER detection
+    /// in the same request is then forwarded to the provider in the clear.
+    /// That makes protection NON-MONOTONIC: adding a class to the rule can
+    /// *reduce* coverage, because a class filter that previously matched
+    /// nothing fell through to `matching_detections`' "redact everything"
+    /// fallback and now matches something. With `fail_closed` set, a firing
+    /// `redact` rule redacts every detection in the request, so widening a
+    /// rule can never expose an entity that a narrower rule protected.
+    pub fail_closed: bool,
 }
 
 pub struct PolicyEvaluationOutcome {
@@ -31,6 +43,24 @@ pub struct PolicyEvaluationOutcome {
     /// rules but they explicitly chose `allow`" from "workspace forgot
     /// to define any rules."
     pub rules_evaluated: usize,
+    /// True when NO enabled, non-dry-run rule both MATCHED this request and
+    /// applied a recognised action.
+    ///
+    /// `rules_evaluated` counts rules the engine *looked at*; this counts
+    /// rules that actually *decided* something. The difference is the whole
+    /// WS1-6a / WS1-8 failure mode: a workspace whose only enabled rule has
+    /// a condition that does not match (or, worse, a condition that CANNOT
+    /// match — two `detection_class` conditions on one rule) has
+    /// `rules_evaluated == 1`, which suppressed the `redact_when_no_rules`
+    /// safety net in `pipeline/service.rs`, while nothing had in fact
+    /// protected the request. At `secure_mode.level = permissive` — where
+    /// `apply_secure_mode_override` is a no-op unless policy denied — that
+    /// left raw PII on the wire to the provider.
+    ///
+    /// An explicit `allow` or `flag` rule that DOES match sets this to
+    /// `false`: the admin looked at the request and chose to pass it, which
+    /// the safety net must not override.
+    pub unprotected: bool,
 }
 
 pub async fn evaluate(
@@ -45,6 +75,11 @@ pub async fn evaluate(
     let mut events = Vec::new();
     let mut final_action = "allow".to_owned();
     let mut denied = false;
+    // Set only by an action arm that actually decided something. An
+    // unrecognised action string leaves it false so the caller's fail-closed
+    // net still engages — a rule reading `action: "redakt"` must not be
+    // mistaken for protection.
+    let mut applied = false;
 
     for rule in rules {
         if !rule_matches(&rule, &input) {
@@ -70,15 +105,49 @@ pub async fn evaluate(
 
         match rule.action.as_str() {
             "deny" => {
+                applied = true;
                 denied = true;
                 break;
             }
-            "allow" => break,
+            "allow" => {
+                applied = true;
+                break;
+            }
             "redact" => {
-                content = apply_redaction(&content, &matching, vault, redaction_map);
+                applied = true;
+                // FIX-WAVE (FIX 1): under `fail_closed`, a firing `redact`
+                // rule covers EVERY detection in the request, not only the
+                // classes its own condition names.
+                //
+                // `matching_detections` narrows to the named classes and
+                // everything else was then forwarded to the provider in the
+                // clear. That made protection NON-MONOTONIC: a class filter
+                // matching NOTHING falls through to the "redact everything"
+                // fallback at the bottom of `matching_detections`, so ADDING
+                // a class to a rule could REDUCE coverage. It is why a
+                // prompt with an email plus a bearer token redacted the
+                // email and shipped the credential.
+                //
+                // Redacting the union cannot be less safe than redacting the
+                // subset, and it makes `DEFAULT_POLICY_CLASSES` unable to rot
+                // into a leak: a detector class nobody remembered to list is
+                // still redacted the moment any rule fires.
+                //
+                // NOTE the deliberate asymmetry with `transform` below,
+                // which still applies only to `matching`. Widening it would
+                // not help — the default template is `{value}`, which emits
+                // the value verbatim — so a `transform` rule's residual
+                // detections remain a separate, pre-existing hazard.
+                let to_redact: &[Detection] = if input.fail_closed {
+                    input.detections
+                } else {
+                    &matching
+                };
+                content = apply_redaction(&content, to_redact, vault, redaction_map);
                 break;
             }
             "transform" => {
+                applied = true;
                 let template = rule
                     .action_params
                     .get("template")
@@ -87,7 +156,10 @@ pub async fn evaluate(
                 content = apply_transform(&content, &matching, template);
                 break;
             }
-            "flag" => break,
+            "flag" => {
+                applied = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -100,6 +172,7 @@ pub async fn evaluate(
         },
         denied,
         rules_evaluated,
+        unprotected: !applied,
     })
 }
 
@@ -134,19 +207,55 @@ pub(crate) fn rule_matches(rule: &PolicyRuleRow, input: &PolicyEvaluationInput<'
     // "any detection" independently (the previous behavior) is exactly the
     // bug this replaces.
     //
-    // KNOWN DIVERGENCE (pre-existing, widened by this change — not fixed
-    // here, see WS1-8 fix-round-1 review): a rule with TWO OR MORE
-    // `detection_class` conditions (e.g. two `eq` conditions, or `eq` +
-    // `in`) requires ONE detection whose class satisfies ALL of them
-    // simultaneously here — which no single detection's `class: String`
-    // field ever can, since a detection has exactly one class. Such a rule
-    // now never fires. `matching_detections` below still combines
-    // (with OR) multiple `detection_class` filters into one
-    // `class_filters` list, which is a different, looser semantics. This
-    // is safe (fails closed — the rule simply stops matching rather than
-    // matching too broadly) but the two functions now disagree on what a
-    // multi-`detection_class`-condition rule means; don't assume they
-    // agree if you touch either.
+    // UNSATISFIABLE RULE SHAPE: a rule with TWO OR MORE `detection_class`
+    // conditions (two `eq`s, or `eq` + `in`) requires ONE detection whose
+    // class satisfies ALL of them simultaneously — which no single
+    // detection's `class: String` field ever can, since a detection has
+    // exactly one class. Such a rule can never fire.
+    //
+    // The previous comment here claimed this was "safe (fails closed — the
+    // rule simply stops matching rather than matching too broadly)". THAT
+    // WAS FALSE, and the WS1-6a/WS1-8 fix wave was raised on it. Not
+    // matching is not the same as failing closed: the rule still counts
+    // toward `rules_evaluated`, which is what the `redact_when_no_rules`
+    // safety net in `pipeline/service.rs` used to key off, so the net
+    // stayed disengaged; and at `secure_mode.level = permissive`
+    // `apply_secure_mode_override` is a no-op unless policy denied. The net
+    // result was raw PII forwarded to the provider on a request the
+    // pre-WS1-8 code redacted.
+    //
+    // What actually makes it safe now is `PolicyEvaluationOutcome::
+    // unprotected`: no rule applied an action, so `apply_fallback_redaction`
+    // engages and redacts. The shape is ALSO rejected at save time by
+    // `http/routes/dashboard/policy_rules.rs::validate_conditions`, so no
+    // new rule can be written this way; the warning below is for rows that
+    // predate that validation.
+    //
+    // Evaluation semantics are deliberately NOT relaxed to OR here even
+    // though the operator almost certainly meant OR, and even though
+    // `matching_detections` below does OR-union multiple `detection_class`
+    // filters. Making an unsatisfiable rule fire would be a security
+    // regression for `action: "allow"` — a rule that today protects the
+    // request by not firing would start waving it through. Failing closed
+    // and rejecting at save time is strictly safer than guessing intent.
+    if detection_conditions
+        .iter()
+        .filter(|condition| {
+            condition.get("field").and_then(Value::as_str) == Some("detection_class")
+        })
+        .count()
+        > 1
+    {
+        tracing::warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            "policy rule has more than one `detection_class` condition and can \
+             never match any single detection; it will never fire. Combine the \
+             classes into ONE `detection_class in [...]` condition. The request \
+             is protected by the fail-closed net, not by this rule."
+        );
+    }
+
     detection_conditions.is_empty()
         || input.detections.iter().any(|detection| {
             detection_conditions
@@ -227,9 +336,43 @@ fn matches_condition(condition: &Value, input: &PolicyEvaluationInput<'_>) -> bo
                 .filter_map(Value::as_str)
                 .any(|candidate| candidate == input.model)
         }),
-        ("content_regex", "matches") => value
-            .as_str()
-            .is_some_and(|needle| input.content.contains(needle)),
+        // FIX-WAVE (FIX 4): this was `input.content.contains(needle)` — a
+        // SUBSTRING test on a field named `content_regex`. Any operator who
+        // wrote `^sk-[A-Za-z0-9]{32}$` had a rule that silently matched
+        // nothing and believed they were protected.
+        //
+        // A malformed pattern already in the database (written before
+        // `validate_conditions` shipped, or straight into Postgres) must not
+        // take the gateway down, so compilation failure logs and yields
+        // `false` — the condition is unsatisfied, the rule does not fire,
+        // and `PolicyEvaluationOutcome::unprotected` then routes the request
+        // through the fail-closed net. Returning `true` on a broken pattern
+        // would be the opposite of what an operator writing a `deny` rule
+        // wants; returning `false` is the shape that stays safe under both
+        // `deny` and `redact`.
+        //
+        // `regex` is compiled per evaluation rather than cached. Rust's
+        // `regex` crate is linear-time (no catastrophic backtracking), rule
+        // counts per workspace are small, and the ML sidecar round trip on
+        // this same request path costs milliseconds — several orders of
+        // magnitude more than compiling a short pattern.
+        ("content_regex", "matches") => {
+            value
+                .as_str()
+                .is_some_and(|pattern| match regex::Regex::new(pattern) {
+                    Ok(compiled) => compiled.is_match(input.content),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            pattern,
+                            "policy rule has an invalid `content_regex` pattern; \
+                             treating the condition as unsatisfied. Fix the rule \
+                             in the policy UI — it is enforcing nothing."
+                        );
+                        false
+                    }
+                })
+        }
         _ => false,
     }
 }
@@ -247,6 +390,19 @@ fn matches_condition(condition: &Value, input: &PolicyEvaluationInput<'_>) -> bo
 /// normally to `confidence_gte` bounds and to the single-condition case
 /// (including the `in` operator, which is one condition listing several
 /// classes, not multiple conditions).
+///
+/// The divergence is now contained rather than merely documented: that rule
+/// shape is rejected at save time by `validate_conditions`, and a request it
+/// leaves unmatched is caught by the fail-closed net instead of being
+/// forwarded raw. See the `UNSATISFIABLE RULE SHAPE` comment in
+/// `rule_matches` for why the two functions are NOT being reconciled by
+/// making this one AND, or that one OR.
+///
+/// Also note the "empty filter → return everything" fallback at the bottom.
+/// It is what made protection non-monotonic (a filter that matched nothing
+/// protected MORE than a filter that matched something), and it is why the
+/// `"redact"` arm of `evaluate` bypasses this function entirely under
+/// `fail_closed`.
 fn matching_detections(rule: &PolicyRuleRow, detections: &[Detection]) -> Vec<Detection> {
     let mut class_filters = Vec::new();
     let mut confidence_gte = None;
