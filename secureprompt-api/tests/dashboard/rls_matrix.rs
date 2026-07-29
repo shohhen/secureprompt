@@ -138,6 +138,95 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
     );
 }
 
+/// POST a statement to the test `ClickHouse`, failing loudly with the server's
+/// own error text. Same "never skip" stance as `seed_canary`: an unreachable or
+/// erroring datastore must fail the run, not silently weaken it.
+async fn clickhouse_exec(sql: String, what: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(clickhouse_url())
+        .body(sql)
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "ClickHouse unreachable at {} while {what}: {e}",
+                clickhouse_url()
+            )
+        });
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "ClickHouse {what} failed ({status}): {body}"
+    );
+    body
+}
+
+/// `SELECT count()` over one table, used for premise assertions.
+async fn clickhouse_count(table: &str, predicate: &str) -> u64 {
+    let body = clickhouse_exec(
+        format!(
+            "SELECT count() FROM {db}.{table} WHERE {predicate}",
+            db = clickhouse_db()
+        ),
+        "counting rows",
+    )
+    .await;
+    body.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("count() did not return a number ({body:?}): {e}"))
+}
+
+/// Create `mart_cost_by_model` with its production shape.
+///
+/// Columns and types are transcribed from the two authorities that must agree:
+/// `secureprompt-analytics/models/marts/mart_cost_by_model.sql` (grain and
+/// column list) and `analytics::dashboard_reader::CostByModelRow` (the Rust
+/// types the reader deserializes into — `u64` → `UInt64`, `f64` → `Float64`,
+/// `NaiveDate` → `Date`). Engine, `ORDER BY`, and `PARTITION BY` are copied
+/// from the dbt model's `config()` block.
+async fn create_mart_cost_by_model() {
+    clickhouse_exec(
+        format!(
+            "CREATE TABLE IF NOT EXISTS {db}.mart_cost_by_model \
+             (workspace_id UUID, \
+              model String, \
+              usage_date Date, \
+              daily_cost_usd Float64, \
+              daily_request_count UInt64, \
+              rolling_7d_cost_usd Float64, \
+              rolling_30d_cost_usd Float64) \
+             ENGINE = MergeTree \
+             PARTITION BY toYYYYMM(usage_date) \
+             ORDER BY (workspace_id, model, usage_date)",
+            db = clickhouse_db()
+        ),
+        "creating mart_cost_by_model",
+    )
+    .await;
+}
+
+/// Seed one `mart_cost_by_model` row dated today.
+///
+/// The rolling-window figures are passed in deliberately: the raw fallback
+/// cannot compute them and sets both equal to the daily cost, so a caller that
+/// seeds `rolling != daily` can tell from the response body alone which code
+/// path answered.
+async fn seed_mart_row(ws: Uuid, model: &str, daily: f64, rolling_7d: f64, rolling_30d: f64) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.mart_cost_by_model \
+             (workspace_id, model, usage_date, daily_cost_usd, daily_request_count, \
+              rolling_7d_cost_usd, rolling_30d_cost_usd) \
+             VALUES ('{ws}', '{model}', today(), {daily}, 3, {rolling_7d}, {rolling_30d})",
+            db = clickhouse_db()
+        ),
+        "seeding mart_cost_by_model",
+    )
+    .await;
+}
+
 async fn send_raw(
     router: &Router,
     method: &str,
@@ -440,6 +529,135 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
          — seed the dependency or mark the case explicitly:\n{}",
         inconclusive.len(),
         inconclusive.join("\n")
+    );
+
+    Ok(())
+}
+
+/// WS1-2 follow-up — tenancy on the MART ITSELF, not on the raw fallback.
+///
+/// `cross_tenant_matrix` above can only ever exercise the raw `request_events`
+/// fallback: no `mart_cost_by_model` table exists in the test `ClickHouse`, so
+/// `query_cost_by_model` always fails into `is_stale_mart_err` and answers from
+/// `request_events`. The `WHERE workspace_id = ?` that the WS1-2 fix added to
+/// the *mart* query was therefore covered by nothing at all and could have been
+/// deleted without reddening a single test.
+///
+/// This test creates the mart with its production shape, seeds one row for each
+/// of two workspaces, and asserts workspace A never sees workspace B's row —
+/// while proving the answer actually came from the mart.
+///
+/// Three separate defences against a vacuous pass, because a tenancy test that
+/// "passes" on an error, an empty table, or a silent fallback proves nothing:
+///
+/// 1. **Premise** — B's mart row is confirmed present by a direct `count()`
+///    before the request is issued, so "B is absent from the response" cannot
+///    be true merely because B was never seeded.
+/// 2. **Positive control** — A's own row, differing from B's only in
+///    `workspace_id`, MUST come back. The same assertion set on an empty
+///    response would otherwise pass.
+/// 3. **Path proof** — the raw fallback aggregates `request_events` (asserted
+///    to contain neither canary) and sets `rolling_7d = rolling_30d = daily`.
+///    Reading back three DIFFERENT figures is only possible from the mart.
+///
+/// Falsifier (verified, see the WS1 report): delete `workspace_id = ? AND` from
+/// the `mart_cost_by_model` query in `analytics/dashboard_reader.rs` together
+/// with its matching `.bind(ws)` — i.e. revert the WS1-2 fix — and this test
+/// fails with workspace B's canary model present in workspace A's response.
+#[sqlx::test]
+async fn mart_cost_by_model_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    // Fresh UUIDs rather than the fixed `WS_A_UUID`/`WS_B_UUID`: the mart table
+    // is created once and shared by every run against this ClickHouse, and
+    // seeding rows under the matrix's own workspaces would divert
+    // `cross_tenant_matrix`'s cost-by-model case off the fallback it covers.
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    create_mart_cost_by_model().await;
+
+    // Run-unique model names, same reasoning as `seed_canary`: a sighting can
+    // never be a leftover row from an earlier run.
+    let run = Uuid::new_v4().simple().to_string();
+    let model_a = format!("mart-own-{run}");
+    let model_b = format!("mart-other-{run}");
+
+    // daily / 7d / 30d deliberately all different — see "Path proof" above.
+    // Every figure is exactly representable in binary floating point so the
+    // JSON round-trip compares exactly.
+    seed_mart_row(ws_a.workspace_id, &model_a, 1.25, 77.5, 333.75).await;
+    seed_mart_row(ws_b.workspace_id, &model_b, 9.5, 88.25, 444.5).await;
+
+    // ---- Premise assertions, before anything is asserted to be absent ------
+    assert_eq!(
+        clickhouse_count("mart_cost_by_model", &format!("model = '{model_b}'")).await,
+        1,
+        "premise failed: workspace B has no mart row, so 'A cannot see B' \
+         would pass vacuously"
+    );
+    assert_eq!(
+        clickhouse_count("mart_cost_by_model", &format!("model = '{model_a}'")).await,
+        1,
+        "premise failed: workspace A has no mart row, so the positive control \
+         could not distinguish the mart from the fallback"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("model IN ('{model_a}', '{model_b}')")
+        )
+        .await,
+        0,
+        "premise failed: a canary model exists in request_events, so the raw \
+         fallback could also have produced it and the path proof is void"
+    );
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (_state, router) = build_app(pool);
+
+    let path = format!("/v1/analytics/cost-by-model?{}", date_range());
+    let (status, body) = send_raw(&router, "GET", &path, None, &token_a).await;
+    assert_eq!(status, StatusCode::OK, "cost-by-model failed: {body}");
+
+    let rows = body
+        .as_array()
+        .unwrap_or_else(|| panic!("cost-by-model must return a JSON array, got {body}"));
+
+    // ---- Positive control: the permitted row DOES come back ----------------
+    let own = rows
+        .iter()
+        .find(|row| row["model"] == json!(model_a))
+        .unwrap_or_else(|| {
+            panic!(
+                "positive control failed: workspace A's own mart row \
+                 '{model_a}' is missing, so the absence of B's row proves \
+                 nothing. Response: {body}"
+            )
+        });
+
+    // ---- Path proof: this answer came from the mart, not the fallback ------
+    assert_eq!(
+        own["daily_cost_usd"],
+        json!(1.25),
+        "unexpected daily cost in {own}"
+    );
+    assert_eq!(
+        own["rolling_7d_cost_usd"],
+        json!(77.5),
+        "rolling_7d does not match the seeded mart value — the raw fallback \
+         answered (it sets rolling_7d = daily), so the mart's own tenancy \
+         filter is still untested: {own}"
+    );
+    assert_eq!(
+        own["rolling_30d_cost_usd"],
+        json!(333.75),
+        "rolling_30d does not match the seeded mart value — see above: {own}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    assert!(
+        !body.to_string().contains(&model_b),
+        "workspace B's mart row '{model_b}' leaked into workspace A's \
+         cost-by-model response: {body}"
     );
 
     Ok(())
