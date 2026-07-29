@@ -492,7 +492,7 @@ async fn tokenize(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
     Json(body): Json<TokenizeRequest>,
-) -> Result<Json<TokenizeResponse>, axum::response::Response> {
+) -> Result<axum::response::Response, axum::response::Response> {
     if body.text.is_empty() {
         return Err(api_error_response(ApiError::BadRequest(
             "text must not be empty".into(),
@@ -504,7 +504,22 @@ async fn tokenize(
         )));
     }
 
-    let raw = state.ml_sidecar.detect_if_available(&body.text).await.detections;
+    let outcome = state.ml_sidecar.detect_if_available(&body.text).await;
+
+    // WS2-4 — honour the workspace's `sidecar_unavailable` policy. This
+    // endpoint hands the caller a `tokenized_text` they will paste somewhere
+    // else, so a floor-only answer served as a plain 200 is a laundered
+    // artifact. Runs BEFORE the vault insert below, so a blocked request
+    // leaves no half-redacted mapping behind.
+    let degraded = crate::http::sidecar_coverage::enforce(
+        &state,
+        secureprompt_common::types::RequestId::new(),
+        ctx.workspace_id,
+        &outcome.coverage,
+    )
+    .await
+    .map_err(api_error_response)?;
+    let raw = outcome.detections;
 
     let allowed: Option<Vec<String>> = body
         .entity_labels
@@ -535,11 +550,14 @@ async fn tokenize(
         .await
         .map_err(api_error_response)?;
 
-    Ok(Json(TokenizeResponse {
-        tokenized_text,
-        token_vault_id: vault_id,
-        entity_counts,
-    }))
+    Ok(crate::http::sidecar_coverage::with_sidecar_degraded(
+        axum::response::IntoResponse::into_response(Json(TokenizeResponse {
+            tokenized_text,
+            token_vault_id: vault_id,
+            entity_counts,
+        })),
+        degraded,
+    ))
 }
 
 /// `POST /v1/secure-mode/detokenize` — reverse tokenize by looking up the

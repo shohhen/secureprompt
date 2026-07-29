@@ -89,21 +89,34 @@ pub async fn redact(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<RedactRequest>,
-) -> Result<Json<RedactResponse>, axum::response::Response> {
+) -> Result<axum::response::Response, axum::response::Response> {
     let auth = authenticate_request(&headers, &state)
         .await
         .map_err(api_error_response)?;
 
+    let request_id = RequestId::new();
     let regex_detections = detect_content(&body.text);
-    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await.detections;
-    let detections = merge_detections(regex_detections, ml_detections);
+    let ml_outcome = state.ml_sidecar.detect_if_available(&body.text).await;
+
+    // WS2-4 — honour the workspace's `sidecar_unavailable` policy. The MCP
+    // `redact` tool's answer is what the agent forwards to a model; a
+    // floor-only redaction returned as an ordinary 200 is indistinguishable
+    // from a fully-scanned one.
+    let degraded = crate::http::sidecar_coverage::enforce(
+        &state,
+        request_id,
+        auth.workspace_id,
+        &ml_outcome.coverage,
+    )
+    .await
+    .map_err(api_error_response)?;
+    let detections = merge_detections(regex_detections, ml_outcome.detections);
 
     let mut vault = TokenVault::default();
     let mut redaction_map = HashMap::new();
     let redacted_text = apply_redaction(&body.text, &detections, &mut vault, &mut redaction_map);
 
     // Run policy engine to apply workspace rules (may further redact or block).
-    let request_id = RequestId::new();
     let policy_repo = PolicyRepository::new(state.db.clone());
     let outcome = evaluate(
         &policy_repo,
@@ -137,11 +150,14 @@ pub async fn redact(
         })
         .collect();
 
-    Ok(Json(RedactResponse {
-        redacted_text: final_text,
-        detections: detection_items,
-        vault_size,
-    }))
+    Ok(crate::http::sidecar_coverage::with_sidecar_degraded(
+        axum::response::IntoResponse::into_response(Json(RedactResponse {
+            redacted_text: final_text,
+            detections: detection_items,
+            vault_size,
+        })),
+        degraded,
+    ))
 }
 
 // ── /v1/tokens/estimate ───────────────────────────────────────────────────────
@@ -189,16 +205,29 @@ pub async fn policy_check(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<PolicyCheckRequest>,
-) -> Result<Json<PolicyCheckResponse>, axum::response::Response> {
+) -> Result<axum::response::Response, axum::response::Response> {
     let auth = authenticate_request(&headers, &state)
         .await
         .map_err(api_error_response)?;
 
-    let regex_detections = detect_content(&body.text);
-    let ml_detections = state.ml_sidecar.detect_if_available(&body.text).await.detections;
-    let detections = merge_detections(regex_detections, ml_detections);
-
     let request_id = RequestId::new();
+    let regex_detections = detect_content(&body.text);
+    let ml_outcome = state.ml_sidecar.detect_if_available(&body.text).await;
+
+    // WS2-4 — honour the workspace's `sidecar_unavailable` policy. This is
+    // the sharpest of the three: the caller acts on `allowed`, and an
+    // `allowed = true` derived from a detection set the ML layer never
+    // contributed to is a permission slip for unscanned text.
+    let degraded = crate::http::sidecar_coverage::enforce(
+        &state,
+        request_id,
+        auth.workspace_id,
+        &ml_outcome.coverage,
+    )
+    .await
+    .map_err(api_error_response)?;
+    let detections = merge_detections(regex_detections, ml_outcome.detections);
+
     let policy_repo = PolicyRepository::new(state.db.clone());
     let model = body.model.as_deref().unwrap_or("none");
 
@@ -228,9 +257,12 @@ pub async fn policy_check(
         .map(|e| format!("{e:?}"))
         .collect();
 
-    Ok(Json(PolicyCheckResponse {
-        allowed: !outcome.denied,
-        action: outcome.result.final_action,
-        events,
-    }))
+    Ok(crate::http::sidecar_coverage::with_sidecar_degraded(
+        axum::response::IntoResponse::into_response(Json(PolicyCheckResponse {
+            allowed: !outcome.denied,
+            action: outcome.result.final_action,
+            events,
+        })),
+        degraded,
+    ))
 }

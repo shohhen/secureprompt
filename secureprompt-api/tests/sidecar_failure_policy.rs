@@ -1129,3 +1129,521 @@ async fn workspace_choice_overrides_a_permissive_deployment_default(
     );
     Ok(())
 }
+
+// ── WS2-4 — the same policy on the NON-provider routes ────────────────────
+//
+// `POST /v1/secure-mode/tokenize`, the MCP `redact` tool (`POST /v1/redact`)
+// and the MCP `policy_check` tool (`POST /v1/policy/check`) all called
+// `detect_if_available(..).detections` and threw `.coverage` away, so the
+// workspace's `sidecar_unavailable` choice was ignored on three routes.
+//
+// These routes do not egress to a provider — they hand the CALLER a
+// redaction, a detection list, or an allow/deny verdict, which the caller
+// then acts on. A floor-only answer served as a normal 200 is therefore a
+// laundered artifact: it looks exactly like a fully-scanned one.
+//
+// The mock sidecar reports `PERSON` at bytes 0..13 of whatever it is sent, so
+// every fixture below puts SYNTHETIC_NAME at offset 0. `PERSON` is
+// ML-ONLY — no deterministic Rust recognizer emits it — which makes it the
+// discriminator between "the sidecar was reached" and "only the floor ran".
+
+use axum::body::Body;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use secureprompt_api::http::middleware::jwt_auth::Claims;
+
+/// `/v1/secure-mode/*` is JWT-gated, not API-key-gated. Signed with the same
+/// secret `support::test_config` hands the router.
+fn dashboard_jwt(workspace_id: Uuid) -> String {
+    let claims = Claims {
+        sub: Uuid::new_v4(),
+        ws: workspace_id,
+        role: "owner".to_owned(),
+        jti: Uuid::new_v4().to_string(),
+        iat: chrono::Utc::now().timestamp(),
+        exp: (chrono::Utc::now() + chrono::Duration::seconds(900)).timestamp(),
+        purpose: None,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(support::test_config().jwt.secret.as_bytes()),
+    )
+    .expect("jwt must encode")
+}
+
+/// Text whose ONLY detectable PII is the synthetic name at byte 0 — so the
+/// deterministic floor finds nothing and `PERSON` in the answer can only have
+/// come from the sidecar.
+fn ml_only_text() -> String {
+    format!("{SYNTHETIC_NAME} shartnomani imzoladi")
+}
+
+fn tokenize_request(jwt: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/secure-mode/tokenize")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {jwt}"))
+        .body(Body::from(json!({ "text": ml_only_text() }).to_string()))
+        .expect("request must build")
+}
+
+fn mcp_request(uri: &'static str, api_key: &str) -> Request<Body> {
+    support::authorized_request(
+        Request::builder().method(Method::POST).uri(uri),
+        api_key,
+        json!({ "text": ml_only_text() }),
+    )
+}
+
+fn degraded_header(response: &axum::response::Response) -> Option<String> {
+    response
+        .headers()
+        .get(DEGRADED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+async fn vault_row_count(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM token_vault_entries WHERE workspace_id = $1")
+        .bind(workspace_id)
+        .fetch_one(pool)
+        .await
+}
+
+// ── /v1/secure-mode/tokenize ──────────────────────────────────────────────
+
+/// POSITIVE CONTROL for both tokenize tests below.
+///
+/// Carries the premise every absence-assertion in this section leans on: with
+/// a REACHABLE sidecar the answer contains `PERSON` and a vault row is
+/// written. Without this, "no PERSON" and "no vault row" would be consistent
+/// with tokenize being broken for every input.
+#[sqlx::test]
+async fn tokenize_under_block_policy_succeeds_with_healthy_sidecar(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let sidecar = MockSidecar::spawn();
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(tokenize_request(&dashboard_jwt(workspace_id)))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a healthy sidecar must not be blocked even under the strictest policy; body={body}"
+    );
+    assert!(
+        degraded.is_none(),
+        "a healthy sidecar must not mark the response degraded; got {degraded:?}"
+    );
+
+    let ner = sidecar.ner_requests();
+    assert!(
+        ner.iter().any(|r| r.contains(SYNTHETIC_NAME)),
+        "premise: tokenize must actually have asked the sidecar about the real \
+         text; captured:\n{ner:?}"
+    );
+    assert_eq!(
+        body["entity_counts"]["PERSON"].as_u64(),
+        Some(1),
+        "premise: PERSON is ML-only, so a healthy run must report exactly one; \
+         body={body}"
+    );
+    assert!(
+        body["token_vault_id"].as_str().is_some(),
+        "premise: a served tokenize writes a vault entry; body={body}"
+    );
+    assert_eq!(
+        vault_row_count(&pool, workspace_id).await?,
+        1,
+        "premise: a served tokenize persists exactly one vault row"
+    );
+    Ok(())
+}
+
+/// THE DEFECT, tokenize side: a `block` workspace asked to tokenize during a
+/// sidecar outage used to get HTTP 200 and a floor-only redaction, with
+/// nothing in the response saying so.
+#[sqlx::test]
+async fn tokenize_under_block_policy_rejects_when_sidecar_unreachable(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .clone()
+        .oneshot(tokenize_request(&dashboard_jwt(workspace_id)))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a block workspace must not be handed a floor-only tokenization"
+    );
+
+    // 503 alone does not discriminate — the JWT layer, the license gate and a
+    // Postgres failure can all produce non-200s. The bounded metric label is
+    // what attributes this one to the coverage gate, under the SAME action
+    // vocabulary the chat path uses.
+    let metrics = scrape_metrics(app).await;
+    assert!(
+        metrics.contains(
+            "secureprompt_sidecar_unavailable_total{reason=\"all_calls_failed\",action=\"block\"}"
+        ),
+        "the 503 must be attributed to lost sidecar coverage; got:\n{metrics}"
+    );
+
+    // Premise for this absence is the positive control above: a served
+    // tokenize writes exactly one row.
+    assert_eq!(
+        vault_row_count(&pool, workspace_id).await?,
+        0,
+        "a blocked tokenize must not persist a half-redacted vault entry"
+    );
+    Ok(())
+}
+
+/// `degrade_with_alert` on tokenize: 200, but the caller can TELL from the
+/// header alone — no counting of `entity_counts` required.
+#[sqlx::test]
+async fn tokenize_under_degrade_policy_reports_the_reason(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .oneshot(tokenize_request(&dashboard_jwt(workspace_id)))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "degrade_with_alert must still answer; body={body}"
+    );
+    assert_eq!(
+        degraded.as_deref(),
+        Some("all_calls_failed"),
+        "the caller must be able to tell from the header alone; body={body}"
+    );
+    // The reason the header matters, asserted against the positive control's
+    // premise (`PERSON` == 1 with a live sidecar).
+    assert!(
+        body["entity_counts"]["PERSON"].as_u64().is_none(),
+        "premise check: this answer really is floor-only — PERSON is ML-only \
+         and the sidecar was dead; body={body}"
+    );
+    Ok(())
+}
+
+/// A workspace that never chose fails closed on tokenize too — the default
+/// must not be route-dependent.
+#[sqlx::test]
+async fn tokenize_defaults_to_block_for_a_fresh_workspace(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_sidecar_policy WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        rows, 0,
+        "test premise: the workspace must have no policy row"
+    );
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .oneshot(tokenize_request(&dashboard_jwt(workspace_id)))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    Ok(())
+}
+
+// ── MCP `redact` — POST /v1/redact ────────────────────────────────────────
+
+/// POSITIVE CONTROL: with the sidecar up, `block` serves the request and the
+/// detection list contains the ML-only `PERSON`.
+#[sqlx::test]
+async fn redact_under_block_policy_succeeds_with_healthy_sidecar(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let sidecar = MockSidecar::spawn();
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(mcp_request("/v1/redact", API_KEY))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(degraded.is_none(), "got {degraded:?}");
+    assert!(
+        sidecar
+            .ner_requests()
+            .iter()
+            .any(|r| r.contains(SYNTHETIC_NAME)),
+        "premise: /v1/redact must actually have called the sidecar"
+    );
+    assert!(
+        body["detections"]
+            .as_array()
+            .expect("detections array")
+            .iter()
+            .any(|d| d["class"] == "PERSON"),
+        "premise: PERSON is ML-only, so a healthy run must report it; body={body}"
+    );
+    // NOT `redacted_text`: with no policy rules and `redact_when_no_rules =
+    // false` this endpoint returns the policy engine's passthrough content,
+    // so the name legitimately survives in the text. `vault_size` is the
+    // field that actually moves with ML coverage — 1 here, 0 when the
+    // sidecar is gone.
+    assert_eq!(
+        body["vault_size"].as_u64(),
+        Some(1),
+        "premise: a healthy run vaults the ML-only PERSON; body={body}"
+    );
+    Ok(())
+}
+
+/// THE DEFECT, MCP `redact` side.
+#[sqlx::test]
+async fn redact_under_block_policy_rejects_when_sidecar_unreachable(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+
+    let before = scrape_metrics(app.clone()).await;
+    assert!(
+        !before.contains("secureprompt_sidecar_unavailable_total"),
+        "positive control: a fresh registry must not already report a \
+         degradation; got:\n{before}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(mcp_request("/v1/redact", API_KEY))
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a block workspace must not be handed a floor-only redaction"
+    );
+
+    let after = scrape_metrics(app).await;
+    assert!(
+        after.contains(
+            "secureprompt_sidecar_unavailable_total{reason=\"all_calls_failed\",action=\"block\"}"
+        ),
+        "the 503 must be attributed to lost sidecar coverage; got:\n{after}"
+    );
+    Ok(())
+}
+
+/// `degrade_with_alert` on `redact`: answered, but flagged.
+#[sqlx::test]
+async fn redact_under_degrade_policy_reports_the_reason(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .oneshot(mcp_request("/v1/redact", API_KEY))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        degraded.as_deref(),
+        Some("all_calls_failed"),
+        "the caller must be able to tell without inspecting the detection \
+         list; body={body}"
+    );
+    assert!(
+        !body["detections"]
+            .as_array()
+            .expect("detections array")
+            .iter()
+            .any(|d| d["class"] == "PERSON"),
+        "premise check: this answer really is floor-only; body={body}"
+    );
+    Ok(())
+}
+
+// ── MCP `policy_check` — POST /v1/policy/check ────────────────────────────
+
+/// POSITIVE CONTROL: `block` + healthy sidecar answers, and the sidecar was
+/// really consulted.
+#[sqlx::test]
+async fn policy_check_under_block_policy_succeeds_with_healthy_sidecar(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let sidecar = MockSidecar::spawn();
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(mcp_request("/v1/policy/check", API_KEY))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(degraded.is_none(), "got {degraded:?}");
+    assert!(
+        body["allowed"].as_bool().is_some(),
+        "premise: a served policy_check returns a verdict; body={body}"
+    );
+    assert!(
+        sidecar
+            .ner_requests()
+            .iter()
+            .any(|r| r.contains(SYNTHETIC_NAME)),
+        "premise: /v1/policy/check must actually have called the sidecar"
+    );
+    Ok(())
+}
+
+/// THE DEFECT, MCP `policy_check` side — the worst of the three: the caller
+/// receives an `allowed` verdict computed from a detection set the ML layer
+/// never contributed to, and acts on it.
+#[sqlx::test]
+async fn policy_check_under_block_policy_rejects_when_sidecar_unreachable(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "block").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .clone()
+        .oneshot(mcp_request("/v1/policy/check", API_KEY))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let body = support::response_text(response).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a block workspace must not be handed a verdict the ML layer never \
+         informed; body={body}"
+    );
+    // Premise for the absence below: a served policy_check returns `allowed`
+    // (asserted in the positive control above).
+    assert!(
+        !body.contains("\"allowed\""),
+        "a blocked policy_check must not also ship a verdict; body={body}"
+    );
+
+    let metrics = scrape_metrics(app).await;
+    assert!(
+        metrics.contains(
+            "secureprompt_sidecar_unavailable_total{reason=\"all_calls_failed\",action=\"block\"}"
+        ),
+        "the 503 must be attributed to lost sidecar coverage; got:\n{metrics}"
+    );
+    Ok(())
+}
+
+/// `degrade_with_alert` on `policy_check`: the verdict is served, flagged.
+#[sqlx::test]
+async fn policy_check_under_degrade_policy_reports_the_reason(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    let app = support::router_with(pool.clone(), &dead_sidecar_url(), "default");
+    let response = app
+        .oneshot(mcp_request("/v1/policy/check", API_KEY))
+        .await
+        .expect("router should respond");
+
+    let status = response.status();
+    let degraded = degraded_header(&response);
+    let body = support::response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(
+        body["allowed"].as_bool().is_some(),
+        "premise: the verdict is still served; body={body}"
+    );
+    assert_eq!(
+        degraded.as_deref(),
+        Some("all_calls_failed"),
+        "a verdict computed without ML coverage must say so; body={body}"
+    );
+    Ok(())
+}
+
+/// Partial coverage is a coverage LOSS on these routes too — a long input
+/// whose later chunks were never scanned must not be answered as if it had
+/// been. Uses the distinct `partial_coverage` reason so an operator can tell
+/// it from a total outage.
+#[sqlx::test]
+async fn redact_under_degrade_policy_reports_partial_coverage(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    // Serve exactly one chunk, then refuse — the rest of the text is never
+    // scanned.
+    let sidecar = MockSidecar::spawn_with(1, false);
+    let filler = "lorem ipsum dolor sit amet ".repeat(1_400); // ~37,800 chars
+    let app = support::router_with(pool.clone(), &sidecar.url(), "default");
+    let response = app
+        .oneshot(support::authorized_request(
+            Request::builder().method(Method::POST).uri("/v1/redact"),
+            API_KEY,
+            json!({ "text": format!("{SYNTHETIC_NAME} {filler}") }),
+        ))
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        degraded_header(&response).as_deref(),
+        Some("partial_coverage"),
+        "partial coverage is its own reason, not an outage reason"
+    );
+    Ok(())
+}
