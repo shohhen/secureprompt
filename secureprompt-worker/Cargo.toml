@@ -20,6 +20,9 @@ qdrant-client = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
+# WS4-1 — the audit-export signing key. The scheme itself lives in
+# `secureprompt-common::audit_export`; the worker only holds the key type.
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

@@ -572,7 +572,14 @@ pub struct SignedExport {
     pub signing_key_id: String,
     pub total_rows: u64,
     pub total_pages: u32,
+    /// Lowercase hex SHA-256 per page, index 0 = page 1. Same values as
+    /// `manifest.pages[i].sha256`, surfaced so a caller storing pages does not
+    /// have to re-parse the manifest to label each one.
     pub page_digests: Vec<String>,
+    /// Row count per page, index 0 = page 1. Surfaced for the same reason as
+    /// [`Self::page_digests`], and it is the SIGNED figure — a caller that
+    /// recounted its own pages could store a number the manifest contradicts.
+    pub rows_per_page: Vec<u32>,
 }
 
 /// Why a manifest could not be built. Bounded strings only — none of these
@@ -687,6 +694,7 @@ pub fn build_manifest(
         total_rows: manifest.total_rows,
         total_pages: manifest.total_pages,
         page_digests: digests,
+        rows_per_page: rows_per_page.to_vec(),
     })
 }
 

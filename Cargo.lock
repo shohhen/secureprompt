@@ -3424,6 +3424,7 @@ dependencies = [
  "chrono",
  "clickhouse",
  "deadpool-redis",
+ "ed25519-dalek",
  "qdrant-client",
  "reqwest 0.12.28",
  "secureprompt-common",
