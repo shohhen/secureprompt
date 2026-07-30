@@ -135,6 +135,14 @@ pub fn build_router(state: AppState) -> Router {
                 )),
         )
         .nest(
+            "/v1/leak-report",
+            routes::dashboard::leak_report::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
+        .nest(
             "/v1/data-inventory",
             routes::dashboard::data_inventory::routes()
                 .route_layer(from_fn_with_state(

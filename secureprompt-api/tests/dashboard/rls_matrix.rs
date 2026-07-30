@@ -395,6 +395,19 @@ fn matrix_cases() -> Vec<Case> {
         body_fn: None,
         expect: Expect::NoCanary,
     });
+    // WS3-6. Same shape as data-inventory: no workspace parameter at all, so
+    // `NoCanary` is the only form that applies and what it pins is that an
+    // authenticated admin gets a 2xx (a 403 or 500 lands as `Inconclusive`,
+    // which fails the run). It cannot pin tenancy — the canary is a model NAME
+    // in `request_events` and this endpoint reads `detection_class_counts`,
+    // where the matrix seeds nothing. `leak_report_is_workspace_scoped` below
+    // carries that half.
+    cases.push(Case {
+        method: "GET",
+        path_template: Box::leak(format!("/v1/leak-report?{range}").into_boxed_str()),
+        body_fn: None,
+        expect: Expect::NoCanary,
+    });
 
     cases
 }
@@ -773,5 +786,125 @@ async fn data_inventory_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
          are being reported to A: {events}"
     );
 
+    Ok(())
+}
+
+/// Seed one `detection_class_counts` row for `workspace_id`.
+///
+/// Written directly rather than by driving a request through the pipeline:
+/// this file's job is the tenancy predicate, and `tests/leak_report.rs`
+/// already covers the write path end-to-end.
+async fn seed_detection_count(workspace_id: Uuid, model: &str, class: &str, count: u32) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.detection_class_counts \
+             (request_id, workspace_id, created_at, model, user_id, api_key_name, \
+              entity_class, entity_count) \
+             VALUES ('{rid}', '{ws}', now(), '{model}', NULL, NULL, '{class}', {count})",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding detection_class_counts",
+    )
+    .await;
+}
+
+/// WS3-6 — `GET /v1/leak-report` takes no workspace parameter, so the matrix
+/// above can only prove it answers. This proves it answers with the CALLER'S
+/// data and nobody else's.
+///
+/// The three defences, matching `data_inventory_is_workspace_scoped`:
+///
+/// 1. **Premise** — both workspaces' rows are confirmed by direct `count()`
+///    against ClickHouse first, so "A sees 4" cannot be true merely because B
+///    was never seeded.
+/// 2. **Positive control** — A's own total MUST come back non-zero, and B's
+///    canary model MUST appear in B's OWN report. An empty or errored response
+///    fails there rather than passing the tenancy assertion by returning
+///    nothing.
+/// 3. **Distinguishable totals** — A and B are seeded DIFFERENT, non-zero
+///    counts (4 and 9), so `4` and `13` are different assertions. A query
+///    missing its tenancy predicate reports 13.
+///
+/// Falsifier (VERIFIED, and not where it was first assumed): replace
+/// `workspace_id = ?` with `workspace_id = workspace_id` in
+/// `leak_report::SCOPE`. This test then fails at the POSITIVE CONTROL, not at
+/// the tenancy assertion — B's total comes back as every workspace's rows in a
+/// shared, never-reset ClickHouse, which is far more than 9. The tenancy
+/// assertion is never reached. That is still a correct falsification, and it
+/// is written down rather than guessed because the obvious prediction
+/// (`13 != 4`) is wrong: it would only hold against a database containing
+/// exactly these two tenants.
+#[sqlx::test]
+async fn leak_report_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    let model_a = format!("leak-own-{run}");
+    let model_b = format!("leak-other-{run}");
+    seed_detection_count(ws_a.workspace_id, &model_a, "PERSON", 4).await;
+    seed_detection_count(ws_b.workspace_id, &model_b, "PINFL", 9).await;
+
+    // ---- Premise: both tenants really have rows ---------------------------
+    assert_eq!(
+        clickhouse_count(
+            "detection_class_counts",
+            &format!("workspace_id = toUUID('{}')", ws_a.workspace_id)
+        )
+        .await,
+        1,
+        "premise failed: workspace A has no counts row, so the positive \
+         control below could not distinguish a live query from an empty table"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "detection_class_counts",
+            &format!("workspace_id = toUUID('{}')", ws_b.workspace_id)
+        )
+        .await,
+        1,
+        "premise failed: no OTHER tenant's rows exist, so an unfiltered query \
+         would return the same numbers as a correct one"
+    );
+
+    let (_state, router) = build_app(pool);
+    let path = format!("/v1/leak-report?{}", date_range());
+
+    // ---- Positive control: B's canary is visible in B's OWN report ---------
+    let token_b = fixtures::mint_jwt(TEST_JWT_SECRET, ws_b.workspace_id, ws_b.admin_id, "admin");
+    let (status_b, body_b) = send_raw(&router, "GET", &path, None, &token_b).await;
+    assert_eq!(
+        status_b,
+        StatusCode::OK,
+        "leak-report failed for B: {body_b}"
+    );
+    assert_eq!(
+        body_b["totals"]["entities_detected"],
+        json!(9),
+        "positive control: B must see its own 9, or the absence of 9 from A's \
+         report proves nothing: {body_b}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (status_a, body_a) = send_raw(&router, "GET", &path, None, &token_a).await;
+    assert_eq!(
+        status_a,
+        StatusCode::OK,
+        "leak-report failed for A: {body_a}"
+    );
+    assert_eq!(
+        body_a["totals"]["entities_detected"],
+        json!(4),
+        "workspace A must see only its own 4 entities. Seeing 13 means the \
+         query is missing its tenancy predicate and every tenant's detection \
+         counts are being reported to A: {body_a}"
+    );
+    assert!(
+        !body_a.to_string().contains(&model_b),
+        "another tenant's destination model reached A's leak report: {body_a}"
+    );
     Ok(())
 }
