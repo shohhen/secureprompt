@@ -1070,6 +1070,142 @@ async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPo
     );
 }
 
+/// dbt does NOT materialise the marts in the gateway's `CLICKHOUSE_DB`.
+///
+/// `secureprompt-analytics/dbt_project.yml` puts every mart in the
+/// `secureprompt_marts` database (staging in `secureprompt_staging`,
+/// intermediate in `secureprompt_intermediate`). The inventory resolved
+/// `location` and its count query against `{CLICKHOUSE_DB}.mart_*` instead, so
+/// `row_count_status` was `unavailable` STRUCTURALLY — not on a fresh install,
+/// but always, on every deployment, no matter how many times dbt had run —
+/// while the code comment attributed it to "absent until `dbt build` has run".
+/// A permanently-unknown number in a compliance attestation, blamed on the
+/// deployment rather than on the query.
+///
+/// PREMISE: the mart table is created and seeded in the REAL dbt database and
+/// the row count is confirmed by a direct query, before the endpoint is asked.
+/// POSITIVE CONTROL: a second workspace gets a different, larger count, so a
+/// query missing its tenancy predicate reports the total and fails; and
+/// `mart_usage_daily` must come back `counted` while a mart that dbt has NOT
+/// built stays `unavailable`, so this cannot pass by reporting a constant.
+#[sqlx::test]
+async fn mart_counts_resolve_to_the_database_dbt_actually_builds_into(pool: PgPool) {
+    let (mine, my_user) = seed_workspace(&pool).await;
+    let (theirs, _) = seed_workspace(&pool).await;
+
+    clickhouse_exec(
+        "CREATE DATABASE IF NOT EXISTS secureprompt_marts".to_owned(),
+        "creating the dbt marts database",
+    )
+    .await;
+    // Columns as `models/marts/mart_usage_daily.sql` selects them.
+    clickhouse_exec(
+        "CREATE TABLE IF NOT EXISTS secureprompt_marts.mart_usage_daily (
+             workspace_id UUID, model String, usage_date Date,
+             total_input_tokens UInt64, total_output_tokens UInt64,
+             total_reasoning_tokens UInt64, total_cost_usd Float64,
+             request_count UInt64, estimated_request_count UInt64
+         ) ENGINE = MergeTree() ORDER BY (workspace_id, model, usage_date)"
+            .to_owned(),
+        "creating mart_usage_daily",
+    )
+    .await;
+    for (ws, n) in [(mine, 3), (theirs, 8)] {
+        for i in 0..n {
+            clickhouse_exec(
+                format!(
+                    "INSERT INTO secureprompt_marts.mart_usage_daily \
+                     (workspace_id, model, usage_date, total_input_tokens, \
+                      total_output_tokens, total_reasoning_tokens, total_cost_usd, \
+                      request_count, estimated_request_count) \
+                     VALUES ('{ws}', 'mart-model-{i}', today(), 1, 1, 0, 0.5, 1, 0)"
+                ),
+                "seeding mart_usage_daily",
+            )
+            .await;
+        }
+    }
+
+    // ---- Premise, against the store itself --------------------------------
+    for (ws, expected) in [(mine, "3"), (theirs, "8")] {
+        let got = clickhouse_exec(
+            format!(
+                "SELECT count() FROM secureprompt_marts.mart_usage_daily \
+                 WHERE workspace_id = toUUID('{ws}')"
+            ),
+            "counting mart rows",
+        )
+        .await;
+        assert_eq!(
+            got.trim(),
+            expected,
+            "premise failed: the mart rows this test seeded are not in \
+             secureprompt_marts, so an `unavailable` from the endpoint would \
+             be correct and this test would prove nothing"
+        );
+    }
+    // Premise: the database the endpoint USED to query really does not hold
+    // the table, so "unavailable" was never a transient state.
+    let wrong_db = clickhouse_exec(
+        format!(
+            "SELECT count() FROM system.tables WHERE database = '{}' \
+             AND name = 'mart_usage_daily'",
+            clickhouse_db()
+        ),
+        "checking the gateway database for a mart",
+    )
+    .await;
+    assert_eq!(
+        wrong_db.trim(),
+        "0",
+        "premise failed: a `mart_usage_daily` exists in the gateway's own \
+         database, so querying the wrong database would have worked by \
+         accident and this test could not tell the two apart"
+    );
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(mine, my_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let usage = artifact(&body, "mart_usage_daily");
+    assert_eq!(
+        usage["row_count_status"],
+        Value::String("counted".into()),
+        "the mart exists and holds this workspace's rows, and the inventory \
+         still cannot count it — `location` and the count query must name the \
+         database dbt builds into: {usage}"
+    );
+    assert_eq!(
+        row_count(&body, "mart_usage_daily"),
+        3,
+        "the mart count must be this workspace's rows. Reporting 11 means the \
+         count query lost its tenancy predicate: {usage}"
+    );
+    assert!(
+        usage["location"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("secureprompt_marts."),
+        "`location` must name the database an auditor would have to query to \
+         reproduce the number: {usage}"
+    );
+
+    // POSITIVE CONTROL: a mart dbt has NOT built must still report the honest
+    // unknown, so `counted` above is a live query and not a hardcoded status.
+    let unbuilt = artifact(&body, "mart_policy_violations");
+    assert_eq!(
+        unbuilt["row_count_status"],
+        Value::String("unavailable".into()),
+        "a mart that does not exist reported a count anyway, so the status \
+         above is not derived from the store: {unbuilt}"
+    );
+    assert_eq!(
+        unbuilt["row_count"],
+        Value::Null,
+        "an uncountable class must report null, never a fabricated zero: {unbuilt}"
+    );
+}
+
 // ── 4. Retention ──────────────────────────────────────────────────────────
 
 /// A retention NUMBER with no enforcement MECHANISM is the exact shape of a

@@ -142,6 +142,21 @@ mod mechanism {
     pub const NONE: &str = "none";
 }
 
+/// The databases dbt materialises into, from `+database` in
+/// `secureprompt-analytics/dbt_project.yml`.
+///
+/// NONE of them is the gateway's own `CLICKHOUSE_DB`. Resolving a dbt relation
+/// against `{CLICKHOUSE_DB}.<name>` — which this module did for the four marts
+/// — cannot ever find it, on any deployment, however many times dbt has run,
+/// so `row_count_status` was permanently `unavailable` and the code comment
+/// above the marts blamed the deployment ("absent until `dbt build` has run")
+/// for what was a wrong database name in the query.
+mod dbt_db {
+    pub const STAGING: &str = "secureprompt_staging";
+    pub const INTERMEDIATE: &str = "secureprompt_intermediate";
+    pub const MARTS: &str = "secureprompt_marts";
+}
+
 const CH_TTL_DETAIL: &str =
     "ClickHouse `TTL ... DELETE`, applied by a background merge — NOT at the \
      instant of expiry. Rows past their TTL remain on disk and readable until \
@@ -850,12 +865,12 @@ async fn get_data_inventory(
              name, action, dry-run flag.",
         ),
     ] {
-        let result = ch_count(ch, &format!("secureprompt_staging.{class}"), ws).await;
+        let result = ch_count(ch, &format!("{}.{class}", dbt_db::STAGING), ws).await;
         let (row_count, row_count_status, row_count_detail) = counted(&result);
         artifacts.push(ArtifactClass {
             class: class.to_owned(),
             store: "clickhouse",
-            location: format!("secureprompt_staging.{class}"),
+            location: format!("{}.{class}", dbt_db::STAGING),
             description,
             sensitivity: "derived_metadata",
             row_count,
@@ -887,12 +902,12 @@ async fn get_data_inventory(
 
     // ── dbt intermediate: a ROW-LEVEL copy that outlives its source ───────
     {
-        let result = ch_count(ch, "secureprompt_intermediate.int_requests_enriched", ws).await;
+        let result = ch_count(ch, &format!("{}.int_requests_enriched", dbt_db::INTERMEDIATE), ws).await;
         let (row_count, row_count_status, row_count_detail) = counted(&result);
         artifacts.push(ArtifactClass {
             class: "int_requests_enriched".to_owned(),
             store: "clickhouse",
-            location: "secureprompt_intermediate.int_requests_enriched".to_owned(),
+            location: format!("{}.int_requests_enriched", dbt_db::INTERMEDIATE),
             description:
                 "dbt intermediate model: ONE ROW PER GATEWAY REQUEST, copied out of \
                  `request_events` with the usage date and hour precomputed. Unlike \
@@ -929,9 +944,16 @@ async fn get_data_inventory(
         });
     }
 
-    // dbt marts. Absent until `dbt build` has run, which is the normal state
-    // of a fresh install — reported as `unavailable` with the store's reason
-    // rather than as zero.
+    // dbt marts, in the database dbt actually builds into — see [`dbt_db`].
+    //
+    // These four resolved to `{CLICKHOUSE_DB}.mart_*` until this was fixed,
+    // which is a table that exists on no deployment, so `row_count_status`
+    // was permanently `unavailable`. The comment that stood here said the
+    // marts were "absent until `dbt build` has run" — true of a fresh install
+    // and NOT the reason these were uncountable, so a reader chasing the
+    // missing numbers was pointed at their own pipeline instead of at this
+    // query. `unavailable` is now a real answer about a real relation: it
+    // means dbt has genuinely not built this mart yet.
     for (class, description) in [
         (
             "mart_usage_daily",
@@ -950,12 +972,12 @@ async fn get_data_inventory(
             "dbt mart: latency and TTFT percentiles per model and day.",
         ),
     ] {
-        let result = ch_count(ch, class, ws).await;
+        let result = ch_count(ch, &format!("{}.{class}", dbt_db::MARTS), ws).await;
         let (row_count, row_count_status, row_count_detail) = counted(&result);
         artifacts.push(ArtifactClass {
             class: class.to_owned(),
             store: "clickhouse",
-            location: format!("{ch_db}.{class}"),
+            location: format!("{}.{class}", dbt_db::MARTS),
             description,
             sensitivity: "derived_metadata",
             row_count,
