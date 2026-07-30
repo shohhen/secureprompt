@@ -155,8 +155,7 @@ const CONTENT_POLICY: &str =
 /// `tests/leak_report.rs::the_report_states_that_it_covers_gateway_traffic_only`
 /// asserts the one-call-site premise against the source, so a future endpoint
 /// that starts emitting events reddens rather than making this quietly wrong.
-const COVERAGE: &str =
-    "GATEWAY TRAFFIC ONLY. These figures cover requests through \
+const COVERAGE: &str = "GATEWAY TRAFFIC ONLY. These figures cover requests through \
      `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` — the paths \
      that write `request_events` and `detection_class_counts`. They do NOT \
      cover `/v1/redact`, `/v1/secure-mode/tokenize`, the MCP server, or file \

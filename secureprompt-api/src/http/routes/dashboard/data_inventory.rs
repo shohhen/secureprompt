@@ -1156,8 +1156,7 @@ async fn get_data_inventory(
             class: "int_requests_enriched".to_owned(),
             store: "clickhouse",
             location: format!("{}.int_requests_enriched", dbt_db::INTERMEDIATE),
-            description:
-                "dbt intermediate model: ONE ROW PER GATEWAY REQUEST, copied out of \
+            description: "dbt intermediate model: ONE ROW PER GATEWAY REQUEST, copied out of \
                  `request_events` with the usage date and hour precomputed. Unlike \
                  the marts below it is NOT an aggregate — request_id, workspace_id, \
                  provider, model, final action, every token count and the cost are \
@@ -2028,8 +2027,7 @@ fn provider_key_self_test_for(hex_key: &str) -> (&'static str, String) {
         ),
         Ok(_) => (
             "failed",
-            "the provider key round-tripped a synthetic marker to DIFFERENT bytes"
-                .to_owned(),
+            "the provider key round-tripped a synthetic marker to DIFFERENT bytes".to_owned(),
         ),
         Err(e) => (
             "failed",

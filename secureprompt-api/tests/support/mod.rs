@@ -5,14 +5,17 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use secureprompt_api::{app_state::AppState, db::api_key_repo::hash_api_key, http::build_router, ml_sidecar::MlSidecarClient};
+use secureprompt_api::{
+    app_state::AppState, db::api_key_repo::hash_api_key, http::build_router,
+    ml_sidecar::MlSidecarClient,
+};
 use secureprompt_common::config::{
     AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
     ServerConfig, TelemetryConfig,
 };
-use std::sync::Arc;
 use serde_json::Value;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub fn test_config() -> AppConfig {

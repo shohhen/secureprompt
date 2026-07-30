@@ -762,7 +762,11 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
     // one whose basis is assembled elsewhere. Every seeded ciphertext class
     // must have been examined — including `providers`, whose absence from this
     // list is exactly how its wrong basis survived.
-    for class in ["request_content_captures", "token_vault_entries", "providers"] {
+    for class in [
+        "request_content_captures",
+        "token_vault_entries",
+        "providers",
+    ] {
         assert!(
             covered.contains(class),
             "`{class}` was seeded with a genuinely sealed row and did not \
@@ -840,7 +844,11 @@ async fn a_capture_row_with_no_payload_is_not_reported_as_encrypted(pool: PgPool
     // ---- POSITIVE CONTROL --------------------------------------------------
     let (status, sealed_body) =
         get_inventory(&app, &make_jwt(sealed_ws, sealed_user, "admin")).await;
-    assert_eq!(status, StatusCode::OK, "data-inventory failed: {sealed_body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "data-inventory failed: {sealed_body}"
+    );
     let sealed_entry = artifact(&sealed_body, "request_content_captures");
     assert_eq!(
         sealed_entry["encryption"]["at_rest"],
@@ -1563,7 +1571,12 @@ async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPo
         "caveats": ["the `backup` compose service and its `clickhouse_backups` volume"],
     });
     let probe_names = attestation_identifiers(&probe);
-    for found in ["librechat-mongo", "librechat_mongo_data", "backup", "mongodb"] {
+    for found in [
+        "librechat-mongo",
+        "librechat_mongo_data",
+        "backup",
+        "mongodb",
+    ] {
         assert!(
             probe_names.contains(found),
             "the extractor misses `{found}`, which this attestation names \

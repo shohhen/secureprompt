@@ -12,12 +12,10 @@ secureprompt-api/src/db/license_repo.rs
 secureprompt-api/src/db/policy_repo.rs
 secureprompt-api/src/db/provider_repo.rs
 secureprompt-api/src/db/secure_mode_repo.rs
-secureprompt-api/src/db/token_vault_repo.rs
 secureprompt-api/src/detection/merge.rs
 secureprompt-api/src/detection/tests.rs
 secureprompt-api/src/http/middleware/api_key_auth.rs
 secureprompt-api/src/http/middleware/jwt_auth.rs
-secureprompt-api/src/http/middleware/license_gate.rs
 secureprompt-api/src/http/middleware/rate_limit.rs
 secureprompt-api/src/http/mod.rs
 secureprompt-api/src/http/model_router.rs
@@ -73,7 +71,6 @@ secureprompt-api/tests/license_routes.rs
 secureprompt-api/tests/mcp_routes.rs
 secureprompt-api/tests/openapi_register_tests.rs
 secureprompt-api/tests/ssrf_guard.rs
-secureprompt-api/tests/support/mod.rs
 secureprompt-api/tests/twofactor.rs
 secureprompt-common/src/config.rs
 secureprompt-common/src/crypto.rs

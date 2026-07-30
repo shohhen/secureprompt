@@ -377,7 +377,10 @@ mod tests {
         // name, a national identifier and an e-mail. `resolve_model`'s
         // Phase-1 passthrough forwards it verbatim, so `registered` is false.
         assert_eq!(
-            canonicalize_model("Anvar Karimov 30107030010011 anvar.karimov@example.uz", false),
+            canonicalize_model(
+                "Anvar Karimov 30107030010011 anvar.karimov@example.uz",
+                false
+            ),
             UNREGISTERED_MODEL
         );
         // A caller-supplied name that LOOKS like a model is still not one:
@@ -399,10 +402,10 @@ mod tests {
     #[test]
     fn a_registered_name_that_is_not_label_shaped_is_bucketed() {
         for hostile in [
-            "",                                   // empty
-            "gpt 4o mini",                        // whitespace: prose, not an id
-            "gpt-4o\nmini",                       // newline: breaks any line format
-            "модель",                             // non-ASCII
+            "",                                    // empty
+            "gpt 4o mini",                         // whitespace: prose, not an id
+            "gpt-4o\nmini",                        // newline: breaks any line format
+            "модель",                              // non-ASCII
             "Anvar Karimov, 100011, Toshkent sh.", // an address, registered by hand
         ] {
             assert_eq!(
