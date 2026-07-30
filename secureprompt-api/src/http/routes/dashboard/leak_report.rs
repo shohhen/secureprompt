@@ -97,7 +97,14 @@ use super::leak_report_labels;
 /// Bumped when a field changes meaning or disappears. A pilot report is
 /// archived and re-read months later; a reader needs to know which shape they
 /// are holding.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// 2 — `entities` figures no longer claim to equal the placeholder count, and
+/// the placeholder count is reported separately as [`Placeholders`]. The
+/// NUMBERS did not change; what a reader is entitled to conclude from them
+/// did, which is exactly the case this counter exists for. A version-1 report
+/// pulled out of an archive carries a `counting_rule` that overstates what its
+/// own `entities` figures mean.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Longest window the report will aggregate, matching the analytics
 /// endpoints' cap. Also the practical ceiling: `detection_class_counts` has a
@@ -159,13 +166,87 @@ const COVERAGE: &str =
      is recorded, not a claim that those surfaces detected nothing. A workspace \
      that uses them should read these numbers as a floor.";
 
+/// What an `entities` figure is, and — since 2026-07-30 — what it is NOT.
+///
+/// This constant used to end "…matching the number of placeholders the
+/// redacted prompt carries". That sentence was false, and measurably so:
+/// `analytics::detection_counts::per_class` counts distinct `(class, value)`
+/// pairs, so a span carrying two classes contributes one to each, while
+/// `vault::apply_redaction` walks the spans in order and SKIPS any whose start
+/// is behind its cursor — so the nested detection produces no second
+/// placeholder. `tests/leak_report.rs::a_nested_span_is_two_class_detections_\
+/// and_one_placeholder` runs all three functions over
+/// `Authorization: Bearer <jwt>` and measures 2 against 1.
+///
+/// The fix is the WORDING, not the counting. Dropping the contained detection
+/// would make the old sentence true and would delete a fact: that header
+/// genuinely is both a credential header and a JWT, and an auditor asking
+/// "did a JWT leave the building" is entitled to the JWT row.
 const COUNTING_RULE: &str =
-    "An `entities` figure counts DISTINCT entities of that class, matching the \
-     number of placeholders the redacted prompt carries — the same entity \
-     repeated in one request counts once. A `requests` figure counts requests \
-     in which the class appeared at least once, so summing `requests` across \
-     classes will exceed `requests_with_detections` whenever a request \
-     contained more than one class.";
+    "An `entities` figure counts CLASS-DETECTIONS, not placeholders: distinct \
+     (class, value) pairs of that class. One span may carry MORE THAN ONE \
+     class — an `Authorization: Bearer <token>` header genuinely is both a \
+     credential header and a JWT, and both detections are kept, because \
+     discarding the inner one would delete a fact this report exists to \
+     record. Such a span contributes one figure to EACH of its classes while \
+     the redacted prompt carries a SINGLE placeholder for it, so the sum of \
+     `entities` across `by_class` can EXCEED the number of placeholders, and \
+     does on every request containing a nested detection. `entities_detected` \
+     is that same sum and inherits the same caveat. The placeholder count is \
+     reported separately, as `placeholders`, and is not derivable from these \
+     figures — read that section before treating any number here as one. The \
+     same VALUE repeated in one request still counts once for its class; the \
+     redacted prompt reuses one placeholder token for it, which then appears \
+     at each occurrence. A `requests` figure counts requests in which the \
+     class appeared at least once, so summing `requests` across classes will \
+     exceed `requests_with_detections` whenever a request contained more than \
+     one class.";
+
+/// Why `placeholders.count` is `null` and will stay null until a migration
+/// records it.
+///
+/// Every claim in this string was executed before it was written:
+///
+/// * `apply_redaction` keys its placeholder table on `(class, value)` and
+///   skips any detection whose span starts behind the cursor, so the token
+///   count is a property of the REDACTION, not of the detections
+///   (`vault/redaction.rs`).
+/// * `detection_class_counts` (migration 008) has columns
+///   `entity_class` + `entity_count` and no placeholder column, so
+///   `BEARER_TOKEN 1, JWT 1` on one request is byte-for-byte identical
+///   whether it was one placeholder or two.
+/// * `request_events.redacted_prompt` — the only other stored artifact with
+///   placeholders in it — is NOT a substitute, for three independent reasons
+///   measured in `pipeline/service.rs`: `redact_last_user_message` redacts
+///   only the LAST USER MESSAGE of the request, it runs a SECOND detection
+///   pass (its own `detect_content` + sidecar call) rather than reusing the
+///   one these counts came from, and `record_prompt(RedactedPrompt::\
+///   CoverageLost)` stores NULL whenever ML coverage was lost. Counting
+///   tokens in it would answer a different question and silently under-count.
+///
+/// So the honest answer is a stated gap. The alternative — publishing
+/// `entities_detected` under a `placeholders` label — is the defect this
+/// section was added to fix, in a new field.
+const PLACEHOLDERS_NOT_RECORDED: &str =
+    "NOT RECORDED. This report cannot tell you how many placeholders the \
+     redacted prompts in this window carried, and reports null rather than a \
+     number it cannot support. A placeholder is what the redaction step emits \
+     — one token per distinct (class, value) it actually replaced — and that \
+     figure exists only while the request that produced it is being served. \
+     `detection_class_counts`, the table every figure above is read from, \
+     stores one (entity_class, entity_count) row per request and nothing \
+     else, so a request whose rows read `BEARER_TOKEN 1, JWT 1` is \
+     indistinguishable from one that redacted two separate spans: the same \
+     two rows describe one placeholder or two. The one other stored artifact \
+     that contains placeholders, `request_events.redacted_prompt`, does not \
+     answer it either — it holds only the LAST USER MESSAGE of the request, \
+     it is produced by a SECOND detection pass rather than the one these \
+     counts came from, and it is NULL whenever ML coverage was lost — so \
+     counting tokens in it would answer a different question and under-count \
+     silently. Reporting a placeholder count therefore needs a column on \
+     `detection_class_counts` written from the redaction the request actually \
+     applied. Until that migration exists this field stays null, and no \
+     figure in this report may be read as a placeholder count.";
 
 // ── Query parameters ──────────────────────────────────────────────────────
 
@@ -228,6 +309,24 @@ pub struct ActorBreakdown {
     pub by_class: Vec<ClassCount>,
 }
 
+/// The placeholder count, reported as the gap it is.
+///
+/// Shaped like `data_inventory`'s `row_count` / `row_count_status` /
+/// `row_count_detail` triple on purpose: that endpoint already established
+/// that a compliance document degrades into a STATED gap rather than a
+/// fabricated zero, and a reader who knows one reads the other.
+#[derive(Debug, Serialize)]
+pub struct Placeholders {
+    /// Always `null` today. Present rather than omitted, so its absence is
+    /// never read as a count of zero — the same reason
+    /// `data_inventory::UnenumerableClass::row_count` is present and null.
+    pub count: Option<u64>,
+    /// `not_recorded`. There is no other value: no code path on this route can
+    /// produce a placeholder count. See [`PLACEHOLDERS_NOT_RECORDED`].
+    pub status: &'static str,
+    pub detail: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AvailableDimension {
     pub dimension: &'static str,
@@ -257,6 +356,9 @@ pub struct LeakReportResponse {
     /// Which product surfaces these numbers cover. See [`COVERAGE`].
     pub coverage: &'static str,
     pub counting_rule: &'static str,
+    /// The number of placeholders, which this report does NOT know. See
+    /// [`Placeholders`].
+    pub placeholders: Placeholders,
     pub by_class: Vec<ClassCount>,
     pub by_model: Vec<ModelBreakdown>,
     pub by_actor: Vec<ActorBreakdown>,
@@ -788,6 +890,11 @@ async fn get_leak_report(
         },
         coverage: COVERAGE,
         counting_rule: COUNTING_RULE,
+        placeholders: Placeholders {
+            count: None,
+            status: "not_recorded",
+            detail: PLACEHOLDERS_NOT_RECORDED,
+        },
         by_class,
         by_model,
         by_actor,
