@@ -1205,6 +1205,10 @@ async fn every_redis_key_class_the_gateway_writes_is_accounted_for(pool: PgPool)
     for (class, written_by) in [
         ("redis:filevault", "redis/mod.rs stash_file_vault"),
         ("redis:jti_blacklist", "redis/mod.rs blacklist_jti"),
+        (
+            "redis:session_revocation",
+            "redis/mod.rs revoke_sessions_before (WS4-3)",
+        ),
         ("redis:oidc_state", "redis/mod.rs store_oidc_state"),
         ("redis:budget", "dashboard/budgets.rs daily_key/monthly_key"),
         ("redis:queues", "redis/mod.rs enqueue_task"),

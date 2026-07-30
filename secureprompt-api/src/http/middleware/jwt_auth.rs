@@ -201,6 +201,53 @@ pub const fn is_access_claims(claims: &Claims) -> bool {
     claims.purpose.is_none()
 }
 
+/// WS4-3 — what the two session gates decided about one presented token.
+///
+/// Expressed as a pure function over plain values, following the shape
+/// [`crate::http::middleware::license_gate::license_gate`] established: no
+/// `AppState`, no HTTP, no Redis, so every combination is unit-testable
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionGate {
+    /// Neither gate objects. Continue to role parsing.
+    Proceed,
+    /// `POST /v1/auth/logout` blacklisted this specific token id.
+    RejectLoggedOut,
+    /// An administrator revoked every session for this user at a moment at or
+    /// after this token was minted (WS4-3).
+    RejectRevoked,
+}
+
+/// The whole session decision, as a pure function over plain values.
+///
+/// * `jti_blacklisted` — `jti_blacklist:{jti}` exists (self-service logout).
+/// * `revoked_before_unix` — the value of `session_revoked:{user_id}`, or
+///   `None` when no administrator has revoked this user's sessions.
+/// * `token_iat` — the `iat` claim of the presented access token.
+///
+/// The comparison is `<=`, not `<`, and that is load-bearing. `iat` has
+/// one-second granularity, so a token minted in the SAME second as the
+/// revocation is indistinguishable from one minted just before it. Refusing
+/// it is the safe direction: the cost is that a user re-authenticating within
+/// the same second as the revocation must retry once, and the alternative
+/// cost is a live session surviving the revocation that was meant to end it.
+///
+/// Logout outranks revocation only in which reason is reported — both refuse.
+#[must_use]
+pub const fn session_gate(
+    jti_blacklisted: bool,
+    revoked_before_unix: Option<i64>,
+    token_iat: i64,
+) -> SessionGate {
+    if jti_blacklisted {
+        return SessionGate::RejectLoggedOut;
+    }
+    match revoked_before_unix {
+        Some(watermark) if token_iat <= watermark => SessionGate::RejectRevoked,
+        _ => SessionGate::Proceed,
+    }
+}
+
 /// Axum middleware compatible with `middleware::from_fn_with_state`.
 ///
 /// Returns the pre-rendered error `Response` on failure rather than
@@ -240,11 +287,30 @@ pub async fn require(
         )));
     }
 
-    // jti blacklist gate — `POST /v1/auth/logout` plants these entries.
+    // Session gates, both read in one Redis round trip:
+    //   * jti blacklist — `POST /v1/auth/logout` plants these entries.
+    //   * revocation watermark (WS4-3) — `DELETE /v1/users/{id}/sessions`
+    //     plants `session_revoked:{user_id}`, which refuses every access token
+    //     for that user minted at or before the revocation second.
+    //
     // On Redis failure, fall back to in-memory cache (D-15, PG-04).
+    //
+    // KNOWN, BOUNDED PROPAGATION GAP — measured, not assumed. When Redis
+    // answers, revocation takes effect on the very next request: this read is
+    // synchronous and on every authenticated path. When Redis is UNREACHABLE
+    // the branch below serves from `auth_cache` instead, and that cache cannot
+    // know about a revocation, so a revoked user's already-minted access token
+    // is accepted for up to the remaining 5-minute `CachedAuthEntry` TTL on
+    // each pod that has a warm entry for them. The revoking pod evicts its own
+    // entry (see `dashboard::users::revoke_sessions`), so the bound applies to
+    // OTHER pods only. It is the same gap the jti blacklist has always had
+    // under the same condition; WS4-3 states it rather than widening it. The
+    // refresh chain is unaffected — it is closed in Postgres, so a user in
+    // this window cannot extend the session past that token's own expiry.
     // PITFALL 4: clone out of the DashMap Ref before any await point.
-    let blacklisted = match crate::redis::jti_is_blacklisted(&state.redis_pool, &claims.jti).await {
-        Ok(b) => b,
+    let gates = crate::redis::session_gates(&state.redis_pool, &claims.jti, &claims.sub).await;
+    let (blacklisted, revoked_before) = match gates {
+        Ok(pair) => pair,
         Err(_redis_err) => {
             // Redis/Postgres unavailable — fall back to in-memory cache (D-15, PG-04).
             // Pitfall 4: clone out of the Ref before doing anything else.
@@ -270,10 +336,18 @@ pub async fn require(
         }
     };
 
-    if blacklisted {
-        return Err(api_error_response(ApiError::Unauthorized(
-            "Invalid credentials".into(),
-        )));
+    // One decision, taken by the pure function above so every combination is
+    // covered by unit tests rather than by reading this branch. Both refusals
+    // return the same generic 401 body as every other failure here — an
+    // attacker must not be able to tell "logged out" from "revoked" from
+    // "bad signature" (T-05-02, T-05-07).
+    match session_gate(blacklisted, revoked_before, claims.iat) {
+        SessionGate::Proceed => {}
+        SessionGate::RejectLoggedOut | SessionGate::RejectRevoked => {
+            return Err(api_error_response(ApiError::Unauthorized(
+                "Invalid credentials".into(),
+            )));
+        }
     }
 
     // 2FA (Task 4 review fix): self-enforcing ordering invariant. The
@@ -430,6 +504,70 @@ mod tests {
         validation.leeway = 0;
         let result = decode::<Claims>(&token, &decoding, &validation);
         assert!(result.is_err(), "expired token must fail decode");
+    }
+
+    // ---- WS4-3: the session gate ------------------------------------------
+
+    /// The full truth table. Eight rows: two blacklist states × (no
+    /// watermark, watermark before / equal to / after the token's `iat`).
+    #[test]
+    fn session_gate_truth_table() {
+        const IAT: i64 = 1_800_000_000;
+        let cases = [
+            // (blacklisted, watermark, expected)
+            (false, None, SessionGate::Proceed),
+            // A watermark planted BEFORE this token was minted belongs to an
+            // older revocation; a session started afterwards is legitimate.
+            (false, Some(IAT - 1), SessionGate::Proceed),
+            // Same second: refused. See `session_gate`'s doc comment.
+            (false, Some(IAT), SessionGate::RejectRevoked),
+            (false, Some(IAT + 1), SessionGate::RejectRevoked),
+            (true, None, SessionGate::RejectLoggedOut),
+            (true, Some(IAT - 1), SessionGate::RejectLoggedOut),
+            (true, Some(IAT), SessionGate::RejectLoggedOut),
+            (true, Some(IAT + 1), SessionGate::RejectLoggedOut),
+        ];
+        for (blacklisted, watermark, expected) in cases {
+            let actual = session_gate(blacklisted, watermark, IAT);
+            assert_eq!(
+                actual, expected,
+                "session_gate({blacklisted}, {watermark:?}, {IAT}) = {actual:?}, \
+                 expected {expected:?}"
+            );
+        }
+    }
+
+    /// The headline criterion, as a property: an access token that already
+    /// existed when the revocation happened is refused, no matter how recently
+    /// it was minted.
+    #[test]
+    fn every_token_minted_at_or_before_the_watermark_is_refused() {
+        const WATERMARK: i64 = 1_800_000_000;
+        for age in 0..600_i64 {
+            assert_eq!(
+                session_gate(false, Some(WATERMARK), WATERMARK - age),
+                SessionGate::RejectRevoked,
+                "a token minted {age}s before the revocation must be refused"
+            );
+        }
+        // CONTROL THAT MUST DIFFER: after the watermark second, accepted.
+        for age in 1..600_i64 {
+            assert_eq!(
+                session_gate(false, Some(WATERMARK), WATERMARK + age),
+                SessionGate::Proceed,
+                "a token minted {age}s AFTER the revocation must be accepted — \
+                 revocation is a point in time, not a ban"
+            );
+        }
+    }
+
+    /// Absence of a watermark must never be read as a revocation. This is the
+    /// direction that would take every session in the deployment down.
+    #[test]
+    fn no_watermark_means_no_revocation() {
+        for iat in [0_i64, 1, 1_800_000_000, i64::MAX] {
+            assert_eq!(session_gate(false, None, iat), SessionGate::Proceed);
+        }
     }
 
     // ---- 2FA (Task 4): purpose-claim guard -------------------------------

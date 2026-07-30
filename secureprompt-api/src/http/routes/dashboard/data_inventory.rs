@@ -758,7 +758,9 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM raw_capture_audit WHERE workspace_id = $1) AS c_raw_capture_audit,
            (SELECT count(*) FROM retention_purge_audit WHERE workspace_id = $1) AS c_retention_purge_audit,
            (SELECT count(*) FROM audit_exports WHERE workspace_id = $1) AS c_audit_exports,
-           (SELECT count(*) FROM audit_export_pages WHERE workspace_id = $1) AS c_audit_export_pages",
+           (SELECT count(*) FROM audit_export_pages WHERE workspace_id = $1) AS c_audit_export_pages,
+           (SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1)
+             AS c_session_revocation_audit",
         cred_sealed = pg_sealed("encrypted_credential"),
         vault_sealed = pg_sealed("mapping_ciphertext"),
     );
@@ -1516,6 +1518,42 @@ async fn get_data_inventory(
         enabled: None,
     });
 
+    // WS4-3 — migration 026. The record of every administrative session
+    // termination in this workspace.
+    artifacts.push(ArtifactClass {
+        class: "session_revocation_audit".to_owned(),
+        store: "postgres",
+        location: "session_revocation_audit".to_owned(),
+        description: "Append-only record of every accepted `DELETE \
+                      /v1/users/{user_id}/sessions`: who revoked, whose sessions, when, \
+                      the watermark instant from which that user's access tokens were \
+                      refused, and how many refresh tokens the action closed. Written in \
+                      the same transaction as the revocation itself.",
+        sensitivity: "audit_trail",
+        row_count: Some(pg.n("c_session_revocation_audit")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Identifiers, two email addresses (actor and target, denormalised in the clear \
+             for the reason `raw_capture_audit` gives — a foreign key would let deleting a \
+             user rewrite the evidence), two role names, a unix second and a count. \
+             DELIBERATELY ABSENT: IP address, User-Agent and any free-text reason. This \
+             table is never purged, so it takes only what the record needs; an actor's \
+             device and a free-text note are personal data that would then be retained \
+             forever to no auditable purpose.",
+        ),
+        retention: Retention::none(
+            "Append-only and never purged, by design, like `raw_capture_audit` and \
+             `retention_purge_audit`. `retention.purge` does not cover this table and is \
+             not intended to. DISCLOSED GAP, in the other direction: these rows are NOT \
+             carried by `audit.export`, which reads ClickHouse `request_events` only. An \
+             auditor holding a signed export does not hold this trail and must read it \
+             here.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
     // WS4-1 — the two tables migration 025 creates for `audit.export`.
     //
     // These are declared with more care than their row counts suggest, because
@@ -1834,6 +1872,42 @@ async fn get_data_inventory(
                 mechanism: mechanism::REDIS_TTL,
                 mechanism_detail: "Redis key TTL, set to the token's remaining validity at \
                                    logout."
+                    .to_owned(),
+            },
+        },
+        UnenumerableClass {
+            class: "redis:session_revocation",
+            store: "redis",
+            location: "session_revoked:{user_id}",
+            description: "WS4-3. One key per user whose sessions an administrator has \
+                          terminated, holding the unix second of the revocation. Every \
+                          access token for that user minted at or before it is refused by \
+                          the auth middleware on the next request.",
+            reason: "The key is a bare user id with no workspace id, in the same shape as \
+                     `jti_blacklist`. Counting a workspace's keys would mean issuing one \
+                     EXISTS per member — a per-request cost that grows with headcount for \
+                     a number that says nothing an auditor can act on, since \
+                     `session_revocation_audit` above holds the durable record of every \
+                     revocation and is counted there.",
+            per_workspace_erasure: "not_possible",
+            row_count: None,
+            encryption: Encryption::plain(
+                "A user id in the key and a unix timestamp in the value. No content, no \
+                 credential material.",
+            ),
+            retention: Retention {
+                days: None,
+                window: "access-token lifetime + 120s".to_owned(),
+                mechanism: mechanism::REDIS_TTL,
+                mechanism_detail: "Redis key TTL, sized by \
+                                   `redis::revocation_watermark_ttl_secs` to outlive every \
+                                   access token that existed when the revocation happened \
+                                   (access TTL, plus the 60s JWT validation leeway, plus \
+                                   60s of clock slack). After that every token it would \
+                                   refuse has expired on its own terms, so the key is \
+                                   allowed to lapse rather than accumulating one entry per \
+                                   revoked user forever. The permanent record is \
+                                   `session_revocation_audit`."
                     .to_owned(),
             },
         },

@@ -1,7 +1,10 @@
 //! WS4-3 — admin-initiated session revocation.
 //!
-//! RED phase: every test here fails until `DELETE /v1/users/{id}/sessions`,
-//! the per-user revocation watermark and `session_revocation_audit` exist.
+//! Every test here failed at commit `1323fd7`, before the route, the per-user
+//! revocation watermark and `session_revocation_audit` existed. Each of the
+//! six load-bearing lines behind them has since been mutated one at a time,
+//! grep-verified present in the file, and confirmed to turn the matching test
+//! red — see the WS4-3 report for the transcript.
 //!
 //! The three acceptance criteria, one test each (plus the traps):
 //!   * a revoked session's NEXT request 401s — `revoked_sessions_next_request_401s`
@@ -20,15 +23,15 @@ use axum::{
 use deadpool_redis::{redis::cmd, Config as RedisPoolConfig, Pool as RedisPool, Runtime};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use secureprompt_api::{
-    app_state::AppState, db::refresh_token_repo::hash_refresh_token,
-    http::build_router, http::middleware::jwt_auth::Claims, ml_sidecar::MlSidecarClient,
+    app_state::AppState, db::refresh_token_repo::hash_refresh_token, http::build_router,
+    http::middleware::jwt_auth::Claims, ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
     AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
     ServerConfig, TelemetryConfig,
 };
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgConnectOptions, Connection, PgConnection, PgPool, Row};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -365,7 +368,10 @@ async fn revocation_writes_an_audit_row_that_reads_alone(pool: PgPool) {
         .expect("premise count");
     assert_eq!(before, 0, "premise: the audit table starts empty");
 
-    assert_eq!(revoke(&app, &admin_token, ws.viewer).await.status(), StatusCode::OK);
+    assert_eq!(
+        revoke(&app, &admin_token, ws.viewer).await.status(),
+        StatusCode::OK
+    );
 
     let row = sqlx::query(
         "SELECT workspace_id, actor_user_id, actor_email, actor_role, target_user_id, \
@@ -410,7 +416,10 @@ async fn the_audit_row_counts_the_refresh_rows_it_killed(pool: PgPool) {
     issue_refresh_token(&pool, ws.id, ws.admin).await;
 
     let admin_token = make_jwt(ws.id, ws.admin, "admin");
-    assert_eq!(revoke(&app, &admin_token, ws.viewer).await.status(), StatusCode::OK);
+    assert_eq!(
+        revoke(&app, &admin_token, ws.viewer).await.status(),
+        StatusCode::OK
+    );
 
     let counted: i64 =
         sqlx::query_scalar("SELECT refresh_tokens_revoked FROM session_revocation_audit")
@@ -595,16 +604,185 @@ async fn revocation_cannot_reach_into_another_workspace(pool: PgPool) {
         StatusCode::OK,
         "control: in-workspace revocation must succeed"
     );
-    let rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1",
-    )
-    .bind(b.id)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(b.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
     assert_eq!(rows, 0, "no audit row may be written for workspace B");
 
     forget_watermark(&redis_pool().await, a.viewer).await;
+}
+
+// ── TRAP 3: RLS, proved from a role that cannot bypass it ─────────────────
+
+const RLS_ROLE: &str = "secureprompt_runner";
+const RLS_PASSWORD: &str = "secureprompt";
+
+async fn ensure_low_privilege_role(pool: &PgPool) {
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {RLS_ROLE}
+                 LOGIN PASSWORD '{RLS_PASSWORD}'
+                 NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+         END $$;"
+    ))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "could not create the {RLS_ROLE} role ({e}). In CI this role is \
+             created by scripts/ci/create-nonsuperuser-role.sh; locally the \
+             connecting role needs CREATEROLE."
+        )
+    });
+
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+    ))
+    .execute(pool)
+    .await
+    .expect("grants on the test database");
+}
+
+/// Open a connection to the SAME `#[sqlx::test]` database as `RLS_ROLE`, and
+/// assert on the wire that it really is powerless. The `#[sqlx::test]` pool is
+/// a BYPASSRLS superuser, so without these premise assertions the test below
+/// would keep passing while exercising no RLS at all.
+async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
+    ensure_low_privilege_role(pool).await;
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+    let mut conn = PgConnection::connect_with(&options)
+        .await
+        .expect("low-privilege connection");
+
+    let row = sqlx::query(
+        "SELECT current_user::text AS who, rolsuper, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("identity probe");
+    assert_eq!(row.get::<String, _>("who"), RLS_ROLE);
+    assert!(
+        !row.get::<bool, _>("rolsuper"),
+        "premise: the probe role is a SUPERUSER, so this test proves nothing"
+    );
+    assert!(
+        !row.get::<bool, _>("rolbypassrls"),
+        "premise: the probe role has BYPASSRLS, so this test proves nothing"
+    );
+    conn
+}
+
+/// Migration 026's RLS policy is ARMED. This is the layer no other test in the
+/// repository can see: the application connects as a BYPASSRLS superuser
+/// today, so a missing, malformed, or wrong-column policy would leave every
+/// `#[sqlx::test]` green.
+///
+/// It also demonstrates the silent-zero trap the brief names — with the GUC
+/// unset the read returns the EMPTY SET and reports no error.
+#[sqlx::test]
+async fn migration_026_rls_isolates_the_revocation_trail_from_a_nonsuperuser(pool: PgPool) {
+    let a = seed_workspace(&pool).await;
+    let b = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+    assert_eq!(
+        revoke(&app, &make_jwt(a.id, a.admin, "admin"), a.viewer)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        revoke(&app, &make_jwt(b.id, b.admin, "admin"), b.viewer)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // PREMISE: the superuser pool sees both, so anything the low-privilege
+    // connection cannot see is RLS and not an empty table.
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("premise count");
+    assert_eq!(total, 2, "premise: two revocation rows exist");
+
+    let mut conn = low_privilege_connection(&pool).await;
+
+    let armed: bool = sqlx::query_scalar(
+        "SELECT relrowsecurity AND relforcerowsecurity \
+         FROM pg_class WHERE relname = 'session_revocation_audit'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("pg_class probe");
+    assert!(
+        armed,
+        "session_revocation_audit must have ENABLE + FORCE row level security"
+    );
+
+    // GUC unset -> nothing visible, and NO ERROR. That is the trap.
+    let unset: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
+        .fetch_one(&mut conn)
+        .await
+        .expect("unset read must succeed, which is the whole problem");
+    assert_eq!(
+        unset, 0,
+        "with the GUC unset the policy must hide everything, not leak"
+    );
+
+    // GUC set -> exactly my workspace.
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
+        .bind(a.id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("bind workspace");
+    let visible: Vec<Uuid> =
+        sqlx::query_scalar("SELECT workspace_id FROM session_revocation_audit")
+            .fetch_all(&mut conn)
+            .await
+            .expect("scoped read");
+    assert_eq!(
+        visible,
+        vec![a.id],
+        "only workspace A's revocation trail may be visible"
+    );
+
+    // And an INSERT for somebody else's workspace is REJECTED, not silently
+    // written — the policy governs WITH CHECK too (no command on the policy,
+    // so USING doubles as WITH CHECK).
+    let forged = sqlx::query(
+        "INSERT INTO session_revocation_audit
+             (id, workspace_id, actor_user_id, actor_email, actor_role,
+              target_user_id, target_email, target_role,
+              revoked_before_unix, refresh_tokens_revoked)
+         VALUES ($1, $2, $3, 'x@example.com', 'owner', $4, 'y@example.com', \
+                 'viewer', 1, 0)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(b.id)
+    .bind(b.admin)
+    .bind(b.viewer)
+    .execute(&mut conn)
+    .await;
+    assert!(
+        forged.is_err(),
+        "a bound connection must not be able to write into another \
+         workspace's revocation trail"
+    );
+
+    forget_watermark(&redis_pool().await, a.viewer).await;
+    forget_watermark(&redis_pool().await, b.viewer).await;
 }
 
 // ── The watermark is a point in time, not a ban ───────────────────────────
@@ -619,7 +797,10 @@ async fn a_session_minted_after_the_watermark_second_is_accepted(pool: PgPool) {
     let app = build_app(pool.clone());
     let admin_token = make_jwt(ws.id, ws.admin, "admin");
 
-    assert_eq!(revoke(&app, &admin_token, ws.viewer).await.status(), StatusCode::OK);
+    assert_eq!(
+        revoke(&app, &admin_token, ws.viewer).await.status(),
+        StatusCode::OK
+    );
 
     let same_second = make_jwt(ws.id, ws.viewer, "viewer");
     assert_eq!(
