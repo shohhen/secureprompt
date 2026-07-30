@@ -256,6 +256,13 @@ impl PipelineService {
         request_id: RequestId,
         reason: CoverageLoss,
         prompt: RedactedPrompt,
+        // WS3-6 — the detections the pipeline HAD when it decided to refuse.
+        // A blocked request is the shadow-mode population that matters most,
+        // so its per-class counts are recorded even though nothing was
+        // forwarded. On the NER gate this is the deterministic floor's set
+        // alone (which is exactly why coverage was judged lost); on the
+        // injection gate NER ran, so it is the full merged set.
+        detections: &[secureprompt_common::types::Detection],
         start: Instant,
         capture: CaptureDecision,
     ) -> ApiError {
@@ -324,6 +331,8 @@ impl PipelineService {
         // there the redaction is real, so the two callers pass different
         // values. See `RedactedPrompt`.
         event.record_prompt(prompt);
+        // WS3-6 SITE 1/4 — the fail-closed path.
+        event.record_detections(detections);
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -441,6 +450,12 @@ impl PipelineService {
                         // NER coverage is what was just lost, so nothing here
                         // is a redacted prompt. See `RedactedPrompt`.
                         RedactedPrompt::CoverageLost,
+                        // WS3-6 — `merged_detections` is the deterministic
+                        // floor's output plus whatever partial ML set arrived,
+                        // i.e. everything this request DID detect before the
+                        // gate refused it. Recording nothing here would make a
+                        // pilot's fail-closed traffic look clean.
+                        &merged_detections,
                         start,
                         capture,
                     )
@@ -567,6 +582,7 @@ impl PipelineService {
                                     &pipeline_state.detections,
                                     degraded_reason,
                                 ),
+                                &pipeline_state.detections,
                                 start,
                                 capture,
                             )
@@ -656,6 +672,10 @@ impl PipelineService {
             // is not — and `audit_prompt` records nothing.
             event
                 .record_prompt(audit_prompt(&self.state, &request.messages, degraded_reason).await);
+            // WS3-6 SITE 2/4 — a policy DENY. Nothing was forwarded, but the
+            // detections are exactly what a pilot wants counted: this is the
+            // traffic the customer's own rules stopped.
+            event.record_detections(&pipeline_state.detections);
             self.state
                 .analytics
                 .enqueue(event, self.state.metrics.as_ref())
@@ -952,6 +972,10 @@ impl PipelineService {
         // WS2-3 — the audit/analytics row records that this answer was
         // produced with the deterministic floor alone.
         event.floor_only = degraded_reason.is_some();
+        // WS3-6 SITE 3/4 — the served buffered path. THE population the leak
+        // report is about: these detections are the PII that would have
+        // reached the provider had SecurePrompt not been in front of it.
+        event.record_detections(&pipeline_state.detections);
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -1054,6 +1078,12 @@ impl PipelineService {
             && secure_mode.redact_pii_in_responses
             && !state.config.chat_debug_mode;
 
+        // WS3-6 — the prompt-side detections, moved into the generator so the
+        // deferred finalizer can record the same per-class counts the buffered
+        // path does. Prompt-side ONLY: the response-side `scrub_segment!` pass
+        // re-detects the model's OUTPUT, which is a different population and
+        // would double-count an entity the model echoed back.
+        let prompt_detections = pipeline_state.detections;
         let mut vault = pipeline_state.vault;
         let mut redaction_map = pipeline_state.redaction_map;
         // The PII the client provided this turn, frozen before the stream loop.
@@ -1242,6 +1272,10 @@ impl PipelineService {
             // WS2-3 — floor-only for the whole stream: set at prepare time,
             // or upgraded by a mid-stream response-side coverage loss.
             event.floor_only = stream_degraded.is_some();
+            // WS3-6 SITE 4/4 — the streaming finalizer. Same population as the
+            // buffered path, so a workspace that streams is not invisible to
+            // the leak report.
+            event.record_detections(&prompt_detections);
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
             // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`,
             // captured outside this generator and moved in) times this

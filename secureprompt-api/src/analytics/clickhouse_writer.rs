@@ -1,7 +1,7 @@
 use crate::{
     analytics::events::{
-        LatencySampleRow, PolicyEventRow, RequestContentCaptureRow, RequestEvent, RequestEventRow,
-        TokenUsageRow,
+        DetectionClassCountRow, LatencySampleRow, PolicyEventRow, RequestContentCaptureRow,
+        RequestEvent, RequestEventRow, TokenUsageRow,
     },
     observability::metrics::MetricsRegistry,
 };
@@ -228,6 +228,19 @@ impl AnalyticsHandle {
                 .with_max_rows(BATCH_MAX_ROWS)
                 .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
 
+            // WS3-6 — per-class detection counts, the leak report's source.
+            // A separate inserter because it is the only table with more than
+            // one row per request; a failure here must not cost the analytics
+            // row, and vice versa.
+            let mut cnt_inserter = ch_client
+                .inserter::<DetectionClassCountRow>("detection_class_counts")
+                .with_timeouts(
+                    Some(Duration::from_secs(INSERT_TIMEOUT_SECS)),
+                    Some(Duration::from_secs(INSERT_SEND_TIMEOUT_SECS)),
+                )
+                .with_max_rows(BATCH_MAX_ROWS)
+                .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
+
             let mut tok_inserter = ch_client
                 .inserter::<TokenUsageRow>("token_usage")
                 .with_timeouts(
@@ -350,6 +363,21 @@ impl AnalyticsHandle {
                     }
                 }
 
+                // WS3-6 — one row per class detected on this request. Returns
+                // an EMPTY vec when nothing was detected, so a clean request
+                // writes nothing here. Deliberately NOT `continue` on error,
+                // for the same reason as the capture row above: losing the
+                // leak-report source must not also lose the audit row.
+                for cnt_row in DetectionClassCountRow::from_event(&event, now) {
+                    if let Err(e) = cnt_inserter.write(&cnt_row).await {
+                        tracing::error!(
+                            error = %e,
+                            "detection_class_counts write error; dropping the count row"
+                        );
+                        metrics_task.record_clickhouse_insert_failure();
+                    }
+                }
+
                 for pe in &event.policy_events {
                     let pol_row = PolicyEventRow::from_policy_event(
                         pe,
@@ -421,6 +449,10 @@ impl AnalyticsHandle {
                     );
                     metrics_task.record_clickhouse_insert_failure();
                 }
+                if let Err(e) = cnt_inserter.commit().await {
+                    tracing::error!(error = %e, "detection_class_counts inserter commit error");
+                    metrics_task.record_clickhouse_insert_failure();
+                }
                 if let Err(e) = tok_inserter.commit().await {
                     tracing::error!(error = %e, "token_usage inserter commit error");
                     metrics_task.record_clickhouse_insert_failure();
@@ -431,6 +463,7 @@ impl AnalyticsHandle {
             let _ = pol_inserter.end().await;
             let _ = lat_inserter.end().await;
             let _ = cap_inserter.end().await;
+            let _ = cnt_inserter.end().await;
             let _ = tok_inserter.end().await;
         });
 

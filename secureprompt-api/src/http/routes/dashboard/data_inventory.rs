@@ -569,6 +569,7 @@ async fn get_data_inventory(
     let ch_policy_events = ch_count(ch, "policy_events", ws).await;
     let ch_token_usage = ch_count(ch, "token_usage", ws).await;
     let ch_latency_samples = ch_count(ch, "latency_samples", ws).await;
+    let ch_detection_counts = ch_count(ch, "detection_class_counts", ws).await;
     let ch_hourly_cost = ch_count(ch, "mv_hourly_cost_agg", ws).await;
     let ch_p95_latency = ch_count(ch, "mv_p95_latency_agg", ws).await;
     let ch_captures = ch_capture_shape(ch, ws).await;
@@ -727,17 +728,39 @@ async fn get_data_inventory(
             &ch_latency_samples,
             30,
         ),
+        (
+            "detection_class_counts",
+            "WS3-6, the shadow-mode leak report's source. One row per request \
+             per ENTITY CLASS: how many distinct entities of that class the \
+             detection pass found, plus the destination model and the actor \
+             (user id, API key name) already recorded on request_events. NO \
+             DETECTED VALUE IS STORED — `entity_class` can only ever hold one \
+             of the class-name string literals compiled into the gateway, or \
+             the literal `other`, because a class arriving from the ML sidecar \
+             is mapped through an allowlist before it is written.",
+            &ch_detection_counts,
+            90,
+        ),
     ] {
         let (row_count, row_count_status, row_count_detail) = counted(result);
-        let extra = if class == "token_usage" {
-            Some(
+        let extra = match class {
+            "token_usage" => Some(
                 "SummingMergeTree: `count()` is the number of PARTS rows currently on disk, \
                  which is >= the number of logical (workspace, model, date) keys until a \
                  merge collapses them."
                     .to_owned(),
-            )
-        } else {
-            None
+            ),
+            "detection_class_counts" => Some(
+                "Rows are written ONLY when something was detected, so `count()` here is a \
+                 count of (request, class) pairs and NOT a request count. `api_key_name` is \
+                 operator-chosen free text copied from request_events and may name a person \
+                 — it is not detected PII, but it is personal data for an erasure request. \
+                 The 90-day window is deliberately identical to request_events': this table \
+                 is derived from the same requests, so it must not outlive them the way the \
+                 mv_* aggregates and the dbt marts below do."
+                    .to_owned(),
+            ),
+            _ => None,
         };
         artifacts.push(ArtifactClass {
             class: class.to_owned(),

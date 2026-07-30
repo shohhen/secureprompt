@@ -119,6 +119,23 @@ pub struct RequestEvent {
     /// reviewer can scope an incident to exactly the traffic that ran without
     /// NER rather than guessing from sidecar uptime.
     pub floor_only: bool,
+    /// WS3-6 — how many DISTINCT entities of each class this request's
+    /// detection pass found. The source the shadow-mode leak report
+    /// aggregates.
+    ///
+    /// PRIVATE ON PURPOSE, like `captured` and `redacted_prompt` above,
+    /// though for a different reason. Those two are private so plaintext
+    /// cannot be assigned past a gate. This one is private so a caller cannot
+    /// assign a class name that never went through
+    /// [`crate::analytics::detection_counts::canonicalize`] — the ONLY route
+    /// to a value here is [`Self::record_detections`]. `detection_class_counts`
+    /// is exempt from the WS3-1 capture opt-in precisely because its strings
+    /// are string literals from this binary, and that is enforced here rather
+    /// than asserted in a comment.
+    ///
+    /// Keys are `&'static str` for the same reason: an owned `String` would
+    /// make it possible to construct one from request data.
+    detection_counts: std::collections::BTreeMap<&'static str, u32>,
 }
 
 impl RequestEvent {
@@ -158,7 +175,33 @@ impl RequestEvent {
             redacted_prompt: None,
             captured: None,
             floor_only: false,
+            detection_counts: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// WS3-6 — the ONLY way per-class counts are attached to an analytics
+    /// event.
+    ///
+    /// Takes the DETECTIONS, not a pre-built map, so the counts cannot
+    /// disagree with what the pipeline acted on: every call site passes the
+    /// same slice it passed to policy evaluation and redaction. A re-scan
+    /// would need the stored text (which WS3-1 exists to avoid keeping) and
+    /// would measure a different model version than the one that served the
+    /// request.
+    ///
+    /// Called on all four analytics-emitting paths, including the ones that
+    /// forwarded nothing. During a shadow-mode pilot the blocked and denied
+    /// requests are precisely the interesting population — a counts table
+    /// covering only served traffic would under-report the leak it exists to
+    /// show.
+    pub fn record_detections(&mut self, detections: &[secureprompt_common::types::Detection]) {
+        self.detection_counts = crate::analytics::detection_counts::per_class(detections);
+    }
+
+    /// Read-only view, for the same reason as [`Self::captured`].
+    #[must_use]
+    pub const fn detection_counts(&self) -> &std::collections::BTreeMap<&'static str, u32> {
+        &self.detection_counts
     }
 
     /// WS3-1 / WS3-2 — the ONLY way raw request content is ever attached to
@@ -344,6 +387,61 @@ impl RequestContentCaptureRow {
             raw_response: captured.raw_response.clone(),
             restored_response: captured.restored_response.clone(),
         })
+    }
+}
+
+/// WS3-6 — one row per (request, entity class) in `detection_class_counts`
+/// (ClickHouse migration 008).
+///
+/// Field order MUST match the CREATE TABLE column order.
+///
+/// `model`, `user_id` and `api_key_name` are DENORMALISED from the same event
+/// rather than joined from `request_events` at read time. See the migration
+/// header for why; the short version is that a join would silently drop whole
+/// classes out of a compliance report whenever the `request_events` row was
+/// lost, and the writer can lose one independently.
+#[derive(Row, Serialize)]
+pub struct DetectionClassCountRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub request_id: uuid::Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub workspace_id: uuid::Uuid,
+    #[serde(with = "clickhouse::serde::chrono::datetime")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub model: String,
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub user_id: Option<uuid::Uuid>,
+    pub api_key_name: Option<String>,
+    /// Always one of `detection_counts::CANONICAL_CLASSES` or the literal
+    /// `other` — never a string that came off the ML sidecar's wire.
+    pub entity_class: String,
+    /// DISTINCT `(class, value)` pairs, so it matches the number of
+    /// placeholders a reader of the redacted prompt would see.
+    pub entity_count: u32,
+}
+
+impl DetectionClassCountRow {
+    /// One row per class. EMPTY when the request produced no detections, so a
+    /// clean request writes nothing at all and `count()` on this table is a
+    /// count of detections, never of requests.
+    ///
+    /// `created_at` is the SAME instant the writer stamps on the
+    /// `request_events` row, so a report window that includes one includes the
+    /// other.
+    pub fn from_event(e: &RequestEvent, created_at: chrono::DateTime<chrono::Utc>) -> Vec<Self> {
+        e.detection_counts()
+            .iter()
+            .map(|(class, count)| Self {
+                request_id: e.request_id.0,
+                workspace_id: e.workspace_id.0,
+                created_at,
+                model: e.model.clone(),
+                user_id: e.user_id,
+                api_key_name: e.api_key_name.clone(),
+                entity_class: (*class).to_owned(),
+                entity_count: *count,
+            })
+            .collect()
     }
 }
 
