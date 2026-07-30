@@ -607,12 +607,41 @@ async fn encryption_state_is_derived_from_stored_bytes_not_the_self_asserted_fla
 /// The claim is only as good as the mechanism behind it, so the response must
 /// say what the mechanism IS and whether it is working right now.
 ///
-/// Falsifier: delete the `kms.encrypt`/`kms.decrypt` round trip in
-/// `kms_self_test` and hardcode `"ok"` — the `basis` list loses its
-/// `kms_self_test` entry and this test fails.
+/// The workspace is seeded with a real sealed row in EACH ciphertext-bearing
+/// class first. An earlier version of this test ran against an empty
+/// workspace, where every such class reports `empty` and is skipped by the
+/// loop below — it passed with `basis::KMS_SELF_TEST` deleted from
+/// `Encryption::sealed`, because the only class it ever examined was `users`,
+/// whose basis is assembled separately. The `covered` set at the bottom is
+/// what makes that recurrence impossible.
+///
+/// Falsifier: remove `basis::KMS_SELF_TEST` from `Encryption::sealed`.
+/// Whether the probe itself is real is proved separately, by
+/// `kms_self_test_passes_only_on_a_true_round_trip` in the module's own unit
+/// tests — asserting `kms_self_test == "ok"` here cannot distinguish a live
+/// round trip from a hardcoded string.
 #[sqlx::test]
 async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: PgPool) {
     let (ws, user) = seed_workspace(&pool).await;
+
+    // Give every ciphertext-bearing class something genuinely sealed, so the
+    // loop below actually reaches the `Encryption::sealed` path.
+    let kms = secureprompt_common::kms::kms_backend_from_env()
+        .expect("KMS_FILE_KEY must be set for this suite — see .env");
+    let sealed = String::from_utf8(kms.encrypt(b"synthetic").await.expect("kms encrypt"))
+        .expect("ciphertext is UTF-8");
+    seed_capture(ws, &sealed, true).await;
+    sqlx::query(
+        "INSERT INTO token_vault_entries (id, workspace_id, mapping_ciphertext)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws)
+    .bind(&sealed)
+    .execute(&pool)
+    .await
+    .expect("seed vault");
+
     let app = build_app(pool);
     let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
     assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
@@ -631,38 +660,44 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
 
     // Every class claiming ciphertext must name the substantiation.
     let entries = body["artifacts"].as_array().expect("artifacts array");
-    let mut ciphertext_classes = 0_usize;
+    let mut covered: BTreeSet<String> = BTreeSet::new();
     for entry in entries {
         let at_rest = entry["encryption"]["at_rest"].as_str().unwrap_or("");
         if at_rest != "ciphertext" && at_rest != "mixed" {
             continue;
         }
-        ciphertext_classes += 1;
+        let class = entry["class"].as_str().unwrap_or_default().to_owned();
         let basis: Vec<&str> = entry["encryption"]["basis"]
             .as_array()
-            .unwrap_or_else(|| panic!("class {} has no `basis` list: {entry}", entry["class"]))
+            .unwrap_or_else(|| panic!("class {class} has no `basis` list: {entry}"))
             .iter()
             .filter_map(Value::as_str)
             .collect();
         assert!(
             basis.contains(&"kms_self_test"),
-            "class {} claims {at_rest} without resting on the live KMS probe: \
-             {basis:?}",
-            entry["class"]
+            "class {class} claims {at_rest} without resting on the live KMS \
+             probe: {basis:?}"
         );
         assert!(
             basis.contains(&"stored_payload_shape"),
-            "class {} claims {at_rest} without checking the bytes actually on \
-             disk: {basis:?}",
-            entry["class"]
+            "class {class} claims {at_rest} without checking the bytes \
+             actually on disk: {basis:?}"
+        );
+        covered.insert(class);
+    }
+
+    // Positive controls. The loop above passes vacuously over an empty set,
+    // and it passed for months of nothing if the only class it ever saw was
+    // one whose basis is assembled elsewhere. Both seeded ciphertext classes
+    // must have been examined.
+    for class in ["request_content_captures", "token_vault_entries"] {
+        assert!(
+            covered.contains(class),
+            "`{class}` was seeded with a genuinely sealed row and did not \
+             report ciphertext, so the basis assertions never ran against the \
+             sealed code path. Examined: {covered:?}. Response: {body}"
         );
     }
-    // Positive control: the loop above vacuously passes over an empty set.
-    assert!(
-        ciphertext_classes > 0,
-        "no class claims ciphertext at all, so the assertions above ran zero \
-         times: {body}"
-    );
 }
 
 // ── 3. Completeness ───────────────────────────────────────────────────────
