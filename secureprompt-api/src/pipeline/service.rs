@@ -1,6 +1,6 @@
 use crate::{
     analytics::capture::CaptureDecision,
-    analytics::events::RequestEvent,
+    analytics::events::{RedactedPrompt, RequestEvent},
     app_state::AppState,
     db::raw_capture_repo::RawCaptureRepository,
     db::secure_mode_repo::{SecureModeRepository, SecureModeRow},
@@ -255,7 +255,7 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request_id: RequestId,
         reason: CoverageLoss,
-        detections: &[secureprompt_common::types::Detection],
+        prompt: RedactedPrompt,
         start: Instant,
         capture: CaptureDecision,
     ) -> ApiError {
@@ -305,12 +305,25 @@ impl PipelineService {
                 None,
             )
             .await;
-        // Reuses the detections this request already produced — NO second
-        // sidecar call on a path that is failing precisely because detection
-        // is unavailable or over budget. Shows what was actually caught
-        // (deterministic floor, plus whatever partial ML coverage there was),
-        // which is the evidence for "why was this not safe to forward".
-        event.redacted_prompt = Some(redact_last_user_message_with(&request.messages, detections));
+        // WS3 review — decided by the CALLER, not here.
+        //
+        // This used to be an unconditional
+        // `redact_last_user_message_with(&request.messages, detections)`,
+        // justified as "shows what was actually caught". On the NER gate what
+        // it actually showed was the user's prompt VERBATIM: that gate fires
+        // when NER coverage is lost, PERSON / ORGANIZATION / ADDRESS are
+        // ML-only classes, and both redaction helpers return the content
+        // unchanged when no detection survives. Because `redacted_prompt` was
+        // also exempt from the WS3-1 capture gate, a 503 that forwarded
+        // nothing upstream wrote a plaintext copy of the prompt into
+        // `request_events` — 90-day TTL, no opt-in. The gateway refused to
+        // send the prompt because it could not redact it, then stored it in
+        // the clear itself.
+        //
+        // The INJECTION gate reaches this same function with NER healthy, and
+        // there the redaction is real, so the two callers pass different
+        // values. See `RedactedPrompt`.
+        event.record_prompt(prompt);
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -413,8 +426,6 @@ impl PipelineService {
                 );
                 SidecarUnavailablePolicy::default()
             });
-        // Merged BEFORE the gate so the fail-closed path can reuse these for
-        // the audit row instead of paying for a second scan.
         let merged_detections = merge_detections(regex_detections, ml_outcome.detections);
         let mut degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
             SidecarGate::Proceed => None,
@@ -426,7 +437,9 @@ impl PipelineService {
                         resolved,
                         request_id,
                         reason,
-                        &merged_detections,
+                        // NER coverage is what was just lost, so nothing here
+                        // is a redacted prompt. See `RedactedPrompt`.
+                        RedactedPrompt::CoverageLost,
                         start,
                         capture,
                     )
@@ -539,7 +552,20 @@ impl PipelineService {
                                 resolved,
                                 request_id,
                                 reason,
-                                &pipeline_state.detections,
+                                // The INJECTION classifier is what is
+                                // unavailable here; NER coverage is whatever
+                                // the gate above settled. When it was full,
+                                // these detections produce a genuinely
+                                // placeholder-safe body and it IS recorded —
+                                // reusing detections already computed rather
+                                // than paying a second sidecar call on a path
+                                // that exists because the sidecar is
+                                // struggling.
+                                audit_prompt_with(
+                                    &request.messages,
+                                    &pipeline_state.detections,
+                                    degraded_reason,
+                                ),
                                 start,
                                 capture,
                             )
@@ -622,9 +648,13 @@ impl PipelineService {
                     None,
                 )
                 .await;
-            event.redacted_prompt = Some(
-                redact_last_user_message(&self.state, &request.messages).await,
-            );
+            // A policy DENY also forwards nothing, but unlike the fail-closed
+            // path it normally runs with FULL detection coverage, so the text
+            // recorded here really is placeholder-safe. When the deny happens
+            // in a `degrade_with_alert` workspace whose sidecar is down, it
+            // is not — and `audit_prompt` records nothing.
+            event
+                .record_prompt(audit_prompt(&self.state, &request.messages, degraded_reason).await);
             self.state
                 .analytics
                 .enqueue(event, self.state.metrics.as_ref())
@@ -891,8 +921,7 @@ impl PipelineService {
         // the relevant content under conversation history (especially
         // problematic for LibreChat which sends the entire prior thread
         // on each turn).
-        event.redacted_prompt =
-            Some(redact_last_user_message(&self.state, &request.messages).await);
+        event.record_prompt(audit_prompt(&self.state, &request.messages, degraded_reason).await);
         // WS3-1 SITES 3/7, 4/7 and 5/7 — the buffered path's three
         // assignments, now one gated call:
         //   * `raw_prompt`        — the un-redacted latest user message;
@@ -1184,8 +1213,9 @@ impl PipelineService {
             event.api_key_name = Some(api_key_name.clone());
             event.ip_address = request.client_ip.clone();
             event.user_agent = request.user_agent.clone();
-            event.redacted_prompt =
-                Some(redact_last_user_message(&state, &request.messages).await);
+            event.record_prompt(
+                audit_prompt(&state, &request.messages, stream_degraded).await,
+            );
             // WS3-1 SITES 6/7 and 7/7 — the streaming finalizer's three
             // assignments (raw_prompt, raw_response, restored_response),
             // now one gated call. `capture` was resolved in `prepare` and
@@ -1487,12 +1517,19 @@ const FILE_VAULT_MARKER_CLOSE: &str = "]]";
 /// `last_user_message_span` strips PER MESSAGE. A marker split across the
 /// `\n` join (`"…[[sp:v="` ending one message, `"ref]]"` opening the next) is
 /// therefore stripped by the join-path and NOT by the per-message path, so
-/// the two disagree on offsets for that input. It fails safe: the value guard
-/// in `redact_last_user_message_with` sees mismatched bytes and drops the
-/// detection, so the audit row's `redacted_prompt` shows that text unredacted
-/// rather than redacting the wrong bytes. `raw_prompt` stores the message raw
-/// regardless, so this is not an incremental disclosure — but it IS one fewer
-/// redaction in the audit view for a genuinely pathological input.
+/// the two disagree on offsets for that input. It fails safe in the sense
+/// that matters — the value guard in `redact_last_user_message_with` sees
+/// mismatched bytes and drops the detection rather than redacting the wrong
+/// bytes — but the dropped detection means that text would appear UNREDACTED
+/// in the audit row.
+///
+/// CORRECTION (WS3 review): this used to add "`raw_prompt` stores the message
+/// raw regardless, so this is not an incremental disclosure". That is no
+/// longer true and was the wrong way round anyway — WS3-1 put `raw_prompt`
+/// behind an opt-in gate, so on a default install nothing else stores the raw
+/// message and an unredacted `redacted_prompt` IS the disclosure. It stays
+/// bounded only because a dropped detection needs a marker split across the
+/// `\n` join, which no client produces.
 pub(crate) fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
     let mut cleaned = String::with_capacity(text.len());
@@ -1902,6 +1939,12 @@ fn last_user_message_raw(messages: &[Message]) -> Option<String> {
 /// Cost: one extra ML sidecar call per gateway request. The classifier
 /// is sub-200ms on cached models; in exchange we get a deterministic
 /// audit log that doesn't depend on prior-turn NER drift.
+///
+/// RETURNS THE MESSAGE VERBATIM when no detection survives. That is correct
+/// for a prompt with no PII and INDISTINGUISHABLE, in the return type, from a
+/// prompt whose PII the sidecar could not see. Callers must not assume the
+/// result is placeholder-safe — decide with [`audit_prompt`], which knows
+/// whether coverage was lost.
 async fn redact_last_user_message(
     state: &AppState,
     messages: &[Message],
@@ -1984,6 +2027,13 @@ pub(crate) fn last_user_message_span(messages: &[Message]) -> Option<(usize, usi
 /// Detections outside the audited message are dropped and the rest rebased to
 /// message-local offsets, so the result is the same shape the success paths
 /// produce.
+///
+/// RETURNS THE MESSAGE VERBATIM when no detection survives — and on the
+/// fail-closed NER path that is the NORMAL case, not an edge case, because
+/// that path fires when ML coverage is gone and the deterministic floor has
+/// no PERSON / ORGANIZATION / ADDRESS recogniser. Callers must not assume the
+/// result is placeholder-safe: use [`audit_prompt_with`], which refuses to
+/// record anything when coverage was lost.
 pub(crate) fn redact_last_user_message_with(
     messages: &[Message],
     detections: &[secureprompt_common::types::Detection],
@@ -2029,6 +2079,43 @@ pub(crate) fn redact_last_user_message_with(
     let mut vault = secureprompt_common::types::TokenVault::default();
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     crate::vault::apply_redaction(&content, &scoped, &mut vault, &mut map)
+}
+
+/// WS3 review — the value the audit row may record for `redacted_prompt`.
+///
+/// `degraded.is_some()` is the same condition that sets `floor_only` on the
+/// row: the ML sidecar produced no usable coverage and the workspace's
+/// `sidecar_unavailable` policy is `degrade_with_alert`. The answer was then
+/// produced by the deterministic Rust floor alone, which has no PERSON,
+/// ORGANIZATION or ADDRESS recognisers — so the "redacted" prompt is the
+/// user's prompt with those classes intact. It is not recorded. See
+/// [`RedactedPrompt`].
+///
+/// Skipping the call on that branch also skips a second sidecar round-trip
+/// on a path that exists because the sidecar is unavailable.
+async fn audit_prompt(
+    state: &AppState,
+    messages: &[Message],
+    degraded: Option<CoverageLoss>,
+) -> RedactedPrompt {
+    if degraded.is_some() {
+        return RedactedPrompt::CoverageLost;
+    }
+    RedactedPrompt::Redacted(redact_last_user_message(state, messages).await)
+}
+
+/// As [`audit_prompt`], but from detections ALREADY computed over this
+/// prompt — no second sidecar call. Used by the injection-gate fail-closed
+/// path, which is failing because the sidecar is struggling.
+fn audit_prompt_with(
+    messages: &[Message],
+    detections: &[secureprompt_common::types::Detection],
+    degraded: Option<CoverageLoss>,
+) -> RedactedPrompt {
+    if degraded.is_some() {
+        return RedactedPrompt::CoverageLost;
+    }
+    RedactedPrompt::Redacted(redact_last_user_message_with(messages, detections))
 }
 
 /// Decrypt a stored provider credential via the configured KMS backend.

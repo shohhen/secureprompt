@@ -17,6 +17,22 @@
 //! that method's only route to a `Some` is [`seal`] below. A future call site
 //! that forgets the gate does not leak — it fails to compile.
 //!
+//! # Scope correction (WS3 review)
+//!
+//! The paragraph above was true of the three fields it names and FALSE of the
+//! event as a whole, which is how it read. A FOURTH field, `redacted_prompt`,
+//! stayed `pub` and stayed exempt — with a doc comment asserting the
+//! exemption was safe because the field holds "the same bytes that were
+//! forwarded upstream". On the fail-closed path nothing is forwarded and
+//! nothing is redacted, so it held the raw prompt, in the clear, in
+//! `request_events`, under the same 90-day TTL this module exists to escape.
+//!
+//! `redacted_prompt` is now private too, and settable only through
+//! [`crate::analytics::events::RequestEvent::record_prompt`], which takes a
+//! [`crate::analytics::events::RedactedPrompt`] — so a call site must NAME
+//! whether its request was actually redacted. The compile-error property now
+//! covers all four fields, which is what the paragraph above always claimed.
+//!
 //! # Fail-closed in three places
 //!
 //! 1. Capture not enabled for the workspace → `None`. This is the default,

@@ -75,6 +75,18 @@ struct MockSidecar {
 
 impl MockSidecar {
     fn spawn() -> Self {
+        Self::spawn_with(false)
+    }
+
+    /// Healthy `/detect/ner`, 500 on `/detect/injection`. Drives the
+    /// injection-gate fail-closed path, where NER coverage is COMPLETE and
+    /// the redaction is therefore real — the case that separates "nothing was
+    /// forwarded" from "nothing was redacted".
+    fn spawn_failing_injection() -> Self {
+        Self::spawn_with(true)
+    }
+
+    fn spawn_with(fail_injection: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -92,6 +104,14 @@ impl MockSidecar {
             let Some(request) = read_http_request(&mut stream) else {
                 continue;
             };
+            if fail_injection && request.contains("/detect/injection") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+                sink.lock().expect("request sink mutex").push(request);
+                continue;
+            }
             let body: &[u8] = if request.contains("/detect/ner") {
                 ner_body.as_bytes()
             } else if request.contains("/v1/rag-check") {
@@ -451,6 +471,275 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
         0,
         "a fresh install must write no row at all to request_content_captures"
     );
+
+    Ok(())
+}
+
+// ── WS3 review: `redacted_prompt` is not exempt from the gate ─────────────
+
+/// Choose the workspace's `sidecar_unavailable` policy, as
+/// `tests/sidecar_failure_policy.rs` does.
+async fn set_sidecar_policy(pool: &PgPool, workspace_id: Uuid, policy: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO workspace_sidecar_policy (workspace_id, sidecar_unavailable, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+            sidecar_unavailable = EXCLUDED.sidecar_unavailable",
+    )
+    .bind(workspace_id)
+    .bind(policy)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// `isNull(redacted_prompt)` and the value, in one never-empty string so
+/// `await_request_events` can poll on it (an expression that evaluates to the
+/// empty string would make it spin until it panics).
+const PROMPT_PROBE: &str =
+    "concat(toString(isNull(redacted_prompt)), '|', coalesce(redacted_prompt, ''))";
+
+/// THE FAIL-CLOSED CASE. A 503'd request forwarded NOTHING upstream, so
+/// storing its prompt body is a disclosure that would not otherwise exist —
+/// and the prompt is un-redacted, because the path is reached precisely when
+/// detection coverage was lost and PERSON is an ML-only class.
+///
+/// `analytics/events.rs` justified exempting `redacted_prompt` from the WS3-1
+/// capture gate on the grounds that it is "the same bytes that were forwarded
+/// upstream". On this path nothing was forwarded, so the justification does
+/// not hold and the exemption is a leak.
+///
+/// PREMISES, so the absence cannot pass trivially:
+///   1. the served request on the SAME workspace with the SAME prompt DOES
+///      store its redacted body — the POSITIVE CONTROL, proving both that the
+///      column is populated at all and that the probe reads it;
+///   2. the fail-closed request produced an audit row, and it is the
+///      fail-closed one (`final_action = block_sidecar_unavailable`).
+#[sqlx::test]
+async fn fail_closed_request_stores_no_prompt_body_in_clickhouse(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    seed_barrier_workspace(&pool).await?;
+
+    // POSITIVE CONTROL — healthy sidecar, full coverage, request served.
+    let served_marker = format!("ws3-served-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let served_app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
+    let response = served_app
+        .clone()
+        .oneshot(chat_request(&served_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush_capture_writer(served_app, "served").await;
+    assert_eq!(
+        await_request_events(PROMPT_PROBE, &served_marker).await,
+        format!("0|{REDACTED_PROMPT}"),
+        "positive control: a request that WAS forwarded must record the \
+         redacted body it forwarded. If this is NULL the assertion below \
+         proves nothing — every row would read NULL."
+    );
+
+    // THE CASE — dead sidecar, default `block` policy: 503, nothing forwarded.
+    let blocked_marker = format!("ws3-blocked-{}", Uuid::new_v4());
+    let blocked_app = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB);
+    let response = blocked_app
+        .clone()
+        .oneshot(chat_request(&blocked_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "premise: the fail-closed path must actually be taken"
+    );
+    flush_capture_writer(blocked_app, "blocked").await;
+
+    // Premise 2: the audit row exists, and it is the fail-closed one.
+    assert_eq!(
+        await_request_events("final_action", &blocked_marker).await,
+        "block_sidecar_unavailable",
+        "premise: the audit row must exist and be the fail-closed one, so a \
+         NULL prompt means the gate held rather than the request vanishing"
+    );
+
+    // THE ASSERTION. Nothing was forwarded, so there is no "what we sent".
+    assert_eq!(
+        await_request_events(PROMPT_PROBE, &blocked_marker).await,
+        "1|",
+        "a fail-closed request forwarded NOTHING upstream; writing its prompt \
+         body to request_events (plaintext, fixed 90-day TTL, no opt-in) \
+         creates a disclosure that would not otherwise exist"
+    );
+    let leaked = ch_query(&format!(
+        "SELECT count() FROM request_events WHERE user_agent = '{blocked_marker}' \
+         AND position(coalesce(redacted_prompt, ''), '{SYNTHETIC_NAME}') > 0"
+    ))
+    .await;
+    assert_eq!(
+        leaked, "0",
+        "the synthetic PII reached request_events.redacted_prompt on a \
+         request the gateway refused to forward BECAUSE it could not redact it"
+    );
+
+    Ok(())
+}
+
+/// THE DISCRIMINATOR. Not every 503 loses NER coverage, and this is the test
+/// that stops the fix from degenerating into "blank the prompt on every
+/// blocked request".
+///
+/// The injection-gate fail-closed path forwards nothing either, but it fires
+/// when the INJECTION classifier is unavailable while NER is COMPLETE. The
+/// redaction there is genuine, so `redacted_prompt` must still hold
+/// `{{Person_1}}` — the audit view keeps working for the case where keeping
+/// it costs nothing.
+///
+/// Replacing the caller's `audit_prompt_with(...)` with a bare
+/// `RedactedPrompt::CoverageLost` passes every other test in this file and
+/// fails this one.
+#[sqlx::test]
+async fn injection_gate_fail_closed_still_records_the_redacted_prompt(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    seed_barrier_workspace(&pool).await?;
+    sqlx::query(
+        "INSERT INTO workspace_secure_mode
+            (workspace_id, enabled, level, block_on_injection_detection)
+         VALUES ($1, true, 'standard', true)",
+    )
+    .bind(workspace_id)
+    .execute(&pool)
+    .await?;
+
+    let marker = format!("ws3-injection-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn_failing_injection();
+    let app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
+    let response = app
+        .clone()
+        .oneshot(chat_request(&marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "premise: the injection gate must fail closed"
+    );
+    // Premise: NER really was healthy, so this 503 is about the injection
+    // classifier alone and NOT a NER coverage loss.
+    assert!(
+        sidecar
+            .ner_requests()
+            .iter()
+            .any(|r| r.contains(SYNTHETIC_NAME)),
+        "premise: NER must have answered over the real prompt, otherwise this \
+         is just another NER-coverage 503 and proves nothing"
+    );
+    flush_capture_writer(app, "injection").await;
+
+    assert_eq!(
+        await_request_events("final_action", &marker).await,
+        "block_sidecar_unavailable",
+        "premise: the fail-closed audit row must exist"
+    );
+    assert_eq!(
+        await_request_events(PROMPT_PROBE, &marker).await,
+        format!("0|{REDACTED_PROMPT}"),
+        "NER coverage was COMPLETE here, so the redaction is real and the \
+         audit view keeps it. The rule is 'was it redacted', not 'was it \
+         forwarded' — blanking this row would lose audit signal for nothing"
+    );
+
+    Ok(())
+}
+
+/// THE DEGRADE CASE. `degrade_with_alert` answers the request on the
+/// deterministic Rust floor alone. Those bytes DID reach the provider, so
+/// storing them locally is not a NEW disclosure — but they are un-redacted
+/// PII (PERSON/ORGANIZATION/ADDRESS are ML-only) sitting in a table with a
+/// fixed 90-day TTL that the operator never opted into, under a column name
+/// that asserts it is redacted.
+///
+/// Same premises as above: a positive control that a fully-covered request
+/// DOES record its body, and `floor_only = 1` proving the degrade branch was
+/// really taken. Both the buffered and the streaming finalizer are driven,
+/// because they are separate assignment sites.
+#[sqlx::test]
+async fn floor_only_request_stores_no_prompt_body_in_clickhouse(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_sidecar_policy(&pool, workspace_id, "degrade_with_alert").await?;
+    seed_barrier_workspace(&pool).await?;
+
+    // POSITIVE CONTROL — same workspace, same policy, healthy sidecar.
+    let served_marker = format!("ws3-degrade-served-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let served_app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
+    let response = served_app
+        .clone()
+        .oneshot(chat_request(&served_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush_capture_writer(served_app, "degrade-served").await;
+    assert_eq!(
+        await_request_events(PROMPT_PROBE, &served_marker).await,
+        format!("0|{REDACTED_PROMPT}"),
+        "positive control: full coverage must still record the redacted body"
+    );
+    assert_eq!(
+        await_request_events("toUInt8(floor_only)", &served_marker).await,
+        "0",
+        "positive control premise: a fully-covered request is not floor_only"
+    );
+
+    // THE CASES — dead sidecar, `degrade_with_alert`: 200 on the floor alone.
+    for (label, streaming) in [("buffered", false), ("streaming", true)] {
+        let marker = format!("ws3-degrade-{label}-{}", Uuid::new_v4());
+        let app = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB);
+        let request = if streaming {
+            let mut request = streaming_chat_request(&marker);
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer sp_ws3_1_raw_capture"),
+            );
+            request
+        } else {
+            chat_request(&marker)
+        };
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "premise ({label}): degrade_with_alert must serve the request"
+        );
+        drain(response).await;
+        flush_capture_writer(app, label).await;
+
+        assert_eq!(
+            await_request_events("toUInt8(floor_only)", &marker).await,
+            "1",
+            "premise ({label}): the degrade branch must actually be taken, \
+             otherwise this asserts nothing about floor-only redaction"
+        );
+        assert_eq!(
+            await_request_events(PROMPT_PROBE, &marker).await,
+            "1|",
+            "({label}) a floor-only answer was NOT redacted by the coverage \
+             the workspace is configured for; storing it under a column named \
+             `redacted_prompt`, in the clear, for 90 days, with no opt-in, is \
+             the WS3-1 defect wearing the one field the gate did not cover"
+        );
+    }
 
     Ok(())
 }

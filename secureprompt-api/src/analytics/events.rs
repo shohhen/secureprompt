@@ -4,6 +4,59 @@ use secureprompt_common::{
     types::{PolicyEvent, RequestId, TokenUsage, WorkspaceId},
 };
 
+/// WS3 review — what a request path is allowed to record in
+/// [`RequestEvent::redacted_prompt`].
+///
+/// The column means "the placeholder-safe body we forwarded upstream". The
+/// discriminator is NER COVERAGE, not whether the request was forwarded —
+/// `{{Person_1}}` is safe to store whether or not it went anywhere, and the
+/// user's name is not safe to store either way.
+///
+/// Two paths lose that coverage, and both used to write the column anyway:
+///
+/// * **Fail-closed on NER coverage loss** (`final_action =
+///   block_sidecar_unavailable`, HTTP 503). The text is not placeholder-safe:
+///   PERSON, ORGANIZATION and ADDRESS are ML-only classes and the
+///   deterministic Rust floor has no recogniser for them, so both redaction
+///   helpers return the message VERBATIM. This case is the sharp one because
+///   NOTHING WAS FORWARDED — the gateway refused to send the prompt precisely
+///   because it could not redact it, and then wrote a plaintext copy into its
+///   own warehouse, 90-day TTL, no opt-in. That copy existed nowhere else, so
+///   it was a disclosure the request itself never created.
+///
+/// * **Degraded** (`floor_only = true`, HTTP 200, `degrade_with_alert`).
+///   Those bytes DID reach the provider, so retaining them is not a new
+///   disclosure to a third party — the genuinely different case. They are
+///   still un-redacted PII in a table the operator never opted into, under a
+///   column name that asserts the opposite to everyone reading the audit UI,
+///   so they are not recorded either.
+///
+/// Both record [`Self::CoverageLost`] and the column is NULL. A reader is not
+/// left guessing which: `final_action` identifies the first and `floor_only`
+/// the second.
+///
+/// NOT every 503 is `CoverageLost`. The injection-gate fail-closed path also
+/// forwards nothing, but it fires when the INJECTION classifier is
+/// unavailable while NER is healthy — the redaction there is real, so it is
+/// recorded as [`Self::Redacted`]. Same for a policy deny.
+///
+/// Why NULL rather than "put the column behind the capture gate": a workspace
+/// that opts in already has the *raw* prompt for these requests in
+/// `request_content_captures`, encrypted, under its own retention. Writing a
+/// floor-redacted near-duplicate into `request_events` in the clear would add
+/// a plaintext copy of a record that is deliberately ciphertext — strictly
+/// worse than storing nothing, for exactly the workspaces that care most.
+#[derive(Debug, Clone)]
+pub enum RedactedPrompt {
+    /// Detection ran with the coverage the workspace is configured for, and
+    /// this is the placeholder-safe body that was — or, on a policy deny,
+    /// would have been — forwarded upstream.
+    Redacted(String),
+    /// Detection coverage was lost on this request, so nothing here can
+    /// honestly be called a redacted prompt. Records NULL.
+    CoverageLost,
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestEvent {
     pub request_id: RequestId,
@@ -33,12 +86,20 @@ pub struct RequestEvent {
     /// Placeholder-safe prompt body — what was forwarded to the upstream
     /// after PII redaction. Required for the audit detail view.
     ///
-    /// Deliberately NOT behind the WS3-1 capture gate: this is the
-    /// post-tokenization text, the same bytes that were forwarded upstream.
-    /// It is what makes the audit row exist at all for a request whose raw
-    /// content is not captured, and it is what the WS3-1 tests use as their
-    /// positive control that a plaintext search against ClickHouse works.
-    pub redacted_prompt: Option<String>,
+    /// PRIVATE ON PURPOSE, exactly like `captured` below, and settable only
+    /// through [`Self::record_prompt`].
+    ///
+    /// This field used to be `pub`, and its doc comment used to claim it was
+    /// safely exempt from the WS3-1 capture gate because it holds "the same
+    /// bytes that were forwarded upstream". THAT CLAIM WAS FALSE on two of
+    /// its four assignment sites, and it was false in the direction that
+    /// matters: on the fail-closed path nothing is forwarded at all, and the
+    /// text is un-redacted precisely because detection coverage was lost.
+    /// The claim was never checked because the only tests that read this
+    /// column asserted `position(prose) > 0`, which the raw prompt satisfies.
+    ///
+    /// See [`RedactedPrompt`] for what each path may record and why.
+    redacted_prompt: Option<String>,
     /// WS3-1 / WS3-2 — the raw user message, the raw upstream response and
     /// the PII-restored response, encrypted, IF AND ONLY IF the workspace
     /// opted in.
@@ -127,6 +188,27 @@ impl RequestEvent {
     #[must_use]
     pub fn captured(&self) -> Option<&CapturedContent> {
         self.captured.as_ref()
+    }
+
+    /// WS3 review — the ONLY way a prompt body is attached to an analytics
+    /// event.
+    ///
+    /// Taking a [`RedactedPrompt`] rather than a `String` is the point: a
+    /// call site has to NAME which case its request is in, so a path where
+    /// redaction did not actually run cannot record plaintext by omission.
+    /// The field it writes is private, so a new `event.redacted_prompt = …`
+    /// is a compile error rather than a leak.
+    pub fn record_prompt(&mut self, prompt: RedactedPrompt) {
+        self.redacted_prompt = match prompt {
+            RedactedPrompt::Redacted(text) => Some(text),
+            RedactedPrompt::CoverageLost => None,
+        };
+    }
+
+    /// Read-only view, for the same reason as [`Self::captured`].
+    #[must_use]
+    pub fn redacted_prompt(&self) -> Option<&str> {
+        self.redacted_prompt.as_deref()
     }
 }
 
