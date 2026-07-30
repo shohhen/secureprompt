@@ -274,6 +274,25 @@ async fn seed_capture(ws: Uuid, payload: &str, encrypted: bool) {
     .await;
 }
 
+/// A `request_content_captures` row with NO payload in any of the three
+/// content columns. The writer produces one whenever a capture-enabled
+/// workspace makes a request that carried no user message it could keep.
+async fn seed_capture_with_no_payload(ws: Uuid) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.request_content_captures \
+             (request_id, workspace_id, created_at, expires_at, encrypted, \
+              raw_prompt, raw_response, restored_response) \
+             VALUES ('{rid}', '{ws}', now(), now() + INTERVAL 30 DAY, 1, \
+                     NULL, NULL, NULL)",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+        ),
+        "seeding an empty request_content_captures row",
+    )
+    .await;
+}
+
 async fn get_inventory(app: &Router, token: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -641,6 +660,21 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
     .execute(&pool)
     .await
     .expect("seed vault");
+    // And a provider credential. Without one, `providers` reports `empty` and
+    // the loop below never examines the ONE class in this product that is not
+    // sealed by the KMS — which is how it kept passing while that class cited
+    // a KMS round trip performed against a different key.
+    sqlx::query(
+        "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential,
+                                config, created_at, updated_at)
+         VALUES ($1, $2, 'inv-basis-provider', 'openai',
+                 'ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM', '{}'::jsonb, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws)
+    .execute(&pool)
+    .await
+    .expect("seed provider");
 
     let app = build_app(pool);
     let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
@@ -673,10 +707,14 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
             .iter()
             .filter_map(Value::as_str)
             .collect();
+        // A LIVE KEY PROBE, and specifically the probe for the key that
+        // actually sealed this class. `providers` is AES-256-GCM under
+        // SECUREPROMPT_PROVIDER_KEY, never the KMS, and it used to cite
+        // `kms_self_test` — a round trip against a key it does not use.
         assert!(
-            basis.contains(&"kms_self_test"),
-            "class {class} claims {at_rest} without resting on the live KMS \
-             probe: {basis:?}"
+            basis.contains(&"kms_self_test") || basis.contains(&"provider_key_self_test"),
+            "class {class} claims {at_rest} without resting on a live probe of \
+             the key that sealed it: {basis:?}"
         );
         assert!(
             basis.contains(&"stored_payload_shape"),
@@ -686,11 +724,33 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
         covered.insert(class);
     }
 
+    // The two probes must be about DIFFERENT keys, or the disjunction above is
+    // an alias and `providers` is back to citing the KMS.
+    let providers = artifact(&body, "providers");
+    let provider_basis: Vec<&str> = providers["encryption"]["basis"]
+        .as_array()
+        .expect("providers basis")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        provider_basis.contains(&"provider_key_self_test")
+            && !provider_basis.contains(&"kms_self_test"),
+        "`providers` must rest on the provider-key probe and NOT on the KMS \
+         probe: {provider_basis:?}"
+    );
+    assert!(
+        body["encryption_basis"]["provider_key_self_test"].is_string(),
+        "the provider key was never probed, so the basis it names is a label \
+         and not a measurement: {body}"
+    );
+
     // Positive controls. The loop above passes vacuously over an empty set,
     // and it passed for months of nothing if the only class it ever saw was
-    // one whose basis is assembled elsewhere. Both seeded ciphertext classes
-    // must have been examined.
-    for class in ["request_content_captures", "token_vault_entries"] {
+    // one whose basis is assembled elsewhere. Every seeded ciphertext class
+    // must have been examined — including `providers`, whose absence from this
+    // list is exactly how its wrong basis survived.
+    for class in ["request_content_captures", "token_vault_entries", "providers"] {
         assert!(
             covered.contains(class),
             "`{class}` was seeded with a genuinely sealed row and did not \
@@ -698,6 +758,310 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
              sealed code path. Examined: {covered:?}. Response: {body}"
         );
     }
+}
+
+/// A row with NOTHING stored in it must never be reported as encrypted.
+///
+/// `ch_sealed` wraps its predicate in `ifNull(..., 1)`, so a NULL payload
+/// column reads as SEALED. A `request_content_captures` row whose three
+/// content columns are all NULL therefore counted as `matching`, and a
+/// workspace holding only such rows reported `at_rest: ciphertext` with
+/// `rows_not_matching: 0` — the strongest verdict this endpoint can give,
+/// resting on zero bytes of evidence. The vocabulary already has the honest
+/// answer for that state (`empty`: "nothing stored, so nothing was verified"),
+/// and it was unreachable.
+///
+/// PREMISE: the payload-free row is confirmed on disk, all three columns NULL.
+/// POSITIVE CONTROL: a second workspace holding a genuinely sealed row must
+/// still report `ciphertext`, so `empty` below is a verdict about the bytes and
+/// not this endpoint refusing to claim anything.
+#[sqlx::test]
+async fn a_capture_row_with_no_payload_is_not_reported_as_encrypted(pool: PgPool) {
+    let (hollow, hollow_user) = seed_workspace(&pool).await;
+    let (sealed_ws, sealed_user) = seed_workspace(&pool).await;
+
+    seed_capture_with_no_payload(hollow).await;
+
+    let kms = secureprompt_common::kms::kms_backend_from_env()
+        .expect("KMS_FILE_KEY must be set for this suite — see .env");
+    let sealed = String::from_utf8(kms.encrypt(b"synthetic").await.expect("kms encrypt"))
+        .expect("ciphertext is UTF-8");
+    seed_capture(sealed_ws, &sealed, true).await;
+
+    // ---- Premise ----------------------------------------------------------
+    assert_eq!(
+        clickhouse_count(
+            "request_content_captures",
+            &format!(
+                "workspace_id = toUUID('{hollow}') AND raw_prompt IS NULL \
+                 AND raw_response IS NULL AND restored_response IS NULL"
+            )
+        )
+        .await,
+        1,
+        "premise failed: the payload-free row is not on disk in the shape this \
+         test is named for"
+    );
+
+    let app = build_app(pool);
+
+    let (status, body) = get_inventory(&app, &make_jwt(hollow, hollow_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+    let entry = artifact(&body, "request_content_captures");
+
+    // The row still EXISTS and must still be counted — this is about the
+    // encryption verdict, not about hiding the row.
+    assert_eq!(
+        row_count(&body, "request_content_captures"),
+        1,
+        "the payload-free row must still be inventoried: {entry}"
+    );
+    assert_eq!(
+        entry["encryption"]["at_rest"],
+        Value::String("empty".into()),
+        "a row with no payload in any content column was reported as \
+         `{}` — `ifNull(..., 1)` makes an absent column read as ciphertext, so \
+         this verdict rests on nothing: {entry}",
+        entry["encryption"]["at_rest"]
+    );
+
+    // ---- POSITIVE CONTROL --------------------------------------------------
+    let (status, sealed_body) =
+        get_inventory(&app, &make_jwt(sealed_ws, sealed_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {sealed_body}");
+    let sealed_entry = artifact(&sealed_body, "request_content_captures");
+    assert_eq!(
+        sealed_entry["encryption"]["at_rest"],
+        Value::String("ciphertext".into()),
+        "a genuinely sealed payload must still report ciphertext, or the \
+         `empty` above is just this endpoint declining to answer: {sealed_entry}"
+    );
+    assert_eq!(
+        sealed_entry["encryption"]["verification"]["rows_matching"],
+        Value::from(1),
+        "the sealed row must be counted as verified evidence: {sealed_entry}"
+    );
+}
+
+/// `at_rest` is advertised as COMPUTED from `verification`, never declared per
+/// class. Two classes contradicted that, and an auditor reading the caveat had
+/// no way to know which:
+///
+/// * `redis:filevault` is a bare `CIPHERTEXT` literal with `verification:
+///   None` — and its own note admits stashes written before the encryption
+///   upgrade are plaintext JSON.
+/// * `users` has its computed verdict OVERWRITTEN by hand, so it reports
+///   `mixed` whether every password hash is Argon2id or none of them is.
+///
+/// This test does not forbid either. It requires the caveat to STOP CLAIMING
+/// what is not true: any class asserting a protective verdict (`ciphertext`,
+/// `hashed`, `mixed`) whose verdict the documented rule does not reproduce
+/// from its own `verification` block must be NAMED in the caveat as an
+/// exception, with what it actually rests on.
+///
+/// PREMISE + POSITIVE CONTROL: at least one class must be genuinely computed,
+/// otherwise "every declared class is named" is satisfied by an endpoint that
+/// declares everything; and a class name that does not exist must NOT be found
+/// in the caveat, otherwise the substring search says yes to anything.
+#[sqlx::test]
+async fn encryption_verdicts_are_computed_or_named_as_exceptions(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+
+    // Give the endpoint something genuinely verifiable, so the "computed" set
+    // below cannot be empty.
+    let kms = secureprompt_common::kms::kms_backend_from_env()
+        .expect("KMS_FILE_KEY must be set for this suite — see .env");
+    let sealed = String::from_utf8(kms.encrypt(b"synthetic").await.expect("kms encrypt"))
+        .expect("ciphertext is UTF-8");
+    seed_capture(ws, &sealed, true).await;
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let at_rest_caveat = body["caveats"]
+        .as_array()
+        .expect("caveats array")
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|c| c.contains("at_rest"))
+        .unwrap_or_else(|| panic!("no caveat explains `at_rest`: {body}"))
+        .to_owned();
+
+    // POSITIVE CONTROL on the search itself.
+    assert!(
+        !at_rest_caveat.contains("redis:not_a_real_class"),
+        "the caveat search matches classes that do not exist: {at_rest_caveat}"
+    );
+
+    let mut computed: BTreeSet<String> = BTreeSet::new();
+    let mut declared: Vec<(String, String)> = Vec::new();
+    for key in ["artifacts", "not_enumerable"] {
+        for entry in body[key].as_array().expect("array") {
+            let class = entry["class"].as_str().unwrap_or_default().to_owned();
+            let verdict = entry["encryption"]["at_rest"].as_str().unwrap_or_default();
+            // Only PROTECTIVE claims. `plaintext_by_design` and `empty` claim
+            // nothing and need no verification to be honest.
+            if !matches!(verdict, "ciphertext" | "hashed" | "mixed") {
+                continue;
+            }
+            let verification = &entry["encryption"]["verification"];
+            let (Some(matching), Some(not_matching)) = (
+                verification["rows_matching"].as_u64(),
+                verification["rows_not_matching"].as_u64(),
+            ) else {
+                declared.push((class, format!("no verification block: {verdict}")));
+                continue;
+            };
+            // The rule the caveat states, applied to the class's own numbers.
+            // `ciphertext` and `hashed` are the same shape — the difference is
+            // which predicate ran, not which counts came back.
+            let expected: &[&str] = if matching + not_matching == 0 {
+                &["empty"]
+            } else if not_matching == 0 {
+                &["ciphertext", "hashed"]
+            } else if matching == 0 {
+                &["plaintext"]
+            } else {
+                &["mixed"]
+            };
+            if expected.contains(&verdict) {
+                computed.insert(class);
+            } else {
+                declared.push((
+                    class,
+                    format!(
+                        "reports `{verdict}` on {matching} matching / \
+                         {not_matching} not matching, where the stated rule \
+                         gives {expected:?}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // PREMISE + POSITIVE CONTROL: the rule reproduces at least one verdict.
+    assert!(
+        computed.contains("request_content_captures"),
+        "a genuinely sealed capture row was seeded and its verdict is not \
+         reproducible from its own verification block, so the check below is \
+         not measuring what it claims. Computed: {computed:?}"
+    );
+
+    let unexplained: Vec<&(String, String)> = declared
+        .iter()
+        .filter(|(class, _)| !at_rest_caveat.contains(class.as_str()))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "these classes assert a protective `at_rest` verdict that is NOT \
+         computed from their own `verification`, while the caveat claims \
+         `at_rest` is \"COMPUTED from `verification`, never declared per \
+         class\":\n  {unexplained:#?}\nEither compute them or name them in the \
+         caveat with what the verdict actually rests on.\nCaveat: \
+         {at_rest_caveat}"
+    );
+}
+
+/// `providers` claimed `kms_self_test` as part of its basis. It does not use
+/// the KMS at all.
+///
+/// `providers.encrypted_credential` is sealed with AES-256-GCM under
+/// `SECUREPROMPT_PROVIDER_KEY`, a SEPARATE key from the one the KMS backend
+/// holds — and `ProviderKeyConfig::from_env_or_zero` substitutes an ALL-ZERO
+/// key when that variable is unset, which is the default. So the class could
+/// report `ciphertext`, cite a live KMS round trip that had nothing to do with
+/// it, and be sealed under a key every reader of the source knows.
+/// Zero-key ciphertext passes `pg_sealed` too, because the shape check inspects
+/// the envelope and not the key.
+///
+/// PREMISE: a provider row whose credential passes the shape check is seeded,
+/// so the class reaches a protective verdict and its basis is actually
+/// examined.
+/// POSITIVE CONTROL: the classes that DO rest on the KMS must still say so, so
+/// this is not just the basis list being emptied.
+#[sqlx::test]
+async fn the_provider_credential_key_is_probed_separately_from_the_kms(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+
+    let kms = secureprompt_common::kms::kms_backend_from_env()
+        .expect("KMS_FILE_KEY must be set for this suite — see .env");
+    let sealed = String::from_utf8(kms.encrypt(b"synthetic").await.expect("kms encrypt"))
+        .expect("ciphertext is UTF-8");
+    seed_capture(ws, &sealed, true).await;
+
+    // A provider credential shaped like the deployment's envelope. It is NOT
+    // KMS output — provider credentials never are — which is the whole point.
+    sqlx::query(
+        "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential,
+                                config, created_at, updated_at)
+         VALUES ($1, $2, 'inv-provider', 'openai',
+                 'ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM', '{}'::jsonb, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws)
+    .execute(&pool)
+    .await
+    .expect("seed provider");
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let providers = artifact(&body, "providers");
+    let basis: Vec<&str> = providers["encryption"]["basis"]
+        .as_array()
+        .unwrap_or_else(|| panic!("providers has no basis list: {providers}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    // PREMISE: the seeded credential took the class to a protective verdict,
+    // so its basis is a live claim rather than an unexamined default.
+    assert_eq!(
+        providers["encryption"]["at_rest"],
+        Value::String("ciphertext".into()),
+        "premise: the seeded provider credential must reach a protective \
+         verdict, or this class's basis claims nothing: {providers}"
+    );
+
+    assert!(
+        !basis.contains(&"kms_self_test"),
+        "`providers` rests its ciphertext claim on the KMS self-test. The \
+         credential is sealed with AES-256-GCM under SECUREPROMPT_PROVIDER_KEY, \
+         a different key the KMS probe never touches: {basis:?}"
+    );
+
+    // The substitute claim must be substantiated, not merely renamed.
+    assert!(
+        body["encryption_basis"]["provider_key_self_test"].is_string(),
+        "the response does not report whether the provider credential key \
+         itself works: {body}"
+    );
+    let note = providers["encryption"]["note"].as_str().unwrap_or_default();
+    for needle in ["SECUREPROMPT_PROVIDER_KEY", "zero"] {
+        assert!(
+            note.contains(needle),
+            "the note does not mention {needle:?} — an auditor cannot tell that \
+             this class is sealed under a separate key with an all-zero \
+             fallback: {note}"
+        );
+    }
+
+    // ---- POSITIVE CONTROL: the KMS-backed classes still cite the KMS -------
+    let capture = artifact(&body, "request_content_captures");
+    let capture_basis: Vec<&str> = capture["encryption"]["basis"]
+        .as_array()
+        .expect("basis array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        capture_basis.contains(&"kms_self_test"),
+        "the class that IS sealed by the KMS stopped citing it, so the \
+         assertion above was satisfied by emptying every basis list: \
+         {capture_basis:?}"
+    );
 }
 
 // ── 3. Completeness ───────────────────────────────────────────────────────

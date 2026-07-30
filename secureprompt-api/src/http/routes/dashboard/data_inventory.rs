@@ -123,6 +123,20 @@ mod basis {
     /// This request performed a live encrypt→decrypt round trip against the
     /// configured KMS.
     pub const KMS_SELF_TEST: &str = "kms_self_test";
+    /// This request performed a live encrypt→decrypt round trip against
+    /// `SECUREPROMPT_PROVIDER_KEY`, the SEPARATE AES-256-GCM key that seals
+    /// `providers.encrypted_credential`, and checked that it is not the
+    /// all-zero fallback.
+    ///
+    /// Distinct from [`KMS_SELF_TEST`] on purpose. `providers` used to cite
+    /// the KMS probe, which never touches this key: the credential is encrypted
+    /// with `crypto::encrypt_aes_gcm` under `ProviderKeyConfig`, and
+    /// `from_env_or_zero` substitutes 32 zero bytes when the variable is unset.
+    /// Zero-key ciphertext still passes `pg_sealed`, because a shape check
+    /// inspects the envelope and not the key — so the class could report
+    /// `ciphertext`, cite a healthy KMS, and be sealed under a key published
+    /// in this repository.
+    pub const PROVIDER_KEY_SELF_TEST: &str = "provider_key_self_test";
     /// This request compared the bytes on disk against the envelope shape
     /// the configured KMS produces.
     pub const STORED_SHAPE: &str = "stored_payload_shape";
@@ -194,6 +208,21 @@ const KMS_PROBE: &[u8] = b"secureprompt-data-inventory-kms-self-test";
 /// SQL fragment (`ClickHouse` dialect) testing whether `col` looks like the
 /// deployment's ciphertext envelope. Written without `{}` so nothing in the
 /// chain mistakes it for a query parameter.
+///
+/// # `ifNull(..., 1)` means "vacuously true", not "encrypted"
+///
+/// A NULL column has no bytes to compare, so this returns TRUE for it — which
+/// is the only sane behaviour for a per-column fragment that callers AND
+/// together across three optional columns. It is also a trap: a row whose
+/// content columns are ALL NULL satisfies every conjunct and was counted as
+/// `matching`, so a workspace holding nothing but such rows reported
+/// `at_rest: ciphertext`, `rows_not_matching: 0` — the strongest verdict this
+/// endpoint can give, resting on zero bytes of evidence.
+///
+/// Every caller must therefore gate on the row carrying SOMETHING. See
+/// [`ch_capture_shape`], which counts `with_payload` separately and feeds THAT
+/// to [`Encryption::sealed`], so the empty case reaches the `empty` verdict the
+/// vocabulary already had for it.
 fn ch_sealed(col: &str) -> String {
     format!(
         "ifNull((match({col}, '^[A-Za-z0-9_-]+$') AND length({col}) >= 38) \
@@ -382,6 +411,11 @@ pub struct EncryptionBasis {
     /// `ok` | `failed`
     pub kms_self_test: &'static str,
     pub kms_self_test_detail: String,
+    /// `ok` | `failed`. The SECOND key this deployment encrypts with, probed
+    /// separately because it is a separate key — see
+    /// [`basis::PROVIDER_KEY_SELF_TEST`].
+    pub provider_key_self_test: &'static str,
+    pub provider_key_self_test_detail: String,
     pub ciphertext_shape_claim: &'static str,
 }
 
@@ -406,7 +440,11 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(Row, Deserialize)]
 struct ShapeCount {
+    /// Every row for this workspace — what `row_count` reports.
     total: u64,
+    /// Rows carrying at least one non-NULL content column, i.e. rows there is
+    /// anything to verify about. The DENOMINATOR of the encryption verdict.
+    with_payload: u64,
     matching: u64,
 }
 
@@ -428,10 +466,17 @@ async fn ch_count(client: &clickhouse::Client, table: &str, ws: Uuid) -> Result<
         .map_err(|e| e.to_string())
 }
 
-/// Count rows AND, in the same pass, how many of them carry payloads shaped
-/// like this deployment's ciphertext envelope. A row counts as sealed only if
-/// EVERY non-NULL payload column on it does.
+/// Count rows AND, in the same pass, how many of them CARRY a payload and how
+/// many of those are shaped like this deployment's ciphertext envelope.
+///
+/// A row counts as sealed only if it carries at least one content column and
+/// EVERY non-NULL one on it matches. The presence gate is load-bearing: without
+/// it, `ch_sealed`'s `ifNull(..., 1)` makes an all-NULL row satisfy all three
+/// conjuncts, and a workspace holding only payload-free rows reported
+/// `ciphertext` on no evidence at all.
 async fn ch_capture_shape(client: &clickhouse::Client, ws: Uuid) -> Result<ShapeCount, String> {
+    let has_payload = "(raw_prompt IS NOT NULL OR raw_response IS NOT NULL \
+                        OR restored_response IS NOT NULL)";
     let sealed = format!(
         "{} AND {} AND {}",
         ch_sealed("raw_prompt"),
@@ -440,7 +485,9 @@ async fn ch_capture_shape(client: &clickhouse::Client, ws: Uuid) -> Result<Shape
     );
     client
         .query(&format!(
-            "SELECT count() AS total, countIf({sealed}) AS matching \
+            "SELECT count() AS total, \
+                    countIf({has_payload}) AS with_payload, \
+                    countIf({has_payload} AND {sealed}) AS matching \
              FROM request_content_captures WHERE workspace_id = toUUID('{ws}')"
         ))
         .fetch_one::<ShapeCount>()
@@ -597,6 +644,9 @@ async fn get_data_inventory(
     // ---- Is the KMS actually working, right now? --------------------------
     let (kms_self_test, kms_self_test_detail) = kms_self_test(state.kms.as_ref()).await;
     let kms_backend = std::env::var("KMS_BACKEND").unwrap_or_else(|_| "file".to_owned());
+    // The SECOND key. `providers.encrypted_credential` never goes through the
+    // KMS — see `provider_key_self_test`.
+    let (provider_key_self_test, provider_key_self_test_detail) = provider_key_self_test();
 
     // ---- Live counts ------------------------------------------------------
     let pg = postgres_counts(&state.db, ws)
@@ -678,9 +728,16 @@ async fn get_data_inventory(
     }
 
     {
-        let (total, matching, status, detail) = match &ch_captures {
-            Ok(counts) => (counts.total, counts.matching, "counted", None),
+        let (total, with_payload, matching, status, detail) = match &ch_captures {
+            Ok(counts) => (
+                counts.total,
+                counts.with_payload,
+                counts.matching,
+                "counted",
+                None,
+            ),
             Err(e) => (
+                0,
                 0,
                 0,
                 "unavailable",
@@ -691,11 +748,18 @@ async fn get_data_inventory(
             ),
         };
         let encryption = if status == "counted" {
+            // `with_payload`, NOT `total`: a row whose three content columns
+            // are all NULL has nothing to verify, and counting it as evidence
+            // let an empty class report `ciphertext`.
             Encryption::sealed(
-                "every non-NULL raw_prompt / raw_response / restored_response matches the \
-                 deployment's KMS envelope"
-                    .to_owned(),
-                total,
+                format!(
+                    "of {total} row(s), the {with_payload} carrying at least one \
+                     content column were checked: every non-NULL raw_prompt / \
+                     raw_response / restored_response matches the deployment's KMS \
+                     envelope. Rows with no content column at all are NOT counted as \
+                     evidence — there is nothing on them to verify."
+                ),
+                with_payload,
                 matching,
                 Some(CIPHERTEXT_SHAPE_CLAIM),
             )
@@ -1161,12 +1225,40 @@ async fn get_data_inventory(
         row_count: Some(pg.n("c_providers")),
         row_count_status: "counted",
         row_count_detail: None,
-        encryption: Encryption::sealed(
-            "encrypted_credential, where present, matches the deployment's KMS envelope".to_owned(),
-            pg.n("c_providers_cred"),
-            pg.n("v_providers"),
-            Some(CIPHERTEXT_SHAPE_CLAIM),
-        ),
+        encryption: {
+            // The basis is REWRITTEN rather than taken from `sealed()`: this
+            // class is the one place in the product that does NOT use the KMS,
+            // and citing `kms_self_test` here credited it with a round trip
+            // performed against a different key. See `provider_key_self_test`.
+            let mut enc = Encryption::sealed(
+                "encrypted_credential, where present, matches the AES-256-GCM \
+                 envelope (base64url of nonce || ciphertext)"
+                    .to_owned(),
+                pg.n("c_providers_cred"),
+                pg.n("v_providers"),
+                None,
+            );
+            enc.basis = vec![
+                basis::WRITE_PATH,
+                basis::PROVIDER_KEY_SELF_TEST,
+                basis::STORED_SHAPE,
+            ];
+            enc.note = Some(format!(
+                "SEALED WITH A DIFFERENT KEY FROM EVERY OTHER CLASS HERE. \
+                 `providers.encrypted_credential` is AES-256-GCM under \
+                 `SECUREPROMPT_PROVIDER_KEY` (`crypto::encrypt_aes_gcm`), not through \
+                 the KMS backend, so the KMS self-test says nothing about it — this \
+                 request probed that key separately and reports \
+                 `encryption_basis.provider_key_self_test: {provider_key_self_test}`. \
+                 The key has an ALL-ZERO fallback when the variable is unset \
+                 (`ProviderKeyConfig::from_env_or_zero`), and zero-key ciphertext \
+                 PASSES the shape check below, because a shape check inspects the \
+                 envelope and not the key. So read `ciphertext` here as a statement \
+                 about the bytes and read the self-test for whether they are \
+                 confidential. {CIPHERTEXT_SHAPE_CLAIM}"
+            ));
+            enc
+        },
         retention: Retention::none("Configuration. Removed when the provider is deleted."),
         governed_by: None,
         enabled: None,
@@ -1613,16 +1705,33 @@ async fn get_data_inventory(
             kms_backend,
             kms_self_test,
             kms_self_test_detail,
+            provider_key_self_test,
+            provider_key_self_test_detail,
             ciphertext_shape_claim: CIPHERTEXT_SHAPE_CLAIM,
         },
         artifacts,
         not_enumerable,
         caveats: vec![
-            "`at_rest` is COMPUTED from `verification`, never declared per class: \
-             `ciphertext` = every stored payload matched the envelope, `plaintext` = none \
-             did, `mixed` = some did or the class holds fields in different states, \
-             `hashed` = one-way by construction, `empty` = nothing stored so nothing was \
-             verified, `plaintext_by_design` = stored as written and not claimed otherwise.",
+            "`at_rest` is COMPUTED from `verification` wherever a `verification` block is \
+             present, and the rule is: `ciphertext` = every payload checked matched the \
+             envelope, `plaintext` = none did, `mixed` = some did, `hashed` = one-way by \
+             construction and every value matched, `empty` = nothing was stored so nothing \
+             was verified. `plaintext_by_design` carries no `verification` and claims \
+             nothing beyond `stored as written`. THREE CLASSES ARE EXCEPTIONS and their \
+             verdict is DECLARED rather than computed — this caveat used to say `never \
+             declared per class`, which was false: (1) `users` reports `mixed` \
+             unconditionally whenever the workspace has any member, because the table \
+             holds three states at once — an Argon2id password hash, a KMS-encrypted TOTP \
+             secret, and plaintext directory fields — so no single computed verdict would \
+             be honest; its `verification` block still carries the real Argon2 counts, and \
+             those are what to read. (2) `redis:filevault` is declared `ciphertext` with \
+             NO verification, because verifying it would mean enumerating keys this \
+             endpoint has just explained it cannot enumerate; the claim rests on the write \
+             path and the live KMS probe alone, and its own note records that stashes \
+             written before the encryption upgrade are plaintext JSON. (3) `mongo:librechat` \
+             is declared `plaintext_by_design` without verification because it is in a \
+             store this process cannot query at all. Every other class's verdict can be \
+             recomputed from the numbers printed next to it.",
             "A count of zero means the query ran and found nothing. A `row_count` of null \
              with `row_count_status: unavailable` means the store did not answer and the \
              true figure is UNKNOWN. The two are never conflated.",
@@ -1644,6 +1753,82 @@ async fn get_data_inventory(
              any backup taken before the delete may still hold them.",
         ],
     }))
+}
+
+/// Probe `SECUREPROMPT_PROVIDER_KEY` — the key that actually seals
+/// `providers.encrypted_credential` — with a live encrypt→decrypt round trip,
+/// and detect the all-zero fallback.
+///
+/// `providers` used to cite [`basis::KMS_SELF_TEST`], which probes a different
+/// key entirely. The gap that hid behind it:
+/// `ProviderKeyConfig::from_env_or_zero` returns 32 zero bytes when the
+/// variable is unset (`secureprompt-common/src/config.rs`), and ciphertext
+/// under a zero key still passes [`pg_sealed`], because a shape check inspects
+/// the envelope and not the key. A deployment that never set the variable could
+/// therefore read `at_rest: ciphertext, basis: [.., kms_self_test, ..]` over
+/// credentials anyone holding the database could decrypt.
+///
+/// Returns `("ok" | "failed", detail)`. The zero key is a FAILURE, not a
+/// warning: the round trip succeeds perfectly under it, so a probe that only
+/// checked the round trip would call it healthy.
+fn provider_key_self_test() -> (&'static str, String) {
+    use secureprompt_common::{config::ProviderKeyConfig, crypto};
+
+    const PROBE: &[u8] = b"secureprompt-data-inventory-provider-key-self-test";
+
+    let key = match ProviderKeyConfig::from_env_or_zero().to_key_bytes() {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                "failed",
+                format!(
+                    "SECUREPROMPT_PROVIDER_KEY is not 64 hex characters, so no \
+                     provider credential can be sealed or read: {e}"
+                ),
+            )
+        }
+    };
+    if key == [0_u8; 32] {
+        return (
+            "failed",
+            "SECUREPROMPT_PROVIDER_KEY IS UNSET. `ProviderKeyConfig::\
+             from_env_or_zero` substitutes an ALL-ZERO 32-byte key so the API can \
+             start without provider encryption configured, and every credential \
+             sealed under it is decryptable by anyone holding the ciphertext. Note \
+             what this means for the `providers` class below: zero-key ciphertext \
+             still PASSES the stored-shape check, because that check inspects the \
+             envelope and not the key, so `at_rest: ciphertext` there is a \
+             statement about the bytes and NOT about their confidentiality."
+                .to_owned(),
+        );
+    }
+    let (nonce, ciphertext) = match crypto::encrypt_aes_gcm(PROBE, &key) {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            return (
+                "failed",
+                format!("encrypt of a synthetic marker under the provider key failed: {e}"),
+            )
+        }
+    };
+    match crypto::decrypt_aes_gcm(&nonce, &ciphertext, &key) {
+        Ok(plain) if plain == PROBE => (
+            "ok",
+            "a synthetic marker was encrypted and decrypted under \
+             SECUREPROMPT_PROVIDER_KEY while answering this request, and the key \
+             is not the all-zero fallback"
+                .to_owned(),
+        ),
+        Ok(_) => (
+            "failed",
+            "the provider key round-tripped a synthetic marker to DIFFERENT bytes"
+                .to_owned(),
+        ),
+        Err(e) => (
+            "failed",
+            format!("decrypt of a synthetic marker under the provider key failed: {e}"),
+        ),
+    }
 }
 
 /// Probe the configured KMS with a live encrypt→decrypt round trip.
