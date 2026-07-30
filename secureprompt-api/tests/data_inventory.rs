@@ -1209,101 +1209,174 @@ async fn every_redis_key_class_the_gateway_writes_is_accounted_for(pool: PgPool)
     }
 }
 
-/// Every relation dbt MATERIALISES, derived from the model files themselves.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .to_path_buf()
+}
+
+/// The directories dbt builds RELATIONS out of, read from `dbt_project.yml`
+/// rather than hardcoded.
+///
+/// This walked `models/` alone, which is only one of the three. `dbt_project.yml`
+/// also declares `snapshot-paths` and `seed-paths`, and both materialise a
+/// TABLE: a snapshot is precisely the un-TTL'd row-level copy of
+/// `request_events` that `int_requests_enriched` turned out to be, and a seed
+/// is a CSV loaded into one. Verified by mutation — a
+/// `snapshots/snap_request_events.sql` declaring a timestamp-strategy snapshot
+/// of `request_events` was invisible to this scrape and the guard passed.
+///
+/// `test-paths` and `analysis-paths` are deliberately excluded: neither
+/// materialises anything.
+fn dbt_relation_dirs() -> BTreeSet<String> {
+    let path = repo_root().join("secureprompt-analytics/dbt_project.yml");
+    let yaml = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let mut dirs = BTreeSet::new();
+    for line in yaml.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(key.trim(), "model-paths" | "snapshot-paths" | "seed-paths") {
+            continue;
+        }
+        for chunk in value.split('"').skip(1).step_by(2) {
+            dirs.insert(chunk.to_owned());
+        }
+    }
+    dirs
+}
+
+/// Every relation dbt MATERIALISES, derived from the files themselves.
 ///
 /// `tables_declared_in` cannot see these: it greps `CREATE TABLE` out of the
 /// two migration directories, and a dbt model is a `SELECT` in a `.sql` file
-/// under `secureprompt-analytics/models/`. dbt names the relation after the
-/// FILE, so the file stem is the relation name.
+/// under `secureprompt-analytics/`. dbt names the relation after the FILE, so
+/// the file stem is the relation name — for a seed too, which is a `.csv`.
+///
+/// A declared directory that does not exist yet is skipped rather than
+/// panicking: `snapshots/` and `seeds/` are declared in `dbt_project.yml` and
+/// absent from the repo today, and the point of reading the declaration is to
+/// catch the first file dropped into one.
 fn dbt_relations() -> BTreeSet<String> {
     fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
         let entries = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("cannot read dbt model dir {}: {e}", dir.display()));
+            .unwrap_or_else(|e| panic!("cannot read dbt dir {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sql" | "csv")
+            ) {
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .unwrap_or_else(|| panic!("un-nameable dbt model {}", path.display()));
+                    .unwrap_or_else(|| panic!("un-nameable dbt relation {}", path.display()));
                 out.insert(stem.to_owned());
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("repo root")
-        .join("secureprompt-analytics/models");
+    let analytics = repo_root().join("secureprompt-analytics");
     let mut relations = BTreeSet::new();
-    walk(&root, &mut relations);
+    for dir in dbt_relation_dirs() {
+        let path = analytics.join(&dir);
+        if path.is_dir() {
+            walk(&path, &mut relations);
+        }
+    }
     relations
 }
 
-/// Every `docker-compose.yml` service that mounts a NAMED volume — i.e. every
-/// store the product's own deployment starts and keeps across a restart.
+/// Every compose file the repo ships. A store is a store whichever profile
+/// starts it.
+///
+/// This read `docker-compose.yml` alone, so a persistent store declared only in
+/// the on-prem or the simple profile was invisible to the guard. Verified by
+/// mutation: a `mysql` service with a `mysql_data:` volume added to
+/// `docker-compose.simple.yml` was not seen and the guard passed.
+const COMPOSE_FILES: [&str; 3] = [
+    "docker-compose.yml",
+    "docker-compose.onprem.yml",
+    "docker-compose.simple.yml",
+];
+
+/// Every compose service that mounts a NAMED volume — i.e. every store the
+/// product's own deployment starts and keeps across a restart.
 ///
 /// A bind mount (`./backups:/backups`) is host state the operator chose and is
-/// deliberately excluded; a named volume is one this compose file creates.
+/// deliberately excluded; a named volume is one a compose file creates.
+///
+/// The named-volume set is the UNION across the files before any service is
+/// matched, because an overlay (`docker-compose.onprem.yml`) legitimately
+/// mounts a volume the base file declares.
 fn compose_persistent_services() -> BTreeSet<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("repo root")
-        .join("docker-compose.yml");
-    let yaml = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let sources: Vec<String> = COMPOSE_FILES
+        .iter()
+        .map(|file| {
+            let path = repo_root().join(file);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        })
+        .collect();
 
-    // The top-level `volumes:` block. Matched WITHOUT indentation, so the
-    // per-service `    volumes:` keys cannot be mistaken for it.
+    // The top-level `volumes:` block of every file. Matched WITHOUT
+    // indentation, so the per-service `    volumes:` keys cannot be mistaken
+    // for it.
     let mut named: BTreeSet<&str> = BTreeSet::new();
-    let mut in_volumes = false;
-    for line in yaml.lines() {
-        if line.starts_with("volumes:") {
-            in_volumes = true;
-            continue;
-        }
-        if in_volumes {
-            if !line.starts_with("  ") {
-                if !line.trim().is_empty() {
-                    in_volumes = false;
-                }
+    for yaml in &sources {
+        let mut in_volumes = false;
+        for line in yaml.lines() {
+            if line.starts_with("volumes:") {
+                in_volumes = true;
                 continue;
             }
-            let entry = line.trim();
-            if let Some(name) = entry.strip_suffix(':') {
-                named.insert(name);
+            if in_volumes {
+                if !line.starts_with("  ") {
+                    if !line.trim().is_empty() {
+                        in_volumes = false;
+                    }
+                    continue;
+                }
+                let entry = line.trim();
+                if let Some(name) = entry.strip_suffix(':') {
+                    named.insert(name);
+                }
             }
         }
     }
 
     let mut services = BTreeSet::new();
-    let mut current: Option<&str> = None;
-    let mut in_services = false;
-    for line in yaml.lines() {
-        if line.starts_with("services:") {
-            in_services = true;
-            continue;
-        }
-        if in_services && !line.starts_with(' ') && !line.trim().is_empty() {
-            in_services = false;
-        }
-        if !in_services {
-            continue;
-        }
-        // A service key: exactly two spaces of indent, then `name:`.
-        if let Some(rest) = line.strip_prefix("  ") {
-            if !rest.starts_with([' ', '-', '#']) {
-                if let Some(name) = rest.strip_suffix(':') {
-                    current = Some(name);
+    for yaml in &sources {
+        let mut current: Option<&str> = None;
+        let mut in_services = false;
+        for line in yaml.lines() {
+            if line.starts_with("services:") {
+                in_services = true;
+                continue;
+            }
+            if in_services && !line.starts_with(' ') && !line.trim().is_empty() {
+                in_services = false;
+            }
+            if !in_services {
+                continue;
+            }
+            // A service key: exactly two spaces of indent, then `name:`.
+            if let Some(rest) = line.strip_prefix("  ") {
+                if !rest.starts_with([' ', '-', '#']) {
+                    if let Some(name) = rest.strip_suffix(':') {
+                        current = Some(name);
+                    }
                 }
             }
-        }
-        if let Some(mount) = line.trim().strip_prefix("- ") {
-            if let Some((volume, _)) = mount.split_once(':') {
-                if named.contains(volume) {
-                    if let Some(service) = current {
-                        services.insert(service.to_owned());
+            if let Some(mount) = line.trim().strip_prefix("- ") {
+                if let Some((volume, _)) = mount.split_once(':') {
+                    if named.contains(volume) {
+                        if let Some(service) = current {
+                            services.insert(service.to_owned());
+                        }
                     }
                 }
             }
@@ -1312,29 +1385,51 @@ fn compose_persistent_services() -> BTreeSet<String> {
     services
 }
 
-/// Everything the response says, in one lowercase haystack: class names,
-/// stores, locations and caveats. A store is "accounted for" when the reader
-/// can find it here — declared as a class, named as a location, or scoped out
-/// with a reason.
-fn attestation_text(body: &Value) -> String {
-    let mut text = String::new();
+/// Every identifier the attestation NAMES, as opposed to every string whose
+/// letters it happens to contain.
+///
+/// "Accounted for" used to be `text.contains(service)` over one lowercased
+/// blob of every field. That blob already contains `librechat-mongo`,
+/// `mongodb`, `librechat_mongo_data`, the class `mongo:librechat` and the
+/// sentence "the gateway API process holds no Mongo client" — five separate
+/// substrings of `mongo`. So a compose service literally named `mongo`, a
+/// wholly different store, was "accounted for" by collision. Verified by
+/// mutation: adding one to `docker-compose.yml` left the guard green.
+///
+/// Word boundaries alone do not close it — "no Mongo client" is a bounded
+/// whole word. What distinguishes naming a store from mentioning a technology
+/// is the repo's own convention, so that is what this reads:
+///
+/// * a WHOLE field value (`store: "postgres"`, `store: "qdrant"`), and
+/// * every BACKTICKED token in the prose (``the `backup` compose service``,
+///   ``docker-compose service `librechat-mongo` ``).
+///
+/// `mongo:librechat` and `librechat_mongo_data` are backticked tokens in their
+/// own right and neither of them is `mongo`, which is the whole point.
+fn attestation_identifiers(body: &Value) -> BTreeSet<String> {
+    fn absorb(raw: &str, out: &mut BTreeSet<String>) {
+        out.insert(raw.trim().to_lowercase());
+        // Odd-indexed pieces of a backtick split are what was between a pair.
+        for quoted in raw.split('`').skip(1).step_by(2) {
+            out.insert(quoted.trim().to_lowercase());
+        }
+    }
+    let mut names = BTreeSet::new();
     for key in ["artifacts", "not_enumerable"] {
         for entry in body[key].as_array().into_iter().flatten() {
             for field in ["class", "store", "location", "description", "reason"] {
                 if let Some(value) = entry[field].as_str() {
-                    text.push_str(value);
-                    text.push('\n');
+                    absorb(value, &mut names);
                 }
             }
         }
     }
     for caveat in body["caveats"].as_array().into_iter().flatten() {
         if let Some(value) = caveat.as_str() {
-            text.push_str(value);
-            text.push('\n');
+            absorb(value, &mut names);
         }
     }
-    text.to_lowercase()
+    names
 }
 
 /// THE ROOT CAUSE of WS3-5's two omissions, not the omissions themselves.
@@ -1353,22 +1448,57 @@ fn attestation_text(body: &Value) -> String {
 /// a future dbt model, or a future compose service with a named volume, fails
 /// here until somebody declares it or scopes it out.
 ///
+/// # It was narrowed, not closed, and three holes were measured
+///
+/// Each was reproduced by mutation against the version of this test that
+/// preceded it — the mutation was applied, the guard was run, and the guard
+/// said `ok`:
+///
+/// 1. A dbt SNAPSHOT (`snapshots/`, declared in `dbt_project.yml`) was not
+///    seen: the scrape walked `models/` only. A snapshot is exactly the
+///    un-TTL'd row-level copy of `request_events` that `int_requests_enriched`
+///    turned out to be. Closed by reading the relation directories out of
+///    `dbt_project.yml` — `model-paths`, `snapshot-paths`, `seed-paths`.
+/// 2. A compose service named `mongo` was not seen: "accounted for" was
+///    `text.contains(service)` over a lowercased blob that already contains
+///    `librechat-mongo`, `mongodb`, `librechat_mongo_data` and the class
+///    `mongo:librechat` and the sentence "holds no Mongo client". Closed by
+///    [`attestation_identifiers`].
+/// 3. A store declared only in `docker-compose.simple.yml` (or the on-prem
+///    overlay) was not seen: only `docker-compose.yml` was parsed. Closed by
+///    [`COMPOSE_FILES`].
+///
 /// PREMISE: both scrapes are asserted to have found the real thing before
 /// anything is asserted about the response, so a parser that silently matched
-/// nothing cannot make this pass over an empty expected set.
+/// nothing cannot make this pass over an empty expected set. The dbt scrape
+/// additionally asserts that the DECLARED directory list still contains the
+/// snapshot and seed paths, because those directories do not exist in the repo
+/// today and a walk that quietly skipped them would look identical to a walk
+/// that covered them.
 /// POSITIVE CONTROL: a relation and a service that do NOT exist must come back
 /// uncovered, so "everything is covered" is not the coverage check saying yes
-/// to everything.
+/// to everything; and [`attestation_identifiers`] is asserted against a FIXED
+/// body carrying every real collision, in both directions, so the tightened
+/// check is proved to discriminate rather than proved to be strict.
 #[sqlx::test]
 async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPool) {
     let relations = dbt_relations();
     let services = compose_persistent_services();
 
     // ---- Premise on the two scrapes ---------------------------------------
+    let relation_dirs = dbt_relation_dirs();
+    for declared in ["models", "snapshots", "seeds"] {
+        assert!(
+            relation_dirs.contains(declared),
+            "premise failed: `{declared}` is not among the relation-producing \
+             directories read out of dbt_project.yml, so a file dropped into \
+             it would never be scraped. Found: {relation_dirs:?}"
+        );
+    }
     assert!(
         relations.len() >= 7,
         "premise failed: only {} dbt relations found under \
-         secureprompt-analytics/models — the scrape is broken, so this test \
+         secureprompt-analytics — the scrape is broken, so this test \
          would pass vacuously. Found: {relations:?}",
         relations.len()
     );
@@ -1403,7 +1533,7 @@ async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPo
     assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
 
     let declared = class_names(&body);
-    let text = attestation_text(&body);
+    let named = attestation_identifiers(&body);
 
     // ---- Positive controls: the checks below can say NO -------------------
     assert!(
@@ -1412,9 +1542,42 @@ async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPo
          assertion below proves nothing"
     );
     assert!(
-        !text.contains("totally-not-a-real-service"),
-        "the coverage haystack matches services that do not exist, so the \
+        !named.contains("totally-not-a-real-service"),
+        "the coverage check matches services that do not exist, so the \
          assertion below proves nothing"
+    );
+
+    // CONTROL on the extractor, over a FIXED body rather than the live prose,
+    // so it cannot drift when a caveat is reworded. Every string here is one
+    // this attestation really contains, and every one of them made
+    // `text.contains("mongo")` true.
+    let probe = serde_json::json!({
+        "artifacts": [{
+            "class": "mongo:librechat",
+            "store": "mongodb",
+            "location": "docker-compose service `librechat-mongo`, named volume \
+                         `librechat_mongo_data` mounted at /data/db",
+            "description": "The gateway API process holds no Mongo client.",
+        }],
+        "not_enumerable": [],
+        "caveats": ["the `backup` compose service and its `clickhouse_backups` volume"],
+    });
+    let probe_names = attestation_identifiers(&probe);
+    for found in ["librechat-mongo", "librechat_mongo_data", "backup", "mongodb"] {
+        assert!(
+            probe_names.contains(found),
+            "the extractor misses `{found}`, which this attestation names \
+             either as a whole field value or in backticks — so every \
+             assertion below would fail for the wrong reason: {probe_names:?}"
+        );
+    }
+    assert!(
+        !probe_names.contains("mongo"),
+        "five substrings of `mongo` are in that body — `librechat-mongo`, \
+         `mongodb`, `librechat_mongo_data`, `mongo:librechat` and the phrase \
+         \"no Mongo client\" — and NONE of them names a compose service called \
+         `mongo`. Accepting any of them is how a guard passes on the thing it \
+         exists to catch: {probe_names:?}"
     );
 
     // ---- THE ASSERTIONS ---------------------------------------------------
@@ -1433,16 +1596,16 @@ async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPo
 
     let unaccounted: Vec<&String> = services
         .iter()
-        .filter(|service| !text.contains(service.as_str()))
+        .filter(|service| !named.contains(*service))
         .collect();
     assert!(
         unaccounted.is_empty(),
-        "these docker-compose services mount a named volume — they are stores \
+        "these compose services mount a named volume — they are stores \
          a plain `docker compose up -d` starts and keeps — and the inventory \
          neither declares them nor scopes them out with a reason:\n  \
          {unaccounted:?}\n`librechat-mongo` in particular persists \
          PRE-redaction prompts and POST-restoration replies, and has no \
-         `profiles:` gate."
+         `profiles:` gate. Scanned: {COMPOSE_FILES:?}"
     );
 }
 
