@@ -79,9 +79,18 @@ pub async fn vault_stash(
     }
     let vault_ref = RequestId::new().to_string();
     let map_json = serde_json::to_string(&body.token_map).unwrap_or_default();
-    crate::redis::stash_file_vault(&state.redis_pool, &vault_ref, &map_json, FILE_VAULT_TTL_SECS)
-        .await
-        .map_err(api_error_response)?;
+    // WS3 review — encrypted through the same KMS as the token vault and the
+    // captured-content store. The comment above ("A stash holds PII") was
+    // true and the storage did not act on it.
+    crate::redis::stash_file_vault(
+        &state.redis_pool,
+        state.kms.as_ref(),
+        &vault_ref,
+        &map_json,
+        FILE_VAULT_TTL_SECS,
+    )
+    .await
+    .map_err(api_error_response)?;
     Ok(Json(VaultStashResponse { vault_ref }))
 }
 

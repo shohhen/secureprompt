@@ -397,6 +397,7 @@ impl PipelineService {
             &mut prompt,
             &mut pipeline_state.vault,
             &self.state.redis_pool,
+            self.state.kms.as_ref(),
         )
         .await;
         let regex_detections = detect_content(&prompt);
@@ -1567,6 +1568,7 @@ async fn preload_file_vault(
     prompt: &mut String,
     vault: &mut secureprompt_common::types::TokenVault,
     redis_pool: &deadpool_redis::Pool,
+    kms: &dyn secureprompt_common::kms::KmsBackend,
 ) {
     if !prompt.contains(FILE_VAULT_MARKER_OPEN) {
         return;
@@ -1575,7 +1577,7 @@ async fn preload_file_vault(
     *prompt = cleaned;
 
     for vref in refs {
-        if let Some(json) = crate::redis::load_file_vault(redis_pool, &vref).await {
+        if let Some(json) = crate::redis::load_file_vault(redis_pool, kms, &vref).await {
             if let Ok(map) =
                 serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
             {
