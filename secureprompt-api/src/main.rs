@@ -324,7 +324,17 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     t.tick().await; // first tick is immediate — check promptly at startup
                     if st.is_revoked() {
-                        return; // terminal: vendor never un-revokes, stop polling
+                        // WS4-4: idle, do NOT return. The poller used to exit
+                        // here because a revocation was terminal for the
+                        // process. It no longer is — an admin can supersede it
+                        // live via PUT /v1/license — and a poller that had
+                        // already exited would leave the replacement license
+                        // unpolled until the next restart, i.e. allowlisting
+                        // the recovery route would have quietly disabled
+                        // revocation checking. `continue` re-arms on the next
+                        // tick (the tick is at the top of the loop, so this
+                        // does not spin).
+                        continue;
                     }
                     // lic_id is only present while the local file verifies (Valid).
                     let lic_id = match st.snapshot().lic_id {
@@ -338,9 +348,11 @@ async fn main() -> anyhow::Result<()> {
                     let now = chrono::Utc::now().timestamp();
                     match verdict {
                         RevocationVerdict::Revoked => {
-                            st.mark_revoked();
-                            tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403)");
-                            return;
+                            // Record WHICH license was revoked, so a different
+                            // one can supersede it without a restart.
+                            st.mark_revoked(&lic_id);
+                            tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403); install a replacement via PUT /v1/license");
+                            continue;
                         }
                         RevocationVerdict::Active => {
                             // issued_at: Some(_) only when the server returned a sig-verified assertion.

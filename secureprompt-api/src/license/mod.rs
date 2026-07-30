@@ -90,6 +90,11 @@ fn snapshot_from(lic: &License, status: LicenseStatus) -> LicenseSnapshot {
 pub struct LicenseState {
     inner: RwLock<LicenseSnapshot>,
     revoked: AtomicBool,
+    /// WS4-4 — WHICH `lic_id` the vendor revoked. Revocation is a statement
+    /// about one license, not about the deployment, so the identity has to be
+    /// remembered in order to tell "this license is revoked" apart from "this
+    /// gateway is revoked". `None` while `revoked` is false.
+    revoked_lic_id: RwLock<Option<String>>,
     last_assertion_at: AtomicI64, // epoch secs; 0 = never
     highwater_at: AtomicI64,      // epoch secs; 0 = unseen
 }
@@ -99,6 +104,7 @@ impl LicenseState {
         Self {
             inner: RwLock::new(s),
             revoked: AtomicBool::new(false),
+            revoked_lic_id: RwLock::new(None),
             last_assertion_at: AtomicI64::new(0),
             highwater_at: AtomicI64::new(0),
         }
@@ -106,11 +112,47 @@ impl LicenseState {
     pub fn unlicensed() -> Self { Self::new(LicenseSnapshot::unlicensed()) }
     pub fn snapshot(&self) -> LicenseSnapshot { self.inner.read().expect("license lock poisoned").clone() }
     pub fn set(&self, s: LicenseSnapshot) { *self.inner.write().expect("license lock poisoned") = s; }
-    /// Mark the license revoked (fail-closed). Sticky: the vendor never un-revokes,
-    /// so once observed it stays set for the life of the process.
-    pub fn mark_revoked(&self) { self.revoked.store(true, Ordering::SeqCst); }
+    /// Mark `lic_id` revoked (fail-closed). Sticky for that license: the vendor
+    /// never un-revokes, so nothing short of installing a DIFFERENT license
+    /// clears it — see [`clear_revocation_if_superseded`](Self::clear_revocation_if_superseded).
+    /// The hourly local re-verify swaps the snapshot and must not clear this.
+    pub fn mark_revoked(&self, lic_id: &str) {
+        *self.revoked_lic_id.write().expect("license lock poisoned") = Some(lic_id.to_owned());
+        self.revoked.store(true, Ordering::SeqCst);
+    }
     /// True once the online poller has confirmed a `revoked` verdict from sp-admin.
     pub fn is_revoked(&self) -> bool { self.revoked.load(Ordering::SeqCst) }
+    /// The `lic_id` the current revocation applies to, if any.
+    pub fn revoked_lic_id(&self) -> Option<String> {
+        self.revoked_lic_id.read().expect("license lock poisoned").clone()
+    }
+
+    /// WS4-4 — lift a revocation that a DIFFERENT license has superseded.
+    /// Returns true when the flag was cleared.
+    ///
+    /// Called only from `PUT /v1/license`, which has already (a) required an
+    /// admin JWT, (b) verified the replacement token's Ed25519 vendor
+    /// signature, and (c) live-swapped the snapshot. So reaching this point
+    /// means an administrator presented a license the vendor genuinely issued.
+    ///
+    /// The revocation is NOT lifted when `new_lic_id` is the revoked license
+    /// itself — otherwise re-pasting the revoked token would be a one-click
+    /// bypass of the vendor's verdict, which is the hole this whole task warns
+    /// about. It is also not lifted when the revoked identity is unknown
+    /// (`None`): unable to prove supersession, stay fail-closed.
+    pub fn clear_revocation_if_superseded(&self, new_lic_id: &str) -> bool {
+        if !self.is_revoked() { return false; }
+        let mut guard = self.revoked_lic_id.write().expect("license lock poisoned");
+        match guard.as_deref() {
+            None => false,
+            Some(revoked) if revoked == new_lic_id => false,
+            Some(_) => {
+                *guard = None;
+                self.revoked.store(false, Ordering::SeqCst);
+                true
+            }
+        }
+    }
 
     /// Record a freshness observation from a persisted or poller-delivered row.
     /// Both `last_assertion_at` and `highwater_at` advance monotonically.
@@ -237,9 +279,22 @@ fn bump_max(cell: &AtomicI64, v: i64) {
     }
 }
 
-/// Resolve the active license token: prefer the DB-stored token (written by the
-/// console activation endpoint) over the environment/config token.  Falls back
-/// to `env_token` on any DB error or when no row exists — **never fails**.
+/// Resolve the active license token.
+///
+/// **Precedence: DB over env.** A token activated from the console
+/// (`PUT /v1/license`, persisted in `license_activation`) wins over
+/// `SECUREPROMPT_LICENSE_TOKEN`. Rationale: the env token is the deployment's
+/// bootstrap value, baked into a compose file or a Kubernetes Secret, while the
+/// DB row is the most recent deliberate act of an administrator — including the
+/// act of replacing a license that has gone bad. If env won, an operator would
+/// have to edit the deployment manifest and restart to re-license, which is
+/// exactly the bricking this gate is designed to avoid. `DELETE /v1/license`
+/// drops the row and falls back to env (or Unlicensed if env is empty too);
+/// `GET /v1/license` reports which one is live as `source: "db" | "env" |
+/// "none"`. See `docs/runbooks/license-recovery.md`.
+///
+/// Falls back to `env_token` on any DB error or when no row exists — **never
+/// fails**.
 pub async fn resolve_active_token(db: &sqlx::PgPool, env_token: &str) -> String {
     match crate::db::license_repo::get(db).await {
         Ok(Some(row)) => row.token,
@@ -459,8 +514,9 @@ mod tests {
         assert!(st.is_feature_enabled("pii.uz"));
 
         // Revoke out-of-band (as the poller would).
-        st.mark_revoked();
+        st.mark_revoked("lic-1");
         assert!(st.is_revoked());
+        assert_eq!(st.revoked_lic_id().as_deref(), Some("lic-1"));
         assert_eq!(st.status(), LicenseStatus::Revoked); // overrides snapshot
         assert!(!st.is_feature_enabled("pii.uz")); // fail-closed
         assert_eq!(st.max_seats(), None);
@@ -826,8 +882,51 @@ mod tests {
     fn revoked_still_overrides_everything() {
         let st = LicenseState::new(valid_snap_with_policy());
         st.observe_freshness(1000, 1010); // fresh
-        st.mark_revoked();
+        st.mark_revoked("lic-1");
         assert_eq!(st.effective_status_at(1010), LicenseStatus::Revoked);
+    }
+
+    // ── WS4-4: a revocation is about one license, not about the gateway ──────
+
+    /// Installing a DIFFERENT vendor-signed license supersedes the revocation;
+    /// re-installing the revoked one does not. Without the second half this is
+    /// a one-click bypass of the vendor's verdict.
+    #[test]
+    fn revocation_is_superseded_only_by_a_different_lic_id() {
+        let st = LicenseState::new(valid_snap_with_policy()); // lic_id = "lic-1"
+        st.mark_revoked("lic-1");
+        assert!(st.is_revoked(), "premise: revoked");
+
+        // Same license → refused, flag intact.
+        assert!(!st.clear_revocation_if_superseded("lic-1"));
+        assert!(st.is_revoked(), "re-installing the revoked license must not clear it");
+        assert_eq!(st.status(), LicenseStatus::Revoked);
+
+        // Different license → cleared.
+        assert!(st.clear_revocation_if_superseded("lic-2"));
+        assert!(!st.is_revoked());
+        assert_eq!(st.revoked_lic_id(), None);
+        assert_eq!(st.status(), LicenseStatus::Valid);
+
+        // Idempotent: nothing left to clear.
+        assert!(!st.clear_revocation_if_superseded("lic-3"));
+    }
+
+    /// A revocation whose license identity was never recorded cannot be proven
+    /// superseded, so it stays fail-closed. (`mark_revoked` always records one;
+    /// this pins the defensive branch.)
+    #[test]
+    fn unknown_revoked_identity_stays_fail_closed() {
+        let st = LicenseState::new(valid_snap_with_policy());
+        // Not revoked yet → nothing to clear, and no accidental un-revoke.
+        assert!(!st.clear_revocation_if_superseded("lic-2"));
+        assert!(!st.is_revoked());
+
+        st.mark_revoked("lic-1");
+        // Simulate the identity being absent while the flag is set.
+        *st.revoked_lic_id.write().unwrap() = None;
+        assert!(!st.clear_revocation_if_superseded("lic-2"));
+        assert!(st.is_revoked(), "unknown revoked identity must stay fail-closed");
     }
 
     // ── Task 2: resolve_active_token ─────────────────────────────────────────

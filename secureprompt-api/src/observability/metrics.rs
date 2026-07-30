@@ -199,6 +199,21 @@ pub struct MetricsRegistry {
     /// (`block`/`degrade_with_alert`). This is the alert signal for a
     /// gateway running with no ML detection coverage.
     sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
+
+    // ── WS4-4 ─ license gate ────────────────────────────────────────────
+    /// Counter `secureprompt_license_gate_engaged_total{reason,action}`.
+    /// `reason` is a bounded
+    /// [`crate::http::middleware::license_gate::LicenseOutage`] label
+    /// (`license_revoked`/`license_revalidation_lost`) and `action` is what
+    /// the gate did about it (`block`/`degrade_with_alert` — the same two
+    /// strings as `sidecar_unavailable`, bound to
+    /// `SidecarUnavailablePolicy::as_str` at compile time). This is the
+    /// alert signal for a gateway whose license has left good standing.
+    ///
+    /// Deliberately a separate series from `sidecar_unavailable`: same
+    /// vocabulary, different subsystem and different remedy (renew/re-license
+    /// vs. restore the ML sidecar).
+    license_gate_engaged: Mutex<Vec<(String, String, u64)>>,
     /// GAUGE `secureprompt_clickhouse_schema_mismatch` — 1 when the live
     /// `request_events` table is missing columns the writer serialises (the
     /// worker's ClickHouse migrations have not run, and every analytics event
@@ -555,6 +570,43 @@ impl MetricsRegistry {
             .map_or(0, |(_, _, count)| *count)
     }
 
+    /// WS4-4 — record one request the license gate acted on. Both labels are
+    /// bounded: `reason` is
+    /// [`crate::http::middleware::license_gate::LicenseOutage::as_str`],
+    /// `action` is `block` or `degrade_with_alert`. Never a path or a `lic_id`.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn record_license_gate_engaged(&self, reason: &str, action: &str) {
+        let mut guard = self
+            .license_gate_engaged
+            .lock()
+            .expect("license_gate_engaged mutex");
+        if let Some(row) = guard.iter_mut().find(|(r, a, _)| r == reason && a == action) {
+            row.2 += 1;
+        } else {
+            guard.push((reason.to_owned(), action.to_owned(), 1));
+        }
+    }
+
+    /// Return the license-gate count for a `(reason, action)` pair.
+    ///
+    /// Used by tests to assert the counter was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn license_gate_engaged_count(&self, reason: &str, action: &str) -> u64 {
+        let guard = self
+            .license_gate_engaged
+            .lock()
+            .expect("license_gate_engaged mutex");
+        guard
+            .iter()
+            .find(|(r, a, _)| r == reason && a == action)
+            .map_or(0, |(_, _, count)| *count)
+    }
+
     /// Return the policy-violation count for a given `action`.
     ///
     /// Used by tests to assert the counter was touched.
@@ -749,6 +801,23 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_sidecar_unavailable_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
+                    );
+                }
+            }
+        }
+
+        // WS4-4 — license-gate counter.
+        {
+            let guard = self
+                .license_gate_engaged
+                .lock()
+                .expect("license_gate_engaged mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_license_gate_engaged_total counter\n");
+                for (reason, action, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_license_gate_engaged_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
                     );
                 }
             }

@@ -845,6 +845,29 @@ async fn hard_stale_serves_recovery_route_and_degrades_the_rest(pool: PgPool) ->
         Some("license_revalidation_lost"),
         "a degraded answer must name the bounded reason it was degraded for"
     );
+
+    // "Loudly" means the Prometheus series `LicenseGateEngaged` fires on, with
+    // the same bounded (reason, action) label shape WS2-3 uses.
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revalidation_lost", "degrade_with_alert"),
+        1,
+        "the one degraded request must be counted exactly once"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        0,
+        "hard-stale must not be reported as a revocation"
+    );
+    assert!(
+        state.metrics.render_prometheus().contains(
+            "secureprompt_license_gate_engaged_total{reason=\"license_revalidation_lost\",action=\"degrade_with_alert\"} 1"
+        ),
+        "the counter must be exposed on /metrics"
+    );
     Ok(())
 }
 
@@ -866,8 +889,15 @@ async fn revoked_serves_recovery_route_but_still_blocks_everything_else(
         StatusCode::OK,
         "premise: /v1/users must be reachable before revocation"
     );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        0,
+        "premise: a healthy gateway engages the gate zero times"
+    );
 
-    state.license.mark_revoked();
+    state.license.mark_revoked("lic-under-test");
     assert!(state.license.is_revoked(), "premise: the sticky flag must be set");
 
     let resp = get_req(&router, "/v1/license", &jwt).await;
@@ -883,6 +913,13 @@ async fn revoked_serves_recovery_route_but_still_blocks_everything_else(
         StatusCode::FORBIDDEN,
         "revoked must stay fail-closed everywhere except the recovery route"
     );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        1,
+        "the blocked request is counted; the allowlisted one is not"
+    );
     Ok(())
 }
 
@@ -894,7 +931,7 @@ async fn recovery_route_is_above_the_license_gate_not_above_auth(pool: PgPool) -
     let (ws, _user) = seed_admin(&pool).await?;
     let (state, router) = build_app_with_keys(pool.clone(), &sk);
 
-    state.license.mark_revoked();
+    state.license.mark_revoked("lic-under-test");
 
     // No credentials at all → 401, not 200 and not a license 403.
     let anon = router
@@ -996,8 +1033,13 @@ async fn revoked_is_superseded_by_a_different_license_but_not_by_itself(
         put_req(&router, "/v1/license", json!({"token": token_a}), &jwt).await.status(),
         StatusCode::OK
     );
-    state.license.mark_revoked();
+    state.license.mark_revoked(&lic_a);
     assert!(state.license.is_revoked(), "premise: revoked");
+    assert_eq!(
+        state.license.revoked_lic_id().as_deref(),
+        Some(lic_a.as_str()),
+        "premise: the revocation names the license that was actually activated"
+    );
     assert_eq!(
         get_req(&router, "/v1/users", &jwt).await.status(),
         StatusCode::FORBIDDEN,
