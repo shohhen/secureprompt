@@ -1464,6 +1464,56 @@ async fn inventory_never_echoes_stored_content(pool: PgPool) {
 
 // ── 7. Auth ───────────────────────────────────────────────────────────────
 
+/// Authentication is not authorisation. This attestation reports live row
+/// counts for every store, which credential classes hold verified ciphertext
+/// and which do not, the deployment's KMS backend and whether its self-test
+/// passed — i.e. exactly the map an attacker with a low-privilege token would
+/// use to choose a target. It was readable by any authenticated role.
+///
+/// Admin is the minimum, for consistency with every other workspace-wide
+/// dashboard route (`users.rs`, `keys.rs`, `secure_mode.rs`, `license.rs`) and
+/// with the `role_required: "admin"` this very response advertises for the
+/// raw-capture control.
+///
+/// The BOUNDARY is asserted, not just the bottom of it. POSITIVE CONTROLS:
+/// `admin` and `owner` still get a real inventory through the same path.
+#[sqlx::test]
+async fn data_inventory_requires_admin_role(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+
+    for role in ["admin", "owner"] {
+        let (status, body) = get_inventory(&app, &make_jwt(ws, user, role)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "positive control: `{role}` must still be able to read the \
+             inventory: {body}"
+        );
+        assert_eq!(
+            row_count(&body, "users"),
+            1,
+            "positive control: `{role}` must get the real inventory, not an \
+             empty shell: {body}"
+        );
+    }
+
+    for role in ["viewer", "developer", "employee"] {
+        let (status, body) = get_inventory(&app, &make_jwt(ws, user, role)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a `{role}` read the full data inventory — live row counts for \
+             every store, which credential classes hold verified ciphertext, \
+             and the deployment's KMS state: {body}"
+        );
+        assert!(
+            body["artifacts"].as_array().is_none(),
+            "the refusal still returned the inventory body: {body}"
+        );
+    }
+}
+
 #[sqlx::test]
 async fn data_inventory_requires_authentication(pool: PgPool) {
     let app = build_app(pool);

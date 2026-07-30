@@ -78,7 +78,11 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    http::{api_error_response, middleware::jwt_auth::JwtAuthContext},
+    http::{
+        api_error_response,
+        middleware::jwt_auth::{JwtAuthContext, UserRole},
+        routes::dashboard::role::require_role,
+    },
 };
 
 use super::leak_report_labels;
@@ -346,18 +350,33 @@ fn ch_err(table: &str, e: &clickhouse::error::Error) -> ApiError {
 
 /// `GET /v1/leak-report?from=YYYY-MM-DD&to=YYYY-MM-DD`
 ///
-/// Any authenticated role. The payload carries no content and no credential
-/// material, and the people who most need to read a pilot's leak report are
-/// rarely the ones holding an admin token.
+/// ADMIN, and the reason is `by_actor`. This used to say "any authenticated
+/// role — the payload carries no content and no credential material, and the
+/// people who most need to read a pilot's leak report are rarely the ones
+/// holding an admin token." The first half is true and the conclusion does not
+/// follow: the payload carries no *detected* content, but `by_actor` is a
+/// per-person submission profile — which named API key, attributed to which
+/// named user, sent how many entities of which class to which destination. A
+/// `viewer` could read the disclosure history of every colleague in the
+/// workspace. The audience argument is real and is answered by granting the
+/// reader admin, not by leaving the route open.
+///
+/// `UserRole::Admin` matches every other dashboard route that exposes or
+/// changes workspace-wide state (`users.rs`, `keys.rs`, `secure_mode.rs`,
+/// `license.rs`) and the `role_required: "admin"` `GET /v1/data-inventory`
+/// already advertises for the raw-capture control.
 ///
 /// There is NO `workspace_id` parameter. The workspace comes from the verified
 /// JWT and is bound into every query, so there is no guard to bypass and no
-/// unfiltered query to fall through to.
+/// unfiltered query to fall through to. The role check is therefore a check on
+/// WHO may read this workspace's report, never the thing keeping tenants
+/// apart — Global Constraint 3.
 async fn get_leak_report(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<LeakReportResponse>, axum::response::Response> {
+    require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
     let ws = ctx.workspace_id.0;
     validate_window(params.from, params.to).map_err(api_error_response)?;
     let (start, end) = bounds(params.from, params.to).map_err(api_error_response)?;

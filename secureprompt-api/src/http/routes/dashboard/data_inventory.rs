@@ -42,6 +42,12 @@
 //!    checks run as `countIf`/`count(*) WHERE` inside the database and return
 //!    integers.
 //!
+//! # Who may read it
+//!
+//! ADMIN — see [`get_data_inventory`]. "No content" is not "no sensitive
+//! information": the response is a live map of which stores hold how much and
+//! which credential classes are verifiably sealed.
+//!
 //! # Why the raw-capture toggle did NOT move here
 //!
 //! WS3-1's implementer flagged that a plaintext-retention switch living on
@@ -76,7 +82,11 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::raw_capture_repo::RawCaptureRepository,
-    http::{api_error_response, middleware::jwt_auth::JwtAuthContext},
+    http::{
+        api_error_response,
+        middleware::jwt_auth::{JwtAuthContext, UserRole},
+        routes::dashboard::role::require_role,
+    },
 };
 
 // ── Vocabulary ────────────────────────────────────────────────────────────
@@ -560,14 +570,26 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
 /// `GET /v1/data-inventory` — every class of stored artifact for the caller's
 /// workspace.
 ///
-/// Any authenticated role. The payload carries no content and no credential
-/// material, and a viewer who cannot see what is retained about them is the
-/// problem this endpoint exists to solve.
+/// ADMIN. This used to say "any authenticated role — the payload carries no
+/// content and no credential material, and a viewer who cannot see what is
+/// retained about them is the problem this endpoint exists to solve." The
+/// premise is right and the conclusion was wrong. It carries no credential
+/// VALUES, but it carries live row counts for every store, which credential
+/// classes hold verified ciphertext and which report `plaintext` or `mixed`,
+/// the deployment's KMS backend and whether its self-test passed just now —
+/// which is a target list for anyone holding a low-privilege token.
+///
+/// The subject-access argument survives the gate: an individual asking what is
+/// retained about them is asking a workspace ADMIN, who can now answer with
+/// this document. `UserRole::Admin` matches every other workspace-wide
+/// dashboard route, and matches the `role_required: "admin"` this response
+/// itself advertises for the raw-capture control.
 #[allow(clippy::too_many_lines)]
 async fn get_data_inventory(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
 ) -> Result<Json<DataInventoryResponse>, axum::response::Response> {
+    require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
     let ws = ctx.workspace_id.0;
     let ch = state.dashboard_reader.client();
     let ch_db = state.config.clickhouse.database.clone();
