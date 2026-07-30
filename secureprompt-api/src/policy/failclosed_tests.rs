@@ -609,10 +609,27 @@ mod condition_validation_tests {
 /// deliberately the same evidence a human audit would use.
 #[cfg(test)]
 mod registry_drift_tests {
-    use crate::db::workspace_repo::DEFAULT_POLICY_CLASSES;
+    use crate::db::workspace_repo::{DEFAULT_POLICY_CLASSES, OPT_IN_ONLY_CLASSES};
     use std::collections::BTreeSet;
 
     const REGISTRY_SRC: &str = include_str!("../detection/registry.rs");
+
+    /// Classes emitted ONLY by the Python ML sidecar
+    /// (`secureprompt-ml/app/detection/*.py` — Presidio and XLM-R label
+    /// maps), never by the Rust registry. A statement of fact about the
+    /// sidecar, independent of which list a class currently sits on, so that
+    /// both consumers below can rely on it:
+    ///
+    ///   * `default_policy_classes_contains_no_dead_names` — their absence
+    ///     from the registry scan is expected and is not a dead name;
+    ///   * `opt_in_only_classes_contains_no_dead_names` — same question,
+    ///     asked of the exclusion list.
+    ///
+    /// `US_SSN` no longer reaches the first consumer, because it left
+    /// `DEFAULT_POLICY_CLASSES` in the opt-in demotion; it is load-bearing
+    /// for the second. Removing it would make the exclusion list's own
+    /// dead-name guard reject the very entry the demotion added.
+    const ML_ONLY: &[&str] = &["PERSON", "US_SSN", "IBAN_CODE"];
 
     /// Every `class: "..."` literal in the registry, normalized the way
     /// `detection::merge::normalize_class` normalizes it before the class
@@ -667,23 +684,157 @@ mod registry_drift_tests {
         assert!(!classes.contains("EMAIL"), "{classes:?}");
     }
 
+    /// The audit, as a PURE FUNCTION of its three inputs, so the guard's
+    /// logic can be exercised against a synthetic omission instead of only
+    /// against whatever today's real lists happen to contain. Returns the
+    /// registry classes that are neither seeded nor consciously excluded.
+    fn unaccounted_classes(
+        registry: &BTreeSet<String>,
+        listed: &BTreeSet<&str>,
+        excused: &[&str],
+    ) -> Vec<String> {
+        registry
+            .iter()
+            .filter(|class| !listed.contains(class.as_str()) && !excused.contains(&class.as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// The audit that was never run. Every class the registry can emit must
     /// be a deliberate decision in `DEFAULT_POLICY_CLASSES` — present, or
-    /// consciously excluded on the allow-list below.
+    /// consciously excluded by name in `OPT_IN_ONLY_CLASSES`.
+    ///
+    /// Until the SSN demotion this doc comment claimed an "allow-list below"
+    /// that the body did not have: the filter consulted `listed` alone, so
+    /// the only way to satisfy the guard was to seed the class. The
+    /// exclusion list is that allow-list, and the two tests underneath this
+    /// one are what make the claim checkable rather than asserted.
     #[test]
     fn default_policy_classes_cover_every_registry_class() {
         let listed: BTreeSet<&str> = DEFAULT_POLICY_CLASSES.iter().copied().collect();
-        let missing: Vec<String> = registry_classes()
-            .into_iter()
-            .filter(|class| !listed.contains(class.as_str()))
-            .collect();
+        let missing = unaccounted_classes(&registry_classes(), &listed, OPT_IN_ONLY_CLASSES);
 
         assert!(
             missing.is_empty(),
             "these detector classes are emitted by the registry but are NOT in \
              DEFAULT_POLICY_CLASSES, so a new workspace detects them and then \
              forwards them in the clear whenever another listed class is also \
-             present: {missing:?}. Add them here AND in a back-fill migration."
+             present: {missing:?}. Add them here AND in a back-fill migration \
+             — or, if the omission is DELIBERATE, name them in \
+             OPT_IN_ONLY_CLASSES with the reason."
+        );
+    }
+
+    /// The exclusion list must not turn the guard above into a rubber stamp:
+    /// a class in NEITHER list is still an accidental omission and must
+    /// still fail. Proved on a synthetic omission of a class that really is
+    /// seeded today, because the real lists are (correctly) consistent and
+    /// therefore cannot demonstrate the failure path.
+    #[test]
+    fn the_exclusion_list_does_not_excuse_an_accidental_omission() {
+        let registry = registry_classes();
+        // PREMISE: the class used to simulate the omission must actually be
+        // emitted by the registry, else the test simulates nothing.
+        assert!(
+            registry.contains("BEARER_TOKEN"),
+            "premise: the registry must emit BEARER_TOKEN: {registry:?}"
+        );
+
+        let with_an_accidental_omission: BTreeSet<&str> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .copied()
+            .filter(|class| *class != "BEARER_TOKEN")
+            .collect();
+
+        assert_eq!(
+            unaccounted_classes(&registry, &with_an_accidental_omission, OPT_IN_ONLY_CLASSES),
+            vec!["BEARER_TOKEN".to_owned()],
+            "an omission the exclusion list does NOT name must still be \
+             reported — otherwise adding the list disarmed the audit"
+        );
+    }
+
+    /// POSITIVE CONTROL, which must differ from the test above: a class the
+    /// exclusion list DOES name is excused. The second assertion is the
+    /// deletion check, run inline on the same inputs — with the exclusion
+    /// list emptied, the identical call reports `SSN`.
+    #[test]
+    fn a_class_named_on_the_exclusion_list_is_excused() {
+        let registry = registry_classes();
+        let listed: BTreeSet<&str> = DEFAULT_POLICY_CLASSES.iter().copied().collect();
+
+        // PREMISE: `ssn` is still a live registry class (demoted, not
+        // deleted) and is genuinely absent from the seeded defaults, so the
+        // excuse below is doing real work.
+        assert!(
+            registry.contains("SSN"),
+            "premise: `Matcher::Ssn` must still be registered: {registry:?}"
+        );
+        assert!(
+            !listed.contains("SSN"),
+            "premise: SSN must be absent from DEFAULT_POLICY_CLASSES"
+        );
+
+        assert!(
+            unaccounted_classes(&registry, &listed, OPT_IN_ONLY_CLASSES).is_empty(),
+            "a class named on the exclusion list must be excused"
+        );
+        assert_eq!(
+            unaccounted_classes(&registry, &listed, &[]),
+            vec!["SSN".to_owned()],
+            "deletion check: with the exclusion list emptied the SAME inputs \
+             must fail, else the excuse was never load-bearing"
+        );
+    }
+
+    /// The exclusion list's own rot. An entry naming a class no detector
+    /// emits excuses nothing and merely widens the hole in the audit above —
+    /// the same defect `GCP_KEY` / `AZURE_KEY` were in `DEFAULT_POLICY_CLASSES`.
+    #[test]
+    fn opt_in_only_classes_contains_no_dead_names() {
+        let registry = registry_classes();
+
+        // PREMISE: an empty exclusion list would pass the loop below
+        // vacuously, and would also silently disarm
+        // `a_class_named_on_the_exclusion_list_is_excused`.
+        assert_eq!(
+            OPT_IN_ONLY_CLASSES,
+            ["SSN", "US_SSN"],
+            "premise: the exclusion list must hold exactly the two SSN \
+             spellings — the Rust floor's and Presidio's"
+        );
+
+        let dead: Vec<&str> = OPT_IN_ONLY_CLASSES
+            .iter()
+            .copied()
+            .filter(|class| !registry.contains(*class) && !ML_ONLY.contains(class))
+            .collect();
+
+        assert!(
+            dead.is_empty(),
+            "these OPT_IN_ONLY_CLASSES entries name nothing any detector \
+             emits, so they excuse an omission that was never possible: \
+             {dead:?}"
+        );
+    }
+
+    /// A class cannot be both seeded and opt-in-only. The two lists are a
+    /// partition of "decided about", and an overlap would mean the exclusion
+    /// list is excusing something that is present anyway — a demotion that
+    /// silently did not happen.
+    #[test]
+    fn the_two_lists_do_not_overlap() {
+        let listed: BTreeSet<&str> = DEFAULT_POLICY_CLASSES.iter().copied().collect();
+        let both: Vec<&str> = OPT_IN_ONLY_CLASSES
+            .iter()
+            .copied()
+            .filter(|class| listed.contains(class))
+            .collect();
+
+        assert!(
+            both.is_empty(),
+            "these classes are marked opt-in-only AND seeded by default, so \
+             the demotion did not happen: {both:?}"
         );
     }
 
@@ -693,11 +844,6 @@ mod registry_drift_tests {
     #[test]
     fn default_policy_classes_contains_no_dead_names() {
         let registry = registry_classes();
-        // ML-sidecar-only classes. These are emitted by
-        // `secureprompt-ml/app/detection/*.py` (Presidio / XLM-R label maps),
-        // never by the Rust registry, so their absence from the scan is
-        // expected and not a dead name.
-        const ML_ONLY: &[&str] = &["PERSON", "US_SSN", "IBAN_CODE"];
 
         let dead: Vec<&str> = DEFAULT_POLICY_CLASSES
             .iter()
@@ -951,7 +1097,7 @@ mod migration_019_tests {
 /// fails; add one to 020 that Rust does not seed and it fails the other way.
 #[cfg(test)]
 mod migration_class_list_drift_tests {
-    use crate::db::workspace_repo::DEFAULT_POLICY_CLASSES;
+    use crate::db::workspace_repo::{DEFAULT_POLICY_CLASSES, OPT_IN_ONLY_CLASSES};
     use std::collections::BTreeSet;
 
     const MIGRATION_020: &str =
@@ -1017,16 +1163,33 @@ mod migration_class_list_drift_tests {
     }
 
     /// The audit that was never run for 019.
+    ///
+    /// NO LONGER BIDIRECTIONAL EQUALITY, and the asymmetry is the point.
+    /// 020 is already applied on developer and customer databases, and
+    /// changing a byte of it breaks the sqlx checksum, so it still
+    /// back-fills `SSN` / `US_SSN`. The demotion is expressed by a LATER
+    /// migration (024) that removes them again, not by editing 020.
+    ///
+    /// So the surplus side is allowed to be exactly `OPT_IN_ONLY_CLASSES`
+    /// and nothing else. Compared with `assert_eq!` rather than "subtract
+    /// and check empty": a class dropped from `DEFAULT_POLICY_CLASSES`
+    /// WITHOUT being named opt-in still fails here, which is the original
+    /// defect this guard exists for.
     #[test]
-    fn migration_020_backfills_exactly_default_policy_classes() {
+    fn migration_020_backfills_default_policy_classes_plus_the_opt_ins() {
         let listed: BTreeSet<String> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
+        let opt_in: BTreeSet<String> = OPT_IN_ONLY_CLASSES
             .iter()
             .map(|class| (*class).to_owned())
             .collect();
         let migration = migration_backfill_classes();
 
         let missing_from_migration: Vec<&String> = listed.difference(&migration).collect();
-        let missing_from_rust: Vec<&String> = migration.difference(&listed).collect();
+        let surplus_in_migration: BTreeSet<String> =
+            migration.difference(&listed).cloned().collect();
 
         assert!(
             missing_from_migration.is_empty(),
@@ -1035,12 +1198,305 @@ mod migration_class_list_drift_tests {
              class was added detects them and then forwards them in the \
              clear: {missing_from_migration:?}"
         );
+        assert_eq!(
+            surplus_in_migration, opt_in,
+            "020 back-fills exactly these classes that DEFAULT_POLICY_CLASSES \
+             does not seed. Only the OPT_IN_ONLY_CLASSES demotion may appear \
+             here — 020 is frozen (already applied; editing it breaks the \
+             sqlx checksum) and migration 024 removes them again. Anything \
+             ELSE in this set means a class was dropped from the Rust list \
+             without being demoted, so existing workspaces would be better \
+             protected than new ones."
+        );
+    }
+}
+
+/// WS1 — `SSN` / `US_SSN` demoted from default-on to OPT-IN.
+///
+/// SecurePrompt is an Uzbekistan-market product and the US Social Security
+/// Number is not a supported default class:
+///
+///   * `SOCIAL_SECURITY_NUMBER` appears zero times across every ACTIVE
+///     dataset under `data/**` (v5, v7, `v7_corpus_v2`/v3, `v7_hardened`,
+///     `v8_corpus`, `spy_ruz`, `aug_*`). Its only occurrences are in the abandoned
+///     v4 corpus under `docs/backup_v4/`, where the generator hallucinated a
+///     Cyrillic "ССН" into Uzbek HR documents. The deployed v8 model has no
+///     training support for the class.
+///   * `SOCIAL_SECURITY_NUMBER` survives only as a dead entry in
+///     `_V2_RAW_LABELS` (`secureprompt-ml/app/detection/xlmr_ner.py:129`).
+///
+/// DEMOTED, NOT DELETED. `Matcher::Ssn` and its `DetectorSpec` stay, so the
+/// class is still detected and can be re-enabled from the policy UI by
+/// adding it back to the seeded rule — `demoting_ssn_is_reversible_from_the_policy_ui`
+/// below executes that path rather than asserting it.
+///
+/// SEQUENCING. This change was only safe once `fa880be` moved the
+/// bare-nine-digit backstop off `ssn` and onto `stir`. Before that commit
+/// `ssn` was the ONLY detector that redacted an UNLABELLED Uzbek tax number
+/// — `Matcher::Stir` is keyword-gated and needs a nearby `ИНН`/`STIR` label
+/// — so demoting the class would have turned a mislabel into a real leak.
+/// `a_bare_nine_digit_stir_survives_the_demotion` is that property, asserted
+/// on the redacted output of the real policy path.
+#[cfg(test)]
+mod ssn_opt_in_tests {
+    use crate::db::{PolicyRepository, WorkspaceRepository};
+    use crate::detection::{detect_content, merge::merge_detections};
+    use crate::policy::engine::{evaluate, PolicyEvaluationInput, PolicyEvaluationOutcome};
+    use secureprompt_common::types::{Detection, RequestId, TokenVault, WorkspaceId};
+    use sqlx::PgPool;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    /// Synthetic. The email is load-bearing in every fixture below: without a
+    /// detection whose class the seeded rule DOES name, the rule never fires,
+    /// `matching_detections` falls through to its "redact everything"
+    /// fallback, and every assertion here passes for the wrong reason.
+    const EMAIL: &str = "qa-fixture@example.invalid";
+    /// A bare nine-digit run. In Uzbekistan this is a STIR; `fa880be` is what
+    /// made it one. Not a real taxpayer.
+    const BARE_NINE: &str = "300111222";
+    /// The 3-2-4 form the US Social Security Administration prints. Not a
+    /// real SSN — the 900 area is permanently unassigned.
+    const US_SSN: &str = "900-45-6789";
+
+    async fn seed_workspace(pool: &PgPool) -> Uuid {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "SSN Demotion Co",
+                &format!("ssn-optin-{}@example.invalid", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace + seeded rule must be created");
+        workspace.id
+    }
+
+    async fn eval_seeded(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        content: &str,
+        detections: &[Detection],
+        fail_closed: bool,
+    ) -> PolicyEvaluationOutcome {
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace_id),
+                provider_name: "none",
+                model: "none",
+                content,
+                detections,
+                fail_closed,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "premise: the seeded rule must be the one and only rule — at 0 the \
+             redact_when_no_rules net would mask everything under test"
+        );
+        outcome
+    }
+
+    fn classes_of(detections: &[Detection]) -> Vec<&str> {
+        detections.iter().map(|d| d.class.as_str()).collect()
+    }
+
+    /// THE NO-LEAK PROPERTY. An unlabelled Uzbek tax number is still redacted
+    /// by the seeded default rule after `SSN` leaves it, because `fa880be`
+    /// moved that input's class to `stir` and `STIR` remains a default.
+    ///
+    /// Runs with `fail_closed: false` on purpose: with it on, a firing
+    /// `redact` rule covers every detection regardless of the class list, so
+    /// the test would pass no matter what `DEFAULT_POLICY_CLASSES` said.
+    ///
+    /// Deletion check: remove `"STIR"` from `DEFAULT_POLICY_CLASSES` — this
+    /// reddens on the `BARE_NINE` assertion and its email premise does not.
+    #[sqlx::test]
+    async fn a_bare_nine_digit_stir_survives_the_demotion(pool: PgPool) {
+        let content = format!("Contact {EMAIL} about order {BARE_NINE}");
+        let detections = merge_detections(detect_content(&content), vec![]);
+
+        // PREMISE. Both assertions below are about an ABSENCE, so first prove
+        // the detector produced the classes at issue — and that the bare nine
+        // is `stir` rather than `ssn`, which is the whole reason this task was
+        // sequenced after the registry change.
+        let classes = classes_of(&detections);
         assert!(
-            missing_from_rust.is_empty(),
-            "these classes are back-filled by 020 but are NOT in \
-             DEFAULT_POLICY_CLASSES, so a NEW workspace would be seeded \
-             without them — existing workspaces would be better protected \
-             than new ones: {missing_from_rust:?}"
+            classes.contains(&"EMAIL_ADDRESS"),
+            "premise: the email must be detected, got {classes:?}"
+        );
+        assert!(
+            classes.contains(&"STIR"),
+            "premise: a bare nine-digit run must be detected as STIR — this is \
+             `fa880be`, the prerequisite for this change, got {classes:?}"
+        );
+        assert!(
+            !classes.contains(&"SSN"),
+            "premise: the bare nine must NOT also be an SSN, got {classes:?}"
+        );
+
+        let workspace_id = seed_workspace(&pool).await;
+        let outcome = eval_seeded(&pool, workspace_id, &content, &detections, false).await;
+        assert_eq!(outcome.result.final_action, "redact");
+
+        assert!(
+            !outcome.content.contains(EMAIL),
+            "premise: the email must be redacted, else the rule never fired \
+             and this test proves nothing: {:?}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains(BARE_NINE),
+            "NO-LEAK BROKEN: an unlabelled Uzbek tax number was redacted \
+             before the SSN demotion and is now forwarded in the clear: {:?}",
+            outcome.content
+        );
+    }
+
+    /// THE DEMOTION, on behaviour. With `fail_closed` off — the only
+    /// configuration in which `DEFAULT_POLICY_CLASSES` decides anything at
+    /// all — a US SSN alongside an email is now forwarded.
+    ///
+    /// This test asserts a DELIBERATE reduction in coverage, which is what
+    /// "opt-in" means, and it is the honest scope of the change: see
+    /// `fail_closed_still_redacts_a_us_ssn` for the production default and
+    /// `demoting_ssn_is_reversible_from_the_policy_ui` for the way back.
+    #[sqlx::test]
+    async fn a_us_ssn_is_forwarded_by_the_seeded_default_once_demoted(pool: PgPool) {
+        let content = format!("Contact {EMAIL}, SSN {US_SSN}");
+        let detections = merge_detections(detect_content(&content), vec![]);
+
+        // PREMISE: the floor still DETECTS the SSN. Demoted, not deleted —
+        // if this ever fails, `Matcher::Ssn` was removed and the opt-in path
+        // below has nothing to switch back on.
+        let classes = classes_of(&detections);
+        assert!(
+            classes.contains(&"SSN"),
+            "premise: `Matcher::Ssn` must still detect the 3-2-4 form — the \
+             class is demoted, not deleted, got {classes:?}"
+        );
+        assert!(
+            classes.contains(&"EMAIL_ADDRESS"),
+            "premise: the email must be detected, got {classes:?}"
+        );
+
+        let workspace_id = seed_workspace(&pool).await;
+        let outcome = eval_seeded(&pool, workspace_id, &content, &detections, false).await;
+
+        assert!(
+            !outcome.content.contains(EMAIL),
+            "premise: the listed class must still be redacted, else the rule \
+             never fired: {:?}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains(US_SSN),
+            "the demotion is not real — the seeded default still redacts a US \
+             SSN: {:?}",
+            outcome.content
+        );
+    }
+
+    /// SCOPE LIMIT, and the reason the test above is not a regression: with
+    /// `fail_closed` on — `config.redact_when_no_rules`, the production
+    /// default — a firing `redact` rule covers EVERY detection in the
+    /// request, so the demoted class is still redacted.
+    ///
+    /// Same fixture as the test above, opposite expected result. If this ever
+    /// starts forwarding, the demotion has become a real leak on the default
+    /// configuration rather than an opt-in.
+    #[sqlx::test]
+    async fn fail_closed_still_redacts_a_us_ssn(pool: PgPool) {
+        let content = format!("Contact {EMAIL}, SSN {US_SSN}");
+        let detections = merge_detections(detect_content(&content), vec![]);
+
+        let workspace_id = seed_workspace(&pool).await;
+        let outcome = eval_seeded(&pool, workspace_id, &content, &detections, true).await;
+
+        assert!(
+            !outcome.content.contains(US_SSN),
+            "on the PRODUCTION default (redact_when_no_rules on) a demoted \
+             class must still be redacted once any rule fires: {:?}",
+            outcome.content
+        );
+    }
+
+    /// "Opt-in" is only a real offer if the way back works. The brief asserts
+    /// that `DEFAULT_POLICY_CLASSES` is consumed in exactly one place — the
+    /// seeded rule's `detection_class in [...]` condition — and that an admin
+    /// re-enables the class by editing that rule. This EXECUTES that path
+    /// instead of asserting it: the `UPDATE` below is what
+    /// `PUT /v1/dashboard/policy-rules/{id}` writes.
+    ///
+    /// Runs with `fail_closed: false` throughout, so the class list is the
+    /// only thing that can decide the outcome.
+    #[sqlx::test]
+    async fn demoting_ssn_is_reversible_from_the_policy_ui(pool: PgPool) {
+        let content = format!("Contact {EMAIL}, SSN {US_SSN}");
+        let detections = merge_detections(detect_content(&content), vec![]);
+        let workspace_id = seed_workspace(&pool).await;
+
+        // PREMISE: forwarded before the admin opts in. Without this the
+        // "redacted after" assertion below would pass against a build where
+        // SSN never left the defaults.
+        let before = eval_seeded(&pool, workspace_id, &content, &detections, false).await;
+        assert!(
+            before.content.contains(US_SSN),
+            "premise: the demoted class must be forwarded BEFORE the opt-in: {:?}",
+            before.content
+        );
+
+        // What the policy UI does: append the class to the seeded rule.
+        let updated = sqlx::query(
+            "UPDATE policy_rules
+             SET conditions = jsonb_set(conditions, '{0,value}',
+                     (conditions -> 0 -> 'value') || '[\"SSN\"]'::jsonb)
+             WHERE workspace_id = $1 AND name = 'Redact common PII'",
+        )
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .expect("the opt-in edit must succeed")
+        .rows_affected();
+        assert_eq!(
+            updated, 1,
+            "premise: exactly one seeded rule must be edited"
+        );
+
+        let after = eval_seeded(&pool, workspace_id, &content, &detections, false).await;
+        assert!(
+            !after.content.contains(US_SSN),
+            "OPT-IN IS NOT REAL: re-adding `SSN` to the seeded rule did not \
+             restore redaction, so the class cannot be turned back on from \
+             the policy UI: {:?}",
+            after.content
+        );
+    }
+
+    /// The demotion itself, asserted on the const rather than on behaviour so
+    /// the failure names the exact edit required.
+    #[test]
+    fn default_policy_classes_omits_both_ssn_spellings() {
+        let listed = crate::db::workspace_repo::DEFAULT_POLICY_CLASSES;
+        assert!(
+            !listed.contains(&"SSN"),
+            "`SSN` (the Rust floor's spelling, upper-cased by \
+             `merge::normalize_class`) is still a seeded default"
+        );
+        assert!(
+            !listed.contains(&"US_SSN"),
+            "`US_SSN` (Presidio's spelling, emitted by the ML sidecar's \
+             `_map_label`) is still a seeded default — leaving either \
+             spelling in makes the demotion cosmetic"
         );
     }
 }
