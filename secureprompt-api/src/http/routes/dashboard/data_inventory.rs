@@ -91,8 +91,34 @@ use crate::{
 
 // ── Vocabulary ────────────────────────────────────────────────────────────
 
-/// Values [`Encryption::at_rest`] can take. Every one of them is COMPUTED
-/// from a count, never written down for a class.
+/// Values [`Encryption::at_rest`] can take.
+///
+/// This said "every one of them is COMPUTED from a count, never written down
+/// for a class". 72233c8 corrected the same sentence where it appeared in the
+/// PAYLOAD and left it standing here, and it is false in three ways. The rule
+/// and its exceptions, enumerated from the assignment sites in this file:
+///
+/// * COMPUTED from a count, in [`Encryption::sealed`] and
+///   [`Encryption::hashed`]: [`CIPHERTEXT`], [`PLAINTEXT`], [`MIXED`],
+///   [`HASHED`], [`EMPTY`].
+/// * [`PLAIN_BY_DESIGN`] is ALWAYS declared — there is no count that could
+///   produce it. It claims nothing beyond "stored as written", which is why
+///   declaring it is honest.
+/// * [`EMPTY`] is also declared once, for `request_content_captures` when the
+///   store did not answer: nothing was inspected, so no verdict is claimed.
+/// * Two classes declare a PROTECTIVE verdict, and both carry their reason in
+///   the response rather than only here: `users` is [`MIXED`] whenever the
+///   workspace has a member, because the table holds an Argon2id hash, a
+///   KMS-sealed TOTP secret and plaintext directory fields at once; and
+///   `redis:filevault` is [`CIPHERTEXT`] with no verification, because
+///   verifying it would mean enumerating the keys this endpoint has just
+///   declared it cannot enumerate.
+///
+/// `tests/data_inventory.rs::encryption_verdicts_are_computed_or_named_as_exceptions`
+/// is what keeps that list from going stale: it recomputes every protective
+/// verdict from the class's own `verification` numbers and requires any class
+/// the rule does not reproduce to be NAMED in the response's own `at_rest`
+/// caveat.
 mod at_rest {
     /// Every stored payload in this class matched the deployment's ciphertext
     /// envelope.
