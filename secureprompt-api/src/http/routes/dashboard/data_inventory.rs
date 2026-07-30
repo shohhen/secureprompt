@@ -756,7 +756,9 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM workspace_sidecar_policy WHERE workspace_id = $1) AS c_workspace_sidecar_policy,
            (SELECT count(*) FROM workspace_raw_capture WHERE workspace_id = $1) AS c_workspace_raw_capture,
            (SELECT count(*) FROM raw_capture_audit WHERE workspace_id = $1) AS c_raw_capture_audit,
-           (SELECT count(*) FROM retention_purge_audit WHERE workspace_id = $1) AS c_retention_purge_audit",
+           (SELECT count(*) FROM retention_purge_audit WHERE workspace_id = $1) AS c_retention_purge_audit,
+           (SELECT count(*) FROM audit_exports WHERE workspace_id = $1) AS c_audit_exports,
+           (SELECT count(*) FROM audit_export_pages WHERE workspace_id = $1) AS c_audit_export_pages",
         cred_sealed = pg_sealed("encrypted_credential"),
         vault_sealed = pg_sealed("mapping_ciphertext"),
     );
@@ -1510,6 +1512,99 @@ async fn get_data_inventory(
              are irrecoverable from backups or unmerged parts.",
         ),
         retention: Retention::none("Append-only and never purged, by design."),
+        governed_by: None,
+        enabled: None,
+    });
+
+    // WS4-1 — the two tables migration 025 creates for `audit.export`.
+    //
+    // These are declared with more care than their row counts suggest, because
+    // `audit_export_pages` is the only class in this inventory that holds a
+    // MATERIALISED COPY of another class's rows. Everything the
+    // `request_events` entry says about its own contents becomes true of this
+    // table too, minus that table's TTL — so an omission here would not just
+    // hide a table, it would hide a second copy of the audit trail with a
+    // different retention story.
+    artifacts.push(ArtifactClass {
+        class: "audit_exports".to_owned(),
+        store: "postgres",
+        location: "audit_exports".to_owned(),
+        description: "One row per requested audit export: the window, format, page size, \
+                      status, and — once complete — the signed manifest, its detached \
+                      Ed25519 signature, the public key and the signing-key fingerprint. \
+                      No exported rows live here; they are in `audit_export_pages`.",
+        sensitivity: "audit_trail",
+        row_count: Some(pg.n("c_audit_exports")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Manifest, signature and public key, stored in the clear. `manifest_json` is \
+             deliberately TEXT and byte-exact: the signature covers those bytes, so \
+             normalising them (JSONB, re-serialisation) would make every export fail its \
+             own verification. The manifest contains counts, digests and column \
+             DESCRIPTIONS — no exported row values. NOTE what the signature is and is not: \
+             it establishes that an export has not been ALTERED since it was produced. It \
+             is not encryption and provides no confidentiality for `audit_export_pages`.",
+        ),
+        retention: Retention::none(
+            "INDEFINITE. Nothing deletes rows in this table: there is no TTL, and the \
+             `retention.purge` worker job does not cover it. An export requested once is \
+             kept until an operator removes it by hand. This is a STATED GAP, not a \
+             design: how long a regulated customer must keep an export is a compliance \
+             decision that has not been made, and defaulting to a silent forever is the \
+             thing this entry exists to stop a reader assuming otherwise.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
+    artifacts.push(ArtifactClass {
+        class: "audit_export_pages".to_owned(),
+        store: "postgres",
+        location: "audit_export_pages".to_owned(),
+        description: "The exported audit rows themselves, as the exact CSV or JSONL bytes \
+                      that were signed. A MATERIALISED COPY of `request_events` metadata \
+                      for the export's window: request id, timestamp, provider, model, \
+                      disposition, token counts, cost, and the actor columns — user id, \
+                      API key id, API key name, IP address, User-Agent. NO PROMPT OR \
+                      RESPONSE CONTENT: `raw_prompt`, `raw_response`, `redacted_prompt` \
+                      and `restored_response` are not exported, by construction.",
+        // Not `derived_metadata`. These pages carry the actor columns verbatim,
+        // which are personal data under an erasure request even though no
+        // detected PII is among them.
+        sensitivity: "audit_trail",
+        row_count: Some(pg.n("c_audit_export_pages")),
+        row_count_status: "counted",
+        row_count_detail: Some(
+            "Counts PAGES, not exported rows. One page holds up to the export's \
+             `page_size` rows (default 5000); the signed per-page row counts are in the \
+             manifest on the parent `audit_exports` row."
+                .to_owned(),
+        ),
+        encryption: Encryption::plain(
+            "PLAINTEXT, and this is the entry's most important line. The page bytes are \
+             stored exactly as signed, so they are readable by anyone with database \
+             access. Two consequences a reader must not have to infer. (1) The Ed25519 \
+             signature protects INTEGRITY ONLY — it makes alteration detectable and \
+             provides NO confidentiality. (2) The bytes carry personal data: \
+             `api_key_name` is administrator-chosen free text that routinely names a \
+             person, and `ip_address`, `user_agent`, `user_id` and `api_key_id` identify \
+             an actor. `model` is copied VERBATIM from `request_events.model` and, unlike \
+             the leak report's `by_model`, is NOT bounded against the workspace model \
+             catalogue — `analytics::detection_counts::canonicalize_model` is applied only \
+             on the `detection_class_counts` write path — so it carries whatever string \
+             the caller asked for. Encrypting this column at rest is possible (decrypt on \
+             read would still serve byte-identical pages) and is NOT implemented; treat \
+             that as an open gap rather than a considered decision.",
+        ),
+        retention: Retention::none(
+            "INDEFINITE, and this outlives the source. `request_events` carries a 90-day \
+             ClickHouse TTL; these pages carry none, so an export taken today preserves \
+             that window's audit metadata in Postgres after the ClickHouse rows have \
+             expired. That is the POINT of an export — but it means a workspace's \
+             90-day retention claim does not hold for data that has been exported, and an \
+             erasure request must reach this table too.",
+        ),
         governed_by: None,
         enabled: None,
     });

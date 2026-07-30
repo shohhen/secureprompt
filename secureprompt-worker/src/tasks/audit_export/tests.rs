@@ -1072,3 +1072,75 @@ async fn re_running_the_same_export_replaces_rather_than_appends(pool: PgPool) -
 
     Ok(())
 }
+
+/// `model` reaches the export VERBATIM — it is not bounded against the
+/// workspace model catalogue the way the leak report's `by_model` is.
+///
+/// This test exists to make an ATTESTATION CLAIM executable rather than
+/// argued. `data_inventory`'s `audit_export_pages` entry tells an auditor that
+/// this column carries whatever string the caller asked for, because
+/// `analytics::detection_counts::canonicalize_model` is applied only on the
+/// `detection_class_counts` write path and nothing bounds `request_events.model`
+/// on the way into an export. A claim in a compliance document that no test
+/// backs is exactly the kind of assertion this branch has been burned by.
+///
+/// It is a DISCLOSURE, not a defect to fix here: bounding the column would
+/// destroy audit fidelity, since the destination a request actually named is
+/// the fact an auditor is entitled to. The fix is that the inventory says so.
+///
+/// The fixture string is synthetic and contains no real PII (Constraint 5) —
+/// it is shaped like the hostile model name that put caller bytes into
+/// `detection_class_counts`, without being one.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn the_model_column_reaches_the_export_verbatim(pool: PgPool) -> sqlx::Result<()> {
+    const CALLER_CHOSEN: &str = "not-a-registered-model SYNTHETIC-MARKER-9c1f";
+
+    let workspace_id = Uuid::new_v4();
+    let export_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+
+    // Seeded through the same raw INSERT the other tests use, which is how a
+    // gateway request that named an uncatalogued model lands on disk.
+    let (from, _) = window();
+    let ts = (from + chrono::Duration::minutes(61)).timestamp();
+    ch_query(&format!(
+        "INSERT INTO request_events \
+         (request_id, workspace_id, provider, model, final_action, input_tokens, \
+          output_tokens, estimated_usage, cost_usd, created_at, floor_only, engines) \
+         VALUES (toUUID('{request_id}'), toUUID('{workspace_id}'), 'openai', \
+                 '{CALLER_CHOSEN}', 'allow', 1, 1, false, 0.0, toDateTime({ts}), \
+                 false, ['floor'])"
+    ))
+    .await;
+    seed_export_row(&pool, export_id, workspace_id, "csv", 100).await?;
+
+    // PREMISE: the row really is there with that model, so the assertion below
+    // measures the export rather than an empty window.
+    let live = live_rows(workspace_id).await;
+    assert_eq!(live.len(), 1, "premise: one row seeded");
+    assert_eq!(
+        live[0][4], CALLER_CHOSEN,
+        "premise: ClickHouse stored the caller-chosen model verbatim"
+    );
+
+    run_with(
+        &pool,
+        &ch_client(),
+        &envelope(export_id, workspace_id, "csv", 100),
+        Ok(test_key()),
+        MAX_EXPORT_ROWS,
+        Utc::now(),
+    )
+    .await;
+
+    let stored = load_export(&pool, export_id).await?;
+    assert_eq!(stored.status, STATUS_COMPLETE, "error: {:?}", stored.error);
+    let body = String::from_utf8(load_pages(&pool, export_id).await?.concat()).expect("utf8");
+    assert!(
+        body.contains(CALLER_CHOSEN),
+        "the export must carry the caller's model string verbatim — the \
+         data-inventory entry for `audit_export_pages` says so; got:\n{body}"
+    );
+
+    Ok(())
+}
