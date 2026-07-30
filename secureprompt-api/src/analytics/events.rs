@@ -119,6 +119,21 @@ pub struct RequestEvent {
     /// reviewer can scope an incident to exactly the traffic that ran without
     /// NER rather than guessing from sidecar uptime.
     pub floor_only: bool,
+    /// WS2-4 — WHICH detection engines produced coverage for this request's
+    /// prompt, as opposed to `floor_only`'s coarser "was the answer produced
+    /// on the floor alone".
+    ///
+    /// PUBLIC, unlike `captured` and `detection_counts` above, and for a
+    /// reason worth stating rather than leaving to inference: those two are
+    /// private because a caller could otherwise assign an *unbounded* value —
+    /// plaintext past the capture gate, or a class name off the sidecar's
+    /// wire. This one is a closed three-variant enum, so there is no
+    /// out-of-vocabulary value to guard against and a setter would buy
+    /// nothing. What it CAN be is wrong, and the defence against that is the
+    /// default: [`crate::analytics::engines::DetectionEngines::FloorOnly`]
+    /// under-claims, so a forgotten call site records less scanning than
+    /// happened rather than asserting a model ran when it did not.
+    pub engines: crate::analytics::engines::DetectionEngines,
     /// WS3-6 — how many DISTINCT entities of each class this request's
     /// detection pass found. The source the shadow-mode leak report
     /// aggregates.
@@ -175,6 +190,7 @@ impl RequestEvent {
             redacted_prompt: None,
             captured: None,
             floor_only: false,
+            engines: crate::analytics::engines::DetectionEngines::FloorOnly,
             detection_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -303,8 +319,16 @@ pub struct RequestEventRow {
     pub raw_response: Option<String>,
     // ── Migration 006 (WS2-3): deterministic-floor-only answer ─────────────
     // Column order MUST match the ALTER TABLE order; ClickHouse appends
-    // ADD COLUMN at the end of the row, so this field stays last.
+    // ADD COLUMN at the end of the row, so each new field goes last.
     pub floor_only: bool,
+    // ── Migration 009 (WS2-4): which engines produced coverage ─────────────
+    //
+    // `Array(String)`, always one of `['floor']`, `['floor','ml']`,
+    // `['floor','ml_partial']` — the three `&'static str` literals in
+    // `analytics::engines`. Never a wire-sourced string; the value comes from
+    // a closed enum whose only constructor is an exhaustive match over
+    // `SidecarCoverage`.
+    pub engines: Vec<String>,
 }
 
 impl RequestEventRow {
@@ -337,6 +361,7 @@ impl RequestEventRow {
             raw_prompt: None,
             raw_response: None,
             floor_only: e.floor_only,
+            engines: e.engines.to_names(),
         }
     }
 }

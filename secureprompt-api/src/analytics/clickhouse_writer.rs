@@ -37,6 +37,7 @@ pub const REQUEST_EVENTS_COLUMNS: &[&str] = &[
     "raw_prompt",
     "raw_response",
     "floor_only",
+    "engines",
 ];
 
 #[derive(Row, Deserialize)]

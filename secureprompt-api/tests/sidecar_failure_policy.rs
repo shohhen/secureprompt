@@ -635,10 +635,7 @@ async fn apply_ch_migration(migration: &str) {
 async fn ensure_floor_only_column() {
     // Read the real migration rather than restating its DDL, so this cannot
     // drift from what the worker actually applies at startup.
-    apply_ch_migration(include_str!(
-        "../clickhouse/migrations/006_floor_only.sql"
-    ))
-    .await;
+    apply_ch_migration(include_str!("../clickhouse/migrations/006_floor_only.sql")).await;
 }
 
 /// WS2-4 — same, for migration 009's `engines` column.
@@ -1786,5 +1783,68 @@ async fn audit_row_names_the_engines_that_produced_coverage(pool: PgPool) -> sql
         "premise for the non-redundancy claim: floor_only really does read \
          the same for partial coverage as for no coverage at all"
     );
+    Ok(())
+}
+
+/// WS2-4, client-visible half: `x-secureprompt-engines` on the gateway
+/// response, so a caller can read the provenance of the answer it just got
+/// without querying the audit store.
+///
+/// THE DISCRIMINATING PAIR: the header must differ between a request the model
+/// scanned and one it did not. Asserting only "the header is present" would
+/// pass for a constant.
+///
+/// UNCONDITIONAL, unlike `x-secureprompt-sidecar-degraded`: the healthy leg
+/// carries the header too. That is the point — a client should not have to
+/// infer "the model ran" from the ABSENCE of a degradation header, which is
+/// the same inference-from-silence that made an empty ML detection set
+/// indistinguishable from "no PII" before WS2-3.
+#[sqlx::test]
+async fn the_response_states_which_engines_scanned_the_prompt(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    // POSITIVE CONTROL: healthy sidecar.
+    let sidecar = MockSidecar::spawn();
+    let healthy = support::router_with(pool.clone(), &sidecar.url(), "default")
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+    assert_eq!(healthy.status(), StatusCode::OK);
+    assert!(
+        !sidecar.ner_requests().is_empty(),
+        "positive control premise: the gateway must actually have reached a sidecar"
+    );
+
+    let degraded = support::router_with(pool.clone(), &dead_sidecar_url(), "default")
+        .oneshot(chat_request(API_KEY, false))
+        .await
+        .expect("router should respond");
+    assert_eq!(degraded.status(), StatusCode::OK);
+
+    let engines_of = |response: &axum::response::Response| {
+        response
+            .headers()
+            .get("x-secureprompt-engines")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    assert_eq!(engines_of(&healthy).as_deref(), Some("floor,ml"));
+    assert_eq!(
+        engines_of(&degraded).as_deref(),
+        Some("floor"),
+        "a request the model never saw must not claim the model ran"
+    );
+    assert_ne!(engines_of(&healthy), engines_of(&degraded));
+
+    // The degradation header stays what it was — this is an ADDITIONAL
+    // statement, not a replacement, and the reason vocabulary is unchanged.
+    assert_eq!(
+        degraded_header(&degraded).as_deref(),
+        Some("all_calls_failed")
+    );
+    assert_eq!(degraded_header(&healthy), None);
     Ok(())
 }

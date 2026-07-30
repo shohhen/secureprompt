@@ -124,6 +124,12 @@ struct RequestDetailRow {
     // ── Migration 005: raw input + raw upstream output ─────────────────────
     pub raw_prompt: Option<String>,
     pub raw_response: Option<String>,
+    // ── Migration 009 (WS2-4): detection provenance ────────────────────────
+    //
+    // `[]` on rows written before migration 009 — read as "not recorded", NOT
+    // as "no engine ran". The floor is unconditional, so an empty array is
+    // never a true statement about a served request.
+    pub engines: Vec<String>,
 }
 
 /// WS3-1 / WS3-2 — one row from `request_content_captures`, the opt-in
@@ -224,6 +230,14 @@ pub struct RequestDetail {
     /// Coarse classifier of where the request came from, derived from
     /// the user-agent header. `None` when no UA was sent.
     pub source: Option<String>,
+    /// WS2-4 — which detection engines produced coverage for this request's
+    /// PROMPT: `["floor"]`, `["floor","ml"]` or `["floor","ml_partial"]`.
+    ///
+    /// EMPTY for rows written before ClickHouse migration 009. That is not a
+    /// claim that nothing scanned the request — the deterministic floor is
+    /// unconditional — it means the provenance was not recorded. A UI must
+    /// render an empty array as "not recorded", never as "no engines".
+    pub engines: Vec<String>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -428,7 +442,7 @@ async fn get_request_detail(
             toUnixTimestamp(created_at) AS created_at_unix, \
             user_id, api_key_id, api_key_name, \
             ip_address, user_agent, redacted_prompt, restored_response, \
-            raw_prompt, raw_response \
+            raw_prompt, raw_response, engines \
         FROM request_events \
         WHERE workspace_id = toUUID('{ws}') \
           AND request_id = toUUID('{rid}') \
@@ -589,6 +603,7 @@ async fn get_request_detail(
         user_position,
         user_device_mac,
         source,
+        engines: req_row.engines,
     }))
 }
 

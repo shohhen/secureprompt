@@ -1,5 +1,6 @@
 use crate::{
     analytics::capture::CaptureDecision,
+    analytics::engines::DetectionEngines,
     analytics::events::{RedactedPrompt, RequestEvent},
     app_state::AppState,
     db::raw_capture_repo::RawCaptureRepository,
@@ -78,6 +79,22 @@ pub fn sidecar_gate(coverage: &SidecarCoverage, policy: SidecarUnavailablePolicy
 /// sidecar apart from one that just fell over.
 pub const SIDECAR_DEGRADED_HEADER: &str = "x-secureprompt-sidecar-degraded";
 
+/// WS2-4 — response header naming the engines that scanned the PROMPT:
+/// `floor`, `floor,ml`, or `floor,ml_partial`. The client-visible half of the
+/// statement the audit row's `engines` column records, and set on EVERY
+/// response from the gateway request path, not only degraded ones.
+///
+/// Deliberately NOT added to the single-pass routes (`/v1/redact`,
+/// `/v1/tokenize`, the MCP tools). There,
+/// [`SIDECAR_DEGRADED_HEADER`] already determines the engine set without loss
+/// — absent means complete coverage, `partial_coverage` means partial, any
+/// other value means no ML coverage — so a second header would be exactly the
+/// redundant restatement this field exists to avoid being. The gateway path is
+/// different because its `degraded_reason` is OR-ed across the prompt-side and
+/// response-side passes and is `None` on the fail-closed path, so it cannot be
+/// inverted back into a prompt-side engine set.
+pub const DETECTION_ENGINES_HEADER: &str = "x-secureprompt-engines";
+
 /// Metric/log `action` label for a prompt-side outage in a workspace whose
 /// policy is `block`: the request was rejected before reaching the provider.
 const ACTION_BLOCK: &str = "block";
@@ -152,6 +169,10 @@ pub struct PipelineExecution {
     /// coverage. Drives the `x-secureprompt-sidecar-degraded` response header
     /// and mirrors the analytics row's `floor_only`.
     pub degraded_reason: Option<CoverageLoss>,
+    /// WS2-4 — which engines produced coverage for the prompt. Drives the
+    /// `x-secureprompt-engines` response header, the client-visible half of
+    /// the same statement the audit row records.
+    pub engines: DetectionEngines,
 }
 
 /// WS2-3 — return value of [`PipelineService::execute_stream`].
@@ -166,6 +187,11 @@ pub struct StreamExecution {
     /// add a header; that case still alerts and still marks the analytics
     /// row (see the response-side scrub in `execute_stream`).
     pub degraded_reason: Option<CoverageLoss>,
+    /// WS2-4 — same meaning as [`PipelineExecution::engines`]. Determined at
+    /// `prepare` time, which is when the prompt-side scan happened, so unlike
+    /// `degraded_reason` there is nothing a mid-stream sidecar death could
+    /// retroactively change about it.
+    pub engines: DetectionEngines,
 }
 
 /// One item emitted by the streaming pipeline path (`execute_stream`).
@@ -220,6 +246,16 @@ struct Prepared {
     /// Rust floor alone. `None` under normal operation; a `block` workspace
     /// never reaches here (`prepare` returns 503 instead).
     degraded_reason: Option<CoverageLoss>,
+    /// WS2-4 — which engines produced coverage for the PROMPT-side detection
+    /// pass. Derived once from `ml_outcome.coverage` and carried, so the
+    /// buffered and streaming finalizers cannot disagree about it.
+    ///
+    /// Not the same statement as `degraded_reason`, and not derivable from
+    /// it: `degraded_reason` is `None` on a `block` workspace precisely
+    /// BECAUSE such a request never gets this far, and it is later OR-ed with
+    /// the response-side pass's outcome. This field is fixed at the prompt
+    /// scan and never revised.
+    engines: DetectionEngines,
     /// WS3-1 — whether this workspace opted in to raw-content capture, and
     /// for how long. Read ONCE in `prepare` and carried, so the buffered and
     /// streaming finalizers cannot disagree about it and neither pays a
@@ -263,6 +299,14 @@ impl PipelineService {
         // alone (which is exactly why coverage was judged lost); on the
         // injection gate NER ran, so it is the full merged set.
         detections: &[secureprompt_common::types::Detection],
+        // WS2-4 — the PROMPT-side engines, passed in rather than inferred from
+        // `reason`. The two callers are genuinely different: the NER gate
+        // reaches here because ML coverage was lost, so its engines follow
+        // from `reason`; the INJECTION gate reaches here with NER coverage
+        // intact, so inferring from `reason` would record `['floor']` on a
+        // request the model DID fully scan. That inference was the obvious
+        // implementation and it is wrong on one of the two paths.
+        engines: DetectionEngines,
         start: Instant,
         capture: CaptureDecision,
     ) -> ApiError {
@@ -333,6 +377,8 @@ impl PipelineService {
         event.record_prompt(prompt);
         // WS3-6 SITE 1/4 — the fail-closed path.
         event.record_detections(detections);
+        // WS2-4 SITE 1/4.
+        event.engines = engines;
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -411,6 +457,14 @@ impl PipelineService {
         .await;
         let regex_detections = detect_content(&prompt);
         let ml_outcome = self.state.ml_sidecar.detect_if_available(&prompt).await;
+        // WS2-4 — fixed HERE, at the prompt scan, and never revised
+        // afterwards. Deriving it later from `degraded_reason` would be
+        // wrong twice over: that value is `None` on the `block` path (the
+        // request 503s before it is ever set) and it is OR-ed with the
+        // RESPONSE-side pass's outcome further down, which would make a
+        // request whose prompt was fully ML-scanned report `['floor']`
+        // because the sidecar happened to die during the upstream call.
+        let engines = DetectionEngines::from_coverage(&ml_outcome.coverage);
 
         // WS2-3 — the workspace's `sidecar_unavailable` policy.
         //
@@ -456,6 +510,7 @@ impl PipelineService {
                         // gate refused it. Recording nothing here would make a
                         // pilot's fail-closed traffic look clean.
                         &merged_detections,
+                        engines,
                         start,
                         capture,
                     )
@@ -583,6 +638,11 @@ impl PipelineService {
                                     degraded_reason,
                                 ),
                                 &pipeline_state.detections,
+                                // NER coverage is whatever the gate above
+                                // settled — normally COMPLETE. It is the
+                                // injection classifier that failed, and that
+                                // is not a NER engine.
+                                engines,
                                 start,
                                 capture,
                             )
@@ -676,6 +736,10 @@ impl PipelineService {
             // detections are exactly what a pilot wants counted: this is the
             // traffic the customer's own rules stopped.
             event.record_detections(&pipeline_state.detections);
+            // WS2-4 SITE 2/4 — a policy DENY. It ran the same prompt-side
+            // detection pass as a served request, so it makes the same
+            // provenance statement.
+            event.engines = engines;
             self.state
                 .analytics
                 .enqueue(event, self.state.metrics.as_ref())
@@ -718,6 +782,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            engines,
             capture,
         })
     }
@@ -739,6 +804,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            engines,
             capture,
         } = self.prepare(auth, resolved, &request).await?;
         // WS2-3 — may be upgraded below if the RESPONSE-side detection pass
@@ -972,6 +1038,12 @@ impl PipelineService {
         // WS2-3 — the audit/analytics row records that this answer was
         // produced with the deterministic floor alone.
         event.floor_only = degraded_reason.is_some();
+        // WS2-4 SITE 3/4 — the served buffered path. NOT
+        // `degraded_reason`-derived: the line above ORs in the RESPONSE-side
+        // pass, so a request whose prompt WAS fully ML-scanned is
+        // `floor_only = true` when the sidecar died during the upstream call.
+        // `engines` is fixed at the prompt scan and stays true about it.
+        event.engines = engines;
         // WS3-6 SITE 3/4 — the served buffered path. THE population the leak
         // report is about: these detections are the PII that would have
         // reached the provider had SecurePrompt not been in front of it.
@@ -1013,6 +1085,7 @@ impl PipelineService {
             finish_reason: provider_output.finish_reason.clone(),
             pipeline_output,
             degraded_reason,
+            engines,
         })
     }
 
@@ -1047,6 +1120,7 @@ impl PipelineService {
             pipeline_input,
             start,
             degraded_reason,
+            engines,
             capture,
         } = self.prepare(auth, resolved, &request).await?;
 
@@ -1272,6 +1346,10 @@ impl PipelineService {
             // WS2-3 — floor-only for the whole stream: set at prepare time,
             // or upgraded by a mid-stream response-side coverage loss.
             event.floor_only = stream_degraded.is_some();
+            // WS2-4 SITE 4/4 — the streaming finalizer. `engines` was moved
+            // into this generator from `prepare`; a sidecar that dies
+            // mid-stream changes `stream_degraded`, never this.
+            event.engines = engines;
             // WS3-6 SITE 4/4 — the streaming finalizer. Same population as the
             // buffered path, so a workspace that streams is not invisible to
             // the leak report.
@@ -1310,6 +1388,7 @@ impl PipelineService {
         Ok(StreamExecution {
             items: Box::pin(stream),
             degraded_reason,
+            engines,
         })
     }
 
