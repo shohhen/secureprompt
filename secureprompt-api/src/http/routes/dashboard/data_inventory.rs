@@ -130,6 +130,12 @@ mod mechanism {
     pub const CH_TTL_AND_PURGE: &str = "clickhouse_ttl+worker_purge";
     pub const WORKER_PURGE: &str = "worker_purge";
     pub const REDIS_TTL: &str = "redis_ttl";
+    /// The class has no storage of its own — a dbt VIEW — so rows leave it
+    /// exactly when the source table's TTL removes them, and not otherwise.
+    /// Distinct from [`NONE`]: nothing deletes anything HERE, but the data is
+    /// not kept forever either, and conflating the two would misreport a view
+    /// as an indefinite copy.
+    pub const SOURCE_TTL: &str = "inherits_source_ttl";
     /// Nothing deletes rows in this class. Reported plainly rather than
     /// dressed up with the row's own `expires_at`, which is a validity check
     /// at read time and not a deletion.
@@ -823,6 +829,106 @@ async fn get_data_inventory(
         });
     }
 
+    // ── dbt staging: VIEWS over the source tables ─────────────────────────
+    //
+    // A view stores no bytes, so it is not an additional copy — but it IS a
+    // relation dbt materialises, in a database of its own, and an auditor
+    // enumerating what exists will find it. Omitting it because "it's only a
+    // view" is the same silence this endpoint exists to prevent.
+    for (class, source, description) in [
+        (
+            "stg_request_events",
+            "request_events",
+            "dbt staging model: a VIEW, 1:1 with `request_events`, coalescing the \
+             nullable token columns to 0 for the layers above. It selects no \
+             content column — not `redacted_prompt`, not the legacy raw columns.",
+        ),
+        (
+            "stg_policy_events",
+            "policy_events",
+            "dbt staging model: a VIEW, 1:1 with `policy_events`. Rule id, rule \
+             name, action, dry-run flag.",
+        ),
+    ] {
+        let result = ch_count(ch, &format!("secureprompt_staging.{class}"), ws).await;
+        let (row_count, row_count_status, row_count_detail) = counted(&result);
+        artifacts.push(ArtifactClass {
+            class: class.to_owned(),
+            store: "clickhouse",
+            location: format!("secureprompt_staging.{class}"),
+            description,
+            sensitivity: "derived_metadata",
+            row_count,
+            row_count_status,
+            row_count_detail,
+            encryption: Encryption::plain(
+                "A VIEW has no bytes of its own — it is a saved query, so the count \
+                 above is the SOURCE table's rows seen through it, not a second \
+                 copy. `secureprompt-analytics/dbt_project.yml` materialises the \
+                 staging layer as `view`.",
+            ),
+            retention: Retention {
+                days: Some(90),
+                window: "90 days".to_owned(),
+                mechanism: mechanism::SOURCE_TTL,
+                mechanism_detail: format!(
+                    "Nothing deletes rows HERE, and nothing needs to: a view shows \
+                     whatever `{source}` currently holds, so a row leaves it at the \
+                     moment that table's 90-day TTL removes it. {CH_TTL_DETAIL} \
+                     This is reported as an inherited window rather than as `none` \
+                     because `none` would read as an indefinite copy, which a view \
+                     is not."
+                ),
+            },
+            governed_by: None,
+            enabled: None,
+        });
+    }
+
+    // ── dbt intermediate: a ROW-LEVEL copy that outlives its source ───────
+    {
+        let result = ch_count(ch, "secureprompt_intermediate.int_requests_enriched", ws).await;
+        let (row_count, row_count_status, row_count_detail) = counted(&result);
+        artifacts.push(ArtifactClass {
+            class: "int_requests_enriched".to_owned(),
+            store: "clickhouse",
+            location: "secureprompt_intermediate.int_requests_enriched".to_owned(),
+            description:
+                "dbt intermediate model: ONE ROW PER GATEWAY REQUEST, copied out of \
+                 `request_events` with the usage date and hour precomputed. Unlike \
+                 the marts below it is NOT an aggregate — request_id, workspace_id, \
+                 provider, model, final action, every token count and the cost are \
+                 carried per request.",
+            sensitivity: "derived_metadata",
+            row_count,
+            row_count_status,
+            row_count_detail,
+            encryption: Encryption::plain(
+                "Stored as written, and it carries `model` as the CALLER supplied it: \
+                 `resolve_model` passes an uncatalogued model name through to the \
+                 provider verbatim, and `request_events` records that raw string, so \
+                 this copy holds it too. The leak report's own `model` column is \
+                 bounded to registered names (see `detection_class_counts`); this one \
+                 is not, because per-model cost for a passthrough workspace depends \
+                 on the raw name. No prompt or response content is selected into this \
+                 model.",
+            ),
+            retention: Retention::none(
+                "NO TTL — `materialized='table'`, `MergeTree()`, no TTL clause \
+                 (secureprompt-analytics/models/intermediate/int_requests_enriched.sql). \
+                 This is the sharpest retention gap in the inventory, because the copy \
+                 is PER REQUEST rather than aggregated: once `request_events`' 90-day \
+                 TTL has removed the source rows, a row-level record of every request \
+                 this workspace made survives here. It is replaced wholesale by the \
+                 next `dbt build`, which rebuilds it from whatever `request_events` \
+                 still holds — so a deployment that stops running dbt keeps the old \
+                 rows indefinitely, and nothing in this product schedules a build.",
+            ),
+            governed_by: None,
+            enabled: None,
+        });
+    }
+
     // dbt marts. Absent until `dbt build` has run, which is the normal state
     // of a fresh install — reported as `unavailable` with the store's reason
     // rather than as zero.
@@ -1269,6 +1375,44 @@ async fn get_data_inventory(
             },
         },
         UnenumerableClass {
+            class: "mongo:librechat",
+            store: "mongodb",
+            location: "docker-compose service `librechat-mongo`, named volume \
+                       `librechat_mongo_data` mounted at /data/db",
+            description: "LibreChat's own database. It stores each conversation as the \
+                          CHAT UI held it: the user's message BEFORE SecurePrompt \
+                          redacted it, and the assistant's reply AFTER SecurePrompt \
+                          restored the placeholders into it. That makes it the SECOND \
+                          store in this deployment holding un-redacted request content, \
+                          alongside `request_content_captures` — and unlike that one it \
+                          is not opt-in, not gated, and not encrypted by this product.",
+            reason: "A separate MongoDB service with no SecurePrompt workspace id \
+                     anywhere in its schema: LibreChat has its own user and \
+                     conversation model and knows nothing about workspaces. The gateway \
+                     API process holds no Mongo client, so it could not attribute a \
+                     document to a tenant even if the schema allowed it. Note this is \
+                     NOT an optional add-on that an operator opted into: the service \
+                     carries no `profiles:` key (line 127 is the only one in \
+                     docker-compose.yml), so a plain `docker compose up -d` starts it.",
+            per_workspace_erasure: "not_possible",
+            row_count: None,
+            encryption: Encryption::plain(
+                "Stored as LibreChat writes it. SecurePrompt's KMS is not in this path \
+                 at any point — `by_design` here means this product never encrypts it, \
+                 NOT that leaving it in the clear is safe: these are un-redacted \
+                 prompts and restored replies. At-rest protection is whatever MongoDB \
+                 and the host volume provide, which by default is none.",
+            ),
+            retention: Retention::none(
+                "NO TTL and no purge. LibreChat keeps a conversation until its own user \
+                 deletes it; the worker's `retention.purge` job does not know this store \
+                 exists; and the `librechat_mongo_data` volume survives \
+                 `docker compose down` (removing it takes `-v`). A SecurePrompt erasure \
+                 request does not reach this data, and neither does the retention window \
+                 an operator configures on `PUT /v1/secure-mode`.",
+            ),
+        },
+        UnenumerableClass {
             class: "redis:jti_blacklist",
             store: "redis",
             location: "jti_blacklist:{jti}",
@@ -1438,10 +1582,19 @@ async fn get_data_inventory(
             "A count of zero means the query ran and found nothing. A `row_count` of null \
              with `row_count_status: unavailable` means the store did not answer and the \
              true figure is UNKNOWN. The two are never conflated.",
-            "This inventory covers the stores the gateway API can reach: Postgres, \
-             ClickHouse and Redis. Backups, replicas, WAL archives, the ML sidecar's \
-             temporary upload directory and any operator-side log aggregation are OUTSIDE \
-             its scope and are not evidence of absence.",
+            "This inventory covers the stores the gateway API can reach — Postgres, \
+             ClickHouse and Redis — plus the Qdrant collections and the LibreChat \
+             MongoDB it CANNOT reach and declares anyway, under `not_enumerable`. \
+             The following are OUT OF SCOPE and their absence from this document is \
+             not evidence of their absence from the deployment: replicas and WAL \
+             archives; the `backup` compose service, its `clickhouse_backups` volume \
+             and the `./backups` host directory it writes, which by construction hold \
+             copies of everything listed above INCLUDING rows the TTLs have since \
+             removed; the `prometheus` service's metric series and the `grafana` \
+             service's dashboards, users and sessions, which carry no request content \
+             but do carry model names and workspace ids as label values; the ML \
+             sidecar's temporary upload directory; and any operator-side log \
+             aggregation.",
             "A logical DELETE — by TTL, by the purge job, or by hand — is not an assurance \
              that the bytes are irrecoverable. ClickHouse parts, Postgres dead tuples and \
              any backup taken before the delete may still hold them.",

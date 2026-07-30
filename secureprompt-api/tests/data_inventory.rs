@@ -833,6 +833,243 @@ async fn every_redis_key_class_the_gateway_writes_is_accounted_for(pool: PgPool)
     }
 }
 
+/// Every relation dbt MATERIALISES, derived from the model files themselves.
+///
+/// `tables_declared_in` cannot see these: it greps `CREATE TABLE` out of the
+/// two migration directories, and a dbt model is a `SELECT` in a `.sql` file
+/// under `secureprompt-analytics/models/`. dbt names the relation after the
+/// FILE, so the file stem is the relation name.
+fn dbt_relations() -> BTreeSet<String> {
+    fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read dbt model dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_else(|| panic!("un-nameable dbt model {}", path.display()));
+                out.insert(stem.to_owned());
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("secureprompt-analytics/models");
+    let mut relations = BTreeSet::new();
+    walk(&root, &mut relations);
+    relations
+}
+
+/// Every `docker-compose.yml` service that mounts a NAMED volume — i.e. every
+/// store the product's own deployment starts and keeps across a restart.
+///
+/// A bind mount (`./backups:/backups`) is host state the operator chose and is
+/// deliberately excluded; a named volume is one this compose file creates.
+fn compose_persistent_services() -> BTreeSet<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("docker-compose.yml");
+    let yaml = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+    // The top-level `volumes:` block. Matched WITHOUT indentation, so the
+    // per-service `    volumes:` keys cannot be mistaken for it.
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    let mut in_volumes = false;
+    for line in yaml.lines() {
+        if line.starts_with("volumes:") {
+            in_volumes = true;
+            continue;
+        }
+        if in_volumes {
+            if !line.starts_with("  ") {
+                if !line.trim().is_empty() {
+                    in_volumes = false;
+                }
+                continue;
+            }
+            let entry = line.trim();
+            if let Some(name) = entry.strip_suffix(':') {
+                named.insert(name);
+            }
+        }
+    }
+
+    let mut services = BTreeSet::new();
+    let mut current: Option<&str> = None;
+    let mut in_services = false;
+    for line in yaml.lines() {
+        if line.starts_with("services:") {
+            in_services = true;
+            continue;
+        }
+        if in_services && !line.starts_with(' ') && !line.trim().is_empty() {
+            in_services = false;
+        }
+        if !in_services {
+            continue;
+        }
+        // A service key: exactly two spaces of indent, then `name:`.
+        if let Some(rest) = line.strip_prefix("  ") {
+            if !rest.starts_with([' ', '-', '#']) {
+                if let Some(name) = rest.strip_suffix(':') {
+                    current = Some(name);
+                }
+            }
+        }
+        if let Some(mount) = line.trim().strip_prefix("- ") {
+            if let Some((volume, _)) = mount.split_once(':') {
+                if named.contains(volume) {
+                    if let Some(service) = current {
+                        services.insert(service.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    services
+}
+
+/// Everything the response says, in one lowercase haystack: class names,
+/// stores, locations and caveats. A store is "accounted for" when the reader
+/// can find it here — declared as a class, named as a location, or scoped out
+/// with a reason.
+fn attestation_text(body: &Value) -> String {
+    let mut text = String::new();
+    for key in ["artifacts", "not_enumerable"] {
+        for entry in body[key].as_array().into_iter().flatten() {
+            for field in ["class", "store", "location", "description", "reason"] {
+                if let Some(value) = entry[field].as_str() {
+                    text.push_str(value);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    for caveat in body["caveats"].as_array().into_iter().flatten() {
+        if let Some(value) = caveat.as_str() {
+            text.push_str(value);
+            text.push('\n');
+        }
+    }
+    text.to_lowercase()
+}
+
+/// THE ROOT CAUSE of WS3-5's two omissions, not the omissions themselves.
+///
+/// `every_table_the_product_creates_appears_in_the_inventory` derives its
+/// expected set by grepping `CREATE TABLE` out of the two migration
+/// directories. A dbt model is a `SELECT` in `secureprompt-analytics/models/`
+/// and a Mongo instance is a service in `docker-compose.yml`, so NEITHER is
+/// visible to it — which is how `int_requests_enriched` (a row-level, un-TTL'd
+/// copy of `request_events`) and `librechat-mongo` (the only store in the
+/// deployment holding PRE-redaction prompts and POST-restoration replies) were
+/// absent from `artifacts`, from `not_enumerable`, and from the out-of-scope
+/// caveat, all at once.
+///
+/// This test closes the class of omission rather than the two instances:
+/// a future dbt model, or a future compose service with a named volume, fails
+/// here until somebody declares it or scopes it out.
+///
+/// PREMISE: both scrapes are asserted to have found the real thing before
+/// anything is asserted about the response, so a parser that silently matched
+/// nothing cannot make this pass over an empty expected set.
+/// POSITIVE CONTROL: a relation and a service that do NOT exist must come back
+/// uncovered, so "everything is covered" is not the coverage check saying yes
+/// to everything.
+#[sqlx::test]
+async fn every_dbt_relation_and_compose_backed_store_is_accounted_for(pool: PgPool) {
+    let relations = dbt_relations();
+    let services = compose_persistent_services();
+
+    // ---- Premise on the two scrapes ---------------------------------------
+    assert!(
+        relations.len() >= 7,
+        "premise failed: only {} dbt relations found under \
+         secureprompt-analytics/models — the scrape is broken, so this test \
+         would pass vacuously. Found: {relations:?}",
+        relations.len()
+    );
+    for expected in [
+        "int_requests_enriched",
+        "stg_request_events",
+        "mart_usage_daily",
+    ] {
+        assert!(
+            relations.contains(expected),
+            "premise failed: the dbt scrape missed `{expected}`, which is a \
+             file on disk. Found: {relations:?}"
+        );
+    }
+    assert!(
+        services.len() >= 5,
+        "premise failed: only {} compose services with a named volume found — \
+         the parser is broken. Found: {services:?}",
+        services.len()
+    );
+    for expected in ["librechat-mongo", "postgres", "clickhouse"] {
+        assert!(
+            services.contains(expected),
+            "premise failed: the compose parser missed `{expected}`, which \
+             mounts a named volume in docker-compose.yml. Found: {services:?}"
+        );
+    }
+
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let declared = class_names(&body);
+    let text = attestation_text(&body);
+
+    // ---- Positive controls: the checks below can say NO -------------------
+    assert!(
+        !declared.contains("mart_that_does_not_exist"),
+        "the class-name check matches relations that do not exist, so the \
+         assertion below proves nothing"
+    );
+    assert!(
+        !text.contains("totally-not-a-real-service"),
+        "the coverage haystack matches services that do not exist, so the \
+         assertion below proves nothing"
+    );
+
+    // ---- THE ASSERTIONS ---------------------------------------------------
+    let undeclared: Vec<&String> = relations
+        .iter()
+        .filter(|relation| !declared.contains(*relation))
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "dbt MATERIALISES these relations and the inventory does not mention \
+         them, in `artifacts` or in `not_enumerable`:\n  {undeclared:?}\n\
+         `int_requests_enriched` in particular is a ROW-LEVEL per-request copy \
+         of request_events with NO TTL, so it outlives the 90-day window on \
+         its own source. Declared: {declared:?}"
+    );
+
+    let unaccounted: Vec<&String> = services
+        .iter()
+        .filter(|service| !text.contains(service.as_str()))
+        .collect();
+    assert!(
+        unaccounted.is_empty(),
+        "these docker-compose services mount a named volume — they are stores \
+         a plain `docker compose up -d` starts and keeps — and the inventory \
+         neither declares them nor scopes them out with a reason:\n  \
+         {unaccounted:?}\n`librechat-mongo` in particular persists \
+         PRE-redaction prompts and POST-restoration replies, and has no \
+         `profiles:` gate."
+    );
+}
+
 // ── 4. Retention ──────────────────────────────────────────────────────────
 
 /// A retention NUMBER with no enforcement MECHANISM is the exact shape of a
