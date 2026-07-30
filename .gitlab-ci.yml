@@ -15,7 +15,11 @@
 #        ─┘
 #
 #   fmt / lint / test  run on EVERY merge request and every push to the default
-#                      branch. They are the gate.
+#                      branch. They are the gate. The `test` stage holds three
+#                      jobs that run in parallel: `test` (the whole Rust
+#                      suite), `test:rls-nonsuperuser`, and `bench` (WS2-5 —
+#                      `cargo bench -- --test`, a compile-and-run check with
+#                      no timing assertion; see the job's header).
 #   build              publishes 6 images to the GitLab Container Registry.
 #                      `needs:` the whole gate, so a red gate makes it
 #                      un-runnable, and `when: manual` so it is never spent
@@ -275,6 +279,58 @@ test:
       bash scripts/ci/rust-test-gate.sh
 
 # ---------------------------------------------------------------------------
+# WS2-5 — the deterministic detection floor's latency budget.
+#
+# WHAT RUNS HERE, AND WHAT DELIBERATELY DOES NOT
+#
+# This job runs `cargo bench -- --test`: criterion executes each benchmark
+# for exactly ONE iteration, collects no statistics, and asserts nothing about
+# time. It is a compile-and-run check that keeps `benches/detection_floor.rs`
+# from bit-rotting, which is the failure mode a benchmark actually suffers —
+# nobody notices a bench stopped building until the day they need a number.
+#
+# IT IS NOT A WALL-CLOCK GATE, and that is the whole design. A threshold like
+# "the floor must take under 5 ms" measured by criterion on a shared runner
+# goes red for a noisy neighbour, a cold cache or a slow spot instance. This
+# repository has the receipts for what happens next: four .github/workflows
+# were abandoned once they were permanently red (see
+# .github/workflows-retired/README), and both `fmt` and `clippy` had to be
+# rebuilt here as ratchets for the same reason. A flaky perf gate does not
+# just fail to catch regressions — it teaches people to ignore the gates
+# beside it.
+#
+# THE REAL REGRESSION GUARD IS IN THE `test` JOB.
+# `secureprompt-api/tests/detection_floor_budget.rs` is picked up
+# automatically by rust-test-gate.sh (it discovers tests/*.rs from the
+# filesystem) and asserts things that do not depend on how fast the runner is:
+#   * 40 KB of "1 " must not explode into thousands of detections — the
+#     property MAX_IDENTIFIER_GROUPS provides, asserted as a COUNT. Verified
+#     by raising the cap to 14, which reproduced the original incident at
+#     20,467 detections in 1.96 s.
+#   * detection count is linear, not quadratic, in document size.
+#   * hostile input is bounded as a RATIO against a realistic document of the
+#     same size, measured in the same process on the same machine — so runner
+#     slowness cancels instead of causing false alarms.
+#
+# The actual latency curve, and the honest statement of the input size at
+# which the 5 ms budget stops holding (~105 KiB; a 256 KiB document costs
+# 11.6 ms p95), is produced by running `cargo bench` locally and is recorded
+# in the WS2-5 report. A number that has to be interpreted belongs in a report
+# a human reads, not in a pass/fail gate.
+#
+# No services: the bench touches no database, cache or analytics store, and
+# SQLX_OFFLINE makes the compile-time query checks read the committed
+# .sqlx metadata instead of a live Postgres.
+# ---------------------------------------------------------------------------
+bench:
+  extends: .rust-gate
+  stage: test
+  variables:
+    SQLX_OFFLINE: "true"
+  script:
+    - cargo bench -p secureprompt-api --bench detection_floor -- --test
+
+# ---------------------------------------------------------------------------
 # The AUTH-05 gate, carried over from the retired .github/workflows/ci.yml.
 #
 # WHY A SEPARATE JOB WITH A DIFFERENT ROLE: the `test` job above connects as
@@ -351,6 +407,7 @@ build:
     - static-checks
     - test
     - test:rls-nonsuperuser
+    - bench
   rules:
     # Manual because each run is 6 concurrent image builds. Not `allow_failure`
     # — a started build that fails must fail the pipeline.
