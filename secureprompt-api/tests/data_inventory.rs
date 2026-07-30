@@ -93,10 +93,22 @@ fn test_config() -> AppConfig {
 }
 
 fn build_app(pool: PgPool) -> Router {
+    build_app_with_ch_db(pool, &clickhouse_db())
+}
+
+/// As [`build_app`], but pointed at a named `ClickHouse` database.
+///
+/// Used to make every gateway-table count FAIL — the only way to execute the
+/// `row_count_status: unavailable` path for `request_events`,
+/// `request_content_captures` and the legacy-plaintext scan, which on a healthy
+/// deployment always succeed.
+fn build_app_with_ch_db(pool: PgPool, database: &str) -> Router {
     let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    let mut config = test_config();
+    config.clickhouse.database = database.to_owned();
     build_router(AppState::new(
         pool,
-        test_config(),
+        config,
         ml,
         Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
     ))
@@ -1567,6 +1579,166 @@ async fn mart_counts_resolve_to_the_database_dbt_actually_builds_into(pool: PgPo
         unbuilt["row_count"],
         Value::Null,
         "an uncountable class must report null, never a fabricated zero: {unbuilt}"
+    );
+}
+
+/// Every free-text field an unreachable store can write into: the two
+/// `row_count_detail`s and the `encryption.note` the legacy-plaintext scan
+/// fills in. All three interpolated the store's exception.
+fn failure_details(body: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in body["artifacts"].as_array().into_iter().flatten() {
+        if let Some(detail) = entry["row_count_detail"].as_str() {
+            out.push(detail.to_owned());
+        }
+        if let Some(note) = entry["encryption"]["note"].as_str() {
+            out.push(note.to_owned());
+        }
+    }
+    out
+}
+
+/// `row_count_detail` must not echo `ClickHouse`'s own exception text.
+///
+/// Commit 42c99f4 was titled "stop echoing ClickHouse exceptions". It fixed
+/// `leak_report::ch_err` and left three sites in `data_inventory.rs`
+/// interpolating `{e}` — `clickhouse::error::Error::to_string()`, which carries
+/// the server's message verbatim — into `row_count_detail` IN THE RESPONSE
+/// BODY: `counted()`, the legacy-plaintext scan, and the capture shape check.
+/// The justification for leaving them (every query selects aggregates, so no
+/// row data can appear) is the same statement about the SELECT list that
+/// `ch_err` was fixed for; a ClickHouse exception is not bounded by the select
+/// list and routinely quotes schema, identifiers and, in some error classes,
+/// values.
+///
+/// This is not a hypothetical path. It is reached on ANY deployment where dbt
+/// has not run: the staging views and the four marts are counted in
+/// `secureprompt_staging` / `secureprompt_marts`, and a missing relation raises
+/// `Code: 81. DB::Exception: Database ... does not exist`.
+///
+/// PREMISE 1: at least one class must actually report `unavailable` on the
+/// healthy app, or "no exception text in the body" is true because the failure
+/// path never ran.
+/// PREMISE 2: with the gateway's own database pointed at a database that does
+/// not exist, `request_events` must report `unavailable` too — that is what
+/// executes `counted()`, the legacy scan and the capture shape check.
+/// POSITIVE CONTROL: on the healthy app `request_events` must be `counted`
+/// with no detail, so `unavailable` is a live verdict and not a constant; and
+/// the refusal must still name the store and the reason, or the fix has taken
+/// away what the operator debugs with.
+#[sqlx::test]
+async fn an_unreachable_store_does_not_echo_the_stores_own_message(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let token = make_jwt(ws, user, "admin");
+
+    // ---- The healthy app: the dbt relations are the reachable case ---------
+    let healthy = build_app(pool.clone());
+    let (status, body) = get_inventory(&healthy, &token).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    // POSITIVE CONTROL: a table that DOES exist is counted, so `unavailable`
+    // below is a real answer from the store.
+    let events = artifact(&body, "request_events");
+    assert_eq!(
+        events["row_count_status"],
+        Value::String("counted".into()),
+        "premise: the gateway's own tables must be countable on the healthy \
+         app, or this test is measuring a broken harness: {events}"
+    );
+    assert_eq!(
+        events["row_count_detail"],
+        Value::Null,
+        "a successful count must carry no detail at all: {events}"
+    );
+
+    // PREMISE 1: the failure path really ran on this response.
+    let unavailable: Vec<String> = body["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .filter(|entry| entry["row_count_status"] == Value::String("unavailable".into()))
+        .filter_map(|entry| entry["class"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        !unavailable.is_empty(),
+        "premise failed: every class was countable, so the `unavailable` \
+         branch never executed and the absence asserted below proves nothing. \
+         This test needs at least one dbt relation that has not been built: \
+         {body}"
+    );
+
+    // ---- The broken app: every gateway-table count fails -------------------
+    let broken = build_app_with_ch_db(pool, "sp_no_such_database");
+    let (broken_status, broken_body) = get_inventory(&broken, &token).await;
+    assert_eq!(
+        broken_status,
+        StatusCode::OK,
+        "an unreachable analytics store must still yield an inventory with \
+         stated gaps, not a 500: {broken_body}"
+    );
+
+    // PREMISE 2: the three sites under test executed.
+    for class in ["request_events", "request_content_captures"] {
+        assert_eq!(
+            artifact(&broken_body, class)["row_count_status"],
+            Value::String("unavailable".into()),
+            "premise failed: `{class}` was counted against a database that \
+             does not exist, so the failure path did not run: {broken_body}"
+        );
+    }
+
+    // ---- THE ASSERTION ----------------------------------------------------
+    for (label, response) in [("healthy", &body), ("unreachable store", &broken_body)] {
+        let text = response.to_string();
+        for leak in [
+            "DB::Exception",
+            "Code:",
+            "SELECT",
+            "countIf",
+            "toUUID",
+            "UNKNOWN_DATABASE",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "the {label} response carries the store's own exception text or \
+                 this module's SQL ({leak:?}) inside `row_count_detail`. A \
+                 ClickHouse exception quotes schema, identifiers and in some \
+                 error classes the value it choked on, so this path can hand \
+                 stored bytes back to the caller: {text}"
+            );
+        }
+        // The workspace id is interpolated into every count query, so an
+        // echoed exception carries it. It is checked per-detail rather than
+        // over the whole body, which legitimately carries `workspace_id`.
+        for detail in failure_details(response) {
+            assert!(
+                !detail.contains(&ws.to_string()),
+                "the {label} response echoed the interpolated workspace id \
+                 back inside a failure detail: {detail}"
+            );
+        }
+    }
+
+    // The operator keeps what they can act on: WHICH store failed, and that
+    // the gap is a stated unknown rather than a zero.
+    let failed = artifact(&broken_body, "request_events");
+    let detail = failed["row_count_detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an unavailable class must explain itself: {failed}"));
+    assert!(
+        detail.contains("request_events"),
+        "the refusal does not name the store that could not be read, so an \
+         operator cannot act on it: {detail}"
+    );
+    assert!(
+        detail.contains("log"),
+        "the detail must say where the store's own message went, or a reader \
+         will assume it was discarded: {detail}"
+    );
+    assert_eq!(
+        failed["row_count"],
+        Value::Null,
+        "an uncountable class must report null, never a fabricated zero: {failed}"
     );
 }
 

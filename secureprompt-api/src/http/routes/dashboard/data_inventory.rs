@@ -495,19 +495,67 @@ async fn ch_capture_shape(client: &clickhouse::Client, ws: Uuid) -> Result<Shape
         .map_err(|e| e.to_string())
 }
 
+/// Say WHAT is now unknown and WHICH relation could not be read, without
+/// echoing the store's own message.
+///
+/// `clickhouse::error::Error::to_string()` carries ClickHouse's server message
+/// verbatim, and this module interpolated it into `row_count_detail` — a field
+/// in the RESPONSE BODY — at three sites. `leak_report::ch_err` was fixed for
+/// exactly this in 42c99f4 and these were missed, on the reasoning that every
+/// query here selects aggregates so no row data can appear. That is a statement
+/// about the SELECT list, and an exception is not bounded by it. Measured, on a
+/// deployment where dbt has not run — which is the DEFAULT state, since nothing
+/// in this product schedules a build:
+///
+/// ```text
+/// the store did not answer, so no count is reported rather than a zero:
+/// bad response: Code: 60. DB::Exception: Unknown table expression identifier
+/// 'secureprompt_marts.mart_cost_by_model' in scope SELECT count() FROM
+/// secureprompt_marts.mart_cost_by_model WHERE workspace_id =
+/// toUUID('6c2705e7-a1b9-477e-9d8d-76f13bc9dd64'). (UNKNOWN_TABLE)
+/// ```
+///
+/// — the whole statement and the tenancy predicate's bound value, handed to an
+/// HTTP caller. Other error classes (`TYPE_MISMATCH`, `CANNOT_PARSE_*`) quote
+/// the offending value instead.
+///
+/// `table` is safe to interpolate and is deliberately kept: every caller passes
+/// a `&'static str` or a `format!` over the [`dbt_db`] constants, all literals
+/// in this binary, and an operator debugging a gap needs to know which relation
+/// was unreadable. The store's message goes to `tracing::error!`, where it is
+/// subject to the deployment's log handling instead.
+///
+/// `tests/data_inventory.rs::an_unreachable_store_does_not_echo_the_stores_own_message`
+/// executes both the healthy path (unbuilt dbt relations) and a database that
+/// does not exist, and asserts no `DB::Exception`, no SQL and no bound
+/// workspace id reaches the body.
+fn unavailable(table: &str, consequence: &str, error: &str) -> String {
+    tracing::error!(
+        table,
+        error,
+        "data-inventory count failed; the store's message is logged here and \
+         deliberately NOT returned to the caller"
+    );
+    format!(
+        "{consequence} Reading `{table}` failed. The store's own error message \
+         is in the gateway log, not in this response, because a database \
+         exception quotes the statement that provoked it — schema, identifiers, \
+         and for some error classes the value it choked on."
+    )
+}
+
+/// The `consequence` sentence for a plain `count()` that did not answer.
+const NO_COUNT: &str = "the store did not answer, so no count is reported rather than a zero.";
+
 /// Turn a count result into the three reporting fields, so an unreachable
 /// store degrades into a stated gap instead of a fabricated zero.
-fn counted(result: &Result<u64, String>) -> (Option<u64>, &'static str, Option<String>) {
+fn counted(
+    table: &str,
+    result: &Result<u64, String>,
+) -> (Option<u64>, &'static str, Option<String>) {
     match result {
         Ok(n) => (Some(*n), "counted", None),
-        Err(e) => (
-            None,
-            "unavailable",
-            Some(format!(
-                "the store did not answer, so no count is reported rather than \
-                 a zero: {e}"
-            )),
-        ),
+        Err(e) => (None, "unavailable", Some(unavailable(table, NO_COUNT, e))),
     }
 }
 
@@ -686,7 +734,8 @@ async fn get_data_inventory(
 
     // ── ClickHouse ────────────────────────────────────────────────────────
     {
-        let (row_count, row_count_status, row_count_detail) = counted(&ch_request_events);
+        let (row_count, row_count_status, row_count_detail) =
+            counted("request_events", &ch_request_events);
         let legacy_note = match &ch_legacy_plaintext {
             Ok(0) => "No row for this workspace carries a legacy plaintext content column. \
                       `redacted_prompt` holds placeholder-safe text and is NULL whenever NER \
@@ -699,9 +748,11 @@ async fn get_data_inventory(
                  opt-in; the writer now always sends NULL. They are deleted by this table's \
                  90-day TTL and by nothing else."
             ),
-            Err(e) => format!(
-                "the legacy-plaintext column scan did not complete, so this class's plaintext \
-                 exposure is UNKNOWN rather than zero: {e}"
+            Err(e) => unavailable(
+                "request_events (legacy plaintext column scan)",
+                "the legacy-plaintext column scan did not complete, so this class's \
+                 plaintext exposure is UNKNOWN rather than zero.",
+                e,
             ),
         };
         artifacts.push(ArtifactClass {
@@ -741,10 +792,7 @@ async fn get_data_inventory(
                 0,
                 0,
                 "unavailable",
-                Some(format!(
-                    "the store did not answer, so no count is reported rather \
-                     than a zero: {e}"
-                )),
+                Some(unavailable("request_content_captures", NO_COUNT, e)),
             ),
         };
         let encryption = if status == "counted" {
@@ -849,7 +897,7 @@ async fn get_data_inventory(
             90,
         ),
     ] {
-        let (row_count, row_count_status, row_count_detail) = counted(result);
+        let (row_count, row_count_status, row_count_detail) = counted(class, result);
         let extra = match class {
             "token_usage" => Some(
                 "SummingMergeTree: `count()` is the number of PARTS rows currently on disk, \
@@ -904,7 +952,7 @@ async fn get_data_inventory(
             &ch_p95_latency,
         ),
     ] {
-        let (row_count, row_count_status, row_count_detail) = counted(result);
+        let (row_count, row_count_status, row_count_detail) = counted(class, result);
         artifacts.push(ArtifactClass {
             class: class.to_owned(),
             store: "clickhouse",
@@ -951,8 +999,9 @@ async fn get_data_inventory(
              name, action, dry-run flag.",
         ),
     ] {
-        let result = ch_count(ch, &format!("{}.{class}", dbt_db::STAGING), ws).await;
-        let (row_count, row_count_status, row_count_detail) = counted(&result);
+        let relation = format!("{}.{class}", dbt_db::STAGING);
+        let result = ch_count(ch, &relation, ws).await;
+        let (row_count, row_count_status, row_count_detail) = counted(&relation, &result);
         artifacts.push(ArtifactClass {
             class: class.to_owned(),
             store: "clickhouse",
@@ -988,8 +1037,9 @@ async fn get_data_inventory(
 
     // ── dbt intermediate: a ROW-LEVEL copy that outlives its source ───────
     {
-        let result = ch_count(ch, &format!("{}.int_requests_enriched", dbt_db::INTERMEDIATE), ws).await;
-        let (row_count, row_count_status, row_count_detail) = counted(&result);
+        let relation = format!("{}.int_requests_enriched", dbt_db::INTERMEDIATE);
+        let result = ch_count(ch, &relation, ws).await;
+        let (row_count, row_count_status, row_count_detail) = counted(&relation, &result);
         artifacts.push(ArtifactClass {
             class: "int_requests_enriched".to_owned(),
             store: "clickhouse",
@@ -1058,8 +1108,9 @@ async fn get_data_inventory(
             "dbt mart: latency and TTFT percentiles per model and day.",
         ),
     ] {
-        let result = ch_count(ch, &format!("{}.{class}", dbt_db::MARTS), ws).await;
-        let (row_count, row_count_status, row_count_detail) = counted(&result);
+        let relation = format!("{}.{class}", dbt_db::MARTS);
+        let result = ch_count(ch, &relation, ws).await;
+        let (row_count, row_count_status, row_count_detail) = counted(&relation, &result);
         artifacts.push(ArtifactClass {
             class: class.to_owned(),
             store: "clickhouse",
@@ -1429,12 +1480,22 @@ async fn get_data_inventory(
     // ── Redis: the one class whose key IS workspace-partitioned ───────────
     {
         let budget_keys = live_budget_keys(&state, ws).await;
+        // Through the same [`unavailable`] helper as the ClickHouse counts: a
+        // fourth site of the identical defect, in the identical field. The
+        // Redis error text is not a ClickHouse exception, but it is still a
+        // store's own message going into a response body, and the key it would
+        // quote (`budget:{workspace_id}:tokens:...`) carries the tenancy value
+        // this endpoint interpolates.
         let (row_count, row_count_status, row_count_detail) = match budget_keys {
             Ok(n) => (Some(n), "counted", None),
             Err(e) => (
                 None,
                 "unavailable",
-                Some(format!("Redis did not answer: {e}")),
+                Some(unavailable(
+                    "redis:budget (EXISTS on this workspace's two counter keys)",
+                    NO_COUNT,
+                    &e,
+                )),
             ),
         };
         artifacts.push(ArtifactClass {
