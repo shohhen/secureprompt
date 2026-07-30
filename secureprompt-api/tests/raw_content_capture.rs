@@ -35,6 +35,30 @@ const SYNTHETIC_NAME: &str = "Anvar Karimov";
 /// plaintext when plaintext is there".
 const PROMPT_PROSE: &str = "Please summarise the contract for";
 
+/// The exact user message every request in this file sends: `PROMPT_PROSE`,
+/// one space, `SYNTHETIC_NAME`. Spelled out rather than `format!`ed so the
+/// byte offsets below can be `const`; `offsets_address_the_synthetic_name`
+/// proves it really is those three pieces.
+const PROMPT_TEXT: &str = "Please summarise the contract for Anvar Karimov";
+
+/// BYTE offsets of `SYNTHETIC_NAME` inside `PROMPT_TEXT`, derived from the
+/// fixture instead of hardcoded.
+///
+/// The mock sidecar used to report a hardcoded `38..51` while the name
+/// actually sits at `34..47`. `apply_redaction` skips any span whose `end`
+/// exceeds the content length and `redact_last_user_message_with` drops any
+/// span whose bytes do not equal the detection's `value`, so the detection
+/// was discarded on every path — redaction NEVER RAN in this file, and every
+/// test passed identically either way. Deriving the offsets makes that class
+/// of miscalibration impossible; `offsets_address_the_synthetic_name` below
+/// proves the derivation.
+const NAME_START: usize = PROMPT_PROSE.len() + 1; // +1 for the separating space
+const NAME_END: usize = NAME_START + SYNTHETIC_NAME.len();
+
+/// The redacted form the gateway must produce for `PROMPT_TEXT`: prose
+/// verbatim (not PII) with the name replaced by its placeholder.
+const REDACTED_PROMPT: &str = "Please summarise the contract for {{Person_1}}";
+
 /// The gateway's own analytics database, so these assertions run against the
 /// real `request_events` table rather than a bespoke fixture.
 const CH_DB: &str = "sp_analytics";
@@ -56,6 +80,11 @@ impl MockSidecar {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&requests);
 
+        // Offsets DERIVED from the fixture, not typed in. See `NAME_START`.
+        let ner_body = format!(
+            r#"{{"entities":[{{"entity_type":"PERSON","start":{NAME_START},"end":{NAME_END},"score":0.97,"text":"{SYNTHETIC_NAME}","compliance_categories":[]}}]}}"#
+        );
+
         std::thread::spawn(move || loop {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
@@ -64,7 +93,7 @@ impl MockSidecar {
                 continue;
             };
             let body: &[u8] = if request.contains("/detect/ner") {
-                br#"{"entities":[{"entity_type":"PERSON","start":38,"end":51,"score":0.97,"text":"Anvar Karimov","compliance_categories":[]}]}"#
+                ner_body.as_bytes()
             } else if request.contains("/v1/rag-check") {
                 br#"{"matches":[],"is_match":false}"#
             } else if request.contains("/detect/injection") {
@@ -228,7 +257,7 @@ fn chat_request(marker: &str) -> Request<axum::body::Body> {
             "stream": false,
             "messages": [{
                 "role": "user",
-                "content": format!("{PROMPT_PROSE} {SYNTHETIC_NAME}"),
+                "content": PROMPT_TEXT,
             }],
         }),
     );
@@ -244,6 +273,43 @@ fn chat_request(marker: &str) -> Request<axum::body::Body> {
         axum::http::HeaderValue::from_str(marker).expect("marker is a valid header value"),
     );
     request
+}
+
+// ── Fixture self-check ────────────────────────────────────────────────────
+
+/// The mock sidecar's detection offsets must address the synthetic name in
+/// the fixture prompt, and the expected redacted form must be the fixture
+/// with exactly that slice replaced.
+///
+/// This is the guard the file did not have. Every ClickHouse-backed test here
+/// depends on the gateway ACTUALLY REDACTING; when the offsets addressed
+/// `38..51` instead of `34..47` the detection was discarded, redaction never
+/// ran, and all four tests passed anyway. A pure-arithmetic check costs
+/// nothing and fails in milliseconds instead of hiding a leak for a
+/// workstream.
+#[test]
+fn offsets_address_the_synthetic_name() {
+    assert_eq!(
+        PROMPT_TEXT,
+        format!("{PROMPT_PROSE} {SYNTHETIC_NAME}"),
+        "PROMPT_TEXT must be exactly prose + space + name, or NAME_START is \
+         computed against a string the requests do not send"
+    );
+    assert_eq!(
+        &PROMPT_TEXT[NAME_START..NAME_END],
+        SYNTHETIC_NAME,
+        "the offsets the mock sidecar reports must select the synthetic name"
+    );
+    assert_eq!(
+        format!(
+            "{}{{{{Person_1}}}}{}",
+            &PROMPT_TEXT[..NAME_START],
+            &PROMPT_TEXT[NAME_END..]
+        ),
+        REDACTED_PROMPT,
+        "REDACTED_PROMPT must be PROMPT_TEXT with exactly the detected span \
+         replaced by the placeholder"
+    );
 }
 
 // ── WS3-1: a fresh install stores ZERO raw content ────────────────────────
@@ -281,10 +347,13 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
         "test premise: a fresh workspace must have no capture opt-in"
     );
 
+    seed_barrier_workspace(&pool).await?;
+
     let marker = format!("ws3-1-default-{}", Uuid::new_v4());
     let sidecar = MockSidecar::spawn();
     let app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
     let response = app
+        .clone()
         .oneshot(chat_request(&marker))
         .await
         .expect("router should respond");
@@ -303,18 +372,36 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
          captured requests:\n{ner:?}"
     );
 
+    // Barrier BEFORE any ClickHouse read — see `flush_capture_writer`. It
+    // must come first for a second reason: a `clickhouse::inserter` only
+    // re-checks its 1s period when the writer task handles the NEXT event, so
+    // while this test still holds `app` the lone buffered row never flushes
+    // at all and even the `request_events` poll below would time out.
+    flush_capture_writer(app, "default").await;
+
     // Premise 2 + POSITIVE CONTROL: the audit row exists AND a plaintext
     // substring search over it succeeds.
-    let prose_hits = await_request_events(
-        &format!("toUInt8(position(coalesce(redacted_prompt, ''), '{PROMPT_PROSE}') > 0)"),
+    //
+    // Asserted as EXACT EQUALITY against the redacted form, not as
+    // `position(prose) > 0`. The substring form is satisfied just as well by
+    // the ENTIRE un-redacted prompt, so it passed for four tests while the
+    // mock sidecar's offsets addressed bytes the synthetic name does not
+    // occupy, `apply_redaction` discarded the out-of-range span, and NOTHING
+    // in this file ever redacted anything. Equality is what makes a
+    // miscalibrated mock fail loudly instead of silently disabling the
+    // feature under test.
+    let stored_prompt = await_request_events(
+        "concat(toString(isNull(redacted_prompt)), '|', coalesce(redacted_prompt, ''))",
         &marker,
     )
     .await;
     assert_eq!(
-        prose_hits, "1",
-        "positive control: `redacted_prompt` must contain the prompt prose \
-         verbatim. If this fails, the absence assertions below prove nothing \
-         because the search method itself does not work."
+        stored_prompt,
+        format!("0|{REDACTED_PROMPT}"),
+        "positive control: `redacted_prompt` must hold the REDACTED prompt — \
+         the prose verbatim (it is not PII) with the synthetic name replaced \
+         by its placeholder. A value equal to the raw prompt means redaction \
+         never ran and every absence assertion below proves nothing."
     );
 
     // THE ASSERTION. Every raw-content column must be NULL.
@@ -351,6 +438,14 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
     // `request_content_captures` and leave every request_events assertion
     // above still passing. Without this line the test would keep its name and
     // stop testing the gate.
+    //
+    // CORRECTION (WS3 review): the claim above was true of the QUERY and
+    // false of the TEST. The `count()` below used to run immediately after
+    // `await_request_events`, and the capture row is flushed by a different
+    // inserter that the writer `end()`s LATER — so with the gate deleted the
+    // row really was written and this assertion still read 0. It is the
+    // `flush_capture_writer` barrier above, not this line on its own, that
+    // makes the deletion check bite.
     assert_eq!(
         capture_rows_for(&marker).await,
         0,
@@ -404,7 +499,7 @@ fn streaming_chat_request(marker: &str) -> Request<axum::body::Body> {
             "stream": true,
             "messages": [{
                 "role": "user",
-                "content": format!("{PROMPT_PROSE} {SYNTHETIC_NAME}"),
+                "content": PROMPT_TEXT,
             }],
         }),
     );
@@ -437,6 +532,72 @@ async fn capture_rows_for(marker: &str) -> u32 {
     .await
     .parse()
     .expect("count() returns a number")
+}
+
+/// API key of the always-opted-in workspace used only to flush the capture
+/// writer. See [`flush_capture_writer`].
+const BARRIER_KEY: &str = "sp_ws3_capture_barrier";
+const BARRIER_BEARER: &str = "Bearer sp_ws3_capture_barrier";
+
+/// A workspace that HAS opted in, used exclusively as the flush barrier.
+async fn seed_barrier_workspace(pool: &PgPool) -> sqlx::Result<Uuid> {
+    let workspace_id = Uuid::new_v4();
+    support::seed_workspace(pool, workspace_id, BARRIER_KEY).await?;
+    support::seed_provider_and_model(
+        pool,
+        workspace_id,
+        Uuid::new_v4(),
+        "anthropic-primary",
+        "anthropic",
+        None,
+        "claude-3-haiku",
+    )
+    .await?;
+    enable_capture(pool, workspace_id, 30).await?;
+    Ok(workspace_id)
+}
+
+/// Block until the analytics writer behind `app` has flushed
+/// `request_content_captures` past every request already sent through it.
+///
+/// WHY THIS IS NEEDED, and why `await_request_events` is not enough: the
+/// capture row and the audit row go to two SEPARATE `clickhouse::inserter`s,
+/// and `analytics/clickhouse_writer.rs` calls `req_inserter.end()` BEFORE
+/// `cap_inserter.end()`. An inserter with a 1s period also does not flush a
+/// lone buffered row until either another event arrives on the same handle or
+/// the handle is dropped. So "the audit row is visible" implies nothing about
+/// the capture row, and a single non-polling `count()` taken straight after
+/// `await_request_events` races the writer it is trying to observe.
+///
+/// The barrier: one request on a workspace that DID opt in, pushed through
+/// the SAME `Router` — therefore the same `AnalyticsHandle`, the same writer
+/// task and the same `cap_inserter`, in FIFO order. `app` is taken BY VALUE
+/// and consumed here, so the writer's channel closes and its final
+/// `cap_inserter.end()` flushes every buffered capture row in one insert.
+/// Once the barrier's own row is on disk, any capture row written for an
+/// earlier request on that router is on disk too.
+///
+/// It is simultaneously the POSITIVE CONTROL for `capture_rows_for`: it
+/// proves that helper CAN see a row, so a `0` from it means "nothing was
+/// written", not "the query never matches".
+async fn flush_capture_writer(app: axum::Router, label: &str) {
+    let marker = format!("ws3-barrier-{label}-{}", Uuid::new_v4());
+    let mut request = chat_request(&marker);
+    request.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static(BARRIER_BEARER),
+    );
+    let response = app.oneshot(request).await.expect("router should respond");
+    drain(response).await;
+    // Panics if it never lands — a barrier that silently gives up would put
+    // the race straight back.
+    await_capture("toString(request_id)", &marker).await;
+    assert_eq!(
+        capture_rows_for(&marker).await,
+        1,
+        "positive control: an opted-in request must produce exactly one \
+         capture row, and `capture_rows_for` must be able to see it"
+    );
 }
 
 /// Poll for the capture row's columns, since the writer batches.
@@ -484,13 +645,16 @@ async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Re
         false,
     )
     .await?;
+    seed_barrier_workspace(&pool).await?;
 
     // Site 3/7, 4/7, 5/7 — buffered execute. Sidecar healthy, so the deny
     // rule fires: run this workspace's buffered case on the DENY path and
     // cover the success path on a second workspace below.
     let deny_marker = format!("ws3-1-deny-{}", Uuid::new_v4());
     let sidecar = MockSidecar::spawn();
-    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+    let deny_app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
+    let response = deny_app
+        .clone()
         .oneshot(chat_request(&deny_marker))
         .await
         .expect("router should respond");
@@ -504,7 +668,9 @@ async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Re
     // Site 1/7 — fail-closed on coverage loss. Default sidecar policy is
     // `block`, so a dead sidecar rejects with 503 after writing an audit row.
     let blocked_marker = format!("ws3-1-blocked-{}", Uuid::new_v4());
-    let response = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB)
+    let blocked_app = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB);
+    let response = blocked_app
+        .clone()
         .oneshot(chat_request(&blocked_marker))
         .await
         .expect("router should respond");
@@ -536,7 +702,9 @@ async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Re
         axum::http::header::AUTHORIZATION,
         axum::http::HeaderValue::from_static("Bearer sp_ws3_1_clean"),
     );
-    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+    let stream_app = support::router_with(pool.clone(), &sidecar.url(), CH_DB);
+    let response = stream_app
+        .clone()
         .oneshot(request)
         .await
         .expect("router should respond");
@@ -546,6 +714,16 @@ async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Re
         "premise: the streaming path must actually be taken"
     );
     drain(response).await;
+
+    // Each path ran on its OWN router, so each has its own analytics writer
+    // and its own `request_content_captures` inserter. Every one of them
+    // needs its own barrier before the counts below mean anything — see
+    // `flush_capture_writer`. Without these three lines the loop races three
+    // writers at once and the deletion check reports only whichever ones
+    // happened to have flushed.
+    flush_capture_writer(deny_app, "deny").await;
+    flush_capture_writer(blocked_app, "blocked").await;
+    flush_capture_writer(stream_app, "stream").await;
 
     // Accumulate rather than assert-and-abort, so a deletion check sees
     // EVERY site that regressed in one run instead of only the first.
