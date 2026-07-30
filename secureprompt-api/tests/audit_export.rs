@@ -364,7 +364,8 @@ async fn pages_are_served_byte_for_byte_and_still_verify(pool: PgPool) -> sqlx::
 
         // Byte equality against what was signed.
         assert_eq!(
-            fetched, seeded.pages,
+            fetched,
+            seeded.pages,
             "{}: the served pages must be the signed pages, byte for byte",
             format.as_str()
         );
@@ -492,12 +493,13 @@ async fn a_requested_export_is_recorded_and_enqueued(pool: PgPool) -> sqlx::Resu
         "the artifact does not exist yet, so 202 rather than 200"
     );
     let body = response_json(response).await;
-    let export_id: Uuid = body["export_id"].as_str().expect("id").parse().expect("uuid");
+    let export_id: Uuid = body["export_id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
     assert_eq!(body["status"], "queued");
-    assert_eq!(
-        body["status_url"],
-        format!("/v1/audit-exports/{export_id}")
-    );
+    assert_eq!(body["status_url"], format!("/v1/audit-exports/{export_id}"));
 
     // The row exists, is queued, and is attributed.
     let row = sqlx::query(
@@ -595,10 +597,11 @@ async fn without_a_signing_key_the_route_refuses_up_front(pool: PgPool) -> sqlx:
     );
 
     // Nothing was recorded — a `queued` row nobody will ever serve is a lie.
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_exports WHERE workspace_id = $1")
-        .bind(ws)
-        .fetch_one(&pool)
-        .await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_exports WHERE workspace_id = $1")
+            .bind(ws)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(count, 0);
 
     Ok(())
@@ -699,9 +702,7 @@ async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
 /// missing, malformed, or attached to the wrong column, every `#[sqlx::test]`
 /// would still be green.
 #[sqlx::test]
-async fn migration_025_rls_isolates_exports_from_a_nonsuperuser(
-    pool: PgPool,
-) -> sqlx::Result<()> {
+async fn migration_025_rls_isolates_exports_from_a_nonsuperuser(pool: PgPool) -> sqlx::Result<()> {
     let mine = Uuid::new_v4();
     let theirs = Uuid::new_v4();
     seed_completed_export(&pool, mine, ExportFormat::Csv).await?;
@@ -747,7 +748,11 @@ async fn migration_025_rls_isolates_exports_from_a_nonsuperuser(
     let visible: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM audit_exports")
         .fetch_all(&mut conn)
         .await?;
-    assert_eq!(visible, vec![mine], "only my workspace's export may be visible");
+    assert_eq!(
+        visible,
+        vec![mine],
+        "only my workspace's export may be visible"
+    );
 
     let pages: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM audit_export_pages")
         .fetch_all(&mut conn)

@@ -397,11 +397,46 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     // Five rows over three pages of two — so "a row removed from the MIDDLE
     // page" is a distinct case from "the export was truncated".
     let seeds = vec![
-        Seed { request_id: Uuid::new_v4(), minute: 1, model: "gpt-4o-mini", final_action: "allow",  cost_usd: 0.001, api_key_name: Some("synthetic-key-a") },
-        Seed { request_id: Uuid::new_v4(), minute: 2, model: "gpt-4o",      final_action: "redact", cost_usd: 0.002, api_key_name: Some("synthetic-key-b") },
-        Seed { request_id: Uuid::new_v4(), minute: 3, model: "gpt-4o-mini", final_action: "deny",   cost_usd: 0.0,   api_key_name: None },
-        Seed { request_id: Uuid::new_v4(), minute: 4, model: "claude-3-5",  final_action: "allow",  cost_usd: 0.004, api_key_name: Some("synthetic-key-c") },
-        Seed { request_id: Uuid::new_v4(), minute: 5, model: "gpt-4o-mini", final_action: "allow",  cost_usd: 0.005, api_key_name: Some("synthetic-key-d") },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 1,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.001,
+            api_key_name: Some("synthetic-key-a"),
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 2,
+            model: "gpt-4o",
+            final_action: "redact",
+            cost_usd: 0.002,
+            api_key_name: Some("synthetic-key-b"),
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 3,
+            model: "gpt-4o-mini",
+            final_action: "deny",
+            cost_usd: 0.0,
+            api_key_name: None,
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 4,
+            model: "claude-3-5",
+            final_action: "allow",
+            cost_usd: 0.004,
+            api_key_name: Some("synthetic-key-c"),
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 5,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.005,
+            api_key_name: Some("synthetic-key-d"),
+        },
     ];
     seed_events(workspace_id, &seeds).await;
     seed_export_row(&pool, export_id, workspace_id, "csv", 2).await?;
@@ -434,14 +469,17 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     );
     assert!(outcome.ok());
     assert_eq!(stored.total_rows, Some(5));
-    assert_eq!(stored.total_pages, Some(3), "5 rows at page_size 2 = 3 pages");
+    assert_eq!(
+        stored.total_pages,
+        Some(3),
+        "5 rows at page_size 2 = 3 pages"
+    );
 
     let pages = load_pages(&pool, export_id).await?;
     assert_eq!(pages.len(), 3);
 
     // ── (a) the exported rows ARE the live rows ──────────────────────────
-    let exported: Vec<Vec<Option<String>>> =
-        pages.iter().flat_map(|p| parse_csv_page(p)).collect();
+    let exported: Vec<Vec<Option<String>>> = pages.iter().flat_map(|p| parse_csv_page(p)).collect();
     assert_eq!(
         exported.len(),
         live.len(),
@@ -482,7 +520,10 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     // And the ORDER is the live order, not merely the same set.
     let exported_ids: Vec<&str> = exported.iter().map(|r| r[0].as_deref().unwrap()).collect();
     let live_ids: Vec<&str> = live.iter().map(|r| r[0].as_str()).collect();
-    assert_eq!(exported_ids, live_ids, "export must preserve the live order");
+    assert_eq!(
+        exported_ids, live_ids,
+        "export must preserve the live order"
+    );
 
     // ── (b) the untampered export verifies — the positive control ────────
     let manifest_json = stored.manifest_json.clone().expect("manifest stored");
@@ -519,14 +560,22 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     let refs: Vec<&[u8]> = dropped.iter().map(Vec::as_slice).collect();
     assert_eq!(
         verify_export(&manifest_json, &signature, &public_key, &refs),
-        Err(VerifyError::PageCountMismatch { expected: 3, got: 2 })
+        Err(VerifyError::PageCountMismatch {
+            expected: 3,
+            got: 2
+        })
     );
 
     // ── (e) a single altered VALUE must NOT verify ───────────────────────
     let mut edited = pages.clone();
     let page0 = String::from_utf8(edited[0].clone()).expect("utf8");
-    let flipped = page0.replace("\"deny\"", "\"allow\"").replace("\"redact\"", "\"allow\"");
-    assert_ne!(flipped, page0, "premise: the disposition edit must change bytes");
+    let flipped = page0
+        .replace("\"deny\"", "\"allow\"")
+        .replace("\"redact\"", "\"allow\"");
+    assert_ne!(
+        flipped, page0,
+        "premise: the disposition edit must change bytes"
+    );
     edited[0] = flipped.into_bytes();
     let refs: Vec<&[u8]> = edited.iter().map(Vec::as_slice).collect();
     assert_eq!(
@@ -544,15 +593,40 @@ async fn a_jsonl_export_reproduces_the_live_query(pool: PgPool) -> sqlx::Result<
     let workspace_id = Uuid::new_v4();
     let export_id = Uuid::new_v4();
     let seeds = vec![
-        Seed { request_id: Uuid::new_v4(), minute: 11, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.011, api_key_name: Some("synthetic-key-e") },
-        Seed { request_id: Uuid::new_v4(), minute: 12, model: "gpt-4o",      final_action: "deny",  cost_usd: 0.012, api_key_name: None },
-        Seed { request_id: Uuid::new_v4(), minute: 13, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.013, api_key_name: Some("synthetic-key-f") },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 11,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.011,
+            api_key_name: Some("synthetic-key-e"),
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 12,
+            model: "gpt-4o",
+            final_action: "deny",
+            cost_usd: 0.012,
+            api_key_name: None,
+        },
+        Seed {
+            request_id: Uuid::new_v4(),
+            minute: 13,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.013,
+            api_key_name: Some("synthetic-key-f"),
+        },
     ];
     seed_events(workspace_id, &seeds).await;
     seed_export_row(&pool, export_id, workspace_id, "jsonl", 2).await?;
 
     let live = live_rows(workspace_id).await;
-    assert_eq!(live.len(), 3, "premise: three rows visible to the live query");
+    assert_eq!(
+        live.len(),
+        3,
+        "premise: three rows visible to the live query"
+    );
 
     run_with(
         &pool,
@@ -607,7 +681,12 @@ async fn a_jsonl_export_reproduces_the_live_query(pool: PgPool) -> sqlx::Result<
 
     // No content columns reached the artifact.
     for row in &exported {
-        for forbidden in ["raw_prompt", "raw_response", "redacted_prompt", "restored_response"] {
+        for forbidden in [
+            "raw_prompt",
+            "raw_response",
+            "redacted_prompt",
+            "restored_response",
+        ] {
             assert!(
                 row.get(forbidden).is_none(),
                 "content column `{forbidden}` must never appear in an export"
@@ -640,7 +719,14 @@ async fn a_missing_signing_key_refuses_rather_than_shipping_an_unsigned_export(
     let export_id = Uuid::new_v4();
     seed_events(
         workspace_id,
-        &[Seed { request_id: Uuid::new_v4(), minute: 21, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.02, api_key_name: None }],
+        &[Seed {
+            request_id: Uuid::new_v4(),
+            minute: 21,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.02,
+            api_key_name: None,
+        }],
     )
     .await;
     seed_export_row(&pool, export_id, workspace_id, "csv", 100).await?;
@@ -698,7 +784,11 @@ async fn a_window_over_the_row_cap_is_refused_not_truncated(pool: PgPool) -> sql
 
     // PREMISE: three rows are really there, so the refusal below is caused by
     // the cap and not by an empty window.
-    assert_eq!(live_rows(workspace_id).await.len(), 3, "premise: 3 rows seeded");
+    assert_eq!(
+        live_rows(workspace_id).await.len(),
+        3,
+        "premise: 3 rows seeded"
+    );
 
     let outcome = run_with(
         &pool,
@@ -797,10 +887,16 @@ async fn an_expired_window_is_exported_and_declares_its_expiry(pool: PgPool) -> 
     )
     .await;
     let fresh_manifest: serde_json::Value = serde_json::from_str(
-        &load_export(&pool, fresh).await?.manifest_json.expect("manifest"),
+        &load_export(&pool, fresh)
+            .await?
+            .manifest_json
+            .expect("manifest"),
     )
     .expect("json");
-    assert_eq!(fresh_manifest["retention"]["window_status"], "within_retention");
+    assert_eq!(
+        fresh_manifest["retention"]["window_status"],
+        "within_retention"
+    );
 
     Ok(())
 }
@@ -830,7 +926,11 @@ async fn an_empty_window_still_produces_a_signed_export(pool: PgPool) -> sqlx::R
     let stored = load_export(&pool, export_id).await?;
     assert_eq!(stored.status, STATUS_COMPLETE, "error: {:?}", stored.error);
     assert_eq!(stored.total_rows, Some(0));
-    assert_eq!(stored.total_pages, Some(1), "an empty export still has a page");
+    assert_eq!(
+        stored.total_pages,
+        Some(1),
+        "an empty export still has a page"
+    );
 
     let pages = load_pages(&pool, export_id).await?;
     let refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
@@ -856,13 +956,39 @@ async fn an_export_contains_no_other_tenants_rows(pool: PgPool) -> sqlx::Result<
 
     let my_row = Uuid::new_v4();
     let their_row = Uuid::new_v4();
-    seed_events(mine, &[Seed { request_id: my_row, minute: 41, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.04, api_key_name: None }]).await;
-    seed_events(theirs, &[Seed { request_id: their_row, minute: 41, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.04, api_key_name: None }]).await;
+    seed_events(
+        mine,
+        &[Seed {
+            request_id: my_row,
+            minute: 41,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.04,
+            api_key_name: None,
+        }],
+    )
+    .await;
+    seed_events(
+        theirs,
+        &[Seed {
+            request_id: their_row,
+            minute: 41,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.04,
+            api_key_name: None,
+        }],
+    )
+    .await;
     seed_export_row(&pool, export_id, mine, "jsonl", 100).await?;
 
     // PREMISE: the other tenant's row really exists in the same window, so
     // "it is absent from my export" is a measurement.
-    assert_eq!(live_rows(theirs).await.len(), 1, "premise: the other tenant has a row");
+    assert_eq!(
+        live_rows(theirs).await.len(),
+        1,
+        "premise: the other tenant has a row"
+    );
 
     run_with(
         &pool,
@@ -876,7 +1002,10 @@ async fn an_export_contains_no_other_tenants_rows(pool: PgPool) -> sqlx::Result<
 
     let pages = load_pages(&pool, export_id).await?;
     let body = String::from_utf8(pages.concat()).expect("utf8");
-    assert!(body.contains(&my_row.to_string()), "my own row must be present");
+    assert!(
+        body.contains(&my_row.to_string()),
+        "my own row must be present"
+    );
     assert!(
         !body.contains(&their_row.to_string()),
         "another tenant's request id must never appear in my export"
@@ -895,18 +1024,37 @@ async fn re_running_the_same_export_replaces_rather_than_appends(pool: PgPool) -
     let export_id = Uuid::new_v4();
     seed_events(
         workspace_id,
-        &[Seed { request_id: Uuid::new_v4(), minute: 51, model: "gpt-4o-mini", final_action: "allow", cost_usd: 0.05, api_key_name: None }],
+        &[Seed {
+            request_id: Uuid::new_v4(),
+            minute: 51,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.05,
+            api_key_name: None,
+        }],
     )
     .await;
     seed_export_row(&pool, export_id, workspace_id, "csv", 100).await?;
 
     let env = envelope(export_id, workspace_id, "csv", 100);
     for _ in 0..2 {
-        run_with(&pool, &ch_client(), &env, Ok(test_key()), MAX_EXPORT_ROWS, Utc::now()).await;
+        run_with(
+            &pool,
+            &ch_client(),
+            &env,
+            Ok(test_key()),
+            MAX_EXPORT_ROWS,
+            Utc::now(),
+        )
+        .await;
     }
 
     let pages = load_pages(&pool, export_id).await?;
-    assert_eq!(pages.len(), 1, "a redelivered task must not double the pages");
+    assert_eq!(
+        pages.len(),
+        1,
+        "a redelivered task must not double the pages"
+    );
     let stored = load_export(&pool, export_id).await?;
     assert_eq!(stored.total_pages, Some(1));
 

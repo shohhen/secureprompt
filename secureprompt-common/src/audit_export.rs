@@ -222,10 +222,7 @@ pub const COLUMNS: &[(&str, &str)] = &[
          workspace-scoped key never assigned to a member — reported as NULL \
          rather than folded into an `unknown` bucket.",
     ),
-    (
-        "api_key_id",
-        "Which API key authenticated the request.",
-    ),
+    ("api_key_id", "Which API key authenticated the request."),
     (
         "api_key_name",
         "The administrator-chosen label for that key. FREE TEXT: it is operator \
@@ -635,9 +632,7 @@ pub enum BuildError {
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            Self::PageRowCountMismatch => {
-                "page list and row-count list have different lengths"
-            }
+            Self::PageRowCountMismatch => "page list and row-count list have different lengths",
             Self::ManifestSerialization => "manifest could not be serialized",
         };
         f.write_str(text)
@@ -1232,7 +1227,10 @@ mod tests {
         // 64 chars but not hex → falls through to base64, which also rejects.
         assert_eq!(parse_signing_key(&"z".repeat(64)), Err(KeyError::Malformed));
         // Right encoding, wrong length.
-        assert_eq!(parse_signing_key(&B64.encode([1u8; 16])), Err(KeyError::Malformed));
+        assert_eq!(
+            parse_signing_key(&B64.encode([1u8; 16])),
+            Err(KeyError::Malformed)
+        );
     }
 
     /// A key error must never quote the key. `hex::decode`'s own message is

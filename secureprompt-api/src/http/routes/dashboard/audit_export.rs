@@ -223,9 +223,8 @@ async fn begin_scoped(
 // ── Validation ────────────────────────────────────────────────────────────
 
 fn validate(req: &CreateExportRequest) -> Result<(ExportFormat, u32), ApiError> {
-    let format = ExportFormat::parse(&req.format).ok_or_else(|| {
-        ApiError::BadRequest("format must be `csv` or `jsonl`".into())
-    })?;
+    let format = ExportFormat::parse(&req.format)
+        .ok_or_else(|| ApiError::BadRequest("format must be `csv` or `jsonl`".into()))?;
     if req.from >= req.to {
         return Err(ApiError::BadRequest(
             "invalid window: `from` must be strictly before `to` (the window is \
@@ -312,9 +311,8 @@ async fn create_export(
         }),
         ws,
     );
-    let payload = serde_json::to_string(&envelope).map_err(|e| {
-        api_error_response(store_unavailable("serializing the export task", &e))
-    })?;
+    let payload = serde_json::to_string(&envelope)
+        .map_err(|e| api_error_response(store_unavailable("serializing the export task", &e)))?;
     if let Err(e) = enqueue_task(&state.redis_pool, QUEUE_AUDIT_EXPORT, &payload).await {
         // The row exists and says `queued`, which would be a lie if nothing is
         // ever going to pick it up. Mark it failed so the caller polls a truth.
@@ -437,7 +435,8 @@ async fn get_export(
         .await
         .map_err(|e| api_error_response(store_unavailable("closing the export read", &e)))?;
 
-    let row = row.ok_or_else(|| api_error_response(ApiError::NotFound("export not found".into())))?;
+    let row =
+        row.ok_or_else(|| api_error_response(ApiError::NotFound("export not found".into())))?;
     let status: String = row.get("status");
     let total_pages: Option<i32> = row.get("total_pages");
 
@@ -523,10 +522,7 @@ async fn get_export_page(
             // the transfer without parsing the manifest. It is NOT the
             // signature and proves nothing on its own — the same server sent
             // both — which is why the header is named for what it is.
-            (
-                header::ETAG,
-                format!("\"sha256:{sha256}\""),
-            ),
+            (header::ETAG, format!("\"sha256:{sha256}\"")),
         ],
         body,
     )

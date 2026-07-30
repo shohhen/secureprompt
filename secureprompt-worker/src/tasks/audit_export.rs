@@ -118,9 +118,7 @@ impl RequestError {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Malformed => {
-                "export task payload is not a well-formed audit-export request"
-            }
+            Self::Malformed => "export task payload is not a well-formed audit-export request",
             Self::UnknownFormat => "export format must be `csv` or `jsonl`",
             Self::PageSizeOutOfRange => {
                 "page_size is outside the permitted range for an audit export"
@@ -406,10 +404,7 @@ async fn persist(
         // copy is what an operator reads when they are trying to work out
         // whether a page was altered at rest.
         let rows = signed.rows_per_page.get(index).copied().unwrap_or(0);
-        let digest = signed
-            .page_digests
-            .get(index)
-            .map_or("", String::as_str);
+        let digest = signed.page_digests.get(index).map_or("", String::as_str);
         sqlx::query(
             "INSERT INTO audit_export_pages \
              (export_id, workspace_id, page_number, row_count, sha256, body) \
