@@ -1,0 +1,1095 @@
+//! WS3-5 — `GET /v1/data-inventory`, the transparency endpoint.
+//!
+//! This endpoint is a COMPLIANCE ATTESTATION: a bank auditor reads its output
+//! and believes it. An inventory that omits an artifact class, or claims
+//! encryption it does not have, is worse than no endpoint at all — it converts
+//! an unknown into a false assurance. Every test in this file exists to make
+//! one specific way of lying impossible:
+//!
+//! | Test | The lie it makes impossible |
+//! |---|---|
+//! | `row_counts_are_real_and_workspace_scoped` | counts that are constants, or another tenant's |
+//! | `encryption_state_is_derived_from_stored_bytes_not_the_self_asserted_flag` | `encrypted: true` over a plaintext payload |
+//! | `every_table_the_product_creates_appears_in_the_inventory` | a silently omitted artifact class |
+//! | `retention_days_without_an_enforcement_mechanism_is_never_reported` | "90 days" enforced by nothing |
+//! | `unenumerable_classes_are_declared_rather_than_omitted` | dropping the Redis file vault because it has no workspace id |
+//! | `inventory_never_echoes_stored_content` | an attestation that leaks the thing it attests about |
+//!
+//! All fixture PII is synthetic.
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    Router,
+};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use secureprompt_api::http::middleware::jwt_auth::Claims;
+use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
+use secureprompt_common::config::{
+    AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
+    ServerConfig, TelemetryConfig,
+};
+use serde_json::Value;
+use sqlx::PgPool;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+const TEST_JWT_SECRET: &str = "data-inventory-test-jwt-secret!!";
+
+/// Synthetic PII. Never appears in any real corpus; it is the needle
+/// `inventory_never_echoes_stored_content` hunts for in the response body.
+const SYNTHETIC_NAME: &str = "Anvar Karimov";
+
+// ── Harness ───────────────────────────────────────────────────────────────
+
+fn clickhouse_url() -> String {
+    std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+}
+
+fn clickhouse_db() -> String {
+    std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "sp_analytics".into())
+}
+
+fn redis_url() -> String {
+    std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into())
+}
+
+fn test_config() -> AppConfig {
+    AppConfig {
+        database: DatabaseConfig {
+            url: "postgres://unused".into(),
+            max_connections: 1,
+        },
+        redis: RedisConfig {
+            url: redis_url(),
+            max_connections: 4,
+        },
+        telemetry: TelemetryConfig {
+            otel_enabled: false,
+            prometheus_enabled: false,
+            log_level: "error".into(),
+        },
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+        },
+        clickhouse: ClickhouseConfig {
+            url: clickhouse_url(),
+            database: clickhouse_db(),
+        },
+        jwt: JwtConfig {
+            secret: TEST_JWT_SECRET.into(),
+            access_ttl_secs: 900,
+            refresh_ttl_secs: 3600,
+        },
+        public_signup_enabled: false,
+        chat_debug_mode: false,
+        redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
+        license: LicenseConfig::default(),
+    }
+}
+
+fn build_app(pool: PgPool) -> Router {
+    let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    build_router(AppState::new(
+        pool,
+        test_config(),
+        ml,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    ))
+}
+
+fn make_jwt(workspace_id: Uuid, user_id: Uuid, role: &str) -> String {
+    let claims = Claims {
+        sub: user_id,
+        ws: workspace_id,
+        role: role.to_owned(),
+        jti: Uuid::new_v4().to_string(),
+        exp: (chrono::Utc::now() + chrono::Duration::seconds(900)).timestamp(),
+        iat: chrono::Utc::now().timestamp(),
+        purpose: None,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .expect("jwt encode")
+}
+
+async fn seed_workspace(pool: &PgPool) -> (Uuid, Uuid) {
+    let ws_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, created_at, updated_at)
+         VALUES ($1, 'data-inventory-test-ws', NOW(), NOW())",
+    )
+    .bind(ws_id)
+    .execute(pool)
+    .await
+    .expect("seed workspace");
+    sqlx::query(
+        "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
+         VALUES ($1, $2, $3, '$argon2id$v=19$m=1,t=1,p=1$c29tZXNhbHQ$aaaa', 'admin', NOW(), NOW())",
+    )
+    .bind(user_id)
+    .bind(ws_id)
+    .bind(format!("inv-{}@example.com", Uuid::new_v4().simple()))
+    .execute(pool)
+    .await
+    .expect("seed user");
+    (ws_id, user_id)
+}
+
+/// POST a statement to the test `ClickHouse`, failing loudly with the server's
+/// own error text. Same "never skip" stance as the RLS matrix: an unreachable
+/// datastore must fail the run, not silently weaken it.
+async fn clickhouse_exec(sql: String, what: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(clickhouse_url())
+        .body(sql)
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "ClickHouse unreachable at {} while {what} — the data-inventory \
+                 suite cannot verify row counts without it and must not be \
+                 skipped: {e}",
+                clickhouse_url()
+            )
+        });
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "ClickHouse {what} failed ({status}): {body}"
+    );
+    body
+}
+
+async fn clickhouse_count(table: &str, predicate: &str) -> u64 {
+    let body = clickhouse_exec(
+        format!(
+            "SELECT count() FROM {db}.{table} WHERE {predicate}",
+            db = clickhouse_db()
+        ),
+        "counting rows",
+    )
+    .await;
+    body.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("count() did not return a number ({body:?}): {e}"))
+}
+
+async fn seed_request_events(ws: Uuid, n: usize) {
+    for i in 0..n {
+        clickhouse_exec(
+            format!(
+                "INSERT INTO {db}.request_events \
+                 (request_id, workspace_id, provider, model, final_action, cost_usd, \
+                  estimated_usage, created_at) \
+                 VALUES ('{rid}', '{ws}', 'openai', 'inv-model-{i}', 'allow', 1.5, false, now())",
+                db = clickhouse_db(),
+                rid = Uuid::new_v4(),
+            ),
+            "seeding request_events",
+        )
+        .await;
+    }
+}
+
+async fn seed_policy_events(ws: Uuid, n: usize) {
+    for i in 0..n {
+        clickhouse_exec(
+            format!(
+                "INSERT INTO {db}.policy_events \
+                 (request_id, workspace_id, rule_id, rule_name, action, dry_run, created_at) \
+                 VALUES ('{rid}', '{ws}', '{rule}', 'inv-rule-{i}', 'redact', false, now())",
+                db = clickhouse_db(),
+                rid = Uuid::new_v4(),
+                rule = Uuid::new_v4(),
+            ),
+            "seeding policy_events",
+        )
+        .await;
+    }
+}
+
+async fn seed_latency_samples(ws: Uuid, n: usize) {
+    for i in 0..n {
+        clickhouse_exec(
+            format!(
+                "INSERT INTO {db}.latency_samples \
+                 (request_id, workspace_id, model, latency_ms, created_at) \
+                 VALUES ('{rid}', '{ws}', 'inv-model-{i}', 42, now())",
+                db = clickhouse_db(),
+                rid = Uuid::new_v4(),
+            ),
+            "seeding latency_samples",
+        )
+        .await;
+    }
+}
+
+/// Distinct `model` per row so `SummingMergeTree` cannot collapse two seeded
+/// rows into one between the premise assertion and the request.
+async fn seed_token_usage(ws: Uuid, n: usize) {
+    for i in 0..n {
+        clickhouse_exec(
+            format!(
+                "INSERT INTO {db}.token_usage \
+                 (workspace_id, model, date, input_tokens, output_tokens, cost_usd) \
+                 VALUES ('{ws}', 'inv-tok-{tag}-{i}', today(), 10, 20, 0.5)",
+                db = clickhouse_db(),
+                tag = Uuid::new_v4().simple(),
+            ),
+            "seeding token_usage",
+        )
+        .await;
+    }
+}
+
+/// Insert a `request_content_captures` row with a payload supplied verbatim,
+/// and an `encrypted` flag supplied verbatim. Both are caller-controlled so a
+/// test can build the exact row the WS3 reviewer found in production: the flag
+/// saying `true` over a payload that is plainly not ciphertext.
+async fn seed_capture(ws: Uuid, payload: &str, encrypted: bool) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.request_content_captures \
+             (request_id, workspace_id, created_at, expires_at, encrypted, \
+              raw_prompt, raw_response, restored_response) \
+             VALUES ('{rid}', '{ws}', now(), now() + INTERVAL 30 DAY, {enc}, \
+                     '{payload}', NULL, NULL)",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            enc = u8::from(encrypted),
+            payload = payload.replace('\\', "\\\\").replace('\'', "\\'"),
+        ),
+        "seeding request_content_captures",
+    )
+    .await;
+}
+
+async fn get_inventory(app: &Router, token: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/data-inventory")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 << 20)
+        .await
+        .expect("read body");
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// The artifact entry for `class`, or a panic naming every class that IS
+/// present — so a rename shows up as a readable diff instead of `None`.
+fn artifact<'a>(body: &'a Value, class: &str) -> &'a Value {
+    body["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`artifacts` must be an array, got: {body}"))
+        .iter()
+        .find(|entry| entry["class"] == Value::String(class.to_owned()))
+        .unwrap_or_else(|| {
+            panic!(
+                "no artifact class `{class}` in the inventory. Present: {:?}",
+                class_names(body)
+            )
+        })
+}
+
+/// Every class name the response declares, across BOTH lists. An artifact is
+/// "covered" if it appears in either — enumerable with a count, or declared
+/// un-enumerable with a reason.
+fn class_names(body: &Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for key in ["artifacts", "not_enumerable"] {
+        if let Some(entries) = body[key].as_array() {
+            for entry in entries {
+                if let Some(name) = entry["class"].as_str() {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn row_count(body: &Value, class: &str) -> u64 {
+    let entry = artifact(body, class);
+    entry["row_count"].as_u64().unwrap_or_else(|| {
+        panic!("class `{class}` reported no numeric row_count: {entry}")
+    })
+}
+
+// ── 1. Row counts ─────────────────────────────────────────────────────────
+
+/// Counts must be REAL — queried live, per workspace.
+///
+/// Three separate defences against a vacuous pass:
+///
+/// 1. **Premise** — every seeded count is confirmed by a direct query against
+///    the store BEFORE the endpoint is called, so "the endpoint reports 3"
+///    cannot be true merely because 3 rows happened to exist.
+/// 2. **Positive control that must differ** — a SECOND workspace is seeded
+///    with a different, larger count in every table. A query missing its
+///    tenancy predicate reports `mine + theirs` and fails; the two are never
+///    equal because the other workspace's counts are all non-zero.
+/// 3. **Distinguishing constants** — every class is seeded a DIFFERENT number
+///    of rows (3/5/7/2/4), so a hardcoded constant fails, and so does a
+///    copy-paste that counts the wrong table.
+///
+/// Falsifier: delete `AND workspace_id = ...` from any per-table count in
+/// `clickhouse_counts` (or the `WHERE workspace_id = $1` in
+/// `postgres_counts`) — this test then reports the two-workspace total.
+#[sqlx::test]
+async fn row_counts_are_real_and_workspace_scoped(pool: PgPool) {
+    let (mine, my_user) = seed_workspace(&pool).await;
+    let (theirs, _) = seed_workspace(&pool).await;
+
+    // Deliberately different per class AND per workspace.
+    seed_request_events(mine, 3).await;
+    seed_request_events(theirs, 11).await;
+    seed_policy_events(mine, 5).await;
+    seed_policy_events(theirs, 13).await;
+    seed_latency_samples(mine, 7).await;
+    seed_latency_samples(theirs, 17).await;
+    seed_token_usage(mine, 2).await;
+    seed_token_usage(theirs, 19).await;
+    for _ in 0..4 {
+        seed_capture(mine, "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM", true).await;
+    }
+    for _ in 0..23 {
+        seed_capture(theirs, "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM", true).await;
+    }
+
+    // Postgres: 6 vault entries for me, 29 for them.
+    for (ws, n) in [(mine, 6), (theirs, 29)] {
+        for _ in 0..n {
+            sqlx::query(
+                "INSERT INTO token_vault_entries (id, workspace_id, mapping_ciphertext)
+                 VALUES ($1, $2, 'ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(ws)
+            .execute(&pool)
+            .await
+            .expect("seed token_vault_entries");
+        }
+    }
+
+    // ---- Premise assertions, before anything is asserted about the API ----
+    for (table, expected_mine, expected_theirs) in [
+        ("request_events", 3_u64, 11_u64),
+        ("policy_events", 5, 13),
+        ("latency_samples", 7, 17),
+        ("token_usage", 2, 19),
+        ("request_content_captures", 4, 23),
+    ] {
+        assert_eq!(
+            clickhouse_count(table, &format!("workspace_id = toUUID('{mine}')")).await,
+            expected_mine,
+            "premise failed: {table} does not hold the rows this test seeded \
+             for its own workspace, so an equal report from the endpoint would \
+             prove nothing"
+        );
+        assert_eq!(
+            clickhouse_count(table, &format!("workspace_id = toUUID('{theirs}')")).await,
+            expected_theirs,
+            "premise failed: {table} holds no OTHER tenant's rows, so a query \
+             missing its tenancy predicate would return the same number as a \
+             correct one and this test could not tell them apart"
+        );
+    }
+    let vault_theirs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM token_vault_entries WHERE workspace_id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("premise count");
+    assert_eq!(
+        vault_theirs, 29,
+        "premise failed: no other tenant's vault rows exist"
+    );
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(mine, my_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    for (class, expected) in [
+        ("request_events", 3_u64),
+        ("policy_events", 5),
+        ("latency_samples", 7),
+        ("token_usage", 2),
+        ("request_content_captures", 4),
+        ("token_vault_entries", 6),
+    ] {
+        assert_eq!(
+            row_count(&body, class),
+            expected,
+            "class `{class}` must report exactly this workspace's rows. \
+             Reporting {} (the two-workspace total) means the count query is \
+             missing its tenancy predicate. Response: {body}",
+            expected
+                + match class {
+                    "request_events" => 11,
+                    "policy_events" => 13,
+                    "latency_samples" => 17,
+                    "token_usage" => 19,
+                    "request_content_captures" => 23,
+                    _ => 29,
+                }
+        );
+    }
+
+    // Positive control on the OTHER direction: the workspace's own row in
+    // `workspaces` and its own user are counted too, so a response of all
+    // zeroes (an endpoint that queries nothing) cannot pass.
+    assert_eq!(
+        row_count(&body, "users"),
+        1,
+        "the seeded admin user was not counted, so this workspace's Postgres \
+         counts are not live: {body}"
+    );
+}
+
+// ── 2. Encryption state ───────────────────────────────────────────────────
+
+/// The encryption claim must be DERIVED FROM THE STORED BYTES, not read off
+/// the row's own `encrypted` flag.
+///
+/// The WS3 review found a `request_content_captures` row carrying
+/// `encrypted = true` over a plaintext payload. That flag is written by the
+/// same code path that writes the payload, so it can only ever repeat what
+/// that path believed — it is self-attestation, and an inventory that
+/// republishes it launders a lie into an auditor's evidence pack.
+///
+/// Defences:
+///
+/// 1. **Premise** — the lying row is confirmed in ClickHouse to have
+///    `encrypted = 1` AND a payload equal to the plaintext this test wrote.
+///    Without that, "the endpoint said mixed" could be true because the row
+///    never landed.
+/// 2. **Positive control that MUST DIFFER** — a second workspace holds a row
+///    sealed by the real `AppState` KMS. It must report `ciphertext`. The two
+///    workspaces differ only in the bytes of the payload, so any
+///    implementation that answers from the flag returns `ciphertext` for both
+///    and fails here.
+/// 3. **Bidirectional** — both the "honest ciphertext" and the "lying
+///    plaintext" verdicts are asserted, so an implementation hardcoded to
+///    either verdict fails.
+///
+/// Falsifier: make `capture_encryption_state` read the `encrypted` column
+/// (`countIf(encrypted)`) instead of shape-checking the payload — the lying
+/// workspace then reports `ciphertext` and this test fails.
+#[sqlx::test]
+async fn encryption_state_is_derived_from_stored_bytes_not_the_self_asserted_flag(pool: PgPool) {
+    let (liar, liar_user) = seed_workspace(&pool).await;
+    let (honest, honest_user) = seed_workspace(&pool).await;
+
+    // The exact defect: flag says encrypted, payload is the user's prose.
+    let plaintext = format!("Please summarise the contract for {SYNTHETIC_NAME}");
+    seed_capture(liar, &plaintext, true).await;
+
+    // The control: the same class, sealed by the process's real KMS.
+    let kms = secureprompt_common::kms::kms_backend_from_env()
+        .expect("KMS_FILE_KEY must be set for this suite — see .env");
+    let sealed = String::from_utf8(
+        kms.encrypt(plaintext.as_bytes())
+            .await
+            .expect("kms encrypt"),
+    )
+    .expect("ciphertext is UTF-8");
+    seed_capture(honest, &sealed, true).await;
+
+    // ---- Premise assertions ------------------------------------------------
+    assert_eq!(
+        clickhouse_count(
+            "request_content_captures",
+            &format!("workspace_id = toUUID('{liar}') AND encrypted = 1")
+        )
+        .await,
+        1,
+        "premise failed: the lying row is not flagged encrypted, so this test \
+         does not exercise the flag-versus-bytes disagreement it is named for"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "request_content_captures",
+            &format!(
+                "workspace_id = toUUID('{liar}') AND raw_prompt = '{}'",
+                plaintext.replace('\'', "\\'")
+            )
+        )
+        .await,
+        1,
+        "premise failed: the lying row's payload is not the plaintext this \
+         test wrote, so 'the inventory noticed plaintext' proves nothing"
+    );
+    assert_ne!(
+        sealed, plaintext,
+        "premise failed: the KMS returned its input unchanged, so the control \
+         row is not actually ciphertext"
+    );
+
+    let app = build_app(pool);
+
+    let (status, liar_body) = get_inventory(&app, &make_jwt(liar, liar_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {liar_body}");
+    let liar_entry = artifact(&liar_body, "request_content_captures");
+
+    let (status, honest_body) = get_inventory(&app, &make_jwt(honest, honest_user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {honest_body}");
+    let honest_entry = artifact(&honest_body, "request_content_captures");
+
+    // ---- Positive control: honest ciphertext IS reported as ciphertext -----
+    assert_eq!(
+        honest_entry["encryption"]["at_rest"],
+        Value::String("ciphertext".into()),
+        "a genuinely KMS-sealed capture must report `ciphertext`, otherwise \
+         the `plaintext` verdict below is just this endpoint refusing to \
+         claim anything: {honest_entry}"
+    );
+    assert_eq!(
+        honest_entry["encryption"]["verification"]["rows_not_matching"],
+        Value::from(0),
+        "a KMS-sealed payload failed the endpoint's own ciphertext predicate — \
+         the predicate is wrong, not the data: {honest_entry}"
+    );
+
+    // ---- The assertion this test exists for --------------------------------
+    assert_eq!(
+        liar_entry["encryption"]["at_rest"],
+        Value::String("plaintext".into()),
+        "the inventory republished the row's self-asserted `encrypted = true` \
+         over a plaintext payload. The encryption claim must be derived from \
+         the stored bytes: {liar_entry}"
+    );
+    assert_eq!(
+        liar_entry["encryption"]["verification"]["rows_not_matching"],
+        Value::from(1),
+        "the plaintext row was not counted as failing the ciphertext \
+         predicate: {liar_entry}"
+    );
+}
+
+/// The claim is only as good as the mechanism behind it, so the response must
+/// say what the mechanism IS and whether it is working right now.
+///
+/// Falsifier: delete the `kms.encrypt`/`kms.decrypt` round trip in
+/// `kms_self_test` and hardcode `"ok"` — the `basis` list loses its
+/// `kms_self_test` entry and this test fails.
+#[sqlx::test]
+async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    // Premise: this deployment has a KMS at all.
+    assert!(
+        body["encryption_basis"]["kms_backend"].is_string(),
+        "the response does not name a KMS backend: {body}"
+    );
+    assert_eq!(
+        body["encryption_basis"]["kms_self_test"],
+        Value::String("ok".into()),
+        "the live encrypt→decrypt round trip failed or was never run; an \
+         encryption claim resting on a KMS nobody probed is an assertion: {body}"
+    );
+
+    // Every class claiming ciphertext must name the substantiation.
+    let entries = body["artifacts"].as_array().expect("artifacts array");
+    let mut ciphertext_classes = 0_usize;
+    for entry in entries {
+        let at_rest = entry["encryption"]["at_rest"].as_str().unwrap_or("");
+        if at_rest != "ciphertext" && at_rest != "mixed" {
+            continue;
+        }
+        ciphertext_classes += 1;
+        let basis: Vec<&str> = entry["encryption"]["basis"]
+            .as_array()
+            .unwrap_or_else(|| panic!("class {} has no `basis` list: {entry}", entry["class"]))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            basis.contains(&"kms_self_test"),
+            "class {} claims {at_rest} without resting on the live KMS probe: \
+             {basis:?}",
+            entry["class"]
+        );
+        assert!(
+            basis.contains(&"stored_payload_shape"),
+            "class {} claims {at_rest} without checking the bytes actually on \
+             disk: {basis:?}",
+            entry["class"]
+        );
+    }
+    // Positive control: the loop above vacuously passes over an empty set.
+    assert!(
+        ciphertext_classes > 0,
+        "no class claims ciphertext at all, so the assertions above ran zero \
+         times: {body}"
+    );
+}
+
+// ── 3. Completeness ───────────────────────────────────────────────────────
+
+/// Extract every `CREATE TABLE [IF NOT EXISTS] <name>` from a migration dir.
+fn tables_declared_in(dir: &str) -> BTreeSet<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+    let mut tables = BTreeSet::new();
+    let entries = std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("cannot read migration dir {}: {e}", root.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&path).expect("read migration");
+        for line in sql.lines() {
+            // Skip comment lines — several migrations discuss `CREATE TABLE`
+            // in prose, and a prose mention is not a table.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("--") {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix("CREATE TABLE ") else {
+                continue;
+            };
+            let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+            let name = rest
+                .split(|c: char| c.is_whitespace() || c == '(')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                tables.insert(name.to_owned());
+            }
+        }
+    }
+    tables
+}
+
+/// An inventory that omits an artifact class is worse than no inventory: it
+/// converts an unknown into a false assurance. This test derives the expected
+/// set from the migrations themselves, so a future `CREATE TABLE` that nobody
+/// adds to the inventory reddens the suite — the omission cannot be silent.
+///
+/// A class is "covered" if it appears in `artifacts` (enumerable, with a
+/// count) OR in `not_enumerable` (declared, with a reason). Both are honest;
+/// silence is not.
+///
+/// Falsifier: delete any single entry from `POSTGRES_CLASSES` or
+/// `CLICKHOUSE_CLASSES` in the handler.
+#[sqlx::test]
+async fn every_table_the_product_creates_appears_in_the_inventory(pool: PgPool) {
+    let postgres_tables = tables_declared_in("migrations");
+    let clickhouse_tables = tables_declared_in("clickhouse/migrations");
+
+    // Premise: the extractor found the schema. A regex that silently matches
+    // nothing would make the loop below pass over an empty set.
+    assert!(
+        postgres_tables.len() >= 18,
+        "premise failed: only {} Postgres tables extracted from migrations/, \
+         so this test would pass vacuously. Found: {postgres_tables:?}",
+        postgres_tables.len()
+    );
+    assert!(
+        clickhouse_tables.len() >= 9,
+        "premise failed: only {} ClickHouse tables extracted, so this test \
+         would pass vacuously. Found: {clickhouse_tables:?}",
+        clickhouse_tables.len()
+    );
+    assert!(
+        postgres_tables.contains("token_vault_entries")
+            && clickhouse_tables.contains("request_content_captures"),
+        "premise failed: the extractor missed a table this suite seeds \
+         directly, so its output cannot be trusted as the expected set"
+    );
+
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let declared = class_names(&body);
+    // Positive control: the response declares SOMETHING, so `missing` being
+    // empty cannot be an artefact of an empty expected set meeting an empty
+    // response.
+    assert!(
+        declared.len() >= 20,
+        "the inventory declares only {} classes, which cannot cover the \
+         product's {} Postgres + {} ClickHouse tables: {declared:?}",
+        declared.len(),
+        postgres_tables.len(),
+        clickhouse_tables.len()
+    );
+
+    let missing: Vec<&String> = postgres_tables
+        .iter()
+        .chain(clickhouse_tables.iter())
+        .filter(|table| !declared.contains(*table))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the product stores these tables and the inventory does not mention \
+         them, in `artifacts` or in `not_enumerable`:\n  {missing:?}\n\
+         An omitted artifact class is a false assurance. Declared: {declared:?}"
+    );
+}
+
+/// Every Redis key prefix the gateway writes must be accounted for too. Redis
+/// has no schema to derive from, so the expected set is spelled out here and
+/// pinned to the source line that builds each key — if a key prefix is
+/// renamed, `grep` finds this list.
+#[sqlx::test]
+async fn every_redis_key_class_the_gateway_writes_is_accounted_for(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let declared = class_names(&body);
+    for (class, written_by) in [
+        ("redis:filevault", "redis/mod.rs stash_file_vault"),
+        ("redis:jti_blacklist", "redis/mod.rs blacklist_jti"),
+        ("redis:oidc_state", "redis/mod.rs store_oidc_state"),
+        ("redis:budget", "dashboard/budgets.rs daily_key/monthly_key"),
+        ("redis:queues", "redis/mod.rs enqueue_task"),
+    ] {
+        assert!(
+            declared.contains(class),
+            "Redis key class `{class}` (written by {written_by}) is absent \
+             from the inventory: {declared:?}"
+        );
+    }
+}
+
+// ── 4. Retention ──────────────────────────────────────────────────────────
+
+/// A retention NUMBER with no enforcement MECHANISM is the exact shape of a
+/// false assurance: it reads as a guarantee and is enforced by nothing.
+///
+/// This is a whole-response invariant rather than a spot check, so a class
+/// added later with `days: 90` and no mechanism fails too.
+///
+/// Falsifier: report `refresh_tokens` with `days: 30` while leaving its
+/// mechanism `none` (it genuinely has no purge — see the assertion below).
+#[sqlx::test]
+async fn retention_days_without_an_enforcement_mechanism_is_never_reported(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let mut with_days = 0_usize;
+    let mut with_mechanism = 0_usize;
+    let mut checked = 0_usize;
+
+    for key in ["artifacts", "not_enumerable"] {
+        for entry in body[key].as_array().expect("array") {
+            checked += 1;
+            let retention = &entry["retention"];
+            let mechanism = retention["mechanism"]
+                .as_str()
+                .unwrap_or_else(|| panic!("class {} has no retention mechanism: {entry}", entry["class"]));
+            let days = retention["days"].as_i64();
+
+            if days.is_some() {
+                with_days += 1;
+                assert_ne!(
+                    mechanism, "none",
+                    "class {} advertises a {:?}-day retention enforced by \
+                     nothing. Either name the mechanism or report no window: \
+                     {entry}",
+                    entry["class"], days
+                );
+            }
+            if mechanism != "none" {
+                with_mechanism += 1;
+                assert!(
+                    !retention["mechanism_detail"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty(),
+                    "class {} names mechanism `{mechanism}` without saying \
+                     what it does; an auditor needs the mechanism, not just \
+                     the number: {entry}",
+                    entry["class"]
+                );
+            }
+        }
+    }
+
+    // Positive controls: the loop must have seen both shapes, otherwise the
+    // invariant above passed over nothing.
+    assert!(checked >= 20, "only {checked} classes examined: {body}");
+    assert!(
+        with_days > 0,
+        "no class reports a retention window at all, so the invariant above \
+         never fired: {body}"
+    );
+    assert!(
+        with_mechanism > 0,
+        "no class reports an enforcement mechanism at all: {body}"
+    );
+
+    // A ClickHouse TTL is a background merge, not a delete at the instant of
+    // expiry. An auditor who reads "90 days" and assumes "gone on day 91" has
+    // been misled by an omission.
+    let events = artifact(&body, "request_events");
+    assert_eq!(events["retention"]["days"], Value::from(90));
+    let detail = events["retention"]["mechanism_detail"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        detail.contains("merge"),
+        "request_events reports a 90-day TTL without saying it is applied by \
+         a background merge rather than at the instant of expiry: {detail:?}"
+    );
+
+    // `refresh_tokens` is the class this invariant was written to expose: it
+    // has an `expires_at` column and NOTHING deletes the rows.
+    let refresh = artifact(&body, "refresh_tokens");
+    assert_eq!(
+        refresh["retention"]["mechanism"],
+        Value::String("none".into()),
+        "nothing in this repository deletes refresh_tokens rows — \
+         `grep -rn 'DELETE FROM refresh_tokens'` is empty. Reporting a \
+         mechanism here would be a false assurance: {refresh}"
+    );
+    assert_eq!(
+        refresh["retention"]["days"],
+        Value::Null,
+        "refresh_tokens has an expires_at column, but expiry is checked at \
+         READ time and no row is ever removed. A day count here would read as \
+         a deletion guarantee: {refresh}"
+    );
+}
+
+// ── 5. What the endpoint cannot say ───────────────────────────────────────
+
+/// The Redis file vault carries no workspace id in its key, so it can neither
+/// be counted nor erased per tenant. That limitation is exactly what an
+/// auditor needs to know, and it is the one thing an omission would hide.
+///
+/// Falsifier: give `redis:filevault` a `row_count` and move it into
+/// `artifacts` — the assertions below fail in both directions.
+#[sqlx::test]
+async fn unenumerable_classes_are_declared_rather_than_omitted(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let enumerable: BTreeSet<String> = body["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .filter_map(|entry| entry["class"].as_str().map(str::to_owned))
+        .collect();
+
+    // Positive control: the endpoint DOES enumerate things. Without this,
+    // "filevault is not in artifacts" would also pass on an empty list.
+    assert!(
+        enumerable.contains("request_events") && enumerable.contains("token_vault_entries"),
+        "the enumerable list is missing classes that certainly are \
+         enumerable, so the exclusion below proves nothing: {enumerable:?}"
+    );
+
+    assert!(
+        !enumerable.contains("redis:filevault"),
+        "the Redis file vault appears among the ENUMERABLE artifacts. Its key \
+         is `filevault:{{ref}}` with no workspace id (redis/mod.rs), so any \
+         count attributed to a workspace is fabricated: {enumerable:?}"
+    );
+
+    let vault = body["not_enumerable"]
+        .as_array()
+        .expect("not_enumerable array")
+        .iter()
+        .find(|entry| entry["class"] == Value::String("redis:filevault".into()))
+        .unwrap_or_else(|| panic!("the Redis file vault is not declared at all: {body}"));
+
+    for needle in ["workspace", "key"] {
+        assert!(
+            vault["reason"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(needle),
+            "the declared reason does not explain that the KEY carries no \
+             WORKSPACE id — an auditor cannot act on `not enumerable`: {vault}"
+        );
+    }
+    assert_eq!(
+        vault["per_workspace_erasure"],
+        Value::String("not_possible".into()),
+        "the file vault cannot be erased for one tenant (its keys are not \
+         partitioned by workspace); the inventory must say so: {vault}"
+    );
+    assert_eq!(
+        vault["row_count"],
+        Value::Null,
+        "a class declared un-enumerable must not also carry a count: {vault}"
+    );
+}
+
+// ── 6. No PII ─────────────────────────────────────────────────────────────
+
+/// Counts, classes, retention and encryption state only — never a sample of
+/// the content being inventoried.
+///
+/// Defences: the PII is confirmed present in BOTH stores before the request
+/// (premise), and the response is confirmed to be a real inventory of those
+/// same rows (positive control), so "the needle is absent" cannot be true
+/// because the response was empty or errored.
+#[sqlx::test]
+async fn inventory_never_echoes_stored_content(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+
+    let plaintext = format!("Please summarise the contract for {SYNTHETIC_NAME}");
+    seed_capture(ws, &plaintext, true).await;
+    sqlx::query(
+        "INSERT INTO token_vault_entries (id, workspace_id, mapping_ciphertext)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws)
+    .bind(&plaintext)
+    .execute(&pool)
+    .await
+    .expect("seed vault");
+
+    // ---- Premise: the needle really is in both stores ----------------------
+    assert_eq!(
+        clickhouse_count(
+            "request_content_captures",
+            &format!(
+                "workspace_id = toUUID('{ws}') AND position(raw_prompt, '{SYNTHETIC_NAME}') > 0"
+            )
+        )
+        .await,
+        1,
+        "premise failed: the synthetic PII is not in ClickHouse, so its \
+         absence from the response proves nothing"
+    );
+    let in_pg: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM token_vault_entries
+         WHERE workspace_id = $1 AND mapping_ciphertext LIKE '%' || $2 || '%'",
+    )
+    .bind(ws)
+    .bind(SYNTHETIC_NAME)
+    .fetch_one(&pool)
+    .await
+    .expect("premise count");
+    assert_eq!(in_pg, 1, "premise failed: the synthetic PII is not in Postgres");
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    // ---- Positive control: the response IS an inventory of those rows ------
+    assert_eq!(
+        row_count(&body, "request_content_captures"),
+        1,
+        "the capture row was not inventoried, so this response is not the one \
+         under test: {body}"
+    );
+    assert_eq!(
+        row_count(&body, "token_vault_entries"),
+        1,
+        "the vault row was not inventoried: {body}"
+    );
+
+    let serialized = body.to_string();
+    assert!(
+        !serialized.contains(SYNTHETIC_NAME),
+        "the inventory echoed stored content back to the caller"
+    );
+    for fragment in ["Anvar", "Karimov", "summarise the contract"] {
+        assert!(
+            !serialized.contains(fragment),
+            "the inventory leaked the fragment {fragment:?} of stored content"
+        );
+    }
+}
+
+// ── 7. Auth ───────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn data_inventory_requires_authentication(pool: PgPool) {
+    let app = build_app(pool);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/data-inventory")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The capture toggle is NOT moved here (see the WS3-5 report). The inventory
+/// must therefore point at the control that governs it, by name, or an
+/// auditor reading "capture: enabled" has no way to find who can change it.
+#[sqlx::test]
+async fn capture_toggle_is_attributed_to_the_control_that_governs_it(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let capture = artifact(&body, "request_content_captures");
+    let governance = &capture["governed_by"];
+    assert_eq!(
+        governance["endpoint"],
+        Value::String("PUT /v1/secure-mode".into()),
+        "the inventory does not name the endpoint that switches raw capture \
+         on: {capture}"
+    );
+    assert_eq!(
+        governance["field"],
+        Value::String("capture_raw_content".into()),
+        "the inventory does not name the field: {capture}"
+    );
+    assert_eq!(
+        governance["role_required"],
+        Value::String("admin".into()),
+        "the inventory does not state the admin gate: {capture}"
+    );
+    assert_eq!(
+        governance["audit_table"],
+        Value::String("raw_capture_audit".into()),
+        "the inventory does not point at the append-only record of who \
+         switched it: {capture}"
+    );
+    // Derived, not asserted: capture is OFF for a workspace that never opted in.
+    assert_eq!(
+        capture["enabled"],
+        Value::Bool(false),
+        "a fresh workspace must report capture disabled: {capture}"
+    );
+}
