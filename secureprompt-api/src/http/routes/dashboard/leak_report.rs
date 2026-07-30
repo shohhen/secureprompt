@@ -22,14 +22,20 @@
 //!   write path maps every class through
 //!   `analytics::detection_counts::canonicalize`. So even a compromised ML
 //!   sidecar cannot get bytes into this report through the label channel.
-//! * `model` can only ever hold a name an ADMINISTRATOR registered in `models`
-//!   or the literal `unregistered` — the write path maps it through
-//!   `analytics::detection_counts::canonicalize_model`. This is a FIX, not an
-//!   original property: `resolve_model`'s Phase-1 passthrough forwards an
-//!   unregistered model name verbatim, so before that mapping existed, posting
-//!   `{"model": "<a name and a national id>"}` put those bytes on every counts
-//!   row this workspace wrote and rendered them back in `by_model`. Both the
-//!   header above and `CONTENT_POLICY` asserted otherwise while it did.
+//! * `model` can only ever RENDER as a name in this workspace's `models`
+//!   catalogue or the literal `unregistered`. This is a FIX, not an original
+//!   property, and it took two goes. `resolve_model`'s Phase-1 passthrough
+//!   forwards an unregistered model name verbatim, so before any mapping
+//!   existed, posting `{"model": "<a name and a national id>"}` put those bytes
+//!   on every counts row this workspace wrote and rendered them back in
+//!   `by_model`. 912cd5e closed the WRITE path
+//!   (`analytics::detection_counts::canonicalize_model`) and stopped there —
+//!   but `detection_class_counts` has a 90-day TTL, so every row written before
+//!   that upgrade kept rendering unbounded bytes for ninety days while this
+//!   header and `CONTENT_POLICY` both asserted it could not. The RENDER is now
+//!   bounded too, against the live catalogue, by [`bound_model`]. See
+//!   [`registered_models`] for why that is a read-path guard rather than a
+//!   backfill migration, and what it costs.
 //! * Errors are built from validated dates and fixed strings. No handler in
 //!   this file interpolates a request body or a stored value into an error.
 //!
@@ -73,10 +79,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use clickhouse::Row;
 use secureprompt_common::errors::ApiError;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use crate::{
+    analytics::detection_counts::UNREGISTERED_MODEL,
     app_state::AppState,
     http::{
         api_error_response,
@@ -108,14 +115,24 @@ const CONTENT_POLICY: &str =
     "This report contains COUNTS ONLY. Every string in it comes from one of \
      three bounded sources, and none of them is a request body. `entity_class` \
      values are identifiers from a fixed vocabulary compiled into the gateway. \
-     `model` is either a name an ADMINISTRATOR registered in this workspace's \
-     model catalogue or the literal `unregistered`, which is what a request \
-     naming an uncatalogued model is reported as — a caller cannot choose the \
-     bytes that appear here. `api_key_name` and `user_id` are the operator's \
-     own attribution metadata; `api_key_name` is free text an administrator \
-     chose and may name a person. NO DETECTED VALUE — no name, number, card or \
-     address taken from a prompt — is stored in the table this report reads or \
-     emitted anywhere in this payload.";
+     `model` is either a name that is in this workspace's model catalogue AS \
+     OF NOW or the literal `unregistered`, which is what a request naming an \
+     uncatalogued model is reported as — a caller cannot choose the bytes that \
+     appear here. That bound is applied TWICE, and the second one matters for \
+     reading this document: the gateway bounds `model` when it WRITES a counts \
+     row, and this report bounds it again when it RENDERS one, against the \
+     catalogue at the moment you asked. Two consequences, both real. (1) Rows \
+     written before the write-path bound existed are still on disk for that \
+     table's 90-day retention window and still carry whatever name was \
+     requested; they are reported here under `unregistered`, but a reader \
+     querying `detection_class_counts` DIRECTLY will see the stored value. \
+     (2) A model an administrator has since DELETED from the catalogue is \
+     reported as `unregistered` even for a window in which it was registered. \
+     `api_key_name` and `user_id` are the operator's own attribution metadata; \
+     `api_key_name` is free text an administrator chose and may name a person. \
+     NO DETECTED VALUE — no name, number, card or address taken from a prompt \
+     — is stored in the table this report reads or emitted anywhere in this \
+     payload.";
 
 /// What this report DOES and DOES NOT see.
 ///
@@ -375,6 +392,116 @@ fn validate_window(from: NaiveDate, to: NaiveDate) -> Result<(), ApiError> {
 /// already subject to the deployment's log handling rather than being handed to
 /// an HTTP caller.
 ///
+/// The model names an ADMINISTRATOR registered for this workspace, read at
+/// render time.
+///
+/// # Why the report reads this at all
+///
+/// 912cd5e bounded `model` at the WRITE path and shipped no backfill, and
+/// `detection_class_counts` has a 90-DAY TTL. So for ninety days after that
+/// upgrade, every deployment holds rows whose `model` is whatever bytes an
+/// API-key holder chose, and `by_model` rendered them underneath a
+/// [`CONTENT_POLICY`] asserting the opposite — measured, from rows inserted the
+/// way pre-upgrade rows sit on disk:
+///
+/// ```text
+/// "model":"Anvar Karimov 30107030010011 anvar.karimov@example.uz"
+/// "model":"Bekzod Toshmatov +998 90 123 45 67"
+/// ```
+///
+/// # Why not a migration
+///
+/// A ClickHouse `ALTER TABLE ... UPDATE` was the first candidate and cannot do
+/// the job, for a reason that is not about mutations being asynchronous:
+/// registration is a POSTGRES fact, per workspace, and ClickHouse cannot see
+/// it. A migration could therefore only either (a) apply a charset/length
+/// heuristic — which 912cd5e already rejected, because any bound loose enough
+/// to pass `gpt-4o-mini` also passes `4111111111111111` — or (b) rewrite EVERY
+/// historical row to the bucket, destroying ninety days of legitimate
+/// destination breakdown to fix a subset of it. Both are worse than the defect.
+///
+/// Reading the catalogue at render time evaluates the ACTUAL rule, covers every
+/// row already on disk with no window at all, leaves the stored rows untouched
+/// for anyone re-reading them, and defends the write path a second time.
+///
+/// # What it costs
+///
+/// The claim becomes "a name in this workspace's catalogue AS IT IS NOW". A
+/// model an admin has since DELETED renders as `unregistered` in a report over
+/// a window when it was registered. That is a real change in meaning and it is
+/// stated in [`CONTENT_POLICY`]; it is also the more checkable claim, because a
+/// reader can compare the report against the catalogue in front of them.
+///
+/// # RLS
+///
+/// `models` carries FORCE ROW LEVEL SECURITY keyed on
+/// `app.current_workspace_id`. With that GUC unset the predicate is NULL for
+/// every row and this returns the EMPTY SET, which would collapse every
+/// destination into the bucket and silently delete the breakdown from a
+/// compliance report. It looks fine today only because the compose role is a
+/// superuser. So the read runs inside a transaction that sets the GUC first —
+/// the same pattern, and for the same measured reason, as
+/// `data_inventory::postgres_counts`. The `WHERE` clause is still the filter;
+/// RLS is defence in depth (Global Constraint 3).
+async fn registered_models(pool: &sqlx::PgPool, ws: Uuid) -> Result<BTreeSet<String>, ApiError> {
+    let mut tx = pool.begin().await.map_err(|e| pg_err("begin", &e))?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(ws.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_err("set_config", &e))?;
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM models WHERE workspace_id = $1")
+        .bind(ws)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| pg_err("models", &e))?;
+    tx.commit().await.map_err(|e| pg_err("commit", &e))?;
+    Ok(names.into_iter().collect())
+}
+
+/// The destination name this report may print for a stored `model`.
+///
+/// Same rule as `analytics::detection_counts::canonicalize_model`, evaluated
+/// against the catalogue instead of against `ResolvedModel::is_registered` —
+/// because a stored row carries no resolution, only the string.
+///
+/// [`UNREGISTERED_MODEL`] passes through: it is the bucket the write path
+/// already collapsed uncatalogued destinations into, and it is a literal in
+/// this binary rather than something a caller chose.
+fn bound_model(stored: String, registered: &BTreeSet<String>) -> String {
+    if stored == UNREGISTERED_MODEL || registered.contains(&stored) {
+        stored
+    } else {
+        UNREGISTERED_MODEL.to_owned()
+    }
+}
+
+/// Map a Postgres failure WITHOUT echoing its message.
+///
+/// `ApiError::Database(msg)` renders `msg` into the response body (see
+/// `http::api_error_response`), and a Postgres error quotes column values in
+/// constraint and cast failures. Same rule as [`ch_err`], same reason.
+///
+/// The report is REFUSED rather than rendered with an empty catalogue: an
+/// unreadable `models` table means the destination rule cannot be evaluated,
+/// and collapsing every model into the bucket would silently delete the
+/// breakdown from a compliance document.
+fn pg_err(what: &str, e: &sqlx::Error) -> ApiError {
+    tracing::error!(
+        stage = what,
+        error = %e,
+        "leak report could not read the model catalogue; the store's message is \
+         logged here and deliberately NOT returned to the caller"
+    );
+    ApiError::Internal(
+        "leak report could not be produced: this workspace's model catalogue \
+         could not be read, so `by_model` cannot be bounded to registered \
+         names. The store's own error message is in the gateway log, not in \
+         this response. No partial report is returned."
+            .to_owned(),
+    )
+}
+
 /// A missing table is NOT converted to an empty result — the analytics
 /// endpoints do that for the dbt marts, and here it would render a gateway
 /// whose migrations never ran as "nothing leaked".
@@ -519,15 +646,37 @@ async fn get_leak_report(
         })
         .collect();
 
-    let mut models: BTreeMap<String, Vec<ClassCount>> = BTreeMap::new();
+    // Every stored `model` goes through `bound_model` on the way out, so rows
+    // written before the WRITE path bounded the column — the table's whole
+    // 90-day TTL of them — cannot render caller-chosen bytes. See
+    // [`registered_models`] for why this is a read-path guard and not a
+    // migration.
+    //
+    // Two destinations can now collapse into one bucket, so both levels are
+    // ACCUMULATED rather than pushed. Summing is exact, not an approximation:
+    // `model` is denormalised onto the counts rows from the request that
+    // produced them, so every row sharing a `request_id` carries the same
+    // model, and the request sets of two distinct model values are disjoint.
+    // The per-CLASS figures are still never summed to make a model total —
+    // a request carrying two classes appears in both, and
+    // `a_model_name_stored_before_the_bound_is_never_rendered` asserts the
+    // bucket reports 2 requests and not 3 for exactly that case.
+    let registered = registered_models(&state.db, ws)
+        .await
+        .map_err(api_error_response)?;
+
+    let mut models: BTreeMap<String, BTreeMap<String, (u64, u64)>> = BTreeMap::new();
     for row in model_rows {
-        models.entry(row.model).or_default().push(ClassCount {
-            entity_class: row.entity_class,
-            entities: row.entities,
-            requests: row.requests,
-        });
+        let class = models
+            .entry(bound_model(row.model, &registered))
+            .or_default()
+            .entry(row.entity_class)
+            .or_insert((0, 0));
+        class.0 += row.entities;
+        class.1 += row.requests;
     }
-    let model_totals = group_totals(
+    let mut model_totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for (stored, (entities, requests)) in group_totals(
         ch,
         "model",
         "SELECT model AS grp, sum(entity_count) AS entities, \
@@ -538,16 +687,30 @@ async fn get_leak_report(
         end,
     )
     .await
-    .map_err(api_error_response)?;
+    .map_err(api_error_response)?
+    {
+        let total = model_totals
+            .entry(bound_model(stored, &registered))
+            .or_insert((0, 0));
+        total.0 += entities;
+        total.1 += requests;
+    }
     let by_model: Vec<ModelBreakdown> = models
         .into_iter()
-        .map(|(model, by_class)| {
+        .map(|(model, classes)| {
             let (entities, requests) = model_totals.get(&model).copied().unwrap_or((0, 0));
             ModelBreakdown {
                 model,
                 entities,
                 requests,
-                by_class,
+                by_class: classes
+                    .into_iter()
+                    .map(|(entity_class, (entities, requests))| ClassCount {
+                        entity_class,
+                        entities,
+                        requests,
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -686,20 +849,26 @@ fn attribution() -> Attribution {
         available: vec![
             AvailableDimension {
                 dimension: "model",
-                source: "the workspace's registered `models` entry for the requested \
-                         name, recorded on every counts row",
-                caveat: "The model the CALLER asked for, but only when that name is one \
-                         an administrator REGISTERED for this workspace. A request \
-                         naming an uncatalogued model is served anyway (the gateway \
-                         passes the name through to the provider) and is reported under \
-                         the single bucket `unregistered`, because the name is then \
-                         caller-supplied free text and this report must not render \
-                         those bytes. A pilot that wants passthrough traffic broken \
-                         down by destination must catalogue the models first. \
-                         Separately: when provider fallback redirected a request, the \
-                         model that actually served it can differ; the destination that \
-                         mattered for disclosure is the provider, and this report \
-                         groups by the requested name.",
+                source: "the `model` recorded on every counts row, matched against \
+                         this workspace's `models` catalogue when the report is \
+                         rendered",
+                caveat: "The model the CALLER asked for, but only when that name is in \
+                         this workspace's catalogue at the moment the report is \
+                         produced. A request naming an uncatalogued model is served \
+                         anyway (the gateway passes the name through to the provider) \
+                         and is reported under the single bucket `unregistered`, \
+                         because the name is then caller-supplied free text and this \
+                         report must not render those bytes. Two things follow from \
+                         the match happening at RENDER time: a model deleted from the \
+                         catalogue since the window drops into `unregistered` too, and \
+                         a row written before the gateway bounded the column at write \
+                         time is reported safely here while still holding the \
+                         requested name on disk. A pilot that wants passthrough \
+                         traffic broken down by destination must catalogue the models \
+                         first. Separately: when provider fallback redirected a \
+                         request, the model that actually served it can differ; the \
+                         destination that mattered for disclosure is the provider, and \
+                         this report groups by the requested name.",
             },
             AvailableDimension {
                 dimension: "user_id",
