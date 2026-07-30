@@ -2334,3 +2334,195 @@ async fn capture_toggle_is_attributed_to_the_control_that_governs_it(pool: PgPoo
         "a fresh workspace must report capture disabled: {capture}"
     );
 }
+
+// ── WS3-5: the self-test details are response fields too ──────────────────
+//
+// 42c99f4 stopped `leak_report::ch_err` echoing ClickHouse's message; 38f2a7b
+// did the same for this file's three `counted()` sites and `redis:budget`,
+// through the `unavailable` helper. The two `_self_test_detail` fields were
+// missed both times, and they are the same defect: a `String` on the response
+// struct, built with `format!("… failed: {e}")`, over an error type nothing
+// bounds. `KmsBackend::encrypt` returns `anyhow::Result`, so the message is
+// whatever the backend attached — `FileKms` interpolates the AES layer's
+// error, `VaultKms` attaches its own context, and a backend added later is
+// unconstrained by anything but the trait.
+
+/// What a backend can attach to its own error, and what must therefore never
+/// reach an HTTP caller. Synthetic: no such host exists.
+const KMS_ENDPOINT_MARKER: &str =
+    "https://vault.internal.example:8200/v1/transit/keys/sp-master-key";
+
+/// A backend that fails the way a misconfigured real one does — with its
+/// configuration in the message.
+struct HostileKms {
+    mode: &'static str,
+}
+
+#[async_trait::async_trait]
+impl secureprompt_common::kms::KmsBackend for HostileKms {
+    async fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if self.mode == "encrypt_fails" {
+            anyhow::bail!("transit engine at {KMS_ENDPOINT_MARKER} refused: permission denied");
+        }
+        Ok(plaintext.to_vec())
+    }
+    async fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if self.mode == "decrypt_fails" {
+            anyhow::bail!("transit engine at {KMS_ENDPOINT_MARKER} refused: permission denied");
+        }
+        Ok(ciphertext.to_vec())
+    }
+}
+
+fn build_app_with_kms(pool: PgPool, mode: &'static str) -> Router {
+    let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    let mut state = AppState::new(
+        pool,
+        test_config(),
+        ml,
+        Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
+    );
+    state.kms = Arc::new(HostileKms { mode });
+    build_router(state)
+}
+
+/// A KMS that fails must not put its own message in the attestation.
+///
+/// PREMISE for the absence claim — and this is the point of it: the marker is
+/// asserted to be IN the backend's error first. `report_contains_no_detected_\
+/// value` and `counts_never_store_the_detected_values` hunt for strings no
+/// code path on their route could ever emit, so they could not have caught the
+/// defect they were written for. This one hunts for a string the route
+/// demonstrably DID emit.
+///
+/// POSITIVE CONTROL: the same router with a working backend must report `ok`,
+/// so `failed` is the probe reacting rather than a constant.
+#[sqlx::test]
+async fn a_failing_kms_does_not_echo_its_own_message_into_the_response(pool: PgPool) {
+    // PREMISE: the marker really is in what the backend hands the handler.
+    for mode in ["encrypt_fails", "decrypt_fails"] {
+        let backend = HostileKms { mode };
+        let err = if mode == "encrypt_fails" {
+            secureprompt_common::kms::KmsBackend::encrypt(&backend, b"x")
+                .await
+                .expect_err("this stub must fail")
+        } else {
+            secureprompt_common::kms::KmsBackend::decrypt(&backend, b"x")
+                .await
+                .expect_err("this stub must fail")
+        };
+        assert!(
+            err.to_string().contains(KMS_ENDPOINT_MARKER),
+            "premise failed: the stub's `{mode}` error does not carry the \
+             marker, so the assertion below proves nothing: {err}"
+        );
+    }
+
+    let (ws, user) = seed_workspace(&pool).await;
+    let token = make_jwt(ws, user, "admin");
+
+    // POSITIVE CONTROL first: an identity backend answers `ok`.
+    let healthy = build_app_with_kms(pool.clone(), "identity");
+    let (status, body) = get_inventory(&healthy, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["encryption_basis"]["kms_self_test"],
+        Value::String("ok".into()),
+        "positive control: a working backend must pass, or `failed` below is \
+         a constant: {body}"
+    );
+
+    for mode in ["encrypt_fails", "decrypt_fails"] {
+        let app = build_app_with_kms(pool.clone(), mode);
+        let (status, body) = get_inventory(&app, &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["encryption_basis"]["kms_self_test"],
+            Value::String("failed".into()),
+            "a `{mode}` backend must be reported as failed: {body}"
+        );
+        let detail = body["encryption_basis"]["kms_self_test_detail"]
+            .as_str()
+            .unwrap_or_else(|| panic!("kms_self_test_detail must be a string: {body}"));
+        assert!(
+            detail.len() > 60,
+            "`{mode}` must still SAY something — a bounded sentence is the fix, \
+             an empty one is a regression: {detail:?}"
+        );
+        let text = body.to_string();
+        assert!(
+            !text.contains(KMS_ENDPOINT_MARKER),
+            "the KMS backend's own error message reached the response body of a \
+             compliance attestation, carrying the endpoint it was configured \
+             with. mode={mode} detail={detail}"
+        );
+        assert!(
+            !text.contains("permission denied"),
+            "the backend's message reached the body. mode={mode} detail={detail}"
+        );
+    }
+}
+
+/// The FOURTH site of the same defect, and the one no earlier pass looked at.
+///
+/// `postgres_counts` built all four of its error arms with
+/// `ApiError::Database(e.to_string())`, and `http::api_error_response` renders
+/// an `ApiError`'s message straight into the response body. `leak_report`
+/// already had `pg_err` for exactly this, over the same store.
+///
+/// POSITIVE CONTROL first: the same router, same workspace, answers 200 before
+/// the table is dropped — so the 500 below is the query failing and not the
+/// harness.
+///
+/// PREMISE: the 500 is asserted before the body is inspected, so the
+/// "no store message" claim is made about an error this route really produced.
+#[sqlx::test]
+async fn a_postgres_failure_does_not_echo_the_stores_own_message(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let token = make_jwt(ws, user, "admin");
+    let app = build_app(pool.clone());
+
+    let (status, body) = get_inventory(&app, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "positive control: a healthy deployment must answer 200, or the 500 \
+         below proves nothing: {body}"
+    );
+
+    // Break exactly one relation the counts query reads. `#[sqlx::test]` gives
+    // this test its own database, so nothing else sees it.
+    sqlx::query("DROP TABLE raw_capture_audit CASCADE")
+        .execute(&pool)
+        .await
+        .expect("premise: the table must exist to be dropped");
+
+    let (status, body) = get_inventory(&app, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "premise: the counts query must actually fail once its relation is \
+         gone, or the assertions below run against a healthy body: {body}"
+    );
+    let text = body.to_string();
+    for leaked in [
+        "raw_capture_audit",
+        "does not exist",
+        "app.current_workspace_id",
+        "PgDatabaseError",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "the Postgres error reached the response body of a compliance \
+             attestation, carrying {leaked:?}: {text}"
+        );
+    }
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the error envelope must carry a message: {text}"));
+    assert!(
+        message.len() > 100,
+        "the bounded form must still tell an operator what is now unknown and \
+         where the real message went: {message:?}"
+    );
+}

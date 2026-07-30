@@ -573,6 +573,59 @@ fn unavailable(table: &str, consequence: &str, error: &str) -> String {
 /// The `consequence` sentence for a plain `count()` that did not answer.
 const NO_COUNT: &str = "the store did not answer, so no count is reported rather than a zero.";
 
+/// [`unavailable`], for the OTHER two `String` fields on this response.
+///
+/// `kms_self_test_detail` and `provider_key_self_test_detail` (`:439`, `:444`)
+/// are response-body fields built by [`kms_self_test`] and
+/// [`provider_key_self_test`], and both were built with
+/// `format!("… failed: {e}")`. That is the third round on one defect class:
+/// 42c99f4 fixed `leak_report::ch_err`, 38f2a7b fixed this file's three
+/// `counted()` sites and `redis:budget` through [`unavailable`], and these two
+/// probes were missed both times — because nothing bounds what `e` is.
+///
+/// Not hypothetically:
+///
+/// * `KmsBackend::encrypt` returns `anyhow::Result`, so the message is
+///   whatever the backend attached. `FileKms` interpolates the AES layer's
+///   own error (`anyhow!("FileKms encrypt failed: {e}")`), `VaultKms` attaches
+///   its own context to a `vaultrs` failure, and a backend added later is
+///   bounded by nothing at all.
+/// * The provider-key arm is worse and is MEASURED, not argued.
+///   `ProviderKeyConfig::to_key_bytes` is `hex::decode` over the KEY MATERIAL,
+///   and its message quotes the offending character of the key and its offset.
+///   `tests::a_malformed_provider_key_is_not_quoted_back_to_the_caller` prints
+///   what the response field held before this helper existed:
+///
+///   ```text
+///   SECUREPROMPT_PROVIDER_KEY is not 64 hex characters, so no provider
+///   credential can be sealed or read: invalid key: hex decode failed:
+///   Invalid character 'q' at position 0
+///   ```
+///
+/// `probe` and `consequence` are `&'static str` rather than `&str` so a caller
+/// cannot reach a runtime value into either — the same reason [`unavailable`]
+/// documents for `table`.
+fn probe_failed(
+    probe: &'static str,
+    consequence: &'static str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    tracing::error!(
+        probe,
+        error = %error,
+        "data-inventory self-test failed; the backend's own message is logged \
+         here and deliberately NOT returned to the caller"
+    );
+    format!(
+        "{consequence} The backend's own error message is in the gateway log, \
+         not in this response, because an encryption backend builds its errors \
+         out of what it was configured with — a key file, a vault endpoint, or \
+         the offending character of a key it could not parse. Treat every \
+         `ciphertext` verdict resting on `{probe}` as UNVERIFIED until the log \
+         is read."
+    )
+}
+
 /// Turn a count result into the three reporting fields, so an unreachable
 /// store degrades into a stated gap instead of a fabricated zero.
 fn counted(
@@ -599,6 +652,44 @@ impl PgCounts {
     }
 }
 
+/// Map a Postgres failure WITHOUT echoing its message.
+///
+/// The FOURTH site of this module's recurring defect, and the one neither
+/// earlier pass looked at: `postgres_counts` built its four error arms with
+/// `ApiError::Database(e.to_string())`, and `http::api_error_response` renders
+/// an `ApiError`'s message straight into the response body — so a Postgres
+/// error reached an unauthenticated-shaped 500 body. It is not a hypothetical
+/// channel either: the transaction sets `app.current_workspace_id` and the RLS
+/// predicates cast it with `::uuid`, and a Postgres cast failure quotes the
+/// value it could not convert.
+///
+/// `leak_report::pg_err` already does exactly this, for the same store, for
+/// the same reason, in the file that endpoint shares a header with. This is
+/// that function, one module over.
+///
+/// The inventory is REFUSED rather than rendered without its Postgres half:
+/// this endpoint exists so an absence is never mistaken for a zero, and
+/// returning the ClickHouse artifacts alone would report a workspace's
+/// `api_keys`, `providers` and `token_vault_entries` as missing classes.
+fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
+    tracing::error!(
+        stage,
+        error = %e,
+        "data-inventory could not read the Postgres counts; the store's message \
+         is logged here and deliberately NOT returned to the caller"
+    );
+    ApiError::Database(
+        "the data inventory could not be produced: this workspace's Postgres \
+         counts could not be read. The store's own error message is in the \
+         gateway log, not in this response, because a database error quotes \
+         the statement that provoked it and, for cast and constraint failures, \
+         the value it choked on. No partial inventory is returned — an \
+         inventory missing its Postgres half reports every Postgres class as \
+         absent, which is the false assurance this endpoint exists to prevent."
+            .to_owned(),
+    )
+}
+
 /// Read every per-workspace Postgres count.
 ///
 /// Runs inside a transaction that sets `app.current_workspace_id` first.
@@ -620,16 +711,13 @@ impl PgCounts {
 /// in depth here, not the filter: Global Constraint 3 — a handler guard over
 /// an unfiltered query is not a fix.
 async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::Database(e.to_string()))?;
+    let mut tx = pool.begin().await.map_err(|e| pg_err("begin", &e))?;
 
     sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
         .bind(ws.to_string())
         .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::Database(e.to_string()))?;
+        .map_err(|e| pg_err("set_config", &e))?;
 
     let sql = format!(
         "SELECT
@@ -677,11 +765,9 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
         .bind(ws)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| ApiError::Database(e.to_string()))?;
+        .map_err(|e| pg_err("counts", &e))?;
 
-    tx.commit()
-        .await
-        .map_err(|e| ApiError::Database(e.to_string()))?;
+    tx.commit().await.map_err(|e| pg_err("commit", &e))?;
 
     Ok(PgCounts { row })
 }
@@ -1870,18 +1956,37 @@ async fn get_data_inventory(
 /// warning: the round trip succeeds perfectly under it, so a probe that only
 /// checked the round trip would call it healthy.
 fn provider_key_self_test() -> (&'static str, String) {
+    use secureprompt_common::config::ProviderKeyConfig;
+    provider_key_self_test_for(&ProviderKeyConfig::from_env_or_zero().hex_key)
+}
+
+/// [`provider_key_self_test`] over an EXPLICIT key, so the failure arms can be
+/// executed by a test.
+///
+/// The split exists because `SECUREPROMPT_PROVIDER_KEY` is process-global: a
+/// test that set it to exercise the malformed-key arm would change the key
+/// every other test in the binary reads, and the arms would stay untested —
+/// which is how they came to interpolate the parser's own message into a
+/// response field in the first place.
+fn provider_key_self_test_for(hex_key: &str) -> (&'static str, String) {
     use secureprompt_common::{config::ProviderKeyConfig, crypto};
 
     const PROBE: &[u8] = b"secureprompt-data-inventory-provider-key-self-test";
 
-    let key = match ProviderKeyConfig::from_env_or_zero().to_key_bytes() {
+    let key = match (ProviderKeyConfig {
+        hex_key: hex_key.to_owned(),
+    })
+    .to_key_bytes()
+    {
         Ok(key) => key,
         Err(e) => {
             return (
                 "failed",
-                format!(
+                probe_failed(
+                    basis::PROVIDER_KEY_SELF_TEST,
                     "SECUREPROMPT_PROVIDER_KEY is not 64 hex characters, so no \
-                     provider credential can be sealed or read: {e}"
+                     provider credential can be sealed or read.",
+                    &e,
                 ),
             )
         }
@@ -1905,7 +2010,11 @@ fn provider_key_self_test() -> (&'static str, String) {
         Err(e) => {
             return (
                 "failed",
-                format!("encrypt of a synthetic marker under the provider key failed: {e}"),
+                probe_failed(
+                    basis::PROVIDER_KEY_SELF_TEST,
+                    "encrypt of a synthetic marker under the provider key failed.",
+                    &e,
+                ),
             )
         }
     };
@@ -1924,7 +2033,11 @@ fn provider_key_self_test() -> (&'static str, String) {
         ),
         Err(e) => (
             "failed",
-            format!("decrypt of a synthetic marker under the provider key failed: {e}"),
+            probe_failed(
+                basis::PROVIDER_KEY_SELF_TEST,
+                "decrypt of a synthetic marker under the provider key failed.",
+                &e,
+            ),
         ),
     }
 }
@@ -1943,10 +2056,18 @@ async fn kms_self_test(kms: &dyn secureprompt_common::kms::KmsBackend) -> (&'sta
     let sealed = match kms.encrypt(KMS_PROBE).await {
         Ok(sealed) => sealed,
         Err(e) => {
+            // `{e:#}` in the LOG, so the operator gets anyhow's whole context
+            // chain. Plain `{e}` would print only the outermost message, and
+            // the chain is the half that says which endpoint or key file.
             return (
                 "failed",
-                format!("encrypt of a synthetic marker failed: {e}"),
-            )
+                probe_failed(
+                    basis::KMS_SELF_TEST,
+                    "encrypt of a synthetic marker through the configured KMS \
+                     backend failed.",
+                    &format!("{e:#}"),
+                ),
+            );
         }
     };
     match kms.decrypt(&sealed).await {
@@ -1964,7 +2085,12 @@ async fn kms_self_test(kms: &dyn secureprompt_common::kms::KmsBackend) -> (&'sta
         ),
         Err(e) => (
             "failed",
-            format!("decrypt of a synthetic marker failed: {e}"),
+            probe_failed(
+                basis::KMS_SELF_TEST,
+                "decrypt of a synthetic marker through the configured KMS \
+                 backend failed.",
+                &format!("{e:#}"),
+            ),
         ),
     }
 }
@@ -2029,6 +2155,174 @@ mod tests {
                 _ => Ok(ciphertext.to_vec()),
             }
         }
+    }
+
+    /// The sweep, as a test rather than as a promise.
+    ///
+    /// This defect class has now been fixed three times in three commits —
+    /// 42c99f4 (`leak_report::ch_err`), 38f2a7b (three `counted()` sites and
+    /// `redis:budget`), and this one (the two self-test probes, plus the four
+    /// `postgres_counts` sites the first two passes did not look at). Each
+    /// round fixed the instances someone had named and left the rest. So the
+    /// rule is asserted over the whole file instead.
+    ///
+    /// THE RULE: a line may build a string from an error only if it is a
+    /// `map_err` producing a plain `String` — which in this module always ends
+    /// up inside [`unavailable`] — or the `{e:#}` argument handed to
+    /// [`probe_failed`] for the LOG. Anything else (an `ApiError`, a `format!`
+    /// returned as a detail) reaches the response body.
+    ///
+    /// PREMISE: the scrape must find lines at all, or an empty list passes.
+    /// POSITIVE CONTROL: the classifier is run over the exact shape this file
+    /// used to contain and must call it an offender.
+    #[test]
+    fn no_response_string_in_this_module_is_built_from_a_stores_own_message() {
+        // Only the HANDLER half of the file. This test's own body quotes the
+        // very shapes it hunts for, and scanning itself would make it fail
+        // permanently on its own positive controls.
+        const WHOLE_FILE: &str = include_str!("data_inventory.rs");
+
+        /// `true` when `line` reaches a caller with an error's own text in it.
+        fn is_offender(line: &str) -> bool {
+            let line = line.trim();
+            let interpolates = line.contains("{e}")
+                || line.contains("{e:#}")
+                || line.contains("{e:?}")
+                || line.contains("e.to_string()");
+            if !interpolates || line.starts_with("//") {
+                return false;
+            }
+            // The two bounded shapes. A `map_err` to `String` is consumed by
+            // `unavailable`; `format!("{e:#}")` is `probe_failed`'s log
+            // argument. A `map_err` that builds an `ApiError` is NOT bounded:
+            // `api_error_response` renders the message into the body.
+            let bounded = (line.contains(".map_err(|e|") && !line.contains("ApiError::"))
+                || line.contains("&format!(\"{e:#}\")");
+            !bounded
+        }
+
+        assert!(
+            is_offender(r#"format!("encrypt of a synthetic marker failed: {e}"),"#),
+            "positive control: the classifier must recognise the exact shape \
+             this file shipped, or it proves nothing"
+        );
+        assert!(
+            is_offender(r#".map_err(|e| ApiError::Database(e.to_string()))?;"#),
+            "positive control: an ApiError built from a store's message is an \
+             offender — `api_error_response` renders it into the body"
+        );
+        assert!(
+            !is_offender(r#".map_err(|e| e.to_string())"#),
+            "control: a map_err to a plain String is how the bounded helpers \
+             are fed, and must not be flagged"
+        );
+
+        let handler_half = WHOLE_FILE
+            .split_once("\n#[cfg(test)]\n")
+            .expect("premise: this module must end in a #[cfg(test)] block")
+            .0;
+        assert!(
+            handler_half.len() > WHOLE_FILE.len() / 2,
+            "premise failed: the split kept only {} of {} bytes — the marker \
+             moved and this test is now scanning almost nothing",
+            handler_half.len(),
+            WHOLE_FILE.len()
+        );
+
+        let scraped: Vec<&str> = handler_half
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.starts_with("//")
+                    && (t.contains("{e}") || t.contains("{e:#}") || t.contains("e.to_string()"))
+            })
+            .collect();
+        assert!(
+            scraped.len() >= 5,
+            "premise failed: only {} error-interpolating lines found in this \
+             module — the scrape is broken, so this test proves nothing",
+            scraped.len()
+        );
+
+        let offenders: Vec<(usize, &str)> = handler_half
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| is_offender(l))
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these lines put a store's or a backend's own error message into a \
+             value this endpoint returns. Route it through `unavailable` or \
+             `probe_failed`, which log it and return a bounded sentence: \
+             {offenders:#?}"
+        );
+    }
+
+    /// The parse arm of the provider-key probe must not hand the parser's own
+    /// message to an HTTP caller.
+    ///
+    /// This one is not hypothetical about what an error type "could" carry.
+    /// `ProviderKeyConfig::to_key_bytes` is `crypto::parse_provider_key`, which
+    /// is `hex::decode` over the KEY MATERIAL — its `InvalidHexCharacter`
+    /// message quotes the offending CHARACTER of the configured key and its
+    /// offset, and its length message states how many bytes the key decodes
+    /// to. `provider_key_self_test_detail` is a `String` on the response
+    /// struct. So a deployment with a fat-fingered `SECUREPROMPT_PROVIDER_KEY`
+    /// published a character of it, and the length of it, to every admin who
+    /// opened the inventory.
+    ///
+    /// PREMISE: the parser's message really does carry those bytes — asserted
+    /// against `to_key_bytes` directly, so the absence claim below is about a
+    /// string this code path can actually produce.
+    ///
+    /// POSITIVE CONTROL: a well-formed non-zero key must still pass, or
+    /// `failed` is a constant and every assertion here is vacuous.
+    #[test]
+    fn a_malformed_provider_key_is_not_quoted_back_to_the_caller() {
+        use secureprompt_common::config::ProviderKeyConfig;
+
+        // A synthetic key. `q` is not a hex digit, so the parser rejects it.
+        let non_hex = format!("q{}", "1".repeat(63));
+        let short = "1".repeat(40);
+
+        for bad in [&non_hex, &short] {
+            let parser_said = (ProviderKeyConfig {
+                hex_key: (*bad).clone(),
+            })
+            .to_key_bytes()
+            .expect_err("premise: this key must not parse");
+            let (verdict, detail) = super::provider_key_self_test_for(bad);
+            assert_eq!(verdict, "failed", "{detail}");
+            assert!(
+                !detail.contains(&parser_said),
+                "the key parser's own message reached a response field. It \
+                 quotes the offending character of SECUREPROMPT_PROVIDER_KEY \
+                 and how many bytes it decoded to. parser={parser_said:?} \
+                 detail={detail:?}"
+            );
+            assert!(
+                detail.len() > 60,
+                "the bounded form must still say what failed: {detail:?}"
+            );
+        }
+
+        // Two controls, because "failed" has two honest causes here and the
+        // fix must not collapse them.
+        let (zero, zero_detail) = super::provider_key_self_test_for(&"0".repeat(64));
+        assert_eq!(zero, "failed", "the all-zero fallback is a failure");
+        assert!(
+            zero_detail.contains("UNSET"),
+            "the zero-key case must keep its own diagnosis: {zero_detail:?}"
+        );
+        let good = format!("{}{}", "0".repeat(63), "1");
+        let (ok, ok_detail) = super::provider_key_self_test_for(&good);
+        assert_eq!(
+            ok, "ok",
+            "positive control: a well-formed non-zero key must round-trip, or \
+             every assertion above holds for a function that always fails: \
+             {ok_detail}"
+        );
     }
 
     #[tokio::test]
