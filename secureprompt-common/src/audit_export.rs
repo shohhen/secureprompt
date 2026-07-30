@@ -403,9 +403,48 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// An instant spelled EXACTLY as the manifest will carry it.
+///
+/// This function exists because of a real interoperability bug, caught by
+/// executing `docs/audit-export-format.md`'s verifier against a genuine
+/// export. [`genesis`] used to hash `DateTime::to_rfc3339()`, which renders UTC
+/// as `2026-07-29T12:00:00+00:00`, while the manifest's JSON — chrono's
+/// `Serialize` — carries `2026-07-29T12:00:00Z`. Measured, on a real artifact:
+///
+/// ```text
+/// manifest window.from : '2026-07-29T12:00:00Z'
+/// chain_genesis        : fdf68ee4...d26e
+/// recomputed from the manifest's own text
+///                      : 9c5cfb6e...ec42   <- disagreed
+/// recomputed with '+00:00'
+///                      : fdf68ee4...d26e   <- what the code actually hashed
+/// ```
+///
+/// The chain seed was therefore NOT derivable from the document an auditor
+/// holds, which makes independent verification impossible — the single thing
+/// this whole module is for. Every Rust-side test passed anyway, because
+/// [`verify_export`] recomputed the seed with the same wrong spelling on both
+/// sides; a self-consistent scheme is exactly what a signature scheme must not
+/// be graded on.
+///
+/// The fix goes through `serde` rather than picking the matching
+/// `SecondsFormat` by hand, so the seed and the manifest cannot drift apart
+/// again if chrono's serialization ever changes: both now come from the same
+/// serializer.
+fn manifest_instant(instant: DateTime<Utc>) -> String {
+    serde_json::to_string(&instant).map_or_else(
+        |_| instant.to_rfc3339(),
+        |quoted| quoted.trim_matches('"').to_owned(),
+    )
+}
+
 /// The chain seed. Binds the export's identity and window into every
 /// subsequent link, so a page from another export cannot be spliced in even
 /// when both exports have the same shape.
+///
+/// Every component is spelled the way the MANIFEST spells it — see
+/// [`manifest_instant`] — because the auditor recomputing this has nothing but
+/// the manifest to read the values out of.
 #[must_use]
 pub fn genesis(
     export_id: Uuid,
@@ -417,8 +456,8 @@ pub fn genesis(
 ) -> [u8; 32] {
     let header = format!(
         "{GENESIS_DOMAIN}\n{export_id}\n{workspace_id}\n{}\n{}\n{}\n{page_size}\n",
-        from.to_rfc3339(),
-        to.to_rfc3339(),
+        manifest_instant(from),
+        manifest_instant(to),
         format.as_str(),
     );
     sha256(header.as_bytes())

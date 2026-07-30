@@ -19,6 +19,7 @@ use secureprompt_common::audit_export::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use ed25519_dalek::SigningKey;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -286,6 +287,79 @@ fn an_export_resigned_with_a_different_key_fails_against_the_published_key() {
         ),
         Err(VerifyError::SignatureInvalid)
     );
+}
+
+// ── The auditor's position ────────────────────────────────────────────────
+
+/// Recompute the chain seed and the whole chain from the manifest's **own
+/// text**, exactly as `docs/audit-export-format.md` tells an auditor to, using
+/// nothing but SHA-256 and the JSON strings.
+///
+/// # The bug this exists for
+///
+/// `genesis` used to hash `DateTime::to_rfc3339()` (`...T12:00:00+00:00`)
+/// while the manifest's JSON carried chrono's serde form (`...T12:00:00Z`), so
+/// the seed was NOT derivable from the document an auditor holds. Independent
+/// verification — the entire point of the scheme — was impossible.
+///
+/// Every Rust test still passed, because `verify_export` recomputed the seed
+/// from the same typed values with the same spelling on both sides. A
+/// signature scheme graded only against itself is self-consistent and worth
+/// nothing; it was caught by running the DOCUMENTED verifier against a real
+/// export. This test is that check, in-gate and without a Python dependency:
+/// it reads strings out of the JSON rather than reusing the typed inputs.
+#[test]
+fn the_chain_is_recomputable_from_the_manifest_text_alone() {
+    for format in [ExportFormat::Csv, ExportFormat::Jsonl] {
+        let e = export(format, &key_a());
+        let m: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+
+        let header = [
+            "secureprompt.audit_export.v1",
+            m["export_id"].as_str().expect("export_id"),
+            m["workspace_id"].as_str().expect("workspace_id"),
+            m["window"]["from"].as_str().expect("window.from"),
+            m["window"]["to"].as_str().expect("window.to"),
+            m["format"].as_str().expect("format"),
+            &m["page_size"].as_u64().expect("page_size").to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let seed = Sha256::digest(header.as_bytes());
+        assert_eq!(
+            hex::encode(seed),
+            m["chain_genesis"].as_str().expect("chain_genesis"),
+            "{}: the chain seed must be derivable from the manifest's own text",
+            format.as_str()
+        );
+
+        // And the whole chain, page by page, over raw 32-byte digests.
+        let mut chain: [u8; 32] = seed.into();
+        for (index, page) in e.pages.iter().enumerate() {
+            let digest = Sha256::digest(page);
+            assert_eq!(
+                hex::encode(digest),
+                m["pages"][index]["sha256"].as_str().expect("sha256"),
+                "page {} digest",
+                index + 1
+            );
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&chain);
+            buf[32..].copy_from_slice(&digest);
+            chain = Sha256::digest(buf).into();
+            assert_eq!(
+                hex::encode(chain),
+                m["pages"][index]["chain"].as_str().expect("chain"),
+                "page {} chain link",
+                index + 1
+            );
+        }
+        assert_eq!(
+            hex::encode(chain),
+            m["chain_root"].as_str().expect("chain_root")
+        );
+    }
 }
 
 // ── No content in the export ──────────────────────────────────────────────
