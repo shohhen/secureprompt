@@ -1,0 +1,88 @@
+-- 009 (WS2-4): which detection engines produced coverage for a request.
+--
+-- WHAT THE COLUMN HOLDS
+--
+-- An ordered array drawn from exactly three string literals in the
+-- SecurePrompt binary (`analytics::engines`):
+--
+--   ['floor']              the deterministic Rust floor alone
+--   ['floor','ml']         floor + ML sidecar over the WHOLE input
+--   ['floor','ml_partial'] floor + ML sidecar over SOME chunks of the input
+--
+-- `floor` is always present because `detection::detect_content` is in-process
+-- and unconditional: there is no configuration, policy or outage that can stop
+-- it running. An empty array is therefore NOT "no engines ran" — it is a row
+-- written before this migration existed. That is why the DEFAULT is `[]` and
+-- not `['floor']`: backfilling a claim onto historical rows would be inventing
+-- audit evidence, and `[]` is honestly readable as "not recorded".
+--
+-- WHY THIS IS NOT A RESTATEMENT OF `floor_only` (migration 006)
+--
+-- Two independent reasons, both measured against the code rather than assumed.
+--
+-- 1. `floor_only` CANNOT DISTINGUISH "the model never saw this" from "the
+--    model saw part of it". Both are `CoverageLoss` and both set the flag
+--    (`pipeline/service.rs`, `event.floor_only = degraded_reason.is_some()`).
+--    For a 300-page loan file that tiled into 47 NER chunks of which 3 were
+--    scanned before the aggregate budget expired, `floor_only = true` reads as
+--    "we did not use the model", which is false, and the three chunks' worth
+--    of PERSON/ADDRESS detections in the same row have no explanation. This
+--    column separates the two cases.
+--
+-- 2. `floor_only` IS OR-ED ACROSS THE PROMPT-SIDE AND RESPONSE-SIDE PASSES.
+--    `degraded_reason` is accumulated with `.or(Some(reason))` when the
+--    response-side redaction pass loses coverage, so a request whose PROMPT
+--    was fully ML-scanned — the scan that decides what leaves the network —
+--    is recorded `floor_only = true` when the sidecar happens to die during
+--    the upstream call. The audit row then asserts something false about the
+--    prompt.
+--
+--    This column is scoped to the PROMPT-SIDE pass, deliberately and
+--    explicitly: it answers "what scanned the bytes before they were
+--    forwarded", which is the question an auditor is actually asking. The
+--    response-side pass has its own signal already (`floor_only`, the
+--    `degrade_response_side` alert label and the sidecar_unavailable counter).
+--
+-- WHY PER-REQUEST AND NOT PER-DETECTION
+--
+-- Per-detection provenance is strictly more informative in the abstract, and
+-- `detection::merge::merge_detections` does know which side each surviving
+-- detection came from. It was rejected for two reasons.
+--
+--   a. THE REQUEST AN AUDITOR DOUBTS IS THE ONE WITH NO DETECTIONS. "Your log
+--      says this prompt was clean — was it clean, or did you not look?"
+--      Per-detection provenance is structurally absent from exactly that row:
+--      `detection_class_counts` (migration 008) writes NO rows for a request
+--      with no detections, by design. The provenance has to live on the
+--      request row or it cannot answer the primary question.
+--
+--   b. PER-DETECTION PROVENANCE OFF THE MERGE WOULD BE BIASED, NOT MERELY
+--      COARSER. `merge_detections` DROPS an ML detection that overlaps a floor
+--      detection (regex wins on overlap). Every entity BOTH engines found
+--      therefore survives as a floor-only detection, and the fact that the
+--      model also found it is discarded before anything could record it. An
+--      auditor sizing the model's contribution from that column would
+--      systematically under-count it, and the audit row would be confidently
+--      wrong. Recording "found by both" means changing the merge's drop
+--      semantics on the request hot path, which is a redaction-correctness
+--      change wearing an analytics hat.
+--
+-- NO OPT-IN GATE, FOR THE SAME REASON AS 008
+--
+-- The column holds one of three string literals from this binary. It is not
+-- derived from the prompt, cannot vary with the prompt, and discloses nothing
+-- about content. Unlike 008 there is not even an allowlist to maintain: the
+-- value comes from a closed Rust enum (`analytics::engines::DetectionEngines`)
+-- whose only constructor is an exhaustive match over `SidecarCoverage`, so
+-- there is no wire-sourced string anywhere on the path.
+--
+-- TTL: inherited from `request_events` (90 days). This is a column on that
+-- table, not a new one, so "everything about a request is gone after 90 days"
+-- is unchanged.
+--
+-- NOTE to migration authors: the worker splits this file on raw semicolons
+-- after stripping line comments, so do not put a bare semicolon inside a
+-- parenthetical on a comment line.
+
+ALTER TABLE request_events
+    ADD COLUMN IF NOT EXISTS engines Array(String) DEFAULT [];

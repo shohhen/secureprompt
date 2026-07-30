@@ -611,15 +611,12 @@ async fn ch_query(sql: &str) -> String {
     text
 }
 
-/// Apply ClickHouse migration 006 the same way the worker does at startup.
-/// Idempotent (`IF NOT EXISTS`), and deliberately explicit rather than a
-/// "skip if the column is missing" guard — a missing column must surface as a
-/// real failure, never as a quietly-passing test.
-async fn ensure_floor_only_column() {
-    // Read the real migration rather than restating its DDL, so this cannot
-    // drift from what the worker actually applies at startup.
-    const MIGRATION: &str = include_str!("../clickhouse/migrations/006_floor_only.sql");
-    let sql: String = MIGRATION
+/// Apply one ClickHouse migration file the same way the worker does at
+/// startup: strip `--` line comments FIRST, then split on `;`. That order is
+/// load-bearing — a comment containing a semicolon otherwise cuts a statement
+/// in half.
+async fn apply_ch_migration(migration: &str) {
+    let sql: String = migration
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
@@ -629,6 +626,27 @@ async fn ensure_floor_only_column() {
             ch_query(statement.trim()).await;
         }
     }
+}
+
+/// Apply ClickHouse migration 006 the same way the worker does at startup.
+/// Idempotent (`IF NOT EXISTS`), and deliberately explicit rather than a
+/// "skip if the column is missing" guard — a missing column must surface as a
+/// real failure, never as a quietly-passing test.
+async fn ensure_floor_only_column() {
+    // Read the real migration rather than restating its DDL, so this cannot
+    // drift from what the worker actually applies at startup.
+    apply_ch_migration(include_str!(
+        "../clickhouse/migrations/006_floor_only.sql"
+    ))
+    .await;
+}
+
+/// WS2-4 — same, for migration 009's `engines` column.
+async fn ensure_engines_column() {
+    apply_ch_migration(include_str!(
+        "../clickhouse/migrations/009_detection_engines.sql"
+    ))
+    .await;
 }
 
 /// Poll for one column of the request's audit row — the analytics writer
@@ -1644,6 +1662,129 @@ async fn redact_under_degrade_policy_reports_partial_coverage(pool: PgPool) -> s
         degraded_header(&response).as_deref(),
         Some("partial_coverage"),
         "partial coverage is its own reason, not an outage reason"
+    );
+    Ok(())
+}
+
+// ── WS2-4: client-visible detection provenance ────────────────────────────
+//
+// `floor_only` (WS2-3, above) answers ONE coarse question and answers it
+// lossily. These tests pin the finer statement: which engines actually
+// produced coverage for the prompt.
+
+/// WS2-4 acceptance: the audit row states WHICH engines ran.
+///
+/// THE DISCRIMINATING CASE is the whole point. Asserting that `engines`
+/// contains `floor` proves nothing — the deterministic floor is in-process and
+/// unconditional, so that assertion passes for a column hard-coded to
+/// `['floor']`. What has to differ is the ML half, so all three reachable
+/// states are driven in one test and asserted to produce three DIFFERENT
+/// values:
+///
+///   healthy sidecar     → ['floor','ml']
+///   dead sidecar        → ['floor']
+///   sidecar dies mid-prompt (long input, one chunk served) → ['floor','ml_partial']
+///
+/// POSITIVE CONTROL: the healthy leg. It must produce a DIFFERENT array from
+/// the other two, and the mock sidecar must record having actually been
+/// called — otherwise "the dead leg has no `ml`" would be satisfied by a
+/// harness that never reached a sidecar at all, or by a column that is always
+/// `['floor']`.
+///
+/// PREMISE for the absence assertion (`ml` not in the dead leg's array): the
+/// dead-sidecar URL is a well-formed `http://127.0.0.1:<port>` with nothing
+/// listening, so the client is CONFIGURED and ENABLED and genuinely attempted
+/// the call. Asserted below via the degraded response header, whose value
+/// distinguishes `all_calls_failed` from `unconfigured`/`disabled`.
+#[sqlx::test]
+async fn audit_row_names_the_engines_that_produced_coverage(pool: PgPool) -> sqlx::Result<()> {
+    ensure_floor_only_column().await;
+    ensure_engines_column().await;
+
+    let workspace_id = Uuid::new_v4();
+    seed(&pool, workspace_id).await?;
+    set_policy(&pool, workspace_id, "degrade_with_alert").await?;
+
+    // ── Leg A (POSITIVE CONTROL): healthy sidecar, complete coverage ──────
+    let healthy_marker = format!("ws2-4-healthy-{}", Uuid::new_v4());
+    let sidecar = MockSidecar::spawn();
+    let response = support::router_with(pool.clone(), &sidecar.url(), CH_DB)
+        .oneshot(tagged_chat_request(&healthy_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !sidecar.ner_requests().is_empty(),
+        "positive control premise: the gateway must actually have reached a \
+         sidecar, or 'ml is absent' below proves nothing"
+    );
+    assert_eq!(
+        degraded_header(&response),
+        None,
+        "positive control premise: the healthy leg must not be degraded"
+    );
+
+    // ── Leg B: sidecar configured but dead — no ML coverage at all ────────
+    let dead_marker = format!("ws2-4-dead-{}", Uuid::new_v4());
+    let response = support::router_with(pool.clone(), &dead_sidecar_url(), CH_DB)
+        .oneshot(tagged_chat_request(&dead_marker))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        degraded_header(&response).as_deref(),
+        Some("all_calls_failed"),
+        "premise for the absence assertion: the sidecar was configured and \
+         enabled and the call was genuinely attempted — not 'unconfigured'"
+    );
+
+    // ── Leg C: long prompt, sidecar serves one chunk then dies ────────────
+    let partial_marker = format!("ws2-4-partial-{}", Uuid::new_v4());
+    let dying = MockSidecar::spawn_with(1, false);
+    let response = support::router_with(pool.clone(), &dying.url(), CH_DB)
+        .oneshot(long_chat_request(Some(&partial_marker)))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        degraded_header(&response).as_deref(),
+        Some("partial_coverage"),
+        "premise: leg C must really be PARTIAL coverage, not an outage"
+    );
+
+    let healthy_engines = await_column("engines", &healthy_marker).await;
+    let dead_engines = await_column("engines", &dead_marker).await;
+    let partial_engines = await_column("engines", &partial_marker).await;
+
+    assert_eq!(
+        healthy_engines, "['floor','ml']",
+        "a fully-covered request must name BOTH engines in its audit row"
+    );
+    assert_eq!(
+        dead_engines, "['floor']",
+        "a request the model never saw must not claim the model ran"
+    );
+    assert_eq!(
+        partial_engines, "['floor','ml_partial']",
+        "a request the model saw PART of must say so — 'ml' would over-claim \
+         and 'floor' alone would erase three chunks of real ML detections"
+    );
+
+    // The three legs must be mutually distinct, or the column carries no
+    // information at all.
+    assert_ne!(healthy_engines, dead_engines);
+    assert_ne!(healthy_engines, partial_engines);
+    assert_ne!(dead_engines, partial_engines);
+
+    // WS2-4's reason for existing, asserted rather than argued: `floor_only`
+    // collapses legs B and C into the same value, so it cannot answer "was
+    // this document scanned by the model" for a long document.
+    assert_eq!(await_column("floor_only", &dead_marker).await, "true");
+    assert_eq!(
+        await_column("floor_only", &partial_marker).await,
+        "true",
+        "premise for the non-redundancy claim: floor_only really does read \
+         the same for partial coverage as for no coverage at all"
     );
     Ok(())
 }
