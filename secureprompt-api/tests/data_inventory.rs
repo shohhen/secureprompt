@@ -334,9 +334,9 @@ fn class_names(body: &Value) -> BTreeSet<String> {
 
 fn row_count(body: &Value, class: &str) -> u64 {
     let entry = artifact(body, class);
-    entry["row_count"].as_u64().unwrap_or_else(|| {
-        panic!("class `{class}` reported no numeric row_count: {entry}")
-    })
+    entry["row_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("class `{class}` reported no numeric row_count: {entry}"))
 }
 
 // ── 1. Row counts ─────────────────────────────────────────────────────────
@@ -374,10 +374,20 @@ async fn row_counts_are_real_and_workspace_scoped(pool: PgPool) {
     seed_token_usage(mine, 2).await;
     seed_token_usage(theirs, 19).await;
     for _ in 0..4 {
-        seed_capture(mine, "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM", true).await;
+        seed_capture(
+            mine,
+            "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM",
+            true,
+        )
+        .await;
     }
     for _ in 0..23 {
-        seed_capture(theirs, "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM", true).await;
+        seed_capture(
+            theirs,
+            "ZmFrZS1jaXBoZXJ0ZXh0LXBhZGRpbmctdG8tMzgtY2hhcnM",
+            true,
+        )
+        .await;
     }
 
     // Postgres: 6 vault entries for me, 29 for them.
@@ -483,7 +493,7 @@ async fn row_counts_are_real_and_workspace_scoped(pool: PgPool) {
 ///
 /// Defences:
 ///
-/// 1. **Premise** — the lying row is confirmed in ClickHouse to have
+/// 1. **Premise** — the lying row is confirmed in `ClickHouse` to have
 ///    `encrypted = 1` AND a payload equal to the plaintext this test wrote.
 ///    Without that, "the endpoint said mixed" could be true because the row
 ///    never landed.
@@ -556,7 +566,11 @@ async fn encryption_state_is_derived_from_stored_bytes_not_the_self_asserted_fla
     let liar_entry = artifact(&liar_body, "request_content_captures");
 
     let (status, honest_body) = get_inventory(&app, &make_jwt(honest, honest_user, "admin")).await;
-    assert_eq!(status, StatusCode::OK, "data-inventory failed: {honest_body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "data-inventory failed: {honest_body}"
+    );
     let honest_entry = artifact(&honest_body, "request_content_captures");
 
     // ---- Positive control: honest ciphertext IS reported as ciphertext -----
@@ -809,9 +823,12 @@ async fn retention_days_without_an_enforcement_mechanism_is_never_reported(pool:
         for entry in body[key].as_array().expect("array") {
             checked += 1;
             let retention = &entry["retention"];
-            let mechanism = retention["mechanism"]
-                .as_str()
-                .unwrap_or_else(|| panic!("class {} has no retention mechanism: {entry}", entry["class"]));
+            let mechanism = retention["mechanism"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "class {} has no retention mechanism: {entry}",
+                    entry["class"]
+                )
+            });
             let days = retention["days"].as_i64();
 
             if days.is_some() {
@@ -1002,7 +1019,10 @@ async fn inventory_never_echoes_stored_content(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("premise count");
-    assert_eq!(in_pg, 1, "premise failed: the synthetic PII is not in Postgres");
+    assert_eq!(
+        in_pg, 1,
+        "premise failed: the synthetic PII is not in Postgres"
+    );
 
     let app = build_app(pool);
     let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;

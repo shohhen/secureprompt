@@ -7,6 +7,8 @@
 pub mod analytics;
 pub mod auth;
 pub mod budgets;
+// WS3-5 — `GET /v1/data-inventory`, the transparency/attestation endpoint.
+pub mod data_inventory;
 // Plan 05-04 namespaces.
 pub mod keys;
 // Phase 7 / Task 30 — `/v1/me/*` for trusted server-to-server callers

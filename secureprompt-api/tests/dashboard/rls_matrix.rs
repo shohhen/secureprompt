@@ -380,6 +380,21 @@ fn matrix_cases() -> Vec<Case> {
         body_fn: None,
         expect: Expect::NoCanary,
     });
+    // WS3-5. Takes no workspace parameter at all — the workspace comes from
+    // the JWT — so `NoCanary` is the only shape that applies. What this case
+    // actually pins is that the endpoint ANSWERS 2xx for an authenticated
+    // admin: a 403 or 500 lands as `Inconclusive`, which fails the run.
+    //
+    // It cannot pin tenancy: the canary is a model NAME and this endpoint
+    // returns counts, so an unfiltered count query would still show no
+    // canary. `data_inventory_is_workspace_scoped` below carries that half,
+    // exactly as `mart_cost_by_model_is_workspace_scoped` does for the mart.
+    cases.push(Case {
+        method: "GET",
+        path_template: "/v1/data-inventory",
+        body_fn: None,
+        expect: Expect::NoCanary,
+    });
 
     cases
 }
@@ -658,6 +673,104 @@ async fn mart_cost_by_model_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()
         !body.to_string().contains(&model_b),
         "workspace B's mart row '{model_b}' leaked into workspace A's \
          cost-by-model response: {body}"
+    );
+
+    Ok(())
+}
+
+/// WS3-5 — tenancy on `GET /v1/data-inventory`.
+///
+/// The matrix case above can only prove this endpoint answers 2xx. It returns
+/// COUNTS, so the canary-substring check that catches every other leak here is
+/// structurally blind to it: an unfiltered `SELECT count()` returns a number
+/// containing no canary and the matrix stays green while the endpoint reports
+/// the whole cluster's row counts to one tenant. That is the same shape as the
+/// `cost-by-model` leak this branch already shipped — a guard that fired only
+/// on a supplied parameter over a query that never filtered — so it gets its
+/// own test rather than a matrix row.
+///
+/// Three defences against a vacuous pass:
+///
+/// 1. **Premise** — both workspaces' row counts are confirmed by direct
+///    `count()` queries against ClickHouse before the request, so "A sees 4"
+///    cannot be true merely because B was never seeded.
+/// 2. **Positive control** — A's own count MUST come back, and it is non-zero
+///    and distinct. An empty or errored response fails here rather than
+///    passing the tenancy assertion by returning nothing.
+/// 3. **Distinguishable totals** — A and B are seeded DIFFERENT, non-zero
+///    counts, so `own == 4` and `own == 4 + 9` are different assertions. A
+///    count query missing its tenancy predicate reports 13.
+///
+/// Falsifier (verified, see the WS3-5 report): replace
+/// `WHERE workspace_id = toUUID('{ws}')` with `WHERE 1 = 1` in
+/// `data_inventory::ch_count` — this test fails with `13 != 4`.
+#[sqlx::test]
+async fn data_inventory_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    // Fresh UUIDs: `request_events` is shared across every run against this
+    // ClickHouse, and seeding under the matrix's fixed workspaces would change
+    // what `cross_tenant_matrix` sees.
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    for _ in 0..4 {
+        seed_canary(ws_a.workspace_id, &format!("inv-own-{run}")).await;
+    }
+    for _ in 0..9 {
+        seed_canary(ws_b.workspace_id, &format!("inv-other-{run}")).await;
+    }
+
+    // ---- Premise assertions, before anything is asserted to be absent ------
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("workspace_id = toUUID('{}')", ws_a.workspace_id)
+        )
+        .await,
+        4,
+        "premise failed: workspace A has no request_events rows, so the \
+         positive control below could not distinguish a live count from a zero"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("workspace_id = toUUID('{}')", ws_b.workspace_id)
+        )
+        .await,
+        9,
+        "premise failed: no OTHER tenant's rows exist, so an unfiltered count \
+         would return the same number as a correct one and this test could not \
+         tell them apart"
+    );
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (_state, router) = build_app(pool);
+
+    let (status, body) = send_raw(&router, "GET", "/v1/data-inventory", None, &token_a).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let events = body["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`artifacts` must be an array: {body}"))
+        .iter()
+        .find(|entry| entry["class"] == json!("request_events"))
+        .unwrap_or_else(|| panic!("no `request_events` class in the inventory: {body}"));
+
+    // ---- Positive control: the permitted count DOES come back --------------
+    assert_eq!(
+        events["row_count_status"],
+        json!("counted"),
+        "the count did not run, so the tenancy assertion below would pass on \
+         a null: {events}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    assert_eq!(
+        events["row_count"],
+        json!(4),
+        "workspace A must see only its own 4 rows. Seeing 13 means the count \
+         query is missing its tenancy predicate and every tenant's row counts \
+         are being reported to A: {events}"
     );
 
     Ok(())
