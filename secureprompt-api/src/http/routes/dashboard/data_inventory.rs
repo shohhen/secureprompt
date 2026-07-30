@@ -1732,6 +1732,17 @@ async fn get_data_inventory(
              is declared `plaintext_by_design` without verification because it is in a \
              store this process cannot query at all. Every other class's verdict can be \
              recomputed from the numbers printed next to it.",
+            "The analytics classes above — `request_events`, `detection_class_counts`, \
+             `policy_events`, `latency_samples`, `token_usage`, the mv_* aggregates and \
+             every dbt relation derived from them — cover GATEWAY TRAFFIC ONLY: requests \
+             through `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. \
+             `/v1/redact`, `/v1/secure-mode/tokenize`, the MCP server and file scanning \
+             run the same detection pass and emit NO analytics event (the whole API crate \
+             enqueues one from a single file, the gateway pipeline), so their requests are \
+             absent from every count in this section. Their SIDE EFFECTS are not: \
+             tokenize writes `token_vault_entries` and file scanning writes \
+             `redis:filevault`, both listed above with their own counts. Read the \
+             analytics counts as covering the gateway, not the product.",
             "A count of zero means the query ran and found nothing. A `row_count` of null \
              with `row_count_status: unavailable` means the store did not answer and the \
              true figure is UNKNOWN. The two are never conflated.",

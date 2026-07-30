@@ -117,6 +117,31 @@ const CONTENT_POLICY: &str =
      address taken from a prompt — is stored in the table this report reads or \
      emitted anywhere in this payload.";
 
+/// What this report DOES and DOES NOT see.
+///
+/// Every number here is derived from `detection_class_counts`, which is written
+/// from a `RequestEvent`, which reaches ClickHouse only through
+/// `AnalyticsHandle::enqueue` — and the whole API crate calls that from exactly
+/// one file, `pipeline/service.rs`, the gateway request pipeline. Every other
+/// surface that runs the same detection pass emits nothing, so its detections
+/// are absent from every figure in this document. A compliance officer reading
+/// "N of M requests would have leaked" cannot be expected to know that; it is
+/// stated in the payload.
+///
+/// `tests/leak_report.rs::the_report_states_that_it_covers_gateway_traffic_only`
+/// asserts the one-call-site premise against the source, so a future endpoint
+/// that starts emitting events reddens rather than making this quietly wrong.
+const COVERAGE: &str =
+    "GATEWAY TRAFFIC ONLY. These figures cover requests through \
+     `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` — the paths \
+     that write `request_events` and `detection_class_counts`. They do NOT \
+     cover `/v1/redact`, `/v1/secure-mode/tokenize`, the MCP server, or file \
+     scanning: those run the same detection pass and emit no analytics event at \
+     all, so entities they found are counted nowhere in this report and their \
+     requests are absent from `requests_in_window` too. This is a limit of what \
+     is recorded, not a claim that those surfaces detected nothing. A workspace \
+     that uses them should read these numbers as a floor.";
+
 const COUNTING_RULE: &str =
     "An `entities` figure counts DISTINCT entities of that class, matching the \
      number of placeholders the redacted prompt carries — the same entity \
@@ -212,6 +237,8 @@ pub struct LeakReportResponse {
     pub generated_at: DateTime<Utc>,
     pub window: Window,
     pub totals: Totals,
+    /// Which product surfaces these numbers cover. See [`COVERAGE`].
+    pub coverage: &'static str,
     pub counting_rule: &'static str,
     pub by_class: Vec<ClassCount>,
     pub by_model: Vec<ModelBreakdown>,
@@ -330,19 +357,40 @@ fn validate_window(from: NaiveDate, to: NaiveDate) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Map a `ClickHouse` failure to an `ApiError` WITHOUT echoing the query.
+/// Map a `ClickHouse` failure to an `ApiError` WITHOUT echoing the query OR
+/// the store's own message.
 ///
-/// The store's message is included because an operator debugging an empty
-/// pilot report needs it, and it cannot contain customer data: every query in
-/// this module selects `count`/`sum` aggregates over class names and never a
-/// payload column. A missing table is NOT converted to an empty result — the
-/// analytics endpoints do that for the dbt marts, and here it would render a
-/// gateway whose migrations never ran as "nothing leaked".
+/// This path had no test and it interpolated `{e}` — `clickhouse::error::Error`
+/// carries the server's message verbatim, and a ClickHouse exception routinely
+/// quotes the bytes it choked on (parse errors, type mismatches, constraint
+/// violations all echo the offending value). The justification written here was
+/// that the message "cannot contain customer data: every query in this module
+/// selects `count`/`sum` aggregates over class names and never a payload
+/// column". That is a statement about the SELECT list and the exception is not
+/// bounded by it — so the module whose one rule is "no detected value, not even
+/// quoted back in an error message" had exactly one path that could.
+///
+/// The operator keeps what they can act on: WHICH table failed, and why no
+/// partial report is returned. The store's message goes to the log, where it is
+/// already subject to the deployment's log handling rather than being handed to
+/// an HTTP caller.
+///
+/// A missing table is NOT converted to an empty result — the analytics
+/// endpoints do that for the dbt marts, and here it would render a gateway
+/// whose migrations never ran as "nothing leaked".
 fn ch_err(table: &str, e: &clickhouse::error::Error) -> ApiError {
+    tracing::error!(
+        table,
+        error = %e,
+        "leak report query failed; the store's message is logged here and \
+         deliberately NOT returned to the caller"
+    );
     ApiError::Internal(format!(
-        "leak report could not be produced: reading {table} failed ({e}). \
-         No partial report is returned, because an incomplete leak report is \
-         indistinguishable from a clean one."
+        "leak report could not be produced: reading {table} failed. The \
+         store's own error message is in the gateway log, not in this \
+         response, because a database exception can quote the row that \
+         provoked it. No partial report is returned, because an incomplete \
+         leak report is indistinguishable from a clean one."
     ))
 }
 
@@ -575,6 +623,7 @@ async fn get_leak_report(
             entities_detected: totals.entities,
             distinct_classes: totals.classes,
         },
+        coverage: COVERAGE,
         counting_rule: COUNTING_RULE,
         by_class,
         by_model,

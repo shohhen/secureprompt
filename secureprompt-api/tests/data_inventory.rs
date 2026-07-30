@@ -1570,6 +1570,70 @@ async fn mart_counts_resolve_to_the_database_dbt_actually_builds_into(pool: PgPo
     );
 }
 
+/// The analytics counts cover GATEWAY traffic only, and the inventory must say
+/// which surfaces that excludes.
+///
+/// `request_events` and everything derived from it are written from exactly one
+/// place, the gateway request pipeline. `/v1/redact`,
+/// `/v1/secure-mode/tokenize`, the MCP server and file scanning run the same
+/// detection pass and emit no event — so an auditor reading
+/// "request_events: 4,812 rows" has no way to know the number is not the
+/// product's traffic. (The premise that there is exactly one emitting call site
+/// is asserted against the source in
+/// `leak_report.rs::the_report_states_that_it_covers_gateway_traffic_only`, so
+/// it reddens if a future endpoint starts emitting.)
+///
+/// POSITIVE CONTROL: the caveat must also name what IS covered. A statement
+/// that only lists exclusions reads as "nothing is covered".
+#[sqlx::test]
+async fn the_inventory_states_which_surfaces_its_analytics_counts_cover(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let caveats: Vec<&str> = body["caveats"]
+        .as_array()
+        .expect("caveats array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let scope = caveats
+        .iter()
+        .find(|c| c.contains("request_events") && c.contains("/v1/redact"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no caveat says the analytics counts cover gateway traffic \
+                 only. An auditor reading a `request_events` row count has no \
+                 way to know it excludes /v1/redact, tokenize, MCP and file \
+                 scanning: {caveats:#?}"
+            )
+        });
+
+    for needle in ["tokenize", "MCP"] {
+        assert!(
+            scope.contains(needle),
+            "the scope caveat does not name {needle:?} among the surfaces its \
+             counts exclude: {scope}"
+        );
+    }
+    assert!(
+        scope.contains("/v1/chat/completions"),
+        "positive control: the caveat must name what IS covered, or it reads \
+         as excluding everything: {scope}"
+    );
+    // The surfaces that emit no ANALYTICS event still leave artifacts, and the
+    // caveat must not be read as "those are absent too" — they are inventoried
+    // above with live counts.
+    for class in ["token_vault_entries", "redis:filevault"] {
+        assert!(
+            class_names(&body).contains(class),
+            "the caveat points at `{class}` as the store a non-gateway surface \
+             does write, and it is not declared: {body}"
+        );
+    }
+}
+
 // ── 4. Retention ──────────────────────────────────────────────────────────
 
 /// A retention NUMBER with no enforcement MECHANISM is the exact shape of a
