@@ -1079,3 +1079,70 @@ async fn revoked_is_superseded_by_a_different_license_but_not_by_itself(
     );
     Ok(())
 }
+
+/// The console reaches `/v1/license` from a browser, so the FULL request path
+/// includes a CORS preflight. `CorsLayer` is applied outside the license gate
+/// in `build_router`, so `OPTIONS` short-circuits above it — asserted here
+/// rather than left as a claim about layer ordering.
+#[sqlx::test]
+async fn cors_preflight_for_the_recovery_route_survives_revocation(pool: PgPool) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    state.license.mark_revoked("lic-under-test");
+    // Premise: the gate really is engaged in this state — otherwise a 200
+    // preflight would prove nothing.
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "premise: the gate must be blocking non-allowlisted routes right now"
+    );
+
+    // Premise: this test reads the default CORS origin `build_router` falls
+    // back to when SECUREPROMPT_CORS_ORIGINS is unset.
+    let cors_env = std::env::var("SECUREPROMPT_CORS_ORIGINS").ok();
+    assert!(
+        cors_env.is_none() || cors_env.as_deref() == Some("http://localhost:3000"),
+        "premise: expected the default CORS origin, got SECUREPROMPT_CORS_ORIGINS={cors_env:?}"
+    );
+
+    let preflight = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/license")
+                .header("Origin", "http://localhost:3000")
+                .header("Access-Control-Request-Method", "PUT")
+                .header("Access-Control-Request-Headers", "authorization,content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        preflight.status().is_success(),
+        "a browser preflight for the recovery route must not be license-403ed, got {}",
+        preflight.status()
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://localhost:3000"),
+        "the preflight must actually be answered by the CORS layer"
+    );
+    assert!(
+        preflight
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m.contains("PUT")),
+        "PUT must be an allowed method — that is the activation call"
+    );
+    Ok(())
+}
