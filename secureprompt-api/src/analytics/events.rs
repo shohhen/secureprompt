@@ -134,6 +134,23 @@ pub struct RequestEvent {
     /// under-claims, so a forgotten call site records less scanning than
     /// happened rather than asserting a model ran when it did not.
     pub engines: crate::analytics::engines::DetectionEngines,
+    /// WS3-6 — whether `model` names a `models` row an ADMINISTRATOR
+    /// registered, as opposed to a string this request's caller invented and
+    /// `resolve_model`'s Phase-1 passthrough forwarded verbatim.
+    ///
+    /// PUBLIC for the same reason as `engines`: it is a closed two-variant
+    /// value, so there is no out-of-vocabulary input to guard against and a
+    /// setter would buy nothing. What it can be is WRONG, and the defence
+    /// against that is the default — `false` under-claims, so a call site that
+    /// forgets to set it buckets a legitimate destination rather than writing
+    /// caller-supplied bytes into `detection_class_counts.model`.
+    ///
+    /// Read only by [`DetectionClassCountRow::from_event`], through
+    /// [`crate::analytics::detection_counts::canonicalize_model`].
+    /// `request_events.model` keeps the raw string: it is the operational
+    /// record a workspace using passthrough needs for per-model cost, and
+    /// `GET /v1/data-inventory` declares that it holds the caller's string.
+    pub model_registered: bool,
     /// WS3-6 — how many DISTINCT entities of each class this request's
     /// detection pass found. The source the shadow-mode leak report
     /// aggregates.
@@ -191,6 +208,7 @@ impl RequestEvent {
             captured: None,
             floor_only: false,
             engines: crate::analytics::engines::DetectionEngines::FloorOnly,
+            model_registered: false,
             detection_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -425,6 +443,12 @@ impl RequestContentCaptureRow {
 /// header for why; the short version is that a join would silently drop whole
 /// classes out of a compliance report whenever the `request_events` row was
 /// lost, and the writer can lose one independently.
+///
+/// `model` is NOT the event's raw string. It goes through
+/// [`crate::analytics::detection_counts::canonicalize_model`] for the same
+/// reason `entity_class` goes through `canonicalize`: this table is read by a
+/// compliance attestation, and a caller must not be able to choose bytes that
+/// land in one.
 #[derive(Row, Serialize)]
 pub struct DetectionClassCountRow {
     #[serde(with = "clickhouse::serde::uuid")]
@@ -433,6 +457,8 @@ pub struct DetectionClassCountRow {
     pub workspace_id: uuid::Uuid,
     #[serde(with = "clickhouse::serde::chrono::datetime")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Always a name an administrator registered in `models`, or the literal
+    /// `unregistered` — never a string the caller put in the request body.
     pub model: String,
     #[serde(with = "clickhouse::serde::uuid::option")]
     pub user_id: Option<uuid::Uuid>,
@@ -460,7 +486,10 @@ impl DetectionClassCountRow {
                 request_id: e.request_id.0,
                 workspace_id: e.workspace_id.0,
                 created_at,
-                model: e.model.clone(),
+                model: crate::analytics::detection_counts::canonicalize_model(
+                    &e.model,
+                    e.model_registered,
+                ),
                 user_id: e.user_id,
                 api_key_name: e.api_key_name.clone(),
                 entity_class: (*class).to_owned(),

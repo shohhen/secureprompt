@@ -377,6 +377,8 @@ impl PipelineService {
         event.record_prompt(prompt);
         // WS3-6 SITE 1/4 — the fail-closed path.
         event.record_detections(detections);
+        // WS3-6 model-channel fix, SITE 1/4. See `ResolvedModel::is_registered`.
+        event.model_registered = resolved.is_registered();
         // WS2-4 SITE 1/4.
         event.engines = engines;
         self.state
@@ -736,6 +738,8 @@ impl PipelineService {
             // detections are exactly what a pilot wants counted: this is the
             // traffic the customer's own rules stopped.
             event.record_detections(&pipeline_state.detections);
+            // WS3-6 model-channel fix, SITE 2/4.
+            event.model_registered = resolved.is_registered();
             // WS2-4 SITE 2/4 — a policy DENY. It ran the same prompt-side
             // detection pass as a served request, so it makes the same
             // provenance statement.
@@ -1048,6 +1052,8 @@ impl PipelineService {
         // report is about: these detections are the PII that would have
         // reached the provider had SecurePrompt not been in front of it.
         event.record_detections(&pipeline_state.detections);
+        // WS3-6 model-channel fix, SITE 3/4.
+        event.model_registered = resolved.is_registered();
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -1141,6 +1147,7 @@ impl PipelineService {
         let api_key_id = auth.api_key_id;
         let api_key_name = auth.api_key_name.clone();
         let public_model = request.public_model.clone();
+        let model_registered = resolved.is_registered();
         let final_action = policy_outcome.result.final_action.clone();
         let policy_events = policy_outcome.result.events.clone();
         let redacted_prompt_text = pipeline_input
@@ -1354,6 +1361,10 @@ impl PipelineService {
             // buffered path, so a workspace that streams is not invisible to
             // the leak report.
             event.record_detections(&prompt_detections);
+            // WS3-6 model-channel fix, SITE 4/4. Captured into the generator
+            // alongside `public_model`, because `resolved` is a borrow that
+            // does not outlive this function.
+            event.model_registered = model_registered;
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
             // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`,
             // captured outside this generator and moved in) times this

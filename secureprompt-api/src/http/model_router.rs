@@ -46,6 +46,28 @@ pub struct ResolvedModel {
     pub targets: Vec<ModelTarget>,
 }
 
+impl ResolvedModel {
+    /// Whether `public_model` names a `models` row an administrator created,
+    /// as opposed to a string this request's caller invented.
+    ///
+    /// `resolve_model`'s Phase-1 passthrough (below) synthesises a target with
+    /// `model_id: Uuid::nil()` and copies the caller's raw string into
+    /// `model_name`; real targets come from
+    /// `ProviderRepository::resolve_model_targets`, which populates `model_id`
+    /// from the `models.id` Postgres UUID primary key. So the nil check is the
+    /// signal, and it is the same one `pipeline::service::model_label` already
+    /// uses to bound the Prometheus `model` label.
+    ///
+    /// `false` for a resolution with no targets at all: unknown provenance
+    /// must read as unregistered, never as registered.
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        self.targets
+            .first()
+            .is_some_and(|t| !t.model_id.is_nil())
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigCache {
     api_keys: RwLock<HashMap<String, CachedApiKey>>,

@@ -55,6 +55,75 @@ use std::collections::{BTreeMap, BTreeSet};
 /// can never collide with a real class name.
 pub const OTHER: &str = "other";
 
+/// The bucket for a destination the workspace never registered. See
+/// [`canonicalize_model`].
+pub const UNREGISTERED_MODEL: &str = "unregistered";
+
+/// Longest registered model name written through verbatim. `us.anthropic.
+/// claude-sonnet-4-5-20250929-v1:0` is 44 characters, so this is generous by
+/// a factor of three and still bounds the column.
+const MAX_MODEL_LEN: usize = 128;
+
+/// The destination name that may be written to `detection_class_counts.model`.
+///
+/// # Why this exists
+///
+/// `model` is the THIRD caller-controlled channel into this table, after the
+/// value channel and the class-name channel [`canonicalize`] closes. It is the
+/// one that was open:
+///
+/// * `http::model_router::resolve_model` has a Phase-1 passthrough — when no
+///   `models` row matches the requested name, it synthesises a target from the
+///   workspace's first provider and forwards the caller's string VERBATIM, with
+///   no allowlist, no charset check and no length cap anywhere on the path.
+/// * The analytics writer denormalises that string onto every counts row, and
+///   `GET /v1/leak-report` renders it as `by_model[].model`.
+///
+/// So before this function, any API-key holder could write arbitrary bytes into
+/// an auditor-facing table with a 90-day TTL, and have them rendered back
+/// inside a compliance attestation whose own `content_policy` asserted that no
+/// name, number, card or address appears anywhere in it. Posting
+/// `{"model": "Anvar Karimov 30107030010011 anvar.karimov@example.uz"}`
+/// reproduced exactly that.
+///
+/// # The rule, and why it is this one
+///
+/// `registered` is true only when the name resolved to a `models` row an
+/// ADMINISTRATOR created — see `ResolvedModel::is_registered`. Anything else
+/// collapses to [`UNREGISTERED_MODEL`]. The column can therefore hold only
+/// operator-configured strings or one literal from this binary, which puts
+/// `model` in the same category the report already discloses for
+/// `api_key_name`: operator attribution metadata, never caller content.
+///
+/// Two alternatives were weighed and rejected:
+///
+/// * **Reject the request.** `resolve_model`'s passthrough is deliberate — it
+///   lets a workspace call a provider model it has not catalogued yet, and the
+///   provider (not SecurePrompt) is the layer that knows which names it
+///   accepts. Refusing here would break working traffic to fix a reporting
+///   defect.
+/// * **A charset/length bound alone.** It does not make the claim true. Every
+///   real model name contains hyphens and digits, so a bound loose enough to
+///   pass `gpt-4o-mini` also passes `4111111111111111` and `Anvar-Karimov`.
+///   A bound is kept below, but as defence in depth over the registered name —
+///   `models.model_name` is still a write channel, just an admin-privileged
+///   one — not as the primary rule.
+///
+/// Bucketing rather than dropping, for the same reason as [`OTHER`]: the
+/// passthrough request's detections are real, and a report that silently
+/// discarded them would under-state the leak it exists to measure.
+#[must_use]
+pub fn canonicalize_model(model: &str, registered: bool) -> String {
+    let bounded = !model.is_empty()
+        && model.len() <= MAX_MODEL_LEN
+        && model.chars().all(|c| c.is_ascii_graphic());
+    if registered && bounded {
+        model.to_owned()
+    } else {
+        UNREGISTERED_MODEL.to_owned()
+    }
+}
+
 /// Every class name that may be written to `detection_class_counts`.
 ///
 /// Two origins, deliberately in one list because the column does not
@@ -298,5 +367,55 @@ mod tests {
     #[test]
     fn no_detections_means_no_rows() {
         assert!(per_class(&[]).is_empty());
+    }
+
+    /// The property `CONTENT_POLICY` now rests on: a caller cannot choose the
+    /// bytes that land in `detection_class_counts.model`.
+    #[test]
+    fn a_model_name_the_caller_invented_is_bucketed() {
+        // The exact reproduction: a chat request whose `model` field carried a
+        // name, a national identifier and an e-mail. `resolve_model`'s
+        // Phase-1 passthrough forwards it verbatim, so `registered` is false.
+        assert_eq!(
+            canonicalize_model("Anvar Karimov 30107030010011 anvar.karimov@example.uz", false),
+            UNREGISTERED_MODEL
+        );
+        // A caller-supplied name that LOOKS like a model is still not one:
+        // registration, not the string's shape, is the signal.
+        assert_eq!(canonicalize_model("gpt-4o-mini", false), UNREGISTERED_MODEL);
+        // Positive control: a registered name is written through VERBATIM, or
+        // the destination breakdown the report exists for is destroyed and
+        // every assertion above would hold for a constant.
+        assert_eq!(canonicalize_model("gpt-4o-mini", true), "gpt-4o-mini");
+        assert_eq!(
+            canonicalize_model("us.anthropic.claude-sonnet-4-5-20250929-v1:0", true),
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+    }
+
+    /// Defence in depth over the registered name. `models.model_name` is
+    /// admin-writable through the dashboard API, so "registered" bounds WHO
+    /// wrote the string, not WHAT it is.
+    #[test]
+    fn a_registered_name_that_is_not_label_shaped_is_bucketed() {
+        for hostile in [
+            "",                                   // empty
+            "gpt 4o mini",                        // whitespace: prose, not an id
+            "gpt-4o\nmini",                       // newline: breaks any line format
+            "модель",                             // non-ASCII
+            "Anvar Karimov, 100011, Toshkent sh.", // an address, registered by hand
+        ] {
+            assert_eq!(
+                canonicalize_model(hostile, true),
+                UNREGISTERED_MODEL,
+                "a registered but non-label-shaped name reached the column: {hostile:?}"
+            );
+        }
+        let too_long = "a".repeat(MAX_MODEL_LEN + 1);
+        assert_eq!(canonicalize_model(&too_long, true), UNREGISTERED_MODEL);
+        // Positive control on the boundary, so the length rule is a bound and
+        // not a rejection of everything.
+        let at_limit = "a".repeat(MAX_MODEL_LEN);
+        assert_eq!(canonicalize_model(&at_limit, true), at_limit);
     }
 }

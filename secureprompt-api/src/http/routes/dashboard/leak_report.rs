@@ -15,13 +15,21 @@
 //! It is enforced structurally rather than by review discipline:
 //!
 //! * The only table this module reads is `detection_class_counts`, which
-//!   holds class names and integers by construction (migration 008). There is
-//!   no join to `request_content_captures`, and no column in scope that could
-//!   carry a detected value even if someone added a field to the response.
+//!   holds class names, an operator-chosen attribution and integers by
+//!   construction (migration 008). There is no join to
+//!   `request_content_captures`, and no payload column in scope.
 //! * `entity_class` can only ever hold a string literal from this binary — the
 //!   write path maps every class through
 //!   `analytics::detection_counts::canonicalize`. So even a compromised ML
 //!   sidecar cannot get bytes into this report through the label channel.
+//! * `model` can only ever hold a name an ADMINISTRATOR registered in `models`
+//!   or the literal `unregistered` — the write path maps it through
+//!   `analytics::detection_counts::canonicalize_model`. This is a FIX, not an
+//!   original property: `resolve_model`'s Phase-1 passthrough forwards an
+//!   unregistered model name verbatim, so before that mapping existed, posting
+//!   `{"model": "<a name and a national id>"}` put those bytes on every counts
+//!   row this workspace wrote and rendered them back in `by_model`. Both the
+//!   header above and `CONTENT_POLICY` asserted otherwise while it did.
 //! * Errors are built from validated dates and fixed strings. No handler in
 //!   this file interpolates a request body or a stored value into an error.
 //!
@@ -93,13 +101,17 @@ const WINDOW_INTERPRETATION: &str =
      report cannot distinguish an expired day from a quiet one.";
 
 const CONTENT_POLICY: &str =
-    "This report contains COUNTS ONLY. `entity_class` values are identifiers \
-     from a fixed vocabulary compiled into the gateway, never text taken from \
-     a request, and no detected value — no name, number, card or address — is \
-     stored in the table this report reads or emitted anywhere in this \
-     payload. `api_key_name` and `user_id` are the operator's own attribution \
-     metadata, not detected content; `api_key_name` is free text an \
-     administrator chose and may name a person.";
+    "This report contains COUNTS ONLY. Every string in it comes from one of \
+     three bounded sources, and none of them is a request body. `entity_class` \
+     values are identifiers from a fixed vocabulary compiled into the gateway. \
+     `model` is either a name an ADMINISTRATOR registered in this workspace's \
+     model catalogue or the literal `unregistered`, which is what a request \
+     naming an uncatalogued model is reported as — a caller cannot choose the \
+     bytes that appear here. `api_key_name` and `user_id` are the operator's \
+     own attribution metadata; `api_key_name` is free text an administrator \
+     chose and may name a person. NO DETECTED VALUE — no name, number, card or \
+     address taken from a prompt — is stored in the table this report reads or \
+     emitted anywhere in this payload.";
 
 const COUNTING_RULE: &str =
     "An `entities` figure counts DISTINCT entities of that class, matching the \
@@ -606,12 +618,20 @@ fn attribution() -> Attribution {
         available: vec![
             AvailableDimension {
                 dimension: "model",
-                source: "request.public_model, recorded on every counts row",
-                caveat: "The model the CALLER asked for. When provider fallback \
-                         redirected the request, the model that actually served it \
-                         can differ; the destination that mattered for disclosure \
-                         is the provider, and this report groups by the requested \
-                         name.",
+                source: "the workspace's registered `models` entry for the requested \
+                         name, recorded on every counts row",
+                caveat: "The model the CALLER asked for, but only when that name is one \
+                         an administrator REGISTERED for this workspace. A request \
+                         naming an uncatalogued model is served anyway (the gateway \
+                         passes the name through to the provider) and is reported under \
+                         the single bucket `unregistered`, because the name is then \
+                         caller-supplied free text and this report must not render \
+                         those bytes. A pilot that wants passthrough traffic broken \
+                         down by destination must catalogue the models first. \
+                         Separately: when provider fallback redirected a request, the \
+                         model that actually served it can differ; the destination that \
+                         mattered for disclosure is the provider, and this report \
+                         groups by the requested name.",
             },
             AvailableDimension {
                 dimension: "user_id",
