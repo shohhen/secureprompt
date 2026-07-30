@@ -5,6 +5,8 @@
 //! populate the remaining submodules.
 
 pub mod analytics;
+// WS4-1 — `/v1/audit-exports`, the signed paginated audit-trail export.
+pub mod audit_export;
 pub mod auth;
 pub mod budgets;
 // WS3-5 — `GET /v1/data-inventory`, the transparency/attestation endpoint.

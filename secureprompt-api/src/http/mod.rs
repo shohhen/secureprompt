@@ -150,6 +150,18 @@ pub fn build_router(state: AppState) -> Router {
                     middleware::jwt_auth::require,
                 )),
         )
+        // WS4-1 — the signed audit-trail export. Admin-gated inside the
+        // handlers, exactly like `data-inventory` and `leak-report`, and
+        // deliberately NOT on the license gate's recovery allowlist: it is
+        // ordinary dashboard functionality, not recovery infrastructure.
+        .nest(
+            "/v1/audit-exports",
+            routes::dashboard::audit_export::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
         .nest(
             "/v1/secure-mode",
             routes::dashboard::secure_mode::routes()
