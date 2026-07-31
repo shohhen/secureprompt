@@ -22,10 +22,12 @@
 //! per-test random prefix so concurrent runs cannot collide.
 
 use super::*;
-use secureprompt_common::audit_export::{verify_export, VerifyError};
+use secureprompt_common::audit_export::{
+    verify_export, VerifyError, SECTION_CONTROL_PLANE, SECTION_REQUEST_EVENTS,
+};
 use secureprompt_common::tasks::{task_types, TaskEnvelope};
 use serde_json::Value;
-use sqlx::{PgPool, Row as _};
+use sqlx::PgPool;
 
 // ── Environment ───────────────────────────────────────────────────────────
 
@@ -470,17 +472,35 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     );
     assert!(outcome.ok());
     assert_eq!(stored.total_rows, Some(5));
+    // 5 data rows at page_size 2 = 3 data pages, plus the control plane's one
+    // empty page: this workspace has no administrative actions in the window,
+    // and "we looked and there were none" is itself a signed claim.
     assert_eq!(
         stored.total_pages,
-        Some(3),
-        "5 rows at page_size 2 = 3 pages"
+        Some(4),
+        "3 data pages + 1 empty control-plane page"
     );
 
+    let manifest_value: serde_json::Value = serde_json::from_str(
+        stored
+            .manifest_json
+            .as_deref()
+            .expect("a complete export has a manifest"),
+    )
+    .expect("manifest is json");
+
     let pages = load_pages(&pool, export_id).await?;
-    assert_eq!(pages.len(), 3);
+    assert_eq!(pages.len(), 4);
 
     // ── (a) the exported rows ARE the live rows ──────────────────────────
-    let exported: Vec<Vec<Option<String>>> = pages.iter().flat_map(|p| parse_csv_page(p)).collect();
+    //
+    // Only the DATA-PLANE pages are compared against the ClickHouse query;
+    // the control-plane page has different columns and its own test.
+    let exported: Vec<Vec<Option<String>>> =
+        section_pages(&manifest_value, &pages, SECTION_REQUEST_EVENTS)
+            .into_iter()
+            .flat_map(|p| parse_csv_page(p))
+            .collect();
     assert_eq!(
         exported.len(),
         live.len(),
@@ -562,8 +582,24 @@ async fn an_export_reproduces_the_live_query_for_its_window(pool: PgPool) -> sql
     assert_eq!(
         verify_export(&manifest_json, &signature, &public_key, &refs),
         Err(VerifyError::PageCountMismatch {
-            expected: 3,
-            got: 2
+            expected: 4,
+            got: 3
+        })
+    );
+
+    // ── (d2) the CONTROL-PLANE page dropped must NOT verify either ───────
+    //
+    // The page an operator would most like to lose is the last one, and it is
+    // the one whose absence an auditor is least able to notice from the
+    // contents of the others.
+    let mut without_control = pages.clone();
+    without_control.pop();
+    let refs: Vec<&[u8]> = without_control.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&manifest_json, &signature, &public_key, &refs),
+        Err(VerifyError::PageCountMismatch {
+            expected: 4,
+            got: 3
         })
     );
 
@@ -641,19 +677,26 @@ async fn a_jsonl_export_reproduces_the_live_query(pool: PgPool) -> sqlx::Result<
 
     let stored = load_export(&pool, export_id).await?;
     assert_eq!(stored.status, STATUS_COMPLETE, "error: {:?}", stored.error);
+    let manifest_value: serde_json::Value =
+        serde_json::from_str(stored.manifest_json.as_deref().expect("manifest")).expect("json");
     let pages = load_pages(&pool, export_id).await?;
-    assert_eq!(pages.len(), 2, "3 rows at page_size 2 = 2 pages");
+    assert_eq!(
+        pages.len(),
+        3,
+        "3 data rows at page_size 2 = 2 data pages, + 1 empty control page"
+    );
 
-    let exported: Vec<serde_json::Value> = pages
-        .iter()
-        .flat_map(|p| {
-            String::from_utf8(p.clone())
-                .expect("utf8")
-                .lines()
-                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("json line"))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let exported: Vec<serde_json::Value> =
+        section_pages(&manifest_value, &pages, SECTION_REQUEST_EVENTS)
+            .into_iter()
+            .flat_map(|p| {
+                String::from_utf8(p.clone())
+                    .expect("utf8")
+                    .lines()
+                    .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("json line"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
     assert_eq!(exported.len(), live.len());
     for (index, (got, want)) in exported.iter().zip(live.iter()).enumerate() {
@@ -864,15 +907,40 @@ async fn an_expired_window_is_exported_and_declares_its_expiry(pool: PgPool) -> 
     assert_eq!(stored.status, STATUS_COMPLETE, "error: {:?}", stored.error);
     let manifest: serde_json::Value =
         serde_json::from_str(&stored.manifest_json.expect("manifest")).expect("json");
+    let data_source = &manifest["sections"][0]["sources"][0];
     assert_eq!(
-        manifest["retention"]["window_status"], "wholly_expired",
+        data_source["source_table"], "request_events",
+        "premise: sections[0].sources[0] is the ClickHouse relation"
+    );
+    assert_eq!(
+        data_source["window_status"], "wholly_expired",
         "an export behind the TTL must declare it"
     );
-    let detail = manifest["retention"]["detail"].as_str().expect("detail");
+    let detail = data_source["detail"].as_str().expect("detail");
     assert!(
         detail.contains("EVIDENCE OF EXPIRY"),
         "the manifest must warn that an empty result is expiry, not quiet; got: {detail}"
     );
+
+    // TRAP: the SAME window must NOT inherit that verdict for the control
+    // plane. Those tables are Postgres, have no TTL and are not purged, so the
+    // window is complete for them however far back it reaches — and an auditor
+    // told otherwise would discount a trail that is in fact whole.
+    for source in manifest["sections"][1]["sources"]
+        .as_array()
+        .expect("control sources")
+    {
+        assert_eq!(
+            source["window_status"], "no_expiry",
+            "{} must not inherit the data plane's expiry verdict",
+            source["source_table"]
+        );
+        assert!(
+            source["ttl_days"].is_null(),
+            "{} must declare no TTL",
+            source["source_table"]
+        );
+    }
 
     // POSITIVE CONTROL: the same window generated NOW is within retention, so
     // the verdict above is the clock's doing and not a hardcoded string.
@@ -895,7 +963,7 @@ async fn an_expired_window_is_exported_and_declares_its_expiry(pool: PgPool) -> 
     )
     .expect("json");
     assert_eq!(
-        fresh_manifest["retention"]["window_status"],
+        fresh_manifest["sections"][0]["sources"][0]["window_status"],
         "within_retention"
     );
 
@@ -929,8 +997,9 @@ async fn an_empty_window_still_produces_a_signed_export(pool: PgPool) -> sqlx::R
     assert_eq!(stored.total_rows, Some(0));
     assert_eq!(
         stored.total_pages,
-        Some(1),
-        "an empty export still has a page"
+        Some(2),
+        "an empty export still has one page PER SECTION — a section with no \
+         pages could not be told apart from one that was removed"
     );
 
     let pages = load_pages(&pool, export_id).await?;
@@ -1053,11 +1122,11 @@ async fn re_running_the_same_export_replaces_rather_than_appends(pool: PgPool) -
     let pages = load_pages(&pool, export_id).await?;
     assert_eq!(
         pages.len(),
-        1,
+        2,
         "a redelivered task must not double the pages"
     );
     let stored = load_export(&pool, export_id).await?;
-    assert_eq!(stored.total_pages, Some(1));
+    assert_eq!(stored.total_pages, Some(2));
 
     let refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
     assert!(
@@ -1279,31 +1348,45 @@ async fn live_control_rows(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<Ve
         .collect())
 }
 
-/// Every JSONL object on the pages the manifest assigns to `section`.
-fn section_objects(manifest: &serde_json::Value, pages: &[Vec<u8>], section: &str) -> Vec<Value> {
-    let mut out = Vec::new();
-    for (index, page) in pages.iter().enumerate() {
-        let page_number = index + 1;
-        let belongs = manifest["pages"]
-            .as_array()
-            .map(|entries| {
+/// The pages the manifest assigns to `section`, in page order.
+///
+/// Reads the assignment out of the manifest's own `pages[i].section` rather
+/// than assuming a layout, because that field is what an auditor has and what
+/// `verify_export` checks. A page whose section the manifest does not name is
+/// silently skipped here; `verify_export` is what refuses it.
+fn section_pages<'a>(
+    manifest: &serde_json::Value,
+    pages: &'a [Vec<u8>],
+    section: &str,
+) -> Vec<&'a Vec<u8>> {
+    pages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let page_number = *index as u64 + 1;
+            manifest["pages"].as_array().is_some_and(|entries| {
                 entries.iter().any(|e| {
-                    e["page"].as_u64() == Some(page_number as u64)
+                    e["page"].as_u64() == Some(page_number)
                         && e["section"].as_str() == Some(section)
                 })
             })
-            .unwrap_or(false);
-        if !belongs {
-            continue;
-        }
-        for line in String::from_utf8_lossy(page).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            out.push(serde_json::from_str::<Value>(line).expect("jsonl line is an object"));
-        }
-    }
-    out
+        })
+        .map(|(_, page)| page)
+        .collect()
+}
+
+/// Every JSONL object on the pages the manifest assigns to `section`.
+fn section_objects(manifest: &serde_json::Value, pages: &[Vec<u8>], section: &str) -> Vec<Value> {
+    section_pages(manifest, pages, section)
+        .into_iter()
+        .flat_map(|page| {
+            String::from_utf8_lossy(page)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).expect("jsonl line is an object"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// **The gap this task closes.** The signed export must carry the Postgres
@@ -1366,11 +1449,11 @@ async fn an_export_carries_the_control_plane_audit_trail(pool: PgPool) -> sqlx::
         })
         .unwrap_or_default();
     assert!(
-        sections.iter().any(|s| s == "request_events"),
+        sections.iter().any(|s| s == SECTION_REQUEST_EVENTS),
         "the manifest must declare the data-plane section; got {sections:?}"
     );
     assert!(
-        sections.iter().any(|s| s == "control_plane_events"),
+        sections.iter().any(|s| s == SECTION_CONTROL_PLANE),
         "the manifest must declare the control-plane section — an auditor \
          holding this export has to be able to tell that administrative \
          actions are in it; got {sections:?}"
@@ -1378,7 +1461,7 @@ async fn an_export_carries_the_control_plane_audit_trail(pool: PgPool) -> sqlx::
 
     // 2. And carry it: exactly the live query's rows, in the same order.
     let pages = load_pages(&pool, export_id).await?;
-    let exported = section_objects(&manifest, &pages, "control_plane_events");
+    let exported = section_objects(&manifest, &pages, SECTION_CONTROL_PLANE);
     let got: Vec<(Uuid, String)> = exported
         .iter()
         .map(|o| {
@@ -1546,7 +1629,7 @@ async fn the_control_plane_read_is_tenant_scoped_under_real_rls(pool: PgPool) ->
     let manifest: Value =
         serde_json::from_str(stored.manifest_json.as_deref().expect("manifest")).expect("json");
     let pages = load_pages(&pool, export_id).await?;
-    let exported = section_objects(&manifest, &pages, "control_plane_events");
+    let exported = section_objects(&manifest, &pages, SECTION_CONTROL_PLANE);
     let got: Vec<(Uuid, String)> = exported
         .iter()
         .map(|o| {
@@ -1576,6 +1659,66 @@ async fn the_control_plane_read_is_tenant_scoped_under_real_rls(pool: PgPool) ->
             "another tenant's control event {id} must never appear"
         );
     }
+
+    low.close().await;
+    Ok(())
+}
+
+/// The scope guard, tested directly against the failure it exists for.
+///
+/// On the WRITE path a missing `app.current_workspace_id` is loud: the INSERT
+/// is rejected. On the READ path it is SILENT — the query succeeds and returns
+/// the empty set, and an empty control-plane section is indistinguishable from
+/// "this workspace's administrators did nothing". The product would then SIGN
+/// that. `scope_is_armed` reads the GUC back inside the same transaction so
+/// that becomes a recorded failure instead.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn the_scope_guard_refuses_a_transaction_that_was_not_scoped(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    seed_workspace(&pool, workspace_id).await?;
+    seed_control_plane(&pool, workspace_id, 21).await?;
+    let low = low_privilege_pool(&pool).await;
+
+    // An UNSCOPED transaction. The premise assertion measures the trap itself:
+    // the read succeeds and returns nothing, while the superuser pool sees the
+    // row — so an export built here would be signed over a false emptiness.
+    let mut plain = low.begin().await?;
+    let hidden: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&mut *plain)
+            .await?;
+    assert_eq!(
+        hidden, 0,
+        "premise: an unscoped read must silently return the empty set"
+    );
+    let guard = scope_is_armed(&mut plain, workspace_id).await;
+    assert!(
+        guard.is_err(),
+        "an unscoped transaction must be refused, not exported from"
+    );
+    plain.rollback().await?;
+
+    // POSITIVE CONTROL: through `begin_scoped` the same read sees the row, so
+    // the refusal above is the missing GUC and not a broken query.
+    let mut scoped = begin_scoped(&low, workspace_id).await?;
+    let visible: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&mut *scoped)
+            .await?;
+    assert_eq!(visible, 1, "a scoped read must see this workspace's row");
+    assert!(scope_is_armed(&mut scoped, workspace_id).await.is_ok());
+
+    // And the guard is about THIS workspace, not merely about the GUC being
+    // set to something: a transaction scoped to another tenant is refused too.
+    assert!(
+        scope_is_armed(&mut scoped, Uuid::new_v4()).await.is_err(),
+        "a transaction scoped to a different workspace must be refused"
+    );
+    scoped.rollback().await?;
 
     low.close().await;
     Ok(())
