@@ -544,13 +544,42 @@ fn validate_window(from: NaiveDate, to: NaiveDate) -> Result<(), ApiError> {
 /// the same pattern, and for the same measured reason, as
 /// `data_inventory::postgres_counts`. The `WHERE` clause is still the filter;
 /// RLS is defence in depth (Global Constraint 3).
+///
+/// The arming goes through [`crate::db::scope::arm_scope`] rather than a bare
+/// `set_config`, because that helper READS THE SETTING BACK inside the
+/// transaction. Migration 033's `NULLIF` sweep made an unscoped read uniformly
+/// invisible instead of sometimes raising `22P02`, so the read-back is now the
+/// only thing standing between "this workspace registered no models" and "this
+/// transaction has no scope" — and this function resolves the empty set into
+/// the `unregistered` bucket for every destination in the report.
+///
+/// `arm_scope`'s `ApiError::Database` is NOT passed through, for the reason
+/// [`pg_err`] states: it carries the Postgres message and
+/// `http::api_error_response` renders an `ApiError`'s message into the response
+/// body. Its `ApiError::Internal` is `db::scope::SCOPE_NOT_ARMED`, a fixed
+/// string from this repository, and is returned as written.
 async fn registered_models(pool: &sqlx::PgPool, ws: Uuid) -> Result<BTreeSet<String>, ApiError> {
     let mut tx = pool.begin().await.map_err(|e| pg_err("begin", &e))?;
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(ws.to_string())
-        .execute(&mut *tx)
+    crate::db::scope::arm_scope(&mut tx, ws)
         .await
-        .map_err(|e| pg_err("set_config", &e))?;
+        .map_err(|e| match e {
+            internal @ ApiError::Internal(_) => internal,
+            other => {
+                tracing::error!(
+                    stage = "arm_scope",
+                    error = %other,
+                    "leak report could not arm the tenancy scope; the store's \
+                     message is logged here and deliberately NOT returned"
+                );
+                ApiError::Internal(
+                    "leak report could not be produced: this workspace's tenancy \
+                     scope could not be armed, so the model catalogue would have \
+                     been read under a row-level-security policy that admits \
+                     nothing. No partial report is returned."
+                        .to_owned(),
+                )
+            }
+        })?;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM models WHERE workspace_id = $1")
         .bind(ws)
         .fetch_all(&mut *tx)

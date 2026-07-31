@@ -746,6 +746,22 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 /// inventory that silently reports 0 `api_keys` is precisely the false
 /// assurance this endpoint exists to prevent.
 ///
+/// The arming goes through [`crate::db::scope::arm_scope`] rather than a bare
+/// `set_config`, because that helper READS THE SETTING BACK inside the
+/// transaction. Without the read-back, a scope that did not take is not an
+/// error here — it is an inventory of ZEROES, which is precisely the false
+/// assurance the paragraph above says this endpoint exists to prevent. Since
+/// migration 033's `NULLIF` sweep the unscoped read is uniformly invisible
+/// rather than sometimes raising `22P02`, so nothing else can tell the two
+/// apart.
+///
+/// `arm_scope`'s `ApiError::Database` is NOT passed through: it carries the
+/// Postgres message and `http::api_error_response` renders an `ApiError`'s
+/// message into the response body, which is the leak [`pg_err`] exists to
+/// close. Its `ApiError::Internal` is `db::scope::SCOPE_NOT_ARMED`, a fixed
+/// string from this repository with no store text in it, and is returned as
+/// written.
+///
 /// `set_config(..., true)` is transaction-LOCAL, so the setting cannot leak
 /// onto a pooled connection and follow some later request.
 ///
@@ -755,11 +771,26 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiError> {
     let mut tx = pool.begin().await.map_err(|e| pg_err("begin", &e))?;
 
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(ws.to_string())
-        .execute(&mut *tx)
+    crate::db::scope::arm_scope(&mut tx, ws)
         .await
-        .map_err(|e| pg_err("set_config", &e))?;
+        .map_err(|e| match e {
+            internal @ ApiError::Internal(_) => internal,
+            other => {
+                tracing::error!(
+                    stage = "arm_scope",
+                    error = %other,
+                    "data-inventory could not arm the tenancy scope; the store's \
+                     message is logged here and deliberately NOT returned"
+                );
+                ApiError::Database(
+                    "the data inventory could not be produced: this workspace's \
+                     tenancy scope could not be armed, so every Postgres count \
+                     would have been taken under a row-level-security policy \
+                     that admits nothing. No partial inventory is returned."
+                        .to_owned(),
+                )
+            }
+        })?;
 
     let sql = format!(
         "SELECT
