@@ -403,6 +403,31 @@ async fn self_actor(
     ))
 }
 
+/// Write one `admin_audit` row in a transaction of its own.
+///
+/// Used only by `challenge()`, whose "action" — issuing a session — belongs to
+/// FU4's refresh-token chain and cannot be joined. Every other 2FA action here
+/// audits inside the repository transaction that performs it. The ordering
+/// carries the guarantee instead: this commits first, so no session is issued
+/// without a record of what opened it. See `auth::record_login` for the same
+/// argument at length, including the availability cost.
+///
+/// # Errors
+/// `ApiError::Database` on failure, `ApiError::Internal` if the scope does not
+/// arm.
+async fn write_own_audit(
+    state: &AppState,
+    workspace_id: Uuid,
+    actor: &AdminActor,
+    entry: &AdminAuditEntry,
+) -> Result<(), ApiError> {
+    let mut tx = crate::db::scope::begin_scoped(&state.db, workspace_id).await?;
+    crate::db::admin_audit_repo::write(&mut tx, actor, entry).await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))
+}
+
 // ---------- Handlers ----------
 
 /// `POST /v1/auth/2fa/enroll` — start (or restart, if unconfirmed) TOTP
@@ -778,9 +803,14 @@ pub async fn challenge(
     // TOTP first; if that doesn't verify, fall through and try the same
     // input as a backup code (stripping the display dash — codes are
     // stored/matched on their raw alphanumeric form).
-    let success_timestep: Option<i64> =
+    // P1A records WHICH factor cleared the gate alongside the timestep: a
+    // session opened with the authenticator app is different evidence from one
+    // opened with a printed recovery code.
+    let success_timestep: Option<(i64, &'static str)> =
         match verify_totp_step(&state, &user, &body.code, now_unix).await {
-            TotpStepOutcome::Matched(step) => Some(i64::try_from(step).unwrap_or(i64::MAX)),
+            TotpStepOutcome::Matched(step) => {
+                Some((i64::try_from(step).unwrap_or(i64::MAX), "totp"))
+            }
             TotpStepOutcome::SystemError => {
                 // Final-review Fix 2: a KMS/decrypt fault, not a wrong
                 // code — return without touching the failure counter/
@@ -799,13 +829,16 @@ pub async fn challenge(
                 // prevention; advance the watermark to "now" anyway so the
                 // very next TOTP attempt still has to be for the current
                 // (or a future) step, not an already-elapsed one.
-                Ok(true) => Some(i64::try_from(now_unix / 30).unwrap_or(i64::MAX)),
+                Ok(true) => Some((
+                    i64::try_from(now_unix / 30).unwrap_or(i64::MAX),
+                    "backup_code",
+                )),
                 Ok(false) => None,
                 Err(err) => return api_error_response(err),
             },
         };
 
-    let Some(timestep) = success_timestep else {
+    let Some((timestep, verified_with)) = success_timestep else {
         // Neither the TOTP code nor a backup code matched. Threshold/
         // window (5 failures / 15 minutes) matches `verify()` — both
         // surfaces share the same `totp_failed_attempts`/
@@ -818,16 +851,31 @@ pub async fn challenge(
         return api_error_response(err);
     }
 
-    // Role isn't part of `UserRow` — same fetch `verify()` does so the
-    // freshly issued access token carries the real role.
-    let role: String = match sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await
-    {
-        Ok(role) => role,
-        Err(error) => return api_error_response(ApiError::Database(error.to_string())),
+    // P1A — clearing the challenge is its OWN event, not a field on the login
+    // row `token()` already wrote. The challenge token carries no memory of how
+    // the first factor was proven, so folding the two together would mean
+    // recording an unknown; and the gap between the two rows is itself the
+    // interesting quantity when an account is under attack.
+    //
+    // Written BEFORE the pair is issued, for the reason `auth::record_login`
+    // gives: no session is issued without a record of what opened it.
+    //
+    // `self_actor` also supplies the role, replacing a duplicate `SELECT role`
+    // that stood here.
+    let (actor, role) = match self_actor(&state, user_id, workspace_id, &user.email).await {
+        Ok(pair) => pair,
+        Err(err) => return api_error_response(err),
     };
+    let entry = AdminAuditEntry::on_own_account(
+        AdminAuditAction::SecondFactorVerified,
+        user_id,
+        &user.email,
+        &role,
+    )
+    .with_detail(json!({ "verified_with": verified_with }));
+    if let Err(err) = write_own_audit(&state, workspace_id, &actor, &entry).await {
+        return api_error_response(err);
+    }
 
     match build_token_pair_body(
         &state,

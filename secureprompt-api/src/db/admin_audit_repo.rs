@@ -10,13 +10,26 @@
 //! a newly audited action cannot be missing from the export — there is nothing
 //! to add.
 //!
-//! # Every write is in the caller's transaction
+//! # Every write is in a transaction, and almost every one is the caller's
 //!
 //! [`write`] takes a `&mut Transaction` rather than a pool, so the audit row
 //! commits with the action it describes or neither commits. That is WS4-3's
 //! rule (`session_revocation_repo::write_audit`) and
 //! `RawCaptureRepository::upsert_audited`'s before it: a control whose audit
 //! trail can fail independently of the control is a control with a silent mode.
+//!
+//! P1A added two actions that CANNOT share a transaction with what they
+//! record, and they are named here rather than left as exceptions somebody
+//! discovers: `auth.login_succeeded` and `auth.second_factor_verified`. The
+//! "action" for a login is the issuance of a session, which belongs to FU4's
+//! refresh-token chain, and for the two 2FA-gated outcomes there is no database
+//! write at all — the handler mints a five-minute purpose token and returns
+//! 202. Both are therefore written FIRST, in a scoped transaction of their own,
+//! and a failure returns before anything is issued. The guarantee that survives
+//! is the one that matters — no session is issued without a record of the login
+//! that opened it — and the residual, over-reporting a login whose session
+//! issuance then failed, is written down in
+//! `dashboard::auth::record_login` along with the availability consequence.
 //!
 //! WHAT HAPPENS WHEN THE AUDIT WRITE ITSELF FAILS, stated rather than left to
 //! be discovered: the `?` propagates, the caller's transaction is dropped

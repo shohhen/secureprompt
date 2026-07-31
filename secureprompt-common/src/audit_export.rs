@@ -539,7 +539,7 @@ pub const CONTROL_COVERAGE: &str =
      and must not be read as one. The following are NOT audited into any table \
      and therefore appear NOWHERE in this export: every FAILED or refused \
      dashboard login, whether the email named an account or not; creating a \
-     workspace through public signup; logging out; \
+     workspace through public signup; refreshing an access token; logging out; \
      reassigning an API key to a different member; and adding, removing or \
      excluding a provider's models. Their absence here is not evidence they did \
      not happen. THE FAILED-LOGIN GAP IS DELIBERATE AND ITS SHAPE MATTERS: an \
@@ -562,7 +562,12 @@ pub const CONTROL_COVERAGE: &str =
      effect` and says so in its own `outcome` field: it is written when the \
      FIRST factor verified, and `second_factor_required` or \
      `enrolment_required` mean the password was correct and no session was \
-     issued. Rows of `retention_purge_audit` whose `workspace_id` is NULL — \
+     issued. That row COMMITS BEFORE the session it precedes, so no session is \
+     ever issued without one; the residual is the other direction, and it is \
+     stated rather than hidden — if session issuance then fails on an \
+     infrastructure error, an `outcome` of `session_issued` describes a login \
+     that produced no session. Rows of `retention_purge_audit` whose \
+     `workspace_id` is NULL — \
      purge scopes that are not per-workspace, such as the token vault — are \
      excluded because they are not this tenant's records; the section's source \
      block reports how many such rows fell in the window so their exclusion is \

@@ -293,7 +293,29 @@ pub async fn issue_token_or_2fa_response(
         Err(err) => return api_error_to_response(err),
     };
 
-    match decide_2fa(role, row.totp_confirmed_at.is_some()) {
+    let decision = decide_2fa(role, row.totp_confirmed_at.is_some());
+
+    // P1A — the same record the password path writes, labelled `oidc`. One
+    // shared function rather than a second copy, for the same reason
+    // `decide_2fa` is shared: two divergent copies of a login rule is how the
+    // 2FA bypass this function exists to fix happened in the first place.
+    // Written BEFORE anything is issued — see `auth::record_login` for the
+    // guarantee that buys and for the availability cost it carries.
+    if let Err(err) = crate::http::routes::dashboard::auth::record_login(
+        state,
+        row.id,
+        row.workspace_id,
+        &row.email,
+        &row.role,
+        crate::http::routes::dashboard::auth::LoginMethod::Oidc,
+        decision,
+    )
+    .await
+    {
+        return api_error_to_response(err);
+    }
+
+    match decision {
         TwoFaDecision::Access => {
             // Unchanged — same envelope as the credentials flow.
             issue_token_pair(

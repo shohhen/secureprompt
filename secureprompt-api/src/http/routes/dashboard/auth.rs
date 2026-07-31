@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
+        admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry},
         refresh_token_repo::{NewSessionRow, RotationOutcome},
         user_repo::{self, UserRepository},
     },
@@ -194,7 +195,26 @@ pub async fn token(
         Err(err) => return api_error_to_response(err),
     };
 
-    match decide_2fa(role, creds.totp_confirmed_at.is_some()) {
+    let decision = decide_2fa(role, creds.totp_confirmed_at.is_some());
+
+    // P1A — the login is recorded BEFORE anything is issued. "Who logged in,
+    // and when" is the first question of every access review and had no answer
+    // at all. See `record_login` for why this refuses the login when it fails.
+    if let Err(err) = record_login(
+        &state,
+        creds.id,
+        creds.workspace_id,
+        &creds.email,
+        &creds.role,
+        LoginMethod::Password,
+        decision,
+    )
+    .await
+    {
+        return api_error_to_response(err);
+    }
+
+    match decision {
         TwoFaDecision::Access => {
             // Routed through `TokenOr2fa::Access` (not `issue_token_pair`
             // directly) so the 200 body is provably the same
@@ -275,6 +295,114 @@ pub(crate) const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDec
     } else {
         TwoFaDecision::Access
     }
+}
+
+// ---------- The login audit record (P1A) ----------
+
+/// How the FIRST factor was proven.
+///
+/// `pub(crate)` so `oidc_callback`'s tail can label its own sign-ins: an
+/// identity the deployment accepted from an external provider is not the same
+/// evidence as a password this product verified itself, and an auditor
+/// reviewing access after an IdP compromise needs to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginMethod {
+    Password,
+    Oidc,
+}
+
+impl LoginMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Oidc => "oidc",
+        }
+    }
+}
+
+/// What `detail.outcome` says a verified first factor led to.
+///
+/// Derived from [`TwoFaDecision`] rather than passed in, so the recorded
+/// outcome cannot disagree with the branch actually taken.
+const fn login_outcome(decision: TwoFaDecision) -> &'static str {
+    match decision {
+        TwoFaDecision::Access => "session_issued",
+        TwoFaDecision::Challenge => "second_factor_required",
+        TwoFaDecision::Enroll => "enrolment_required",
+    }
+}
+
+/// Write `auth.login_succeeded` for a principal whose first factor verified.
+///
+/// # Why this is recorded for outcomes that issue no session
+///
+/// A login stopped at the 2FA gate is a real event — somebody had the correct
+/// password — and it is one an investigator specifically looks for. Recording
+/// it as a completed login would be a lie; recording nothing would lose the
+/// fact. `detail.outcome` carries the distinction.
+///
+/// # Why it is written BEFORE the session is issued, and what that costs
+///
+/// Every other audited action commits in the same transaction as the thing it
+/// records. A login cannot: the session write belongs to FU4's refresh-token
+/// chain and the two 202 branches write nothing at all. So the ordering carries
+/// the guarantee instead, in the direction that matters — NO SESSION IS EVER
+/// ISSUED WITHOUT A LOGIN RECORD, because the record commits first and a
+/// failure here returns before any token is minted.
+///
+/// The residual is the other direction, and it is stated rather than hidden: if
+/// `build_token_pair_body` fails AFTER this row commits (Redis or Postgres
+/// unavailable during refresh-token persistence), the trail holds a row saying
+/// `session_issued` for a login that produced no session. That is
+/// over-reporting a login the credentials really did pass, which is the safe
+/// direction; under-reporting would be an authentication that happened with
+/// nothing saying so.
+///
+/// # The availability consequence, stated
+///
+/// This refuses the login when the audit write fails, following FU5's rule
+/// that a control whose trail can fail independently of the control is a
+/// control with a silent mode. The cost is larger here than anywhere else FU5
+/// applied it: with `admin_audit` unwritable, NOBODY CAN LOG IN TO THE
+/// DASHBOARD. That is deliberate — a product sold on its audit trail must not
+/// quietly authenticate people it cannot account for — but it means a
+/// Postgres incident is a total dashboard outage rather than a degraded one.
+/// The data plane (`/v1/chat/completions` under an API key) is unaffected.
+///
+/// # Errors
+/// Returns `ApiError::Database` when the write fails and `ApiError::Internal`
+/// when the tenancy scope does not arm.
+pub(crate) async fn record_login(
+    state: &AppState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    email: &str,
+    role: &str,
+    method: LoginMethod,
+    decision: TwoFaDecision,
+) -> Result<(), ApiError> {
+    let actor = AdminActor {
+        workspace_id,
+        user_id: Some(user_id),
+        email: Some(email.to_owned()),
+        role: Some(role.to_owned()),
+    };
+    // NOTHING ABOUT THE REQUEST GOES IN. Not the address, not the User-Agent,
+    // and not FU4's `{browser} on {os}` reduction of it: FU4 stores the device
+    // on the SESSION row and ERASES it when that session ends, and this table
+    // is never purged, so a copy here would undo that erasure permanently.
+    let entry =
+        AdminAuditEntry::on_own_account(AdminAuditAction::LoginSucceeded, user_id, email, role)
+            .with_detail(json!({
+                "method": method.as_str(),
+                "outcome": login_outcome(decision),
+            }));
+
+    let mut tx = crate::db::scope::begin_scoped(&state.db, workspace_id).await?;
+    admin_audit_repo::write(&mut tx, &actor, &entry).await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))
 }
 
 /// `POST /v1/auth/token` response shape (2FA, Task 5). `Access` carries the
