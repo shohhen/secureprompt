@@ -1081,25 +1081,39 @@ async fn the_documented_action_list_matches_the_database(pool: PgPool) -> sqlx::
     Ok(())
 }
 
-/// The two anchors under §3.2 that introduce the per-`event_type` `detail`
-/// key tables. Two tables rather than one because the second is scoped to
-/// `admin_audit` events, which carry three extra merged keys.
-const DETAIL_TABLE_ANCHORS: [&str; 2] =
-    ["`detail` keys, per `event_type`:", "event-specific keys:"];
+/// §3.2's `detail` key tables are located by their own HEADER ROW, not by the
+/// prose around them. A locator tied to a sentence breaks when the sentence is
+/// reworded, and breaks in the direction that matters least loudly: it finds no
+/// table and checks nothing.
+const DETAIL_TABLE_HEADER: &str = "| `event_type` | `detail` keys |";
+
+/// One table for the three per-event source relations, one for `admin_audit`,
+/// which carries three extra merged keys. Asserted so a third cannot appear
+/// and be silently left unchecked.
+const DETAIL_TABLE_COUNT: usize = 2;
 
 /// Every `event_type` §3.2's `detail` tables give a row to, and the keys each
 /// row names.
 fn documented_detail_rows(doc: &str) -> Vec<(String, Vec<String>)> {
     let mut rows = Vec::new();
-    for anchor in DETAIL_TABLE_ANCHORS {
-        for cells in table_rows(doc, anchor) {
+    let mut tables = 0;
+    let mut offset = 0;
+    while let Some(found) = doc[offset..].find(DETAIL_TABLE_HEADER) {
+        let start = offset + found;
+        tables += 1;
+        for cells in table_rows(&doc[start..], DETAIL_TABLE_HEADER) {
             assert!(
                 cells.len() >= 2,
                 "a `detail` key table row must have an event type and a key list, got {cells:?}"
             );
             rows.push((unbacktick(&cells[0]), backticked(&cells[1])));
         }
+        offset = start + DETAIL_TABLE_HEADER.len();
     }
+    assert_eq!(
+        tables, DETAIL_TABLE_COUNT,
+        "§3.2 must carry exactly {DETAIL_TABLE_COUNT} `detail` key tables, found {tables}"
+    );
     rows
 }
 
