@@ -75,23 +75,22 @@ struct CallSite {
 ///   * FALSE POSITIVE of the textual scanner — the statement is correctly
 ///     scoped by construction in a way a line-oriented regex cannot see.
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
-    (
-        "secureprompt-api/src/db/refresh_token_repo.rs",
-        "refresh_tokens",
-        2,
-        "REAL DEFECT. Cross-tenant BY NECESSITY: a refresh token is an opaque random string \
-         and does not name its workspace, so `rotate`'s pre-lookup and \
-         `find_active_by_hash` must find the row before they can know which \
-         scope to arm. Under a non-bypassing role both return None. `rotate` \
-         then reports NotFound and every session refresh 401s — loud, and \
-         fail-closed. `find_active_by_hash` is the dangerous one: it is the \
-         logout path's best-effort revoke, so None means LOGOUT SILENTLY DOES \
-         NOT REVOKE THE REFRESH TOKEN and the session survives the sign-out. \
-         Fixing it needs one of: a SECURITY DEFINER lookup owned by a \
-         BYPASSRLS role (blocked on the ownership decision this workstream \
-         does not own), or making the caller pass the workspace it already \
-         holds in its JWT.",
-    ),
+    // FIXED and therefore GONE, recorded here in prose because the entry
+    // itself may not stay: `secureprompt-api/src/db/refresh_token_repo.rs` /
+    // `refresh_tokens`, two statements, `rotate`'s pre-lookup and
+    // `find_active_by_hash`. Both now run inside
+    // `db::scope::begin_refresh_token_probe`, a transaction armed with the
+    // token hash that migration 032's `refresh_token_possession` policy admits
+    // for SELECT only. `tests/rls_refresh_token_scope.rs` drives both through a
+    // NOSUPERUSER/NOBYPASSRLS pool.
+    //
+    // The entry graded `find_active_by_hash` the severe one because "it is the
+    // logout path's best-effort revoke". It is not, and never was: the method
+    // has no callers anywhere in the repository and `dashboard::auth::logout`
+    // calls `revoke_all_for_user`. The claim came from the method's own doc
+    // comment, which was false from `bc2b586`. Logout's revoke was measured
+    // under the non-bypassing role BEFORE any fix and was already correct;
+    // `logout_revokes_the_refresh_token_under_a_non_bypassing_role` pins it.
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
         "refresh_tokens",
