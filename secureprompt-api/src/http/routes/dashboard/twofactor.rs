@@ -377,6 +377,23 @@ fn strip_backup_code_format(code: &str) -> String {
 /// was when that five-minute token was issued, and `/enroll` has no
 /// `JwtAuthContext` to consult at all.
 ///
+/// P1K: the lookup is keyed on `(id, workspace_id)`, not on `id` alone. It took
+/// a `workspace_id`, used it only to stamp the `AdminActor`, and read the role
+/// from whatever workspace the row happened to sit in. `users` is one of the
+/// six tables migration 033 leaves under `relforcerowsecurity = false`
+/// (measured), so — unlike the `models` reads P1K also fixed — there is no
+/// policy that would have supplied this predicate on ANY role, superuser or
+/// not. `AdminActor::resolve`, which does the same job for every other
+/// administrative surface, has always filtered on both columns; this was the
+/// one that did not.
+///
+/// The pair is consistent today: `accept_enroll_or_access` and
+/// `accept_challenge` both return `(claims.sub, claims.ws)` out of ONE signed
+/// token, so the id and the workspace cannot disagree unless a token outlives a
+/// change to the row it names. When they do disagree the lookup now finds
+/// nothing and the action is refused, which is the behaviour the paragraph
+/// above already promised for an unreadable role.
+///
 /// # Errors
 /// Returns `ApiError::Database` when the role cannot be read. A 2FA change with
 /// no record of who made it is exactly what P1A exists to prevent, so this
@@ -387,11 +404,13 @@ async fn self_actor(
     workspace_id: Uuid,
     email: &str,
 ) -> Result<(AdminActor, String), ApiError> {
-    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|error| ApiError::Database(error.to_string()))?;
+    let role: String =
+        sqlx::query_scalar("SELECT role FROM users WHERE id = $1 AND workspace_id = $2")
+            .bind(user_id)
+            .bind(workspace_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
     Ok((
         AdminActor {
             workspace_id,

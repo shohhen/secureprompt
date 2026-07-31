@@ -379,6 +379,15 @@ impl ProviderRepository {
     /// Used by the dashboard's per-provider model panel and by the
     /// `/v1/providers` list response (nested `models` array) so LibreChat's
     /// discovery client gets the authoritative model list per provider.
+    ///
+    /// P1K: `workspace_id` is in the WHERE, not just in `begin_scoped`. It was
+    /// only in `begin_scoped`, and `GET /v1/providers/{id}/models` takes the
+    /// provider id from the URL path without checking who owns it — so under
+    /// the compose SUPERUSER, which bypasses the `workspace_isolation` policy
+    /// that was silently supplying this predicate, workspace A read workspace
+    /// B's model list by naming B's provider id. Measured, and pinned by
+    /// `tests/rls_missing_predicate.rs`. Do not remove: `begin_scoped` above
+    /// is not the isolation boundary on the role this product deploys as.
     pub async fn list_models_for_provider(
         &self,
         workspace_id: WorkspaceId,
@@ -389,10 +398,12 @@ impl ProviderRepository {
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
-             WHERE provider_id = $1
+             WHERE workspace_id = $1
+               AND provider_id = $2
                AND excluded = FALSE
              ORDER BY name ASC",
         )
+        .bind(workspace_id.0)
         .bind(provider_id)
         .fetch_all(&mut *tx)
         .await
@@ -568,6 +579,13 @@ impl ProviderRepository {
     /// Names of models the admin has removed (soft-deleted) for this provider.
     /// `persist_synced_models` uses this to skip re-adding them during an
     /// upstream sync, so curated deletions survive credential rotations.
+    ///
+    /// P1K: `workspace_id` is in the WHERE for the same reason as
+    /// `list_models_for_provider`. The one caller reaches this through
+    /// `sync_provider_models`, which DOES resolve the provider via
+    /// `list_providers(ctx.workspace_id)` and 404s when it is not there — so
+    /// today's single path was already safe, by a check two files away that
+    /// the next caller of this `pub` method will not know about.
     pub async fn list_excluded_model_names_for_provider(
         &self,
         workspace_id: WorkspaceId,
@@ -577,8 +595,9 @@ impl ProviderRepository {
 
         let rows = sqlx::query(
             "SELECT name FROM models
-             WHERE provider_id = $1 AND excluded = TRUE",
+             WHERE workspace_id = $1 AND provider_id = $2 AND excluded = TRUE",
         )
+        .bind(workspace_id.0)
         .bind(provider_id)
         .fetch_all(&mut *tx)
         .await
@@ -588,15 +607,26 @@ impl ProviderRepository {
         Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
+    /// Every non-excluded model in this workspace, across all its providers.
+    ///
+    /// P1K: this had NO CALLERS and no tenancy predicate — `workspace_id` was
+    /// spent entirely on `begin_scoped` and the SQL read `WHERE excluded =
+    /// FALSE`. Measured under the compose SUPERUSER it returned BOTH
+    /// workspaces' models. Kept rather than deleted because the signature is
+    /// the one a future "all models" view will reach for, and a `pub` method
+    /// that takes a workspace and ignores it is a trap for whoever reaches
+    /// for it. `tests/rls_missing_predicate.rs` is what keeps it honest.
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
         let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
              FROM models
-             WHERE excluded = FALSE
+             WHERE workspace_id = $1
+               AND excluded = FALSE
              ORDER BY created_at DESC",
         )
+        .bind(workspace_id.0)
         .fetch_all(&mut *tx)
         .await
         .map_err(|error| ApiError::Database(error.to_string()))?;
@@ -617,6 +647,18 @@ impl ProviderRepository {
             .collect())
     }
 
+    /// Resolve a public model name to every provider that can serve it.
+    ///
+    /// P1K: the JOIN carries the tenancy predicate on BOTH tables rather than
+    /// trusting the foreign key, the same way `audit_export::get_export_page`
+    /// does. It previously constrained `models.workspace_id` only, and
+    /// `001_init.sql:41` declares `provider_id UUID NOT NULL REFERENCES
+    /// providers(id)` — a SINGLE-column FK that says nothing about workspaces
+    /// — so nothing in the database forbids a `models` row pointing at another
+    /// workspace's provider. `create_model` checks it in application code;
+    /// that check is the only thing there was. Measured with such a row
+    /// present under the compose SUPERUSER: the call returned the foreign
+    /// provider's `encrypted_credential`.
     pub async fn resolve_model_targets(
         &self,
         workspace_id: WorkspaceId,
@@ -636,6 +678,7 @@ impl ProviderRepository {
              FROM models
              INNER JOIN providers ON providers.id = models.provider_id
              WHERE models.workspace_id = $1::uuid
+               AND providers.workspace_id = $1::uuid
                AND models.name = $2
              ORDER BY models.created_at ASC, providers.created_at ASC",
         )
