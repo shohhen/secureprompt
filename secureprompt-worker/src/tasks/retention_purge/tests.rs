@@ -444,3 +444,208 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
     );
     Ok(())
 }
+
+// ── (c) FU4: session device context ───────────────────────────────────────
+
+/// Insert one session's sign-in row. `expires_in_hours` in the past makes the
+/// session dead; `revoked` makes it dead a different way. Both are ways a
+/// session ends, and both must lead to the device context being erased.
+async fn insert_session(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: Uuid,
+    expires_in_hours: i64,
+    revoked: bool,
+) -> sqlx::Result<Uuid> {
+    let session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO refresh_tokens
+             (id, user_id, workspace_id, token_hash, created_at, expires_at,
+              revoked_at, session_id, access_jti, client_ip, client_descriptor)
+         VALUES ($1, $2, $3, $4, NOW(), NOW() + ($5 || ' hours')::INTERVAL,
+                 CASE WHEN $6 THEN NOW() ELSE NULL END,
+                 $7, $8, '203.0.113.7', 'Chrome on macOS')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(Uuid::new_v4().simple().to_string())
+    .bind(expires_in_hours.to_string())
+    .bind(revoked)
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .execute(pool)
+    .await?;
+    Ok(session_id)
+}
+
+async fn device_context_of(pool: &PgPool, session_id: Uuid) -> sqlx::Result<(i64, i64)> {
+    let row = sqlx::query(
+        "SELECT COUNT(*)::BIGINT AS total,
+                COUNT(*) FILTER (
+                    WHERE client_ip IS NOT NULL OR client_descriptor IS NOT NULL
+                )::BIGINT AS with_context
+         FROM refresh_tokens WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.get("total"), row.get("with_context")))
+}
+
+async fn seed_user(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
+         VALUES ($1, $2, $3, 'x', 'viewer', NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(format!("fu4-{}@example.com", id.simple()))
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// FU4 — the device context on a session that has ENDED is erased, and the
+/// context on a LIVE session is not.
+///
+/// This is the retention half of the FU4 privacy argument. Migration 027 puts
+/// an IP address and a client descriptor on a refresh row so that a session can
+/// be told apart from another one; `GET /v1/data-inventory` declares them as
+/// `personal_data` with `worker_purge` as the mechanism. This job is that
+/// mechanism, and without it the declaration is a false assurance — the exact
+/// failure `retention_days_without_an_enforcement_mechanism_is_never_reported`
+/// exists to catch on the other side.
+///
+/// It is a SCRUB, not a delete. The row survives because migration 002's
+/// single-use rotation detects a replayed token by finding the revoked row it
+/// belongs to; deleting rows would turn a replay into a plain 401 and lose
+/// threat T-05-03's detection. The personal data does not survive.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+
+    let expired = insert_session(&pool, workspace_id, user_id, -1, false).await?;
+    let revoked = insert_session(&pool, workspace_id, user_id, 24, true).await?;
+    let live = insert_session(&pool, workspace_id, user_id, 24, false).await?;
+
+    // ── PRE-STATE. Without these, "the context is gone" is satisfied by never
+    // having written any.
+    for (name, session) in [("expired", expired), ("revoked", revoked), ("live", live)] {
+        assert_eq!(
+            device_context_of(&pool, session).await?,
+            (1, 1),
+            "premise: the {name} session must carry device context before the purge"
+        );
+    }
+
+    let outcome = run(&pool, &ch_client()).await;
+
+    // The two dead sessions are scrubbed...
+    for (name, session) in [("expired", expired), ("revoked", revoked)] {
+        let (total, with_context) = device_context_of(&pool, session).await?;
+        assert_eq!(
+            with_context, 0,
+            "the {name} session's device context must be erased once the session \
+             is over"
+        );
+        assert_eq!(
+            total, 1,
+            "...but the ROW must survive: deleting it would turn a replayed \
+             refresh token into a plain 401 and lose the replay detection \
+             migration 002 describes"
+        );
+    }
+
+    // ...and the live one is NOT. Without this the whole test would pass for a
+    // job that erased every device column in the table.
+    assert_eq!(
+        device_context_of(&pool, live).await?,
+        (1, 1),
+        "a LIVE session must keep the context that makes it identifiable in the \
+         listing — scrubbing it would leave an administrator unable to tell \
+         which session to end"
+    );
+
+    // The proof-of-purge record. `rows_deleted` counts rows SCRUBBED for this
+    // scope; the post-check must be able to recompute zero.
+    let rows = audit_rows(&pool, outcome.run_id, "refresh_tokens.device_context").await?;
+    assert_eq!(rows.len(), 1, "one audit row for the device-context scope");
+    assert_eq!(
+        rows[0].get::<i64, _>("rows_deleted"),
+        2,
+        "exactly the two ended sessions"
+    );
+    assert_eq!(
+        rows[0].get::<i64, _>("rows_remaining_past_cutoff"),
+        0,
+        "no ended session may still be carrying device context"
+    );
+    assert_eq!(rows[0].get::<String, _>("status"), "ok");
+    Ok(())
+}
+
+/// A session whose chain has ROTATED is one session, and the scrub must decide
+/// on the CHAIN. The sign-in row of a live session is itself revoked (its
+/// successor replaced it), so a scrub that looked only at the row carrying the
+/// context would erase the device of every session the moment it first
+/// rotated — roughly fifteen minutes in.
+///
+/// STATED PLAINLY: this test passes before the scrub exists, because a job that
+/// erases nothing erases nothing wrongly. It is the control on the test above —
+/// the pair is what distinguishes a correct scrub from one that empties the
+/// column — and it is the one that fails if a later change moves the decision
+/// from the chain to the row.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+
+    // The sign-in row: carries the device, and is REVOKED because it rotated.
+    let session_id = insert_session(&pool, workspace_id, user_id, 24, true).await?;
+    // Its successor: live, no device context, same session.
+    sqlx::query(
+        "INSERT INTO refresh_tokens
+             (id, user_id, workspace_id, token_hash, created_at, expires_at, session_id, access_jti)
+         VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '24 hours', $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(Uuid::new_v4().simple().to_string())
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await?;
+
+    // PREMISE: the row holding the context really is revoked, so a row-level
+    // scrub WOULD erase it and this test is not passing by accident.
+    let revoked_row_holds_context: bool = sqlx::query_scalar(
+        "SELECT bool_or(revoked_at IS NOT NULL AND client_ip IS NOT NULL)
+         FROM refresh_tokens WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        revoked_row_holds_context,
+        "premise: the device context must sit on a REVOKED row, which is what \
+         makes the chain-level decision necessary"
+    );
+
+    run(&pool, &ch_client()).await;
+
+    let (total, with_context) = device_context_of(&pool, session_id).await?;
+    assert_eq!(
+        total, 2,
+        "premise: both rows of the chain are still present"
+    );
+    assert_eq!(
+        with_context, 1,
+        "a session that has merely ROTATED is still live, and must keep its \
+         device context — the scrub decides per CHAIN, not per row"
+    );
+    Ok(())
+}
