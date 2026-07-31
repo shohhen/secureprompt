@@ -177,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 let outcome = tasks::api_key_rotation::run(&pool).await;
                 tracing::info!(
                     keys_revoked = outcome.keys_revoked,
+                    workspaces_swept = outcome.workspaces_swept,
                     failures = outcome.failures,
                     "rotation cleanup complete"
                 );

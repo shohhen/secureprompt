@@ -59,14 +59,8 @@ struct Seeded {
     key_id: Uuid,
 }
 
-/// Insert a workspace and one `'rotating'` key whose grace window closed
-/// `rotated_days_ago - grace` ago (negative = still inside the window).
-///
-/// `workspaces` is NOT under FORCE ROW LEVEL SECURITY (checked against
-/// `pg_class.relforcerowsecurity` in the premise below), so its INSERT needs no
-/// scope. `api_keys` IS, so its INSERT is armed — otherwise this fixture would
-/// fail with `42501` under the runner role and the suite could not run at all.
-async fn seed(pool: &PgPool, label: &str, rotated_ago: &str, grace_secs: i32) -> Seeded {
+/// Insert a fresh workspace and return its id.
+async fn new_workspace(pool: &PgPool, label: &str) -> Uuid {
     let workspace_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
         .bind(workspace_id)
@@ -74,7 +68,31 @@ async fn seed(pool: &PgPool, label: &str, rotated_ago: &str, grace_secs: i32) ->
         .execute(pool)
         .await
         .expect("workspace insert");
+    workspace_id
+}
 
+/// Insert one `'rotating'` key into `workspace_id`, rotated `rotated_ago` ago
+/// with `grace_secs` of grace — so it is past its window exactly when
+/// `rotated_ago > grace_secs`.
+///
+/// The workspace is a PARAMETER rather than created here, because the
+/// within-workspace control in
+/// `grace_expired_keys_are_revoked_under_a_non_bypassing_role` depends on the
+/// two keys sharing one scope: a control in a different workspace would be
+/// spared by a sweep that armed one scope and stopped, which is a different
+/// bug and would make that assertion say something it does not mean.
+///
+/// `workspaces` is NOT under FORCE ROW LEVEL SECURITY (asserted as a premise
+/// below), so its INSERT needs no scope. `api_keys` IS, so this INSERT is
+/// armed — otherwise the fixture would fail with `42501` under the runner role
+/// and the suite could not run at all.
+async fn seed_key(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    label: &str,
+    rotated_ago: &str,
+    grace_secs: i32,
+) -> Seeded {
     let key_id = Uuid::new_v4();
     let mut tx = pool.begin().await.expect("fixture transaction");
     sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
@@ -263,9 +281,10 @@ async fn grace_expired_keys_are_revoked_under_a_non_bypassing_role(pool: PgPool)
     assert_table_is_armed(&pool).await;
 
     // 86_400s grace, rotated 10 days ago -> 9 days past the boundary.
-    let stale = seed(&pool, "Stale", "10 days", 86_400).await;
+    let tenant = new_workspace(&pool, "Discriminates").await;
+    let stale = seed_key(&pool, tenant, "Stale", "10 days", 86_400).await;
     // Same grace, rotated a minute ago -> firmly inside the window.
-    let fresh = seed(&pool, "Fresh", "1 minute", 86_400).await;
+    let fresh = seed_key(&pool, tenant, "Fresh", "1 minute", 86_400).await;
 
     // PREMISE: both rows exist and are UNREVOKED before the sweep. Without
     // this, a `'revoked'` afterwards could be the fixture's doing, and a
@@ -328,8 +347,22 @@ async fn grace_expired_keys_are_revoked_under_a_non_bypassing_role(pool: PgPool)
 async fn the_sweep_reaches_every_workspace(pool: PgPool) {
     assert_table_is_armed(&pool).await;
 
-    let first = seed(&pool, "Tenant A", "3 days", 86_400).await;
-    let second = seed(&pool, "Tenant B", "3 days", 86_400).await;
+    let first = seed_key(
+        &pool,
+        new_workspace(&pool, "Tenant A").await,
+        "A",
+        "3 days",
+        86_400,
+    )
+    .await;
+    let second = seed_key(
+        &pool,
+        new_workspace(&pool, "Tenant B").await,
+        "B",
+        "3 days",
+        86_400,
+    )
+    .await;
     assert_ne!(
         first.workspace_id, second.workspace_id,
         "premise: the two fixtures must be in DIFFERENT workspaces, or this \
@@ -376,7 +409,14 @@ async fn the_sweep_reaches_every_workspace(pool: PgPool) {
 async fn a_sweep_with_nothing_to_do_revokes_nothing(pool: PgPool) {
     assert_table_is_armed(&pool).await;
 
-    let fresh = seed(&pool, "Only Fresh", "1 minute", 86_400).await;
+    let fresh = seed_key(
+        &pool,
+        new_workspace(&pool, "Only Fresh").await,
+        "Only Fresh",
+        "1 minute",
+        86_400,
+    )
+    .await;
     assert_eq!(
         key_state(&pool, &fresh).await,
         Some(("rotating".to_owned(), true)),
