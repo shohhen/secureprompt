@@ -514,6 +514,24 @@ test:rls-nonsuperuser:
     # because the rotation-cleanup sweep it covers is the one whose allowlist
     # entry claimed it "fails CLOSED" and did not.
     - cargo test -p secureprompt-worker api_key_rotation -- --test-threads=4 --nocapture
+    # P1H/P1J. The retention purge — capture purge and the FU4 device-context
+    # scrub — now that both enumerate `workspaces` and work per tenant inside a
+    # scope-armed, read-back transaction, and the suite's own fixtures seed and
+    # verify through armed scopes. Measured 14 passed / 0 failed under
+    # `secureprompt_runner` and 14 / 0 under the compose superuser, per the
+    # header's "run any candidate under BOTH" rule.
+    - cargo test -p secureprompt-worker retention_purge -- --test-threads=4 --nocapture
+    # P1K. The MISSING-PREDICATE class: a query that is armed, read back, and
+    # simply never filters. Both suites are built to mean something under
+    # EITHER role rather than to pass under one — `rls_missing_predicate`
+    # probes `pg_roles` on the wire and asserts the leak on a bypassing role
+    # and the policy's masking on this one, and `tenancy_predicate_guard`
+    # reads its tenant-table list from `information_schema.columns`. Listing
+    # them here is what keeps the second arm honest: without a job that runs
+    # as a non-bypassing role, the masking half is never exercised. Measured
+    # 6 / 0 and 3 / 0 under BOTH roles.
+    - cargo test -p secureprompt-api --test rls_missing_predicate -- --test-threads=4 --nocapture
+    - cargo test -p secureprompt-api --test tenancy_predicate_guard -- --test-threads=4 --nocapture
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.
