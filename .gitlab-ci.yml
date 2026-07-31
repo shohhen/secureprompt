@@ -387,6 +387,11 @@ test:audit-export-doc:
         && echo "OK: python3 can verify Ed25519"
     - bash scripts/ci/clickhouse-migrate.sh
     - |
+      # `set -o pipefail` because of the `| tee` below: without it the
+      # pipeline's status is tee's, which is always 0, and a failing cargo run
+      # would report green. The grep guard would still catch it, but a job that
+      # depends on two independent things going right is a job that goes wrong.
+      set -o pipefail
       # BY NAME, not a bare `--ignored`: that would also sweep in the two
       # ClickHouse migration tests quarantined for an unrelated reason.
       cargo test -p secureprompt-worker --bins -- \
@@ -395,7 +400,8 @@ test:audit-export-doc:
         tasks::audit_export::tests::doc_gate::the_documents_steps_5_and_6_are_load_bearing \
         | tee doc-gate.log
       # See the header: a filter that matches nothing is a green job that
-      # verified nothing.
+      # verified nothing. `cargo test -- --exact <typo>` prints "0 passed" and
+      # exits 0.
       grep -q "2 passed" doc-gate.log \
         || { echo "FAIL: the doc gate did not run both tests — were they renamed?"; exit 1; }
 
