@@ -58,3 +58,28 @@
 -p secureprompt-common --test kms_tests	vault_kms_constructs_with_token	ENVIRONMENT	requires live HashiCorp Vault (see secureprompt-common/src/kms.rs:88)
 -p secureprompt-worker --bins	tests::tests::test_migration_idempotency	ENVIRONMENT	requires live ClickHouse
 -p secureprompt-worker --bins	tests::tests::test_mv_hourly_cost_aggregation	ENVIRONMENT	requires live ClickHouse
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT — P2A, the audit-export DOCUMENT gate.
+#
+# `docs/audit-export-format.md` carries the reference verifier a bank auditor
+# runs. These two tests extract that Python out of the Markdown at run time and
+# execute it against a genuine signed export the real job produced, then
+# against nine tampered copies RE-SIGNED with the private key.
+#
+# WHY THEY ARE #[ignore]d, AND WHERE THEY RUN INSTEAD:
+# the verifier needs the `cryptography` package for its Ed25519 check. Measured
+# by running the CI image: `rust:1.89-bookworm` ships python3 3.11.2 but NOT
+# `cryptography`, and no pip. The shared `test` job could not run them.
+# So they run in their OWN job, `test:audit-export-doc` in .gitlab-ci.yml,
+# which installs python3-cryptography and invokes them BY NAME with
+# `--ignored`. They are not skipped anywhere — and `require_python()` in
+# doc_gate.rs PANICS rather than skipping if the interpreter is missing, so
+# that job cannot pass by doing nothing.
+#
+# TO UN-QUARANTINE: add `python3-cryptography` to `.rust-gate`s before_script
+# so every Rust job has it, drop both #[ignore]s and both rows here, and delete
+# the test:audit-export-doc job.
+# ---------------------------------------------------------------------------
+-p secureprompt-worker --bins	tasks::audit_export::tests::doc_gate::the_documents_verifier_accepts_a_real_export_and_rejects_every_tampering	ENVIRONMENT	runs in the test:audit-export-doc job; needs python3 + cryptography, absent from rust:1.89-bookworm
+-p secureprompt-worker --bins	tasks::audit_export::tests::doc_gate::the_documents_steps_5_and_6_are_load_bearing	ENVIRONMENT	runs in the test:audit-export-doc job; needs python3 + cryptography, absent from rust:1.89-bookworm

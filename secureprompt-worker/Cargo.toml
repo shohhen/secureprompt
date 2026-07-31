@@ -24,5 +24,12 @@ uuid = { workspace = true }
 # `secureprompt-common::audit_export`; the worker only holds the key type.
 ed25519-dalek = { workspace = true }
 
+[dev-dependencies]
+# P2A — the audit-export doc gate re-signs tampered manifests with the test
+# key, which means base64-encoding a signature the way the producer does. The
+# PRODUCT never needs it: `build_manifest` in secureprompt-common does the
+# encoding on the real path, so this stays a test-only dependency.
+base64 = { workspace = true }
+
 [lints]
 workspace = true
