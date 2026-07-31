@@ -794,10 +794,19 @@ async fn migration_026_rls_isolates_the_revocation_trail_from_a_nonsuperuser(poo
     let mut total = 0_i64;
     for workspace in [a.id, b.id] {
         let mut scope = super::fixtures::scoped(&pool, workspace).await;
-        let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
-            .fetch_one(&mut *scope)
-            .await
-            .expect("premise count");
+        // The explicit `WHERE workspace_id` is not redundant with the scope,
+        // and must stay. Under `secureprompt_runner` the RLS policy already
+        // restricts the read to this tenant; under the compose SUPERUSER
+        // nothing does, and without the predicate this count would be 2 for
+        // both workspaces. The premise being established is "both rows
+        // exist", and it has to hold under either role.
+        let seen: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1",
+        )
+        .bind(workspace)
+        .fetch_one(&mut *scope)
+        .await
+        .expect("premise count");
         assert_eq!(
             seen, 1,
             "premise: workspace {workspace} must see exactly its own \
