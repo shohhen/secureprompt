@@ -3,6 +3,8 @@ pub mod credential_test;
 pub mod ollama;
 pub mod openai;
 pub mod openai_compat;
+/// WS4-5 — the connect/read/total deadlines that bound one upstream call.
+pub mod upstream;
 pub mod vertex;
 pub mod vllm;
 #[cfg(test)]

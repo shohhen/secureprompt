@@ -11,6 +11,7 @@
 //! RELEASED, observed from the server side, within the configured deadline.
 //! The hung upstream reports when its accepted socket saw the client let go.
 
+use secureprompt_api::providers::upstream::{build_upstream_client, UpstreamDeadline};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
@@ -21,22 +22,20 @@ use std::time::{Duration, Instant};
 /// could be confused with the 120 s total timeout the gateway ships with.
 const BOUND: Duration = Duration::from_secs(3);
 
-/// The upstream client under test.
+/// The upstream client under test — the PRODUCTION constructor, the one
+/// `providers/openai_compat.rs::shared_upstream` calls, given a deadline short
+/// enough to assert against.
 ///
-/// TODO(WS4-5): this is the configuration `providers/openai_compat.rs`
-/// `shared_http_client()` builds at b9c98a7, copied verbatim. It has no
-/// connect deadline and no read deadline — only a 120 s total timeout — which
-/// is what the assertions below are about. The GREEN change replaces the body
-/// of this function with the production constructor, and every assertion in
-/// this file stays exactly as it is.
+/// The RED commit (d66ab6f) ran these same assertions against the client the
+/// gateway built at b9c98a7 — `.timeout(120s)` and nothing else — and the call
+/// was still in flight after 3 s. Only this function changed; every assertion
+/// below is byte-for-byte what failed then.
 fn client_under_test() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(32)
-        .tcp_keepalive(Duration::from_secs(30))
-        .build()
-        .expect("client must build")
+    build_upstream_client(&UpstreamDeadline::parse(
+        Some("500"),  // connect
+        Some("800"),  // read (idle)
+        Some("5000"), // total — not applied by the client; see the module docs
+    ))
 }
 
 /// What the hung upstream saw before its socket went away.
@@ -130,7 +129,27 @@ fn responsive_upstream() -> String {
 ///      not leaked into the pool while the caller walks away),
 ///   3. the same client still completes a normal call (the deadline is a
 ///      deadline, not a broken client).
-#[tokio::test]
+///
+/// ## The runtime detail this test cannot do without
+///
+/// `flavor = "multi_thread"` and the `spawn_blocking` wait below are both
+/// load-bearing, and the reason is worth writing down because it produced a
+/// convincing false positive on the way here.
+///
+/// What actually closes the socket is hyper's connection TASK: reqwest's read
+/// deadline resolves the caller's future with an error, and hyper then notices
+/// its response callback was dropped and closes the connection. That happens on
+/// the runtime, not on the caller. Waiting for the release with a BLOCKING
+/// `recv_timeout` under the default single-threaded `#[tokio::test]` therefore
+/// starves the one thread that could run it, and the socket stays open for as
+/// long as you are willing to wait — measured here at over 100 s, which reads
+/// exactly like a connection leak and is not one. Production is unaffected:
+/// `main.rs` runs on `#[tokio::main]`, which is multi-threaded.
+///
+/// Measured with the deadline this test configures: caller errors at 803.4 ms,
+/// server observes EOF at 803.8 ms. A raw `TcpStream` close is seen by this
+/// harness in 12 µs, so the harness is not what is being measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hung_upstream_releases_the_connection_within_the_deadline() {
     let client = client_under_test();
     let (url, released) = hung_upstream();
@@ -158,13 +177,18 @@ async fn hung_upstream_releases_the_connection_within_the_deadline() {
     );
     let gave_up_after = started.elapsed();
 
-    let release = released.recv_timeout(BOUND).unwrap_or_else(|err| {
-        panic!(
-            "the hung upstream never saw its socket released ({err}) — the \
-             caller got an error but the connection is still held, which is \
-             the leak this criterion exists to rule out"
-        )
-    });
+    // Off the runtime — see the note above. A blocking wait on a runtime
+    // thread would prevent the very close it is waiting for.
+    let release = tokio::task::spawn_blocking(move || released.recv_timeout(BOUND))
+        .await
+        .expect("the waiting task must not panic")
+        .unwrap_or_else(|err| {
+            panic!(
+                "the hung upstream never saw its socket released ({err}) — the \
+                 caller got an error but the connection is still held, which is \
+                 the leak this criterion exists to rule out"
+            )
+        });
 
     // PREMISE: the connection carried a real request. Without this, "the
     // socket was released" could be true of a socket that was never used.

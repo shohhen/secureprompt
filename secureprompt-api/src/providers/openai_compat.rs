@@ -20,6 +20,7 @@
 use crate::{
     http::model_router::ModelTarget,
     providers::{
+        upstream::{build_upstream_client, UpstreamDeadline},
         ProviderAdapter, ProviderEvent, ProviderEventStream, ProviderFailure, ProviderInvocation,
         ProviderOutput,
     },
@@ -29,27 +30,35 @@ use futures_util::StreamExt;
 use secureprompt_common::types::TokenUsage;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Process-wide HTTP client. `OnceLock` is the cheapest way to lazily
-/// initialize a singleton on stable Rust without an extra dep. Returning
-/// `&'static reqwest::Client` is fine — `reqwest::Client` is `Clone`-cheap
-/// (Arc-wrapped internals) and we never need ownership.
-fn shared_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            // Keep idle connections around for ~90s — long enough that
-            // typical chat sessions land on a warm pool.
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(32)
-            // HTTP/2 is on by default for HTTPS; explicit TCP keep-alive
-            // helps the rare HTTP/1.1 fallbacks.
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .expect("reqwest::Client build with default-only options cannot fail")
+/// Process-wide HTTP client plus the deadline it was built with. `OnceLock` is
+/// the cheapest way to lazily initialize a singleton on stable Rust without an
+/// extra dep.
+///
+/// WS4-5 — the deadline travels WITH the client rather than being re-read from
+/// the environment at each call site, so the per-request total applied in
+/// [`invoke`] can never disagree with the connect/read deadlines baked into the
+/// client. See [`crate::providers::upstream`] for why `total` is not set on the
+/// client itself.
+fn shared_upstream() -> &'static (reqwest::Client, UpstreamDeadline) {
+    static SHARED: OnceLock<(reqwest::Client, UpstreamDeadline)> = OnceLock::new();
+    SHARED.get_or_init(|| {
+        let deadline = UpstreamDeadline::from_env();
+        tracing::info!(
+            connect_ms = deadline.connect.as_millis(),
+            read_idle_ms = deadline.read_idle.as_millis(),
+            total_ms = deadline.total.as_millis(),
+            "upstream provider deadlines"
+        );
+        (build_upstream_client(&deadline), deadline)
     })
+}
+
+/// Returning `&'static reqwest::Client` is fine — `reqwest::Client` is
+/// `Clone`-cheap (Arc-wrapped internals) and we never need ownership.
+fn shared_http_client() -> &'static reqwest::Client {
+    &shared_upstream().0
 }
 
 /// Generic OpenAI-compatible adapter. The `base_url` is fixed at
@@ -409,6 +418,11 @@ pub(crate) async fn invoke(
     let response = client
         .post(url)
         .bearer_auth(bearer_token)
+        // WS4-5 — the wall clock on one buffered call, applied per-request
+        // rather than on the client so that `invoke_stream` (which shares the
+        // client) is not capped by it. A stream is bounded by the idle
+        // deadline instead.
+        .timeout(shared_upstream().1.total)
         .json(&body)
         .send()
         .await
