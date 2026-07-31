@@ -578,13 +578,24 @@ async fn create_model_cannot_revive_a_foreign_workspaces_excluded_model(pool: Pg
     );
 
     // And B's row is untouched — the refusal is not merely a returned error.
+    //
+    // Read through B's OWN armed scope, not the bare pool. This assertion was
+    // written on the pool first and the `secureprompt_runner` role caught it
+    // with `RowNotFound`: under a non-bypassing role an unscoped read of
+    // `models` returns nothing, so the check would have been reading its own
+    // blindness rather than B's row. It failed loudly here because it reads
+    // ONE row with `fetch_one`; the same mistake behind `assert_eq!(count, 0)`
+    // is silent, which is the shape that made six of twenty-four
+    // absence-assertions hollow in an earlier sweep.
+    let mut tx = scoped_tx(&pool, workspace_b).await;
     let still_excluded: bool = sqlx::query_scalar(
         "SELECT excluded FROM models WHERE workspace_id = $1 AND name = 'model-b'",
     )
     .bind(workspace_b)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
-    .expect("B's row must still be readable to be checked");
+    .expect("B's row must still be readable from B's own scope to be checked");
+    tx.commit().await.expect("verification read commit");
     assert!(
         still_excluded,
         "workspace B's excluded model was revived by a call made from \
