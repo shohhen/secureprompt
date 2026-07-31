@@ -9,11 +9,23 @@
 //! GET  /v1/audit-exports/{id}/pages/{n}      one page, as the signed bytes
 //! ```
 //!
+//! # What one export contains (FU1)
+//!
+//! Two planes, in two sections of one signed artifact: the ClickHouse request
+//! log and the Postgres control-plane audit trail — `raw_capture_audit`,
+//! `retention_purge_audit`, `session_revocation_audit`. There is no
+//! plane-selecting parameter on `POST`, deliberately. An auditor handed one of
+//! two possible artifacts cannot tell "the other was never produced" from "the
+//! other was withheld", and the whole point of the control is that they can
+//! tell nothing was omitted. `verify_export` enforces it: a manifest that does
+//! not declare both sections is refused.
+//!
 //! # Why poll-based, and why the API does not produce the export
 //!
-//! An export walks a window of `request_events`, renders it and signs it. That
-//! is a background job by nature, and this codebase already has exactly one
-//! way to run those: the hand-rolled Redis-list + JSON envelope protocol in
+//! An export walks a window of `request_events` and three Postgres audit
+//! tables, renders it and signs it. That is a background job by nature, and
+//! this codebase already has exactly one way to run those: the hand-rolled
+//! Redis-list + JSON envelope protocol in
 //! `secureprompt_common::tasks`. So `POST` writes a `queued` row and RPUSHes
 //! an envelope onto `queue:audit_export`; `secureprompt-worker` does the work;
 //! the caller polls `GET`. No job framework is introduced — the stack decision
@@ -94,10 +106,17 @@ const SIGNATURE_NOTE: &str =
      the manifest before verifying. The manifest carries a SHA-256 for every page \
      and a hash chain over those digests in order, so removing a row from the \
      middle of a page, dropping a whole page, or reordering pages all break \
-     verification. `public_key_b64` is published here for convenience ONLY: it is \
-     served by the same deployment that produced the export, so it is not a trust \
-     root. Obtain the deployment's audit-export public key THROUGH A SEPARATE \
-     CHANNEL and compare `signing_key_id` against it before believing any of this.";
+     verification. The manifest also divides the export into SECTIONS — \
+     `request_events` (what requests passed through the gateway) and \
+     `control_plane_events` (what administrators did) — and names the section of \
+     every page. CHECK THE SECTION LIST: a version-2 export that does not declare \
+     both is not a shorter export, it is an export part of which is missing, and \
+     it must be refused. Each section states its own retention, because they come \
+     from stores with different expiry. `public_key_b64` is published here for \
+     convenience ONLY: it is served by the same deployment that produced the \
+     export, so it is not a trust root. Obtain the deployment's audit-export \
+     public key THROUGH A SEPARATE CHANNEL and compare `signing_key_id` against \
+     it before believing any of this.";
 
 // ── Router ────────────────────────────────────────────────────────────────
 
@@ -612,9 +631,21 @@ mod tests {
 
     /// The signature note has to tell an auditor the one thing that makes the
     /// scheme worth anything: the published key is not a trust root.
+    ///
+    /// Since FU1 it has to tell them a second thing, for the same reason. An
+    /// auditor who does not know the export is supposed to contain BOTH
+    /// sections cannot notice that one is missing, and the section list is the
+    /// only place the artifact says so about itself.
     #[test]
     fn the_signature_note_says_to_get_the_key_out_of_band() {
         assert!(SIGNATURE_NOTE.contains("SEPARATE CHANNEL"));
         assert!(SIGNATURE_NOTE.contains("not a trust root"));
+        assert!(SIGNATURE_NOTE.contains("CHECK THE SECTION LIST"));
+        for section in secureprompt_common::audit_export::REQUIRED_SECTIONS {
+            assert!(
+                SIGNATURE_NOTE.contains(section),
+                "the note must name the `{section}` section a complete export carries"
+            );
+        }
     }
 }

@@ -12,6 +12,12 @@
 //!   * that the RLS policy migration 025 installs is actually armed — which no
 //!     `#[sqlx::test]` can see, because that pool is a BYPASSRLS superuser.
 //!
+//! Since FU1 the fixture export is a whole schema-2 artifact: two data-plane
+//! pages and one CONTROL-plane page, whose columns and header are different.
+//! The byte-for-byte test fetches all three, so a transport that special-cased
+//! the request schema — or re-encoded a page carrying a quoted, comma-bearing
+//! email address — fails there rather than in front of an auditor.
+//!
 //! All fixture data is synthetic (Constraint 5).
 
 mod support;
@@ -21,7 +27,9 @@ use axum::{
     http::{Request, StatusCode},
 };
 use secureprompt_common::audit_export::{
-    build_manifest, render_page, verify_export, AuditRow, ExportFormat,
+    build_manifest, control_section, no_expiry_for, render_page, request_section, retention_for,
+    verify_export, AuditRow, ControlRow, ExportFormat, CONTROL_SOURCE_TABLES,
+    EVENT_SESSION_REVOKED,
 };
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnectOptions;
@@ -118,6 +126,30 @@ fn synthetic_row(workspace_id: Uuid, n: u32) -> AuditRow {
     }
 }
 
+/// One synthetic control-plane row — an administrative action, the half of the
+/// export the transport has never carried before.
+fn synthetic_control_row(workspace_id: Uuid) -> ControlRow {
+    ControlRow {
+        event_id: Uuid::from_u128(0x5100),
+        workspace_id,
+        occurred_at: chrono::Utc::now() - chrono::Duration::minutes(9),
+        event_type: EVENT_SESSION_REVOKED.into(),
+        source_table: "session_revocation_audit".into(),
+        actor_user_id: Some(Uuid::from_u128(0x5101)),
+        // Same trap as `api_key_name` above: a comma and a quote, so a
+        // transport that re-encoded the page would show it here too.
+        actor_email: Some(r#"synthetic "admin", comma@example.invalid"#.into()),
+        actor_role: Some("admin".into()),
+        target_user_id: Some(Uuid::from_u128(0x5102)),
+        target_email: Some("synthetic-target@example.invalid".into()),
+        target_role: Some("member".into()),
+        detail: serde_json::json!({
+            "revoked_before_unix": 1_780_000_000_i64,
+            "refresh_tokens_revoked": 3,
+        }),
+    }
+}
+
 /// Write a finished, signed export directly into `audit_exports` /
 /// `audit_export_pages`, the way the worker would have left it.
 ///
@@ -134,7 +166,14 @@ async fn seed_completed_export(
     let from = now - chrono::Duration::days(1);
 
     let rows: Vec<AuditRow> = (0..4).map(|n| synthetic_row(workspace_id, n)).collect();
-    let pages: Vec<Vec<u8>> = rows.chunks(2).map(|c| render_page(c, format)).collect();
+    let data_pages: Vec<Vec<u8>> = rows.chunks(2).map(|c| render_page(c, format)).collect();
+    // One control-plane page carrying one administrative action, so the
+    // fixture is a whole schema-2 export and the transport assertions below
+    // cover a page of EACH section — the control-plane page is the one whose
+    // bytes are least like the data plane's and therefore the one a
+    // re-encoding transport would mangle first.
+    let control = vec![synthetic_control_row(workspace_id)];
+    let control_pages: Vec<Vec<u8>> = vec![render_page(&control, format)];
     let signed = build_manifest(
         export_id,
         workspace_id,
@@ -142,19 +181,34 @@ async fn seed_completed_export(
         now,
         format,
         2,
-        &pages,
-        &[2, 2],
+        &[
+            request_section(
+                data_pages.clone(),
+                vec![2, 2],
+                vec![retention_for(from, now, now)],
+            ),
+            control_section(
+                control_pages.clone(),
+                vec![1],
+                CONTROL_SOURCE_TABLES
+                    .iter()
+                    .map(|t| no_expiry_for(t))
+                    .collect(),
+            ),
+        ],
         now,
         &test_key(),
     )
     .expect("manifest");
+    let mut pages = data_pages;
+    pages.extend(control_pages);
 
     sqlx::query(
         "INSERT INTO audit_exports \
          (id, workspace_id, requested_by, window_from, window_to, format, page_size, \
           status, total_rows, total_pages, manifest_json, signature_b64, \
           public_key_b64, signing_key_id, completed_at) \
-         VALUES ($1, $2, NULL, $3, $4, $5, 2, 'complete', 4, 2, $6, $7, $8, $9, NOW())",
+         VALUES ($1, $2, NULL, $3, $4, $5, 2, 'complete', 5, 3, $6, $7, $8, $9, NOW())",
     )
     .bind(export_id)
     .bind(workspace_id)
@@ -172,11 +226,12 @@ async fn seed_completed_export(
         sqlx::query(
             "INSERT INTO audit_export_pages \
              (export_id, workspace_id, page_number, row_count, sha256, body) \
-             VALUES ($1, $2, $3, 2, $4, $5)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(export_id)
         .bind(workspace_id)
         .bind(i32::try_from(index).unwrap() + 1)
+        .bind(i32::try_from(signed.rows_per_page[index]).unwrap())
         .bind(&signed.page_digests[index])
         .bind(String::from_utf8(body.clone()).expect("utf8"))
         .execute(pool)
@@ -342,8 +397,12 @@ async fn pages_are_served_byte_for_byte_and_still_verify(pool: PgPool) -> sqlx::
         let seeded = seed_completed_export(&pool, ws, format).await?;
         let token = make_jwt(ws, Uuid::new_v4(), "admin");
 
+        // Pages 1-2 are the data plane, page 3 the control plane. Fetching all
+        // three matters: the control-plane page has different columns and a
+        // different header, so a transport that special-cased the request
+        // schema would show up only here.
         let mut fetched: Vec<Vec<u8>> = Vec::new();
-        for page in 1..=2 {
+        for page in 1..=3 {
             let response = router(pool.clone())
                 .oneshot(get(
                     &format!("/v1/audit-exports/{}/pages/{page}", seeded.export_id),

@@ -1490,7 +1490,9 @@ async fn get_data_inventory(
         ),
         retention: Retention::none(
             "Append-only and never purged, by design. An audit trail with a retention \
-             window is an audit trail with a deadline.",
+             window is an audit trail with a deadline. These rows are carried by \
+             `audit.export`'s `control_plane_events` section, so a COPY of any exported \
+             window also lives in `audit_export_pages`.",
         ),
         governed_by: None,
         enabled: None,
@@ -1513,7 +1515,15 @@ async fn get_data_inventory(
              process can modify, and a logical DELETE is not an assurance that the bytes \
              are irrecoverable from backups or unmerged parts.",
         ),
-        retention: Retention::none("Append-only and never purged, by design."),
+        retention: Retention::none(
+            "Append-only and never purged, by design. Rows whose `workspace_id` is this \
+             workspace's are carried by `audit.export`'s `control_plane_events` section, \
+             so a COPY of any exported window also lives in `audit_export_pages`. Rows \
+             whose `workspace_id` IS NULL — purge scopes that are not per-workspace — are \
+             NOT exported to any tenant, and the count of them in the window is reported \
+             in the export manifest so the exclusion is visible. The `error` column is \
+             never exported: it holds a ClickHouse exception message.",
+        ),
         governed_by: None,
         enabled: None,
     });
@@ -1545,10 +1555,13 @@ async fn get_data_inventory(
         retention: Retention::none(
             "Append-only and never purged, by design, like `raw_capture_audit` and \
              `retention_purge_audit`. `retention.purge` does not cover this table and is \
-             not intended to. DISCLOSED GAP, in the other direction: these rows are NOT \
-             carried by `audit.export`, which reads ClickHouse `request_events` only. An \
-             auditor holding a signed export does not hold this trail and must read it \
-             here.",
+             not intended to. The gap WS4-3 disclosed here — that these rows were not \
+             carried by `audit.export` — is CLOSED: they are now the \
+             `control_plane_events` section of every export, and the manifest states \
+             that this table has no TTL, so that section's window is complete however \
+             far back it reaches. A COPY of these rows therefore also lives in \
+             `audit_export_pages` for every window that has been exported, and an \
+             erasure request must reach that table too.",
         ),
         governed_by: None,
         enabled: None,
@@ -1570,7 +1583,11 @@ async fn get_data_inventory(
         description: "One row per requested audit export: the window, format, page size, \
                       status, and — once complete — the signed manifest, its detached \
                       Ed25519 signature, the public key and the signing-key fingerprint. \
-                      No exported rows live here; they are in `audit_export_pages`.",
+                      The manifest (schema version 2) describes the export as two \
+                      SECTIONS — `request_events` and `control_plane_events` — each with \
+                      its own column list, coverage statement and per-source retention \
+                      block, and names the section of every page. No exported rows live \
+                      here; they are in `audit_export_pages`.",
         sensitivity: "audit_trail",
         row_count: Some(pg.n("c_audit_exports")),
         row_count_status: "counted",
@@ -1601,12 +1618,22 @@ async fn get_data_inventory(
         store: "postgres",
         location: "audit_export_pages".to_owned(),
         description: "The exported audit rows themselves, as the exact CSV or JSONL bytes \
-                      that were signed. A MATERIALISED COPY of `request_events` metadata \
-                      for the export's window: request id, timestamp, provider, model, \
-                      disposition, token counts, cost, and the actor columns — user id, \
-                      API key id, API key name, IP address, User-Agent. NO PROMPT OR \
-                      RESPONSE CONTENT: `raw_prompt`, `raw_response`, `redacted_prompt` \
-                      and `restored_response` are not exported, by construction.",
+                      that were signed. A MATERIALISED COPY OF TWO PLANES, in two \
+                      sections of the same export. The DATA PLANE copies \
+                      `request_events` metadata for the window: request id, timestamp, \
+                      provider, model, disposition, token counts, cost, and the actor \
+                      columns — user id, API key id, API key name, IP address, \
+                      User-Agent. The CONTROL PLANE copies this workspace's rows from \
+                      `raw_capture_audit`, `retention_purge_audit` and \
+                      `session_revocation_audit`: who changed raw-content capture, what a \
+                      purge run deleted, and who terminated whose sessions, with the \
+                      actor and target emails and roles as they read at the time. NO \
+                      PROMPT OR RESPONSE CONTENT: `raw_prompt`, `raw_response`, \
+                      `redacted_prompt` and `restored_response` are not exported, by \
+                      construction. `retention_purge_audit.error` is not exported either \
+                      — it holds a ClickHouse exception message, which quotes the \
+                      statement that provoked it; the export carries a boolean \
+                      `error_present` in its place.",
         // Not `derived_metadata`. These pages carry the actor columns verbatim,
         // which are personal data under an erasure request even though no
         // detected PII is among them.
@@ -1627,7 +1654,11 @@ async fn get_data_inventory(
              provides NO confidentiality. (2) The bytes carry personal data: \
              `api_key_name` is administrator-chosen free text that routinely names a \
              person, and `ip_address`, `user_agent`, `user_id` and `api_key_id` identify \
-             an actor. `model` is copied VERBATIM from `request_events.model` and, unlike \
+             an actor, and the control-plane section adds two more email addresses per \
+             revocation row — the actor's and the target's — copied verbatim from \
+             `session_revocation_audit`, plus the acting administrator's email from \
+             `raw_capture_audit`. `model` is copied VERBATIM from `request_events.model` \
+             and, unlike \
              the leak report's `by_model`, is NOT bounded against the workspace model \
              catalogue — `analytics::detection_counts::canonicalize_model` is applied only \
              on the `detection_class_counts` write path — so it carries whatever string \
