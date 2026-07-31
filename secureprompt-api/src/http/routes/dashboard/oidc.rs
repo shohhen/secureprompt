@@ -277,7 +277,13 @@ pub async fn oidc_callback(
 /// `decide_2fa`/`TokenOr2fa`/`encode_purpose_token` machinery — so an
 /// OIDC-authenticated Owner/Admin cannot skip 2FA by using this path
 /// instead of `/v1/auth/token`.
-async fn issue_token_or_2fa_response(
+/// `pub` rather than private so an integration test can drive it directly.
+/// `oidc_callback` cannot be exercised without a live identity provider —
+/// discovery, code exchange and a userinfo fetch all happen before this point —
+/// and this is the whole of the callback that decides what an OIDC sign-in
+/// does, so testing it here is testing the OIDC path with only the network
+/// hops omitted.
+pub async fn issue_token_or_2fa_response(
     state: &AppState,
     row: &crate::db::user_repo::UserCredentials,
     device: &DeviceContext,
