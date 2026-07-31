@@ -429,37 +429,54 @@ test:audit-export-doc:
 #
 # WHAT KEEPS THE REST OUT, measured suite by suite as `secureprompt_runner`:
 #   --lib                      695 passed / 30 failed
-#   dashboard                  ~87 failed
 #   admin_audit                 1 passed / 22 failed
 #   migration_017_023_rls       6 passed /  8 failed
-#   migration_020_rls           0 passed /  7 failed
 #   rls_repo_scope              0 passed /  5 failed
 #   raw_content_capture         1 passed /  7 failed
 #   data_inventory             18 passed /  3 failed
+# (`dashboard` — 43 failed — and `migration_020_rls` — 0/7 — were on this list
+# and have since been converted; both are in the job below.)
+#
 # Every one of those residual failures is in TEST FIXTURE or VERIFICATION SQL,
 # not in an application path: the suites were written on the assumption that
 # `#[sqlx::test]`'s pool bypasses RLS, so they seed armed tables on a bare pool
 # (`42501 new row violates row-level security policy for ...`) or read them back
 # unscoped. Two shapes recur and both need care rather than bulk edits:
-#   * a fixture that leaves a SESSION-level `set_config(..., false)` on a
-#     pooled connection (tests/fixtures/workspace_*.sql), so which workspace a
-#     later insert can write depends on which connection the pool hands out;
-#   * a verification read that becomes a VACUOUS PASS — `assert_eq!(count, 0)`
-#     satisfied by RLS filtering rather than by the code being right. One such
-#     was found and fixed in cross_tenant.rs; assume there are siblings.
+#   * a SEED on the bare pool. Loud: 42501, and it names the table.
+#   * a VERIFICATION READ on the bare pool. NOT loud, and the dangerous one.
+#     `assert_eq!(count, 0)` becomes satisfied by RLS filtering rather than by
+#     the code being right — an absence-assertion that passes because the
+#     reader cannot see. Converting a suite without auditing its
+#     absence-assertions therefore makes the suite GREEN and EMPTY. Four such
+#     were found in the dashboard conversion; three were demonstrated by
+#     mutation to have passed while the fact they assert was false.
 #
 # So: widen this list as each suite's fixtures are converted to `begin_scoped`.
 # Do not delete the job, and do not widen it to a suite that has not been run
-# under the runner role first.
+# under the runner role first. Run any candidate under BOTH roles: an armed
+# scope filters nothing under a superuser, so a premise that leans on RLS to do
+# its filtering passes here and fails in `test:` (measured — see the two
+# `migration_00x ... unscoped read` premises).
 # ---------------------------------------------------------------------------
 test:rls-nonsuperuser:
   extends: .rust-gate
   stage: test
+  # redis + clickhouse are here for `dashboard`, which drives real HTTP handlers
+  # (budget counters, session revocation watermarks) and the analytics reader.
+  # Versions pinned to match docker-compose.yml and the `test:` job exactly.
   services:
     - name: postgres:16-alpine
       alias: postgres
+    - name: valkey/valkey:8.1.6-alpine
+      alias: redis
+    - name: clickhouse/clickhouse-server:24.8
+      alias: clickhouse
   variables:
     DATABASE_URL: "postgres://secureprompt_runner:secureprompt@postgres:5432/postgres"
+    REDIS_URL: "redis://redis:6379"
+    CLICKHOUSE_URL: "http://clickhouse:8123"
+    CLICKHOUSE_DB: "sp_analytics"
+    CLICKHOUSE_SKIP_USER_SETUP: "1"
     RUST_LOG: "info"
   # The role setup lives in `script`, not `before_script`, so this job inherits
   # .rust-gate's ssh setup unchanged. (GitLab's `!reference` would also work,
@@ -468,12 +485,18 @@ test:rls-nonsuperuser:
   script:
     - apt-get update -qq && apt-get install -y -qq postgresql-client
     - bash scripts/ci/create-nonsuperuser-role.sh
+    # Same reason as the `test:` job: ClickHouse DDL is applied by the WORKER at
+    # boot and CI never starts one, so `dashboard::analytics` and
+    # `dashboard::rls::cross_tenant_matrix` would run against an empty database.
+    - bash scripts/ci/clickhouse-migrate.sh
     # Each of these was RUN as `secureprompt_runner` and observed green before
     # being listed here. Separate invocations rather than one comma list, so a
     # failure names the suite that failed.
     - cargo test -p secureprompt-api --test cross_tenant -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test rls_workspace_creation -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test rls_call_site_guard -- --test-threads=4 --nocapture
+    - cargo test -p secureprompt-api --test migration_020_rls -- --test-threads=4 --nocapture
+    - cargo test -p secureprompt-api --test dashboard -- --test-threads=4 --nocapture
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.
