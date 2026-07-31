@@ -11,7 +11,8 @@ resolver = "2"
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "compression-br"] }
+# `limit` — WS4-5 `RequestBodyLimitLayer`, the edge body-size limit.
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "compression-br"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

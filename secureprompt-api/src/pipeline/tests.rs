@@ -39,6 +39,8 @@ mod pipeline_contract_tests {
             extra_params: serde_json::json!({}),
             client_ip: None,
             user_agent: None,
+            // No middleware above a direct invocation — `prepare` mints one.
+            request_id: None,
         }
     }
 
