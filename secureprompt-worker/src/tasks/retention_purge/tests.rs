@@ -381,13 +381,10 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
     insert_capture(workspace_id, recent, 2).await;
 
     // The operator LOWERS retention to 7 days, after the rows were written.
-    sqlx::query(
-        "INSERT INTO workspace_raw_capture (workspace_id, enabled, retention_days)
-         VALUES ($1, true, 7)",
-    )
-    .bind(workspace_id)
-    .execute(&pool)
-    .await?;
+    // `workspace_raw_capture` is armed (migration 030), so the write goes
+    // through the same scoped helper the P1H tests below use — a bare-pool
+    // INSERT here is refused with `42501` under `secureprompt_runner`.
+    set_capture_retention(&pool, workspace_id, 7).await?;
 
     // ── PRE-STATE.
     assert_eq!(
@@ -422,11 +419,13 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
          deleting by something other than the configured window"
     );
 
-    let rows = audit_rows(&pool, outcome.run_id, "request_content_captures").await?;
-    let mine: Vec<_> = rows
-        .iter()
-        .filter(|r| r.get::<Option<Uuid>, _>("workspace_id") == Some(workspace_id))
-        .collect();
+    // Read from THIS workspace's armed scope. `retention_purge_audit` is armed
+    // (migration 030) and this row is per-workspace, so a bare read answers
+    // nothing under `secureprompt_runner` — the assertion below would then be
+    // measuring the reader rather than the purge.
+    let mine =
+        audit_rows_for_workspace(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES, workspace_id)
+            .await?;
     assert_eq!(
         mine.len(),
         1,
@@ -447,6 +446,29 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
 
 // ── (c) FU4: session device context ───────────────────────────────────────
 
+/// Arm one transaction to a workspace, the way every fixture and every read in
+/// this file that touches an ARMED table has to.
+///
+/// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration
+/// 002, so a bare-pool INSERT into it is refused with `42501` when
+/// `DATABASE_URL` names `secureprompt_runner`, and a bare-pool SELECT of it
+/// answers zero rows since migration 033. MEASURED: before this helper existed,
+/// `purge_scrubs_device_context_from_ended_sessions_only` and
+/// `a_rotated_but_live_session_keeps_its_device_context` both failed under the
+/// runner with `new row violates row-level security policy for table
+/// "refresh_tokens"`, and the suite could only ever run as a superuser — which
+/// is the one role that cannot observe any of what it tests.
+async fn arm(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
 /// Insert one session's sign-in row. `expires_in_hours` in the past makes the
 /// session dead; `revoked` makes it dead a different way. Both are ways a
 /// session ends, and both must lead to the device context being erased.
@@ -458,6 +480,8 @@ async fn insert_session(
     revoked: bool,
 ) -> sqlx::Result<Uuid> {
     let session_id = Uuid::new_v4();
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, created_at, expires_at,
@@ -474,12 +498,28 @@ async fn insert_session(
     .bind(revoked)
     .bind(session_id)
     .bind(Uuid::new_v4().to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(session_id)
 }
 
-async fn device_context_of(pool: &PgPool, session_id: Uuid) -> sqlx::Result<(i64, i64)> {
+/// The device context on one session, read FROM A SCOPE THAT WOULD SEE IT.
+///
+/// The workspace is a PARAMETER rather than something this helper looks up,
+/// because looking it up would mean reading `refresh_tokens` unarmed — the very
+/// read whose silent zero every assertion here is written against. Under
+/// `secureprompt_runner` a bare-pool version of this query answers `(0, 0)`,
+/// which is byte-identical to "the row was deleted" and to "the context was
+/// scrubbed". Every caller pairs its absence claim with a control row this same
+/// helper DOES return.
+async fn device_context_of(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    session_id: Uuid,
+) -> sqlx::Result<(i64, i64)> {
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     let row = sqlx::query(
         "SELECT COUNT(*)::BIGINT AS total,
                 COUNT(*) FILTER (
@@ -488,8 +528,9 @@ async fn device_context_of(pool: &PgPool, session_id: Uuid) -> sqlx::Result<(i64
          FROM refresh_tokens WHERE session_id = $1",
     )
     .bind(session_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((row.get("total"), row.get("with_context")))
 }
 
@@ -535,7 +576,7 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
     // having written any.
     for (name, session) in [("expired", expired), ("revoked", revoked), ("live", live)] {
         assert_eq!(
-            device_context_of(&pool, session).await?,
+            device_context_of(&pool, workspace_id, session).await?,
             (1, 1),
             "premise: the {name} session must carry device context before the purge"
         );
@@ -545,7 +586,7 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
 
     // The two dead sessions are scrubbed...
     for (name, session) in [("expired", expired), ("revoked", revoked)] {
-        let (total, with_context) = device_context_of(&pool, session).await?;
+        let (total, with_context) = device_context_of(&pool, workspace_id, session).await?;
         assert_eq!(
             with_context, 0,
             "the {name} session's device context must be erased once the session \
@@ -562,7 +603,7 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
     // ...and the live one is NOT. Without this the whole test would pass for a
     // job that erased every device column in the table.
     assert_eq!(
-        device_context_of(&pool, live).await?,
+        device_context_of(&pool, workspace_id, live).await?,
         (1, 1),
         "a LIVE session must keep the context that makes it identifiable in the \
          listing — scrubbing it would leave an administrator unable to tell \
@@ -606,6 +647,8 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
     // The sign-in row: carries the device, and is REVOKED because it rotated.
     let session_id = insert_session(&pool, workspace_id, user_id, 24, true).await?;
     // Its successor: live, no device context, same session.
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, created_at, expires_at, session_id, access_jti)
@@ -617,18 +660,23 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
     .bind(Uuid::new_v4().simple().to_string())
     .bind(session_id)
     .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // PREMISE: the row holding the context really is revoked, so a row-level
-    // scrub WOULD erase it and this test is not passing by accident.
+    // scrub WOULD erase it and this test is not passing by accident. Read on
+    // the SAME armed transaction as the insert above — `bool_or` over an empty
+    // set is NULL, so a blind read would fail decoding into `bool` rather than
+    // answering `false`, but an armed read that is proving a premise should not
+    // be relying on that.
     let revoked_row_holds_context: bool = sqlx::query_scalar(
         "SELECT bool_or(revoked_at IS NOT NULL AND client_ip IS NOT NULL)
          FROM refresh_tokens WHERE session_id = $1",
     )
     .bind(session_id)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     assert!(
         revoked_row_holds_context,
         "premise: the device context must sit on a REVOKED row, which is what \
@@ -637,7 +685,7 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
 
     run(&pool, &ch_client()).await;
 
-    let (total, with_context) = device_context_of(&pool, session_id).await?;
+    let (total, with_context) = device_context_of(&pool, workspace_id, session_id).await?;
     assert_eq!(
         total, 2,
         "premise: both rows of the chain are still present"
@@ -791,38 +839,46 @@ async fn write_audit_records_both_global_and_per_workspace_scopes_under_rls(
              the row's own workspace to get it past the policy",
     );
 
-    // Read back through the PRIVILEGED pool: what landed on disk, not what
-    // the writes claimed.
-    let scopes: Vec<String> = sqlx::query_scalar(
-        "SELECT scope FROM retention_purge_audit WHERE run_id = $1 ORDER BY scope",
+    // Read back what landed on disk, not what the writes claimed — and read
+    // each shape through a lens that WOULD see it. `pool` is only a privileged
+    // connection when `DATABASE_URL` names a superuser; under the runner it is
+    // as filtered as `low`, so a bare read of the per-workspace row answers
+    // nothing whether or not the row exists. That ambiguity is the disease this
+    // whole file is about, so the two shapes are read separately.
+    let global_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM retention_purge_audit
+         WHERE run_id = $1 AND workspace_id IS NULL ORDER BY scope",
     )
     .bind(run_id)
     .fetch_all(&pool)
     .await?;
     assert_eq!(
-        scopes,
+        global_scopes,
         vec![
             SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
-            SCOPE_CONTENT_CAPTURES.to_owned(),
             SCOPE_TOKEN_VAULT.to_owned(),
         ],
-        "all three scopes of the run must be on disk. A missing per-workspace \
-         scope is the silent gap: the purge ran and left no evidence."
+        "both GLOBAL scopes must be on disk: `workspace_id IS NULL` satisfies \
+         030's policy with nothing armed, so these are the rows that survive a \
+         run in which arming a scope is what failed."
     );
 
-    // And the per-workspace row is attributed to the right tenant — the scope
-    // was armed to that workspace, not merely to something.
-    let attributed: Option<Uuid> = sqlx::query_scalar(
-        "SELECT workspace_id FROM retention_purge_audit WHERE run_id = $1 AND scope = $2",
-    )
-    .bind(run_id)
-    .bind(SCOPE_CONTENT_CAPTURES)
-    .fetch_one(&pool)
-    .await?;
+    // The per-workspace row, read from ITS OWN armed scope — which is also the
+    // control proving the read above is not simply blind, since the same
+    // connection returns this row only once the scope is armed.
+    let per_workspace =
+        audit_rows_for_workspace(&pool, run_id, SCOPE_CONTENT_CAPTURES, workspace).await?;
     assert_eq!(
-        attributed,
+        per_workspace.len(),
+        1,
+        "a PER-WORKSPACE scope row must be on disk. Zero is the silent gap: the \
+         purge ran and left no evidence."
+    );
+    assert_eq!(
+        per_workspace[0].get::<Option<Uuid>, _>("workspace_id"),
         Some(workspace),
-        "the per-workspace record must carry the workspace it is about"
+        "the per-workspace record must carry the workspace it is about — the \
+         scope was armed to that workspace, not merely to something"
     );
     Ok(())
 }
