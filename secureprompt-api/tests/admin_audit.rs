@@ -33,6 +33,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use secureprompt_api::db::admin_audit_repo::AdminAuditAction;
 use secureprompt_api::{
     app_state::AppState, http::build_router, http::middleware::jwt_auth::Claims,
     ml_sidecar::MlSidecarClient,
@@ -42,7 +43,8 @@ use secureprompt_common::config::{
     ServerConfig, TelemetryConfig,
 };
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgConnectOptions, Connection, PgConnection, PgPool, Row};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -973,4 +975,291 @@ async fn a_refused_role_writes_nothing_where_an_admin_writes_a_row(pool: PgPool)
         1,
         "control: the admin's identical call IS audited"
     );
+}
+
+// ── The audit write and the action are one transaction ────────────────────
+
+/// The claim `admin_audit_repo` makes in its header, proved rather than
+/// asserted: if the audit write fails, the administrative action does NOT take
+/// effect.
+///
+/// A trail that can fail independently of the control it records is a trail
+/// that lies — the action would have happened with nothing saying so. The
+/// failure is induced the only honest way available from outside the code, by
+/// removing the table the writer needs; `#[sqlx::test]` gives this test its own
+/// database, so the DROP reaches nothing else.
+#[sqlx::test]
+async fn when_the_audit_write_fails_the_action_does_not_take_effect(pool: PgPool) {
+    let ws = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+    let admin = make_jwt(ws.id, ws.admin, "admin");
+
+    // POSITIVE CONTROL first: with the trail intact the call succeeds and the
+    // key exists. Without this the failure below could be any 500 at all.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/keys",
+        &admin,
+        Some(json!({"name": "control-key"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let control_keys: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE workspace_id = $1")
+            .bind(ws.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count keys");
+    assert_eq!(control_keys, 1, "control: the key really was created");
+
+    sqlx::query("DROP TABLE admin_audit")
+        .execute(&pool)
+        .await
+        .expect("drop the audit table to force the audit write to fail");
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/keys",
+        &admin,
+        Some(json!({"name": "must-not-exist"})),
+    )
+    .await;
+    assert!(
+        status.is_server_error() || status.is_client_error(),
+        "an action whose audit write failed must not report success; got {status}"
+    );
+
+    let keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_keys WHERE workspace_id = $1 AND name = 'must-not-exist'",
+    )
+    .bind(ws.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count keys");
+    assert_eq!(
+        keys, 0,
+        "the API key was created even though its audit row could not be \
+         written — the action and its record must commit together or not at all"
+    );
+}
+
+// ── The vocabulary is pinned, so a new action cannot drift ────────────────
+
+/// Extract the string literals from a CHECK constraint's definition.
+fn literals_in(def: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = def;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else { break };
+        out.insert(after[..close].to_owned());
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+/// The action vocabulary exists in three places that can drift apart, and this
+/// test is what makes adding an action a chain of failures rather than a
+/// convention.
+///
+///   1. `AdminAuditAction::ALL` — the Rust enum the writers use.
+///   2. migration 028's `admin_audit_action_known` CHECK — what the database
+///      will accept, so an undocumented action cannot even be stored.
+///   3. `audit_export::CONTROL_COVERAGE` — the prose copied verbatim into every
+///      signed manifest, which is what an auditor actually reads.
+///
+/// The export itself needs no entry: it selects every row of `admin_audit`
+/// without an `action` predicate, so a new action reaches the artifact with no
+/// export change at all. What can still go wrong is the DOCUMENT falling behind
+/// the code, and that is what this pins.
+#[sqlx::test]
+async fn the_action_vocabulary_is_pinned_in_three_places(pool: PgPool) {
+    let in_rust: BTreeSet<String> = AdminAuditAction::ALL
+        .iter()
+        .map(|a| a.as_str().to_owned())
+        .collect();
+
+    // PREMISE: there really is a vocabulary to compare, so three empty sets
+    // cannot agree with each other and pass.
+    assert!(
+        in_rust.len() >= 12,
+        "premise: the enum must carry the audited actions, found {}",
+        in_rust.len()
+    );
+
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'admin_audit_action_known'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migration 028 must install the action CHECK constraint");
+    let in_database = literals_in(&def);
+    assert_eq!(
+        in_database, in_rust,
+        "migration 028's CHECK constraint and `AdminAuditAction::ALL` disagree. \
+         A variant added in Rust without a migration entry would be REFUSED by \
+         the database at the moment an administrator performed it."
+    );
+
+    let missing_from_prose: Vec<&String> = in_rust
+        .iter()
+        .filter(|action| {
+            !secureprompt_common::audit_export::CONTROL_COVERAGE.contains(action.as_str())
+        })
+        .collect();
+    assert!(
+        missing_from_prose.is_empty(),
+        "these audited actions are not named in `CONTROL_COVERAGE`, the text \
+         copied into every signed manifest, so the auditor's own document does \
+         not know they exist: {missing_from_prose:?}"
+    );
+}
+
+// ── RLS, proved from a role that cannot bypass it ─────────────────────────
+
+const RLS_ROLE: &str = "secureprompt_runner";
+const RLS_PASSWORD: &str = "secureprompt";
+
+async fn ensure_low_privilege_role(pool: &PgPool) {
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {RLS_ROLE}
+                 LOGIN PASSWORD '{RLS_PASSWORD}'
+                 NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+         END $$;"
+    ))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "could not create the {RLS_ROLE} role ({e}). In CI this role is \
+             created by scripts/ci/create-nonsuperuser-role.sh; locally the \
+             connecting role needs CREATEROLE."
+        )
+    });
+
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+    ))
+    .execute(pool)
+    .await
+    .expect("grants on the test database");
+}
+
+/// Open a connection to the SAME `#[sqlx::test]` database as `RLS_ROLE`, and
+/// assert on the wire that it really is powerless. The `#[sqlx::test]` pool is
+/// a BYPASSRLS superuser, so without these premise assertions the test below
+/// would keep passing while exercising no RLS at all.
+async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
+    ensure_low_privilege_role(pool).await;
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+    let mut conn = PgConnection::connect_with(&options)
+        .await
+        .expect("low-privilege connection");
+
+    let row = sqlx::query(
+        "SELECT current_user::text AS who, rolsuper, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("identity probe");
+    assert_eq!(row.get::<String, _>("who"), RLS_ROLE);
+    assert!(
+        !row.get::<bool, _>("rolsuper"),
+        "premise: the probe role is a SUPERUSER, so this test proves nothing"
+    );
+    assert!(
+        !row.get::<bool, _>("rolbypassrls"),
+        "premise: the probe role has BYPASSRLS, so this test proves nothing"
+    );
+    conn
+}
+
+/// Migration 028's RLS policy is ARMED, and the silent-zero trap is real.
+///
+/// This is the layer no other test in the repository can see: the application
+/// connects as a BYPASSRLS superuser today, so a missing, malformed or
+/// wrong-column policy would leave every `#[sqlx::test]` green while one
+/// tenant's administrative history sat readable by another.
+#[sqlx::test]
+async fn migration_028_rls_isolates_the_admin_trail_from_a_nonsuperuser(pool: PgPool) {
+    let a = seed_workspace(&pool).await;
+    let b = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+
+    for ws in [&a, &b] {
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/keys",
+            &make_jwt(ws.id, ws.admin, "admin"),
+            Some(json!({"name": "rls-probe"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // PREMISE: the superuser pool sees both, so anything the low-privilege
+    // connection cannot see is RLS and not an empty table.
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("premise count");
+    assert_eq!(total, 2, "premise: two audit rows exist across two tenants");
+
+    let mut conn = low_privilege_connection(&pool).await;
+
+    // THE SILENT HALF OF THE TRAP: with the GUC unset the read SUCCEEDS and
+    // returns nothing. On an export this reads as "these administrators did
+    // nothing", which is why `scope::begin_scoped` reads the setting back.
+    let unscoped: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_audit")
+        .fetch_one(&mut conn)
+        .await
+        .expect("an unscoped SELECT must SUCCEED — that is the trap");
+    assert_eq!(
+        unscoped, 0,
+        "with `app.current_workspace_id` unset the policy predicate is NULL \
+         for every row, so this must be a silent zero rather than an error"
+    );
+
+    // Scoped to A: exactly A's row, and never B's.
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
+        .bind(a.id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("arm the scope");
+    let seen_a: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM admin_audit")
+        .fetch_all(&mut conn)
+        .await
+        .expect("scoped read");
+    assert_eq!(
+        seen_a,
+        vec![a.id],
+        "scoped to A, a non-superuser must see exactly A's administrative trail"
+    );
+
+    // POSITIVE CONTROL: the same connection scoped to B sees exactly B's row,
+    // so the result above is the policy filtering and not a broken connection.
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
+        .bind(b.id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("re-arm the scope");
+    let seen_b: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM admin_audit")
+        .fetch_all(&mut conn)
+        .await
+        .expect("scoped read");
+    assert_eq!(seen_b, vec![b.id], "control: scoped to B it sees B's row");
 }
