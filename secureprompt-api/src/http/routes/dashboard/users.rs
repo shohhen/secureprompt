@@ -1,10 +1,11 @@
-//! User management — GET /v1/users, POST /v1/users,
-//! DELETE /v1/users/{user_id}/sessions.
+//! User management — GET /v1/users, POST /v1/users, and the session surface.
 //!
 //! GET    — any authenticated role; lists users in the caller's workspace.
 //! POST   — admin only; invites (creates) a new user in the same workspace.
+//! GET    /{user_id}/sessions — FU4; the live sessions that user holds.
 //! DELETE /{user_id}/sessions — WS4-3; admin/owner only; terminates every
 //!          session that user currently holds.
+//! DELETE /{user_id}/sessions/{session_id} — FU4; ends ONE of them.
 
 use axum::{
     extract::{Extension, Path, State},
@@ -12,7 +13,7 @@ use axum::{
     routing::{delete, get},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use secureprompt_common::errors::ApiError;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,7 +21,10 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
-        session_revocation_repo::{RevocationRecord, SessionRevocationRepository},
+        session_repo::SessionRepository,
+        session_revocation_repo::{
+            RevocationRecord, RevocationTarget, SessionRevocationRepository,
+        },
         user_repo::UserRepository,
     },
     http::{
@@ -62,7 +66,19 @@ pub fn routes() -> Router<AppState> {
         // functionality, not the infrastructure needed to re-license a
         // bricked gateway, and allowlisting above a security gate is the
         // shape of change that opens a hole.
-        .route("/{user_id}/sessions", delete(revoke_sessions))
+        // FU4 adds GET on the SAME path. The two verbs are the pair the WS4-3
+        // report said was missing: an administrator could terminate everything
+        // for a user and could not see what they were terminating.
+        .route(
+            "/{user_id}/sessions",
+            delete(revoke_sessions).get(list_sessions),
+        )
+        // FU4 — the narrow lever. Also deliberately outside the license gate's
+        // `RECOVERY_ALLOWLIST`, for the reason above.
+        .route(
+            "/{user_id}/sessions/{session_id}",
+            delete(revoke_one_session),
+        )
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -121,9 +137,9 @@ async fn create_user(
     if let Some(max) = state.license.max_seats() {
         let count = repo.count_total_users().await.map_err(api_error_response)?;
         if count >= i64::from(max) {
-            return Err(api_error_response(ApiError::Forbidden(
-                format!("license seat limit ({max}) reached"),
-            )));
+            return Err(api_error_response(ApiError::Forbidden(format!(
+                "license seat limit ({max}) reached"
+            ))));
         }
     }
 
@@ -293,6 +309,11 @@ async fn revoke_sessions(
             actor_role: ctx.role.as_db_str(),
             target: &target,
             revoked_before_unix: revoked_before,
+            // FU4 — NULL is what marks this row as the USER-WIDE lever, and it
+            // is also what keeps `latest_watermark` reading it. See that
+            // function: a narrow revocation must not be picked up as a
+            // user-wide one when Redis is unreachable.
+            session_id: None,
         })
         .await
         .map_err(api_error_response)?;
@@ -347,6 +368,271 @@ async fn revoke_sessions(
         }),
     ))
 }
+
+// ── FU4: seeing sessions, and ending ONE ──────────────────────────────────
+
+/// One live session as the caller sees it.
+///
+/// `client_ip` and `client` are `None` for a session opened before FU4, for a
+/// client that sent nothing usable, and for a session whose device context
+/// `retention.purge` has already scrubbed. The listing says "unknown" rather
+/// than inventing one.
+///
+/// The refresh-token hash and the access-token `jti` are absent by
+/// construction — [`crate::db::session_repo::SessionSummary`] does not carry
+/// them, so no serializer change can start leaking them.
+#[derive(Debug, Serialize)]
+pub struct SessionDto {
+    pub session_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    /// The last rotation. An access token is used without touching Postgres,
+    /// so this is the freshest evidence of use that exists — it is NOT a
+    /// last-request timestamp and is not presented as one.
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub client_ip: Option<String>,
+    pub client: Option<String>,
+    /// The session whose access token is making this request.
+    pub is_current: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionListResponse {
+    pub user_id: Uuid,
+    pub sessions: Vec<SessionDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndSessionResponse {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+    pub refresh_tokens_revoked: i64,
+    /// How many already-minted access tokens were blacklisted. Zero for a
+    /// session that predates migration 027 and therefore recorded no `jti`;
+    /// such a session still dies, at its current access token's own expiry
+    /// rather than instantly, and this number is how a caller can tell.
+    pub access_tokens_blacklisted: usize,
+    pub audit_id: Uuid,
+    pub revoked_at: DateTime<Utc>,
+}
+
+/// May this actor see and manage this target's sessions?
+///
+/// One new rule on top of WS4-3's ladder, and it DELEGATES rather than
+/// restating: [`may_revoke`] still answers for everybody else, so there is one
+/// privilege table (`role::privilege_level`) with two readers and not three.
+///
+/// **The new rule: an actor may always manage their OWN sessions.** This is not
+/// a widening of WS4-3, which refused self-revocation below Admin on the stated
+/// ground that "`POST /v1/auth/logout` is the route for that". Logout is
+/// precisely what it cannot substitute for here: it revokes EVERY refresh row
+/// the user holds and blacklists only the token it was presented with, so
+/// "sign my other laptop out and keep me signed in here" is not expressible
+/// through it. A user reading and ending their own sessions is strictly less
+/// powerful than the logout they already have, and it is the commonest real use
+/// of a session list.
+///
+/// WS4-3's user-wide `DELETE /v1/users/{id}/sessions` is untouched and still
+/// calls `require_role(_, Admin)` before anything else;
+/// `a_user_may_see_and_end_their_own_sessions_without_being_an_admin` asserts
+/// that in the same test body that exercises the new rule.
+#[must_use]
+pub fn may_manage_sessions(actor: UserRole, target: UserRole, is_self: bool) -> RevokeDecision {
+    if is_self {
+        return RevokeDecision::Allowed;
+    }
+    may_revoke(actor, target)
+}
+
+/// Resolve the subject of a session request and decide whether the caller may
+/// touch it. Shared by both FU4 handlers so the listing and the narrow
+/// revocation cannot drift into two different answers about who may act.
+///
+/// # Ordering, which is load-bearing
+///
+/// For a NON-self target the role gate runs BEFORE any lookup, exactly as
+/// `revoke_sessions` does, so a viewer cannot use the 404-vs-403 difference to
+/// discover which user ids exist. The self case skips it because looking
+/// yourself up is not an enumeration oracle: the caller's own id came from
+/// their own signed token.
+async fn resolve_subject(
+    state: &AppState,
+    ctx: &JwtAuthContext,
+    target_user_id: Uuid,
+) -> Result<RevocationTarget, axum::response::Response> {
+    let is_self = ctx.user_id == target_user_id;
+    if !is_self {
+        require_role(ctx, UserRole::Admin).map_err(api_error_response)?;
+    }
+
+    let repo = SessionRevocationRepository::new(state.db.clone());
+    let target = repo
+        .find_target(ctx.workspace_id.0, target_user_id)
+        .await
+        .map_err(api_error_response)?
+        .ok_or_else(|| api_error_response(ApiError::NotFound("user not found".into())))?;
+
+    let target_role = UserRole::from_db_str(&target.role).map_err(api_error_response)?;
+    match may_manage_sessions(ctx.role, target_role, is_self) {
+        RevokeDecision::Allowed => Ok(target),
+        RevokeDecision::ActorRoleTooLow | RevokeDecision::TargetOutranksActor => Err(
+            api_error_response(ApiError::Forbidden("insufficient role".into())),
+        ),
+    }
+}
+
+/// `GET /v1/users/{user_id}/sessions` — the live sessions that user holds.
+///
+/// This is the half WS4-3 reported missing. Without it an administrator can
+/// terminate everything for a user and cannot see what they are terminating,
+/// cannot end one lost laptop while leaving a desktop signed in, and cannot
+/// answer "where is this account signed in from?" — which is usually the
+/// question that prompted the revocation.
+async fn list_sessions(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<JwtAuthContext>,
+    Path(target_user_id): Path<Uuid>,
+) -> Result<Json<SessionListResponse>, axum::response::Response> {
+    let target = resolve_subject(&state, &ctx, target_user_id).await?;
+
+    let sessions = SessionRepository::new(state.db.clone())
+        .list_live(ctx.workspace_id.0, target.user_id, &ctx.jti)
+        .await
+        .map_err(api_error_response)?;
+
+    Ok(Json(SessionListResponse {
+        user_id: target.user_id,
+        sessions: sessions
+            .into_iter()
+            .map(|s| SessionDto {
+                session_id: s.session_id,
+                started_at: s.started_at,
+                last_seen_at: s.last_seen_at,
+                expires_at: s.expires_at,
+                client_ip: s.client_ip,
+                client: s.client_descriptor,
+                is_current: s.is_current,
+            })
+            .collect(),
+    }))
+}
+
+/// `DELETE /v1/users/{user_id}/sessions/{session_id}` — end ONE session.
+///
+/// # Why this can use the jti blacklist when WS4-3 could not
+///
+/// WS4-3 rejected `jti_blacklist:{jti}` as the revocation seam, and was right
+/// to: "the key is the token's own random id, which is stored nowhere and
+/// listed by no endpoint … an administrator revoking a lost laptop has never
+/// seen that jti". That objection is about DISCOVERABILITY, and it stops
+/// applying the moment sessions are listable — the listing is where the session
+/// id comes from, and migration 027 stores the jti beside it. So the two levers
+/// compose rather than compete: WS4-3's per-user watermark still answers "end
+/// everything for this person", and this one answers "end this device", through
+/// the gate `jwt_auth::session_gate` already applies to both.
+///
+/// # Ordering, which is load-bearing (the same as WS4-3's)
+///
+/// Postgres first — close this chain and write the audit row in one
+/// transaction — then Redis. A Redis failure gives the caller a 500 to retry,
+/// and the operation is idempotent; what has already happened is the durable,
+/// provable half. The other order would let a Postgres failure leave a security
+/// action performed and unrecorded.
+async fn revoke_one_session(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<JwtAuthContext>,
+    Path((target_user_id, session_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<EndSessionResponse>), axum::response::Response> {
+    let target = resolve_subject(&state, &ctx, target_user_id).await?;
+
+    // Only access tokens minted within one validity window can still be alive;
+    // `jwt_auth::require` refuses anything older on `exp` with a 60 s leeway.
+    // Anything before this instant is already dead on its own terms, so
+    // blacklisting it would be wasted Redis.
+    let minted_after = Utc::now()
+        - Duration::seconds(i64::try_from(state.jwt.access_ttl_secs).unwrap_or(i64::MAX))
+        - Duration::seconds(JWT_VALIDATION_LEEWAY_SECS);
+
+    let sessions = SessionRepository::new(state.db.clone());
+    let live = sessions
+        .find_live_session(ctx.workspace_id.0, target.user_id, session_id, minted_after)
+        .await
+        .map_err(api_error_response)?
+        .ok_or_else(|| {
+            // Absent, another user's, another workspace's, and already-ended
+            // all give the identical answer — see `find_live_session`.
+            api_error_response(ApiError::NotFound("session not found".into()))
+        })?;
+
+    let repo = SessionRevocationRepository::new(state.db.clone());
+    let actor_email = repo
+        .actor_email(ctx.workspace_id.0, ctx.user_id)
+        .await
+        .map_err(api_error_response)?;
+
+    let outcome = repo
+        .revoke_one_session(
+            &RevocationRecord {
+                workspace_id: ctx.workspace_id.0,
+                actor_user_id: ctx.user_id,
+                actor_email: actor_email.as_deref(),
+                actor_role: ctx.role.as_db_str(),
+                target: &target,
+                revoked_before_unix: Utc::now().timestamp(),
+                session_id: Some(live.session_id),
+            },
+            live.session_id,
+        )
+        .await
+        .map_err(api_error_response)?;
+
+    // The blacklist TTL is the one `revocation_watermark_ttl_secs` already
+    // computes and documents: long enough to outlive every access token that
+    // existed when it was written, short enough that the key does not
+    // accumulate forever.
+    let ttl = sp_redis::revocation_watermark_ttl_secs(state.jwt.access_ttl_secs);
+    for jti in &live.revocable_jtis {
+        sp_redis::blacklist_jti(&state.redis_pool, jti, ttl)
+            .await
+            .map_err(api_error_response)?;
+    }
+
+    // NOT `auth_cache.remove(&target.user_id)`. That cache is keyed by USER and
+    // evicting it would degrade every session that user holds, which is the
+    // opposite of what this endpoint promises. FU3 established that the cache
+    // is read only when Redis is unreachable, and the residual that leaves for
+    // this lever is stated on `revoke_one_session` in the repository.
+
+    tracing::warn!(
+        alert = "session_revoked",
+        scope = "session",
+        workspace_id = %ctx.workspace_id.0,
+        actor_user_id = %ctx.user_id,
+        target_user_id = %target.user_id,
+        session_id = %live.session_id,
+        refresh_tokens_revoked = outcome.refresh_tokens_revoked,
+        access_tokens_blacklisted = live.revocable_jtis.len(),
+        "administrator terminated one session"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(EndSessionResponse {
+            user_id: target.user_id,
+            session_id: live.session_id,
+            refresh_tokens_revoked: outcome.refresh_tokens_revoked,
+            access_tokens_blacklisted: live.revocable_jtis.len(),
+            audit_id: outcome.audit_id,
+            revoked_at: outcome.created_at,
+        }),
+    ))
+}
+
+/// `Validation::leeway` as `jwt_auth::require` sets it (`validation.leeway =
+/// 60`). Named here rather than written as a bare `60` so the two cannot drift
+/// silently; `the_jti_window_matches_the_middlewares_leeway` pins them
+/// together.
+const JWT_VALIDATION_LEEWAY_SECS: i64 = 60;
 
 #[cfg(test)]
 mod tests {
@@ -423,6 +709,92 @@ mod tests {
             };
             assert_eq!(may_revoke(role, role), expected, "self-revoke as {role:?}");
         }
+    }
+
+    /// FU4 — the narrow lever's table is WS4-3's table plus exactly one rule.
+    ///
+    /// Asserted by DERIVATION from `may_revoke` rather than by a second
+    /// hand-written 25-cell matrix: a copied table is the defect this module
+    /// already documents, and a copy that agreed today would be free to drift
+    /// tomorrow. The one cell that differs is spelled out separately below.
+    #[test]
+    fn may_manage_sessions_is_may_revoke_plus_self_service() {
+        let mut differing = 0_usize;
+        for actor in ALL_ROLES {
+            for target in ALL_ROLES {
+                assert_eq!(
+                    may_manage_sessions(actor, target, false),
+                    may_revoke(actor, target),
+                    "for a target who is not the actor, may_manage_sessions must \
+                     BE may_revoke: {actor:?} -> {target:?}"
+                );
+                let with_self = may_manage_sessions(actor, target, true);
+                assert_eq!(
+                    with_self,
+                    RevokeDecision::Allowed,
+                    "an actor may always manage their own sessions ({actor:?})"
+                );
+                if with_self != may_revoke(actor, target) {
+                    differing += 1;
+                }
+            }
+        }
+        // POSITIVE CONTROL: the new rule actually changes something. If
+        // `is_self` were ignored, every cell would agree and the assertions
+        // above would still pass.
+        assert!(
+            differing > 0,
+            "the self-service rule changed no answer at all, so it is not being \
+             applied"
+        );
+    }
+
+    /// The one cell that FU4 adds, named rather than counted: a Viewer may end
+    /// their OWN session, which WS4-3's `may_revoke` refuses. The control that
+    /// must differ is in the same assertion — the same Viewer may not touch
+    /// anybody else's.
+    #[test]
+    fn a_viewer_may_manage_their_own_sessions_and_nobody_elses() {
+        assert_eq!(
+            may_manage_sessions(UserRole::Viewer, UserRole::Viewer, true),
+            RevokeDecision::Allowed
+        );
+        assert_eq!(
+            may_revoke(UserRole::Viewer, UserRole::Viewer),
+            RevokeDecision::ActorRoleTooLow,
+            "premise: WS4-3's user-wide lever still refuses a viewer, so the \
+             line above is a real change and not a restatement"
+        );
+        for target in ALL_ROLES {
+            assert_eq!(
+                may_manage_sessions(UserRole::Viewer, target, false),
+                RevokeDecision::ActorRoleTooLow,
+                "a viewer must not reach {target:?}'s sessions"
+            );
+        }
+        // And the privilege inversion still holds for the narrow lever: an
+        // Admin may not reach an Owner's sessions.
+        assert_eq!(
+            may_manage_sessions(UserRole::Admin, UserRole::Owner, false),
+            RevokeDecision::TargetOutranksActor
+        );
+    }
+
+    /// The window `revoke_one_session` uses to decide which access tokens are
+    /// still worth blacklisting is `access_ttl + leeway`. The leeway half is a
+    /// constant in this module and a `validation.leeway = 60` in
+    /// `jwt_auth::require`; if they drift, the narrow revocation stops
+    /// blacklisting a token the middleware would still accept.
+    #[test]
+    fn the_jti_window_matches_the_middlewares_leeway() {
+        const JWT_AUTH_SOURCE: &str = include_str!("../../middleware/jwt_auth.rs");
+        assert!(
+            JWT_AUTH_SOURCE.contains("validation.leeway = 60"),
+            "jwt_auth no longer sets a 60 s leeway, so \
+             JWT_VALIDATION_LEEWAY_SECS = {JWT_VALIDATION_LEEWAY_SECS} is now a \
+             guess. Update both together."
+        );
+        assert_eq!(JWT_VALIDATION_LEEWAY_SECS, 60);
     }
 
     /// The route's own role gate (`require_role(_, Admin)`) and `may_revoke`

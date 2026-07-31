@@ -14,6 +14,7 @@
 //!   * Refresh tokens are single-use; replay triggers
 //!     `revoke_all_for_user` (threat T-05-03).
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::{
     body::Body,
     extract::{Extension, State},
@@ -23,7 +24,6 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
@@ -35,10 +35,11 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
-        refresh_token_repo::RotationOutcome,
+        refresh_token_repo::{NewSessionRow, RotationOutcome},
         user_repo::{self, UserRepository},
     },
     http::middleware::jwt_auth::{self, Claims, JwtAuthContext, UserRole},
+    http::routes::dashboard::device::DeviceContext,
     redis as sp_redis,
 };
 
@@ -199,8 +200,15 @@ pub async fn token(
             // directly) so the 200 body is provably the same
             // `(StatusCode::OK, JsonResponse(TokenResponse))` shape as the
             // 202 branches below share a type with — see `TokenOr2fa`.
-            match build_token_pair_body(&state, creds.id, creds.workspace_id, &creds.role, &creds.email)
-                .await
+            match build_token_pair_body(
+                &state,
+                creds.id,
+                creds.workspace_id,
+                &creds.role,
+                &creds.email,
+                &DeviceContext::from_headers(&headers),
+            )
+            .await
             {
                 Ok(body) => TokenOr2fa::Access(body).into_response(),
                 Err(err) => api_error_to_response(err),
@@ -309,18 +317,22 @@ impl IntoResponse for TokenOr2fa {
 }
 
 /// `POST /v1/auth/refresh` — rotate a refresh token atomically.
-pub async fn refresh(
-    State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> Response {
+pub async fn refresh(State(state): State<AppState>, Json(body): Json<RefreshRequest>) -> Response {
     // Generate the successor raw token up front so `rotate` can hash it.
     let new_raw = random_refresh_token();
     let now = Utc::now();
     let new_expires_at = now + Duration::seconds(state.jwt.refresh_ttl_secs as i64);
 
+    // FU4 — the access-token id is minted BEFORE the rotation, not after, so
+    // the successor row can record the jti this request is actually going to
+    // return. Minting it afterwards (as this handler did) would leave the row
+    // describing a token that was never issued, and a later narrow revocation
+    // would blacklist a jti nobody holds while the real one kept working.
+    let new_jti = Uuid::new_v4().to_string();
+
     let outcome = match state
         .refresh_tokens
-        .rotate(&body.refresh_token, &new_raw, new_expires_at)
+        .rotate(&body.refresh_token, &new_raw, &new_jti, new_expires_at)
         .await
     {
         Ok(outcome) => outcome,
@@ -341,16 +353,16 @@ pub async fn refresh(
                 Err(err) => return api_error_to_response(err),
             };
 
-            // Mint fresh access token; refresh token already inserted by rotate.
+            // Mint fresh access token; refresh token already inserted by rotate,
+            // carrying `new_jti` — the same value this token is signed with.
             let access_exp = now + Duration::seconds(state.jwt.access_ttl_secs as i64);
-            let jti = Uuid::new_v4().to_string();
             let access_claims = Claims {
                 sub: user_id,
                 ws: workspace_id,
                 role: creds.role.clone(),
                 iat: now.timestamp(),
                 exp: access_exp.timestamp(),
-                jti,
+                jti: new_jti,
                 purpose: None,
             };
             let access_token = match encode_access(&state, &access_claims) {
@@ -377,7 +389,15 @@ pub async fn refresh(
             let _ = state.refresh_tokens.revoke_all_for_user(user_id).await;
             generic_401(None)
         }
-        RotationOutcome::NotFound | RotationOutcome::Expired => generic_401(None),
+        // FU4 — `Revoked` is deliberately NOT routed through the
+        // `revoke_all_for_user` branch above. A device whose single session an
+        // administrator just ended retries its refresh exactly once; reading
+        // that as a stolen token would terminate every OTHER session that
+        // person holds, which is the behaviour the narrow lever exists to
+        // avoid. See `RotationOutcome::Revoked`.
+        RotationOutcome::NotFound | RotationOutcome::Expired | RotationOutcome::Revoked => {
+            generic_401(None)
+        }
     }
 }
 
@@ -501,7 +521,16 @@ pub async fn register(
     // gets a 500 with no token. They can recover by calling `POST /v1/auth/token`
     // with their email/password. This is rare (only fires on Redis or DB
     // failure during refresh-token persistence) and acceptable for MVP.
-    match build_token_pair_body(&state, user.id, ws.id, "owner", &user.email).await {
+    match build_token_pair_body(
+        &state,
+        user.id,
+        ws.id,
+        "owner",
+        &user.email,
+        &DeviceContext::from_headers(&headers),
+    )
+    .await
+    {
         Ok(body) => (StatusCode::CREATED, JsonResponse(body)).into_response(),
         Err(err) => api_error_to_response(err),
     }
@@ -518,6 +547,7 @@ pub(crate) async fn build_token_pair_body(
     workspace_id: Uuid,
     role: &str,
     email: &str,
+    device: &DeviceContext,
 ) -> Result<TokenResponse, ApiError> {
     let now = Utc::now();
     let access_exp = now + Duration::seconds(state.jwt.access_ttl_secs as i64);
@@ -529,15 +559,27 @@ pub(crate) async fn build_token_pair_body(
         role: role.to_owned(),
         iat: now.timestamp(),
         exp: access_exp.timestamp(),
-        jti,
+        jti: jti.clone(),
         purpose: None,
     };
     let access_token = encode_access(state, &access_claims)?;
 
+    // FU4 — this IS the session record. A fresh `session_id` names the rotation
+    // chain that starts here; the device is recorded on this row and on no
+    // other. Still one INSERT, on the statement that was already here.
     let refresh_raw = random_refresh_token();
     state
         .refresh_tokens
-        .insert(user_id, workspace_id, &refresh_raw, refresh_exp)
+        .insert(&NewSessionRow {
+            user_id,
+            workspace_id,
+            raw_token: &refresh_raw,
+            expires_at: refresh_exp,
+            session_id: Uuid::new_v4(),
+            access_jti: &jti,
+            client_ip: device.client_ip.as_deref(),
+            client_descriptor: device.client_descriptor.as_deref(),
+        })
         .await?;
 
     Ok(TokenResponse {
@@ -560,8 +602,9 @@ pub(crate) async fn issue_token_pair(
     workspace_id: Uuid,
     role: &str,
     email: &str,
+    device: &DeviceContext,
 ) -> Response {
-    match build_token_pair_body(state, user_id, workspace_id, role, email).await {
+    match build_token_pair_body(state, user_id, workspace_id, role, email, device).await {
         Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
         Err(err) => api_error_to_response(err),
     }
@@ -689,13 +732,11 @@ async fn fetch_user_by_id(
     pool: &sqlx::PgPool,
     user_id: Uuid,
 ) -> Result<Option<UserIdentity>, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, workspace_id, email, role FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| ApiError::Database(error.to_string()))?;
+    let row = sqlx::query("SELECT id, workspace_id, email, role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))?;
     Ok(row.map(|record| UserIdentity {
         _id: sqlx::Row::get(&record, "id"),
         _workspace_id: WorkspaceId(sqlx::Row::get(&record, "workspace_id")),

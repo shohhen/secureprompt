@@ -626,6 +626,91 @@ async fn ending_one_session_leaves_the_other_signed_in(pool: PgPool) {
     forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }
 
+/// An ended device retries its refresh once. That retry must not be read as a
+/// stolen token, because the gateway's answer to a stolen token is
+/// `revoke_all_for_user` — which would terminate every OTHER session the person
+/// holds and undo the narrow revocation that had just been performed.
+///
+/// `replaced_by` is what separates the two cases, and this test drives BOTH
+/// through the real `/v1/auth/refresh` in one body so the distinction cannot be
+/// asserted by a mock.
+#[sqlx::test]
+async fn a_revoked_refresh_token_is_not_mistaken_for_a_stolen_one(pool: PgPool) {
+    let ws = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+
+    let ended = sign_in(&app, &ws.viewer_email, "203.0.113.7", CHROME_MAC).await;
+    let bystander = sign_in(&app, &ws.viewer_email, "198.51.100.22", FIREFOX_WINDOWS).await;
+    let admin_token = make_jwt(ws.id, ws.admin, "admin");
+
+    let listed = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
+    let target = sessions_of(&listed)
+        .iter()
+        .find(|s| s["client_ip"] == "203.0.113.7")
+        .unwrap_or_else(|| panic!("the ended session must be listed: {listed}"));
+    assert_eq!(
+        end_session(&app, &admin_token, ws.viewer, session_id(target))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // The ended device retries. 401, and NOTHING else happens.
+    assert_eq!(
+        refresh(&app, &ended.refresh).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let survivors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(ws.viewer)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        survivors, 1,
+        "retrying a revoked refresh token must not revoke the user's other \
+         sessions — that is `revoke_all_for_user` firing on a token that was \
+         never used twice"
+    );
+
+    // CONTROL THAT MUST DIFFER: a REAL replay — rotate first, then present the
+    // spent token — still triggers revoke-all, so the branch above narrowed the
+    // response without losing the detection (threat T-05-03).
+    let rotated = refresh(&app, &bystander.refresh).await;
+    assert_eq!(
+        rotated.status(),
+        StatusCode::OK,
+        "premise: the bystander's token must rotate first, or the next call is \
+         not a replay"
+    );
+    assert_eq!(
+        refresh(&app, &bystander.refresh).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "the spent token must not work twice"
+    );
+    let after_replay: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(ws.viewer)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        after_replay, 0,
+        "control: a genuine replay must still revoke every active refresh row"
+    );
+
+    let jtis: Vec<String> = sqlx::query_scalar(
+        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
+    )
+    .bind(ws.viewer)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
+}
+
 /// Ending one session must be audited exactly as ending all of them is, and
 /// the row must say WHICH session — otherwise the trail cannot distinguish
 /// "ended one device" from "ended everything".
@@ -1187,6 +1272,150 @@ async fn migration_002_rls_hides_sessions_from_an_unscoped_read(pool: PgPool) {
 
     forget_keys(&redis_pool().await, a.viewer, &[]).await;
     forget_keys(&redis_pool().await, b.viewer, &[]).await;
+}
+
+/// FU3 made `jwt_auth` fail CLOSED on admin revocation when Redis is
+/// unreachable, by reading the watermark out of `session_revocation_audit`
+/// instead. FU4 writes into that same table for a NARROW revocation. If the
+/// durable read picked those rows up, a revocation scoped to one lost laptop
+/// would silently become a revocation of every session that person holds — but
+/// only during a Redis outage, which is to say never in a green test run.
+///
+/// `latest_watermark` filters `session_id IS NULL` for exactly this. Asserted
+/// against the real repository rather than through a simulated outage, because
+/// the predicate is the thing under test.
+#[sqlx::test]
+async fn a_narrow_revocation_does_not_raise_the_user_wide_watermark(pool: PgPool) {
+    use secureprompt_api::db::session_revocation_repo::SessionRevocationRepository;
+
+    let ws = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+    sign_in(&app, &ws.viewer_email, "203.0.113.7", CHROME_MAC).await;
+    sign_in(&app, &ws.viewer_email, "198.51.100.22", FIREFOX_WINDOWS).await;
+    let admin_token = make_jwt(ws.id, ws.admin, "admin");
+    let repo = SessionRevocationRepository::new(pool.clone());
+
+    // PREMISE: no watermark before anything happens, so a `Some` later is
+    // something this test caused.
+    assert_eq!(
+        repo.latest_watermark(ws.id, ws.viewer)
+            .await
+            .expect("watermark read"),
+        None,
+        "premise: no revocation on record yet"
+    );
+
+    let listed = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
+    let target_id = session_id(&sessions_of(&listed)[0]);
+    assert_eq!(
+        end_session(&app, &admin_token, ws.viewer, target_id)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // PREMISE: the narrow revocation DID write a row, so the `None` below is
+    // the filter and not an empty table.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM session_revocation_audit WHERE session_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "premise: the narrow revocation wrote an audit row");
+
+    assert_eq!(
+        repo.latest_watermark(ws.id, ws.viewer)
+            .await
+            .expect("watermark read"),
+        None,
+        "a per-session revocation must not raise the per-USER watermark — that \
+         watermark is compared against `iat` for every token the user holds, so \
+         a Redis outage would turn one ended laptop into a full sign-out"
+    );
+
+    // CONTROL THAT MUST DIFFER: the user-wide lever DOES raise it, so the
+    // assertion above is the `session_id IS NULL` filter and not a broken read.
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/users/{}/sessions", ws.viewer))
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router runs")
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        repo.latest_watermark(ws.id, ws.viewer)
+            .await
+            .expect("watermark read")
+            .is_some(),
+        "control: the user-wide lever must still be readable durably, or FU3's \
+         fail-closed path has been broken"
+    );
+
+    forget_keys(&redis_pool().await, ws.viewer, &[]).await;
+}
+
+/// The listing reads an RLS-protected table, so an unarmed transaction would
+/// answer "no active sessions" and report no error. `scope_is_armed` is the
+/// guard that turns that into a refusal — and a guard whose deletion changes no
+/// test result is a guard that defends nothing, so it is exercised directly.
+#[sqlx::test]
+async fn the_listing_repository_refuses_an_unarmed_scope(pool: PgPool) {
+    use secureprompt_api::db::scope::{begin_scoped, scope_is_armed, SCOPE_NOT_ARMED};
+
+    let ws = seed_workspace(&pool).await;
+    let app = build_app(pool.clone());
+    sign_in(&app, &ws.viewer_email, "203.0.113.7", CHROME_MAC).await;
+
+    // An unscoped transaction: the GUC was never set.
+    let mut plain = pool.begin().await.expect("plain transaction");
+    let unarmed = scope_is_armed(&mut plain, ws.id).await;
+    let message = unarmed
+        .expect_err("an unscoped transaction must be refused")
+        .to_string();
+    assert!(
+        message.contains(SCOPE_NOT_ARMED),
+        "the refusal must say what was wrong, got {message:?}"
+    );
+    plain.rollback().await.expect("rollback");
+
+    // POSITIVE CONTROL: through `begin_scoped` the same check passes and the
+    // listing really does see the session, so the refusal above is the guard
+    // and not a broken fixture.
+    let mut scoped = begin_scoped(&pool, ws.id).await.expect("scoped");
+    scope_is_armed(&mut scoped, ws.id)
+        .await
+        .expect("control: an armed scope must pass its own check");
+    scoped.commit().await.expect("commit");
+
+    let sessions = secureprompt_api::db::session_repo::SessionRepository::new(pool.clone())
+        .list_live(ws.id, ws.viewer, "no-such-jti")
+        .await
+        .expect("listing");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "control: the armed listing must see the session"
+    );
+
+    // And arming for the WRONG workspace is refused too — a stale GUC left by
+    // an earlier statement must not pass for a scope.
+    let mut wrong = begin_scoped(&pool, Uuid::new_v4()).await.expect("scoped");
+    assert!(
+        scope_is_armed(&mut wrong, ws.id).await.is_err(),
+        "a transaction armed for another workspace must not satisfy this check"
+    );
+    wrong.rollback().await.expect("rollback");
+
+    forget_keys(&redis_pool().await, ws.viewer, &[]).await;
 }
 
 // ── Device context is bounded, not free text ──────────────────────────────

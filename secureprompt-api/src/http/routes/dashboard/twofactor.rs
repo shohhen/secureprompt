@@ -62,6 +62,7 @@ use crate::{
 };
 
 use super::auth::build_token_pair_body;
+use super::device::DeviceContext;
 
 // ---------- Tunables ----------
 
@@ -513,7 +514,9 @@ pub async fn verify(
     };
 
     let now_unix = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
-    let last_timestep = user.totp_last_timestep.map(|step| u64::try_from(step).unwrap_or(0));
+    let last_timestep = user
+        .totp_last_timestep
+        .map(|step| u64::try_from(step).unwrap_or(0));
 
     match totp::verify_code(&secret_b32, &body.code, last_timestep, now_unix) {
         Ok(step) => {
@@ -543,19 +546,25 @@ pub async fn verify(
             // `users.rs`'s `POST /v1/users` / `workspace_repo.rs`'s
             // `set_workspace_owner`): fetch it directly so the freshly
             // issued access token carries the real role, not a placeholder.
-            let role: String =
-                match sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-                    .bind(user_id)
-                    .fetch_one(&state.db)
-                    .await
-                {
-                    Ok(role) => role,
-                    Err(error) => {
-                        return api_error_response(ApiError::Database(error.to_string()))
-                    }
-                };
+            let role: String = match sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await
+            {
+                Ok(role) => role,
+                Err(error) => return api_error_response(ApiError::Database(error.to_string())),
+            };
 
-            match build_token_pair_body(&state, user_id, workspace_id, &role, &user.email).await {
+            match build_token_pair_body(
+                &state,
+                user_id,
+                workspace_id,
+                &role,
+                &user.email,
+                &DeviceContext::from_headers(&headers),
+            )
+            .await
+            {
                 Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
                 Err(err) => api_error_response(err),
             }
@@ -750,7 +759,16 @@ pub async fn challenge(
         Err(error) => return api_error_response(ApiError::Database(error.to_string())),
     };
 
-    match build_token_pair_body(&state, user_id, workspace_id, &role, &user.email).await {
+    match build_token_pair_body(
+        &state,
+        user_id,
+        workspace_id,
+        &role,
+        &user.email,
+        &DeviceContext::from_headers(&headers),
+    )
+    .await
+    {
         Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
         Err(err) => api_error_response(err),
     }
@@ -868,7 +886,11 @@ pub async fn disable(
     // user stuck unable to confirm 2FA is off).
     let _ = state.refresh_tokens.revoke_all_for_user(ctx.user_id).await;
 
-    (StatusCode::OK, JsonResponse(DisableResponse { disabled: true })).into_response()
+    (
+        StatusCode::OK,
+        JsonResponse(DisableResponse { disabled: true }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -943,7 +965,10 @@ mod tests {
         }
         // Ambiguous characters must never appear.
         for bad in ['0', 'O', '1', 'I', 'L'] {
-            assert!(!code.contains(bad), "ambiguous char {bad} leaked into backup code");
+            assert!(
+                !code.contains(bad),
+                "ambiguous char {bad} leaked into backup code"
+            );
         }
     }
 

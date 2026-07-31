@@ -20,17 +20,13 @@ secureprompt-api/src/http/middleware/rate_limit.rs
 secureprompt-api/src/http/mod.rs
 secureprompt-api/src/http/model_router.rs
 secureprompt-api/src/http/routes/dashboard/analytics.rs
-secureprompt-api/src/http/routes/dashboard/auth.rs
 secureprompt-api/src/http/routes/dashboard/budgets.rs
 secureprompt-api/src/http/routes/dashboard/keys.rs
 secureprompt-api/src/http/routes/dashboard/me.rs
-secureprompt-api/src/http/routes/dashboard/oidc.rs
 secureprompt-api/src/http/routes/dashboard/policy_rules.rs
 secureprompt-api/src/http/routes/dashboard/providers.rs
 secureprompt-api/src/http/routes/dashboard/requests.rs
 secureprompt-api/src/http/routes/dashboard/secure_mode.rs
-secureprompt-api/src/http/routes/dashboard/twofactor.rs
-secureprompt-api/src/http/routes/dashboard/users.rs
 secureprompt-api/src/http/routes/internal.rs
 secureprompt-api/src/http/routes/license.rs
 secureprompt-api/src/http/routes/mcp_routes.rs
