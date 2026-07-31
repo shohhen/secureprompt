@@ -144,7 +144,16 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          setting to decide what captured content to purge. Under a \
          non-bypassing role it returns no rows, which this code cannot \
          distinguish from `no workspace has enabled capture`, so captured \
-         PLAINTEXT PROMPTS are never purged and the record still says `ok`. \
+         PLAINTEXT PROMPTS are never purged. \
+         The tail of this reason said `and the record still says ok`. It is \
+         worse than that, re-derived against the code in P1G: \
+         `purge_content_captures` builds one record PER SETTINGS ROW, so an \
+         empty read produces an EMPTY vector and there is no \
+         `request_content_captures` record at all. `PurgeOutcome::all_ok` is \
+         `records.iter().all(...)`, which is true over the empty set, so the \
+         run reports success AND the proof-of-purge trail simply omits the \
+         scope for that run — an absence, which is harder to notice than a \
+         row falsely claiming `ok`. \
          Same fix: drive it from a loop over `workspaces` with the scope armed.",
     ),
     (

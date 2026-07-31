@@ -497,6 +497,16 @@ test:rls-nonsuperuser:
     - cargo test -p secureprompt-api --test rls_call_site_guard -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test migration_020_rls -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test dashboard -- --test-threads=4 --nocapture
+    # P1G. Both suites drive the code under test through a pool that asserts
+    # `rolsuper = false`, `rolbypassrls = false` and
+    # `row_security_active('api_keys')` on the wire, and every read-back arms
+    # the scope, so they behave identically under this job's role and under
+    # `test:`. Run under BOTH before being listed here, per the header above.
+    - cargo test -p secureprompt-api --test rls_api_key_grace_window -- --test-threads=4 --nocapture
+    # The only worker-crate entry. It is here rather than in `test:` alone
+    # because the rotation-cleanup sweep it covers is the one whose allowlist
+    # entry claimed it "fails CLOSED" and did not.
+    - cargo test -p secureprompt-worker api_key_rotation -- --test-threads=4 --nocapture
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.
