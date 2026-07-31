@@ -290,32 +290,32 @@ impl PolicyRepository {
         admin_audit_repo::changed_field(
             &mut changed,
             "name",
-            serde_json::json!(before.get::<String, _>("name")),
-            serde_json::json!(name),
+            &serde_json::json!(before.get::<String, _>("name")),
+            &serde_json::json!(name),
         );
         admin_audit_repo::changed_field(
             &mut changed,
             "priority",
-            serde_json::json!(before.get::<i32, _>("priority")),
-            serde_json::json!(priority),
+            &serde_json::json!(before.get::<i32, _>("priority")),
+            &serde_json::json!(priority),
         );
         admin_audit_repo::changed_field(
             &mut changed,
             "rule_action",
-            serde_json::json!(before.get::<String, _>("action")),
-            serde_json::json!(action),
+            &serde_json::json!(before.get::<String, _>("action")),
+            &serde_json::json!(action),
         );
         admin_audit_repo::changed_field(
             &mut changed,
             "enabled",
-            serde_json::json!(before.get::<bool, _>("enabled")),
-            serde_json::json!(enabled),
+            &serde_json::json!(before.get::<bool, _>("enabled")),
+            &serde_json::json!(enabled),
         );
         admin_audit_repo::changed_field(
             &mut changed,
             "dry_run",
-            serde_json::json!(before.get::<bool, _>("dry_run")),
-            serde_json::json!(dry_run),
+            &serde_json::json!(before.get::<bool, _>("dry_run")),
+            &serde_json::json!(dry_run),
         );
         admin_audit_repo::write(
             &mut tx,

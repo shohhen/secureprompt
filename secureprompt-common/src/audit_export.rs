@@ -163,13 +163,19 @@ pub const SOURCE_TABLE: &str = "request_events";
 /// read.
 pub const SOURCE_TTL_DAYS: i64 = 90;
 
-/// The three Postgres relations the CONTROL-PLANE section's rows come from,
-/// in the order the manifest lists them. None of them has a TTL and none is
-/// covered by the `retention.purge` job — see [`no_expiry_for`].
+/// The Postgres relations the CONTROL-PLANE section's rows come from, in the
+/// order the manifest lists them. None of them has a TTL and none is covered by
+/// the `retention.purge` job — see [`no_expiry_for`].
 pub const CONTROL_SOURCE_TABLES: &[&str] = &[
     "raw_capture_audit",
     "retention_purge_audit",
     "session_revocation_audit",
+    // FU5. The one source that is not per-action: `admin_audit` holds every
+    // administrative action FU5 audits, keyed by its own `action` column, which
+    // the exporter passes through verbatim as `event_type`. That is the point
+    // of the single-table design — a newly audited action becomes exportable
+    // with no change to this list, to the reader, or to the manifest shape.
+    "admin_audit",
 ];
 
 // ── Sections ──────────────────────────────────────────────────────────────
@@ -376,11 +382,16 @@ pub const CONTROL_COLUMNS: &[(&str, &str)] = &[
     ),
     (
         "event_type",
-        "`raw_capture.changed` (an administrator changed whether this \
-         workspace stores raw prompt/response content, or for how long), \
+        "What was done. `raw_capture.changed` (an administrator changed whether \
+         this workspace stores raw prompt/response content, or for how long), \
          `retention.purge` (a scheduled purge run reported what it deleted for \
-         this workspace), or `session.revoked` (an administrator terminated a \
-         user's sessions).",
+         this workspace), `session.revoked` (an administrator terminated a \
+         user's sessions), or one of the FU5 `admin_audit` actions listed in \
+         this section's coverage note — `api_key.*`, `provider_credential.*`, \
+         `policy_rule.*` and `user.created`. The `admin_audit` values are the \
+         `action` column passed through VERBATIM, so this vocabulary grows with \
+         the product rather than with a translation table somebody has to \
+         remember to extend.",
     ),
     (
         "source_table",
@@ -408,9 +419,11 @@ pub const CONTROL_COLUMNS: &[(&str, &str)] = &[
     ),
     (
         "target_user_id",
-        "The user the action was performed ON. Populated for \
-         `session.revoked` only; equal to the actor on a self-revocation. NULL \
-         for events that have no user target.",
+        "The user the action was performed ON. Populated for `session.revoked` \
+         (equal to the actor on a self-revocation) and for `user.created`. NULL \
+         for events whose target is not a person — an API key, a provider or a \
+         policy rule — whose identity is in `detail.target_id` and \
+         `detail.target_label` instead.",
     ),
     (
         "target_email",
@@ -433,7 +446,28 @@ pub const CONTROL_COLUMNS: &[(&str, &str)] = &[
          `error_present` and its text is NOT exported: it is a ClickHouse \
          exception message, which quotes the statement that provoked it and \
          sometimes the value it choked on. Read it in Postgres or the gateway \
-         log if a run failed.",
+         log if a run failed. EVERY `admin_audit` (FU5) event carries \
+         `target_type` (`api_key`, `provider`, `policy_rule` or `user`), \
+         `target_id` and `target_label` — the acted-on object's own name, kept \
+         so the row still names something after that object is deleted — plus \
+         its own facts: `api_key.created` has `assigned_user_id`; \
+         `api_key.rotated` has `grace_expires_at` and `grace_secs`, the window \
+         in which the rotated key remained usable; `provider_credential.*` have \
+         `provider_type` and, on update, `credential_replaced`, \
+         `credential_cleared` and `config_changed`; `policy_rule.created` and \
+         `policy_rule.deleted` have `priority`, `rule_action`, `enabled` and \
+         `dry_run`; `policy_rule.updated` has `changed` plus \
+         `conditions_changed` and `action_params_changed`; the two toggles have \
+         `before` and `after`; `user.created` has `role_granted`. `changed` is \
+         an object holding ONLY the fields that actually moved, each as \
+         `{before, after}`, so an edit does not read as though it rewrote \
+         everything. NO SECRET APPEARS ANYWHERE IN `detail`, BY CONSTRUCTION: \
+         every value is built from a typed column the product already stores, \
+         and an API key, a provider credential, a password and a TOTP secret \
+         are never among them — nor is any prefix or hash of one. Where a value \
+         is unbounded administrator-authored text — a policy rule's match \
+         conditions, a provider's config blob — only WHETHER it changed is \
+         reported, never its contents.",
     ),
 ];
 
@@ -453,25 +487,41 @@ pub const REQUEST_COVERAGE: &str =
 
 /// What the CONTROL-PLANE section does and does not cover.
 ///
-/// The second half is the load-bearing half. Three administrative actions are
-/// audited into a dedicated table and therefore exportable; the rest of the
-/// administrative surface is not audited AT ALL, and an auditor who reads this
-/// section as "every administrative action" would be reading a floor as a
-/// ceiling. Listing what is missing is the same rule the data plane follows for
-/// `/v1/redact`.
+/// The second half is the load-bearing half. What is audited is exportable;
+/// what is not audited is absent, and an auditor who reads this section as
+/// "every administrative action" would be reading a floor as a ceiling. Listing
+/// what is missing is the same rule the data plane follows for `/v1/redact`.
+///
+/// FU5 moved twelve actions from the "not audited" list into the covered list.
+/// The remaining gaps are named individually rather than summarised, and
+/// `admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places` fails if a
+/// newly audited action is not named in this string — so this prose cannot fall
+/// behind the code without a red test.
 pub const CONTROL_COVERAGE: &str =
-    "THREE AUDITED ADMINISTRATIVE ACTIONS ONLY. This section carries every row \
-     of `raw_capture_audit` (WS3-1), `retention_purge_audit` (WS3-4) and \
-     `session_revocation_audit` (WS4-3) whose instant falls in the window and \
-     whose `workspace_id` is this workspace's. It is NOT a complete record of \
-     administrative activity, and must not be read as one. The following are \
-     NOT audited into any table and therefore appear NOWHERE in this export: \
-     creating, revoking or reassigning an API key; adding or changing a \
-     provider credential; creating, deleting or re-roling a user; editing a \
-     policy rule; changing secure-mode, sidecar-failure or budget settings; \
-     enrolling or resetting 2FA; activating a license; and every dashboard \
-     login, successful or failed. Their absence here is not evidence they did \
-     not happen. Rows of `retention_purge_audit` whose `workspace_id` is NULL — \
+    "AUDITED ADMINISTRATIVE ACTIONS ONLY. This section carries every row of \
+     `raw_capture_audit` (WS3-1), `retention_purge_audit` (WS3-4), \
+     `session_revocation_audit` (WS4-3) and `admin_audit` (FU5) whose instant \
+     falls in the window and whose `workspace_id` is this workspace's. The \
+     audited actions are, in full: `raw_capture.changed`, `retention.purge`, \
+     `session.revoked`, `api_key.created`, `api_key.revoked`, \
+     `api_key.rotated`, `provider_credential.created`, \
+     `provider_credential.updated`, `provider_credential.deleted`, \
+     `policy_rule.created`, `policy_rule.updated`, `policy_rule.deleted`, \
+     `policy_rule.enabled_changed`, `policy_rule.dry_run_changed` and \
+     `user.created`. It is NOT a complete record of administrative activity, \
+     and must not be read as one. The following are NOT audited into any table \
+     and therefore appear NOWHERE in this export: every dashboard login, \
+     successful or failed, and every OIDC sign-in; enrolling, verifying, \
+     disabling or resetting 2FA and regenerating backup codes; activating a \
+     license; changing secure-mode, sidecar-failure or budget settings; \
+     reassigning an API key to a different member; and adding, removing or \
+     excluding a provider's models. Their absence here is not evidence they did \
+     not happen. Two further limits on what IS carried: a repeated \
+     `POST /v1/keys/{id}/rotate` inside the grace window is idempotent, changes \
+     nothing and writes no second `api_key.rotated` row; and a failed or \
+     refused action — a 403, or a 404 for an object that does not exist — is \
+     never recorded, so this section describes actions that TOOK EFFECT rather \
+     than attempts. Rows of `retention_purge_audit` whose `workspace_id` is NULL — \
      purge scopes that are not per-workspace, such as the token vault — are \
      excluded because they are not this tenant's records; the section's source \
      block reports how many such rows fell in the window so their exclusion is \

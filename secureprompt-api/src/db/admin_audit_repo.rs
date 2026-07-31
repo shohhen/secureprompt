@@ -246,7 +246,14 @@ impl AdminAuditEntry {
 ///
 /// Characters and not bytes: slicing a UTF-8 string at a byte offset panics
 /// mid-codepoint, and administrators name things in Russian and Uzbek here.
-fn bounded_label(label: Option<String>) -> Option<String> {
+///
+/// `single_option_map` says to inline this into the caller. Kept as a named
+/// function on purpose: it is the ONE place the bound on
+/// administrator-supplied text is applied, and migration 028's
+/// `admin_audit_target_label_bounded` CHECK is written to match it. Inlining it
+/// makes that pairing invisible.
+#[allow(clippy::single_option_map)]
+fn bounded_label(label: Option<&str>) -> Option<String> {
     label.map(|value| value.chars().take(TARGET_LABEL_MAX).collect())
 }
 
@@ -281,7 +288,7 @@ pub async fn write(
     .bind(actor.role.as_deref())
     .bind(entry.action.target_type())
     .bind(entry.target_id)
-    .bind(bounded_label(entry.target_label.clone()))
+    .bind(bounded_label(entry.target_label.as_deref()))
     .bind(entry.target_user_id)
     .bind(entry.target_email.as_deref())
     .bind(entry.target_role.as_deref())
@@ -300,8 +307,8 @@ pub async fn write(
 pub fn changed_field(
     map: &mut serde_json::Map<String, Value>,
     name: &str,
-    before: Value,
-    after: Value,
+    before: &Value,
+    after: &Value,
 ) {
     if before != after {
         map.insert(name.to_owned(), json!({"before": before, "after": after}));

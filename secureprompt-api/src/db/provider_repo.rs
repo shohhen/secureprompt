@@ -301,14 +301,14 @@ impl ProviderRepository {
         admin_audit_repo::changed_field(
             &mut changed,
             "name",
-            serde_json::json!(old_name),
-            serde_json::json!(new_name),
+            &serde_json::json!(old_name),
+            &serde_json::json!(new_name),
         );
         admin_audit_repo::changed_field(
             &mut changed,
             "provider_type",
-            serde_json::json!(old_type),
-            serde_json::json!(new_type),
+            &serde_json::json!(old_type),
+            &serde_json::json!(new_type),
         );
         admin_audit_repo::write(
             &mut tx,
