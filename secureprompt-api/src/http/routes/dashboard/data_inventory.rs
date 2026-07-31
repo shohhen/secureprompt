@@ -1642,16 +1642,27 @@ async fn get_data_inventory(
         class: "admin_audit".to_owned(),
         store: "postgres",
         location: "admin_audit".to_owned(),
-        description: "Append-only record of the administrative actions FU5 audits: API \
+        description: "Append-only record of the audited administrative actions: API \
                       key create/revoke/rotate, provider credential create/update/delete, \
-                      policy rule create/update/delete and enabled/dry-run toggles, and \
-                      user creation. Each row says who acted, on which object, what \
+                      policy rule create/update/delete and enabled/dry-run toggles, \
+                      user creation (FU5), and 2FA enrolment/confirmation/reset, license \
+                      activation and removal, budget / secure-mode / sidecar-failure \
+                      settings changes, successful dashboard and OIDC logins, and \
+                      second-factor verification (P1A). Each row says who acted, on \
+                      which object, what \
                       changed and when. Written in the SAME transaction as the action it \
                       records, so the action and its record commit together or neither \
-                      does. NOT a complete record of administrative activity: dashboard \
-                      login, 2FA enrolment/reset and license activation are still \
-                      unaudited, and their absence here is not evidence they did not \
-                      happen.",
+                      does — with two named exceptions whose action has no transaction \
+                      to join: `auth.login_succeeded` and `auth.second_factor_verified` \
+                      commit BEFORE the session they precede, so no session is issued \
+                      without a record of the login that opened it. NOT a complete \
+                      record of administrative activity: a FAILED login writes nothing, \
+                      deliberately — an attempt against an unknown email has no \
+                      workspace to be recorded under, and auditing only the resolvable \
+                      failures would make row-absence mean `no such account`. Public \
+                      signup, token refresh, logout, API-key reassignment and provider \
+                      model changes are also unaudited. Their absence here is not \
+                      evidence they did not happen.",
         sensitivity: "audit_trail",
         row_count: Some(pg.n("c_admin_audit")),
         row_count_status: "counted",
@@ -1663,10 +1674,16 @@ async fn get_data_inventory(
              grace-window instant, and before/after pairs for the fields that moved). \
              NO SECRET IS STORED: not an API key or any prefix of one, not a provider \
              credential in plaintext or ciphertext, not a password or its hash, not a \
-             TOTP secret or backup code — `tests/admin_audit.rs` dumps every column of \
+             TOTP secret, a 2FA backup code or the signed license token — \
+             `tests/admin_audit.rs` dumps every column of \
              every row to text and searches it. DELIBERATELY ABSENT for the reason \
              `session_revocation_audit` gives: IP address, User-Agent and any free-text \
-             reason. The object's NAME is the one administrator-supplied string admitted, \
+             reason. That holds for the LOGIN rows too, which are the only ones whose \
+             request carries those headers, and it holds for the reduced \
+             `{browser} on {os}` descriptor a session row stores as well: that \
+             descriptor is ERASED when the session ends, and this table is never purged, \
+             so a copy here would undo the erasure permanently. \
+             The object's NAME is the one administrator-supplied string admitted, \
              because without it a deleted object's audit row names only a UUID that \
              resolves to nothing; it is truncated to 200 characters and the database \
              REFUSES anything longer.",
