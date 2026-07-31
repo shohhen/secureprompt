@@ -119,6 +119,62 @@ impl SessionRevocationRepository {
         }))
     }
 
+    /// FU3 — the durable half of the revocation watermark.
+    ///
+    /// `jwt_auth::require` normally reads `session_revoked:{user_id}` from
+    /// Redis on every authenticated request. When Redis is unreachable that
+    /// read is the only thing standing between a revoked token and a served
+    /// request, so the same fact is read here from the table that recorded it.
+    /// [`RevocationRecord::revoked_before_unix`] is the value published to
+    /// Redis, written in the transaction that closes the refresh chain, so the
+    /// two sources cannot disagree about a revocation that committed.
+    ///
+    /// `MAX` because watermarks only move forward: the newest revocation
+    /// subsumes every earlier one, exactly as the Redis `SET` overwrite does.
+    ///
+    /// Unlike the Redis key this row has no TTL, so it still answers for
+    /// revocations whose watermark key has expired — strictly safer, because a
+    /// token old enough for that to matter expired on its own terms long ago.
+    ///
+    /// # The workspace bind is not bookkeeping
+    ///
+    /// This table has FORCE ROW LEVEL SECURITY and a policy whose predicate is
+    /// NULL for every row when `app.current_workspace_id` is unset, so an
+    /// unbound `SELECT` returns the EMPTY SET and reports no error (migration
+    /// 026's header names the trap). Read without binding, this function would
+    /// answer "never revoked" for every user on the day the API stops
+    /// connecting as a superuser, and the control would be silently off. The
+    /// bind therefore happens in the SAME transaction as the read, and
+    /// `tests/auth_redis_outage.rs::the_durable_watermark_survives_row_level_security`
+    /// asserts it from a NOSUPERUSER/NOBYPASSRLS connection rather than from
+    /// the `#[sqlx::test]` superuser pool that cannot observe the mistake.
+    ///
+    /// # Errors
+    /// Returns `ApiError::Database` for pool/query failures. The caller MUST
+    /// NOT read an error as "not revoked" — that is the whole failure this
+    /// function exists to close.
+    pub async fn latest_watermark(
+        &self,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<i64>, ApiError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        bind_workspace(&mut tx, workspace_id).await?;
+        // Aggregate over zero rows is one row containing NULL, so `fetch_one`
+        // is correct and `None` means "no revocation on record".
+        let watermark: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(revoked_before_unix) FROM session_revocation_audit
+             WHERE target_user_id = $1 AND workspace_id = $2",
+        )
+        .bind(user_id)
+        .bind(workspace_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(watermark)
+    }
+
     /// Look up an actor's email for the audit row. `None` when the row cannot
     /// be read — the audit record still gets written with the actor's id,
     /// because a missing display name must not stop a security action.

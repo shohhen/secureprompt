@@ -307,9 +307,24 @@ async fn revoke_sessions(
     .map_err(api_error_response)?;
 
     // Evict this pod's cached auth entry for the target, exactly as
-    // `/v1/auth/logout` does (D-16). It closes the degraded-mode window on the
-    // pod that served the revocation; `jwt_auth::require` documents the bound
-    // that remains on other pods when Redis is unreachable.
+    // `/v1/auth/logout` does (D-16).
+    //
+    // FU3 — deliberately still LOCAL, and no longer load-bearing. Two facts
+    // make cross-pod eviction unnecessary for THIS action, and both are
+    // asserted in `tests/auth_redis_outage.rs`:
+    //
+    //   1. `auth_cache` is read only when Redis is unreachable. While Redis
+    //      answers, `jwt_auth::require` consults the watermark this handler
+    //      just published, on every pod, on the next request.
+    //   2. When Redis is unreachable, `jwt_auth::require` reads the watermark
+    //      from `session_revocation_audit` — the row the transaction above
+    //      committed — so a pod with a warm cached entry refuses this target
+    //      anyway. `a_revoked_session_is_refused_on_a_pod_that_cannot_reach_redis`
+    //      drives exactly that, from a pod that never saw this request.
+    //
+    // So this line is now a small local optimisation rather than the thing
+    // standing between a revoked token and a served request, and adding a
+    // pub/sub fan-out to replicate it would buy nothing.
     state.auth_cache.remove(&target.user_id);
 
     tracing::warn!(

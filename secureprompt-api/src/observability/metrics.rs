@@ -214,6 +214,21 @@ pub struct MetricsRegistry {
     /// vocabulary, different subsystem and different remedy (renew/re-license
     /// vs. restore the ML sidecar).
     license_gate_engaged: Mutex<Vec<(String, String, u64)>>,
+
+    // ── FU3 ─ JWT auth under a session-store outage ─────────────────────
+    /// Counter `secureprompt_auth_gate_engaged_total{reason,action}`.
+    /// `reason` is a bounded
+    /// [`crate::http::middleware::jwt_auth::AuthOutage`] label and `action` is
+    /// what the gate did about it (`block`/`degrade_with_alert` — the same two
+    /// strings as `sidecar_unavailable` and `license_gate_engaged`, bound to
+    /// `SidecarUnavailablePolicy::as_str` at compile time).
+    ///
+    /// This is the ONLY signal that the gateway answered an authenticated
+    /// request without having read the session gates. Every increment means
+    /// Redis was unreachable on the request path; a
+    /// `reason="logout_unverifiable"` increment additionally means a request
+    /// was SERVED in that state.
+    auth_gate_engaged: Mutex<Vec<(String, String, u64)>>,
     /// GAUGE `secureprompt_clickhouse_schema_mismatch` — 1 when the live
     /// `request_events` table is missing columns the writer serialises (the
     /// worker's ClickHouse migrations have not run, and every analytics event
@@ -607,6 +622,38 @@ impl MetricsRegistry {
             .map_or(0, |(_, _, count)| *count)
     }
 
+    /// FU3 — record one authenticated request the JWT auth gate acted on
+    /// because the session store was unreachable. Both labels are bounded:
+    /// `reason` is
+    /// [`crate::http::middleware::jwt_auth::AuthOutage::as_str`], `action` is
+    /// `block` or `degrade_with_alert`. Never a user id or a path.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn record_auth_gate_engaged(&self, reason: &str, action: &str) {
+        let mut guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
+        if let Some(row) = guard.iter_mut().find(|(r, a, _)| r == reason && a == action) {
+            row.2 += 1;
+        } else {
+            guard.push((reason.to_owned(), action.to_owned(), 1));
+        }
+    }
+
+    /// Return the auth-gate count for a `(reason, action)` pair.
+    ///
+    /// Used by tests to assert the counter was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn auth_gate_engaged_count(&self, reason: &str, action: &str) -> u64 {
+        let guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
+        guard
+            .iter()
+            .find(|(r, a, _)| r == reason && a == action)
+            .map_or(0, |(_, _, count)| *count)
+    }
+
     /// Return the policy-violation count for a given `action`.
     ///
     /// Used by tests to assert the counter was touched.
@@ -818,6 +865,20 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_license_gate_engaged_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
+                    );
+                }
+            }
+        }
+
+        // FU3 — JWT auth gate under a session-store outage.
+        {
+            let guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_auth_gate_engaged_total counter\n");
+                for (reason, action, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_auth_gate_engaged_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
                     );
                 }
             }
