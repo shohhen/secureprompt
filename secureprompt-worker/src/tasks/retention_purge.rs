@@ -27,6 +27,12 @@
 //!   shorten rows already on disk — WS3-2's author deferred that case to
 //!   here. This job re-derives the boundary from the workspace's CURRENT
 //!   retention on every run, so lowering takes effect at the next purge.
+//! * **`refresh_tokens.device_context`** (Postgres, FU4). The IP address and
+//!   client descriptor that migration 027 records on each sign-in so that a
+//!   session listing can tell one device from another. Erased once the session
+//!   is over. This scope SCRUBS COLUMNS rather than deleting rows — see
+//!   [`scrub_session_device_context`] for why the row has to survive — so its
+//!   `rows_deleted` is a count of rows whose personal data was erased.
 //!
 //! Direction matters and is asymmetric on purpose: the purge can only ever
 //! bring the boundary IN. Raising `retention_days` does not resurrect rows
@@ -48,6 +54,13 @@ use uuid::Uuid;
 pub const SCOPE_TOKEN_VAULT: &str = "token_vault_entries";
 /// Scope name for `ClickHouse` captured request content.
 pub const SCOPE_CONTENT_CAPTURES: &str = "request_content_captures";
+/// FU4 — scope name for the device context on ended sessions.
+///
+/// Named for COLUMNS rather than a table, because that is what it acts on and
+/// the distinction matters to whoever reads the audit trail: the rows are not
+/// deleted and never will be. `GET /v1/data-inventory` declares a
+/// `session_device_context` class citing this scope.
+pub const SCOPE_SESSION_DEVICE_CONTEXT: &str = "refresh_tokens.device_context";
 
 /// One scope of one purge run — the in-memory shape of a
 /// `retention_purge_audit` row (migration 023).
@@ -129,6 +142,7 @@ pub async fn run(pg: &PgPool, ch: &clickhouse::Client) -> PurgeOutcome {
 
     records.push(purge_token_vault(pg, now).await);
     records.extend(purge_content_captures(pg, ch, now).await);
+    records.push(scrub_session_device_context(pg, now).await);
 
     for record in &records {
         if let Err(e) = write_audit(pg, run_id, record).await {
@@ -218,6 +232,131 @@ async fn purge_token_vault(pg: &PgPool, now: DateTime<Utc>) -> PurgeRecord {
             started_at,
         },
         Err(e) => PurgeRecord::failure(SCOPE_TOKEN_VAULT, None, now, started_at, &e.to_string()),
+    }
+}
+
+// ── (c) FU4: device context on sessions that have ended ───────────────────
+
+/// Erase `client_ip` and `client_descriptor` from every session that is over.
+///
+/// # Why this scope exists
+///
+/// Migration 027 put an IP address and a client descriptor on the sign-in row
+/// of each session, because a listing an administrator cannot tell apart does
+/// not answer "which of these is the laptop I lost". Both are personal data on
+/// a table whose rows are never deleted, so without this job the product would
+/// accumulate one address per sign-in, per person, forever — and
+/// `GET /v1/data-inventory` would have to say so.
+///
+/// # Why it is a SCRUB and not a DELETE
+///
+/// Deleting the rows would be simpler and would be wrong. Migration 002's
+/// single-use rotation detects a replayed refresh token by finding the REVOKED
+/// row it hashes to; a row that has been deleted is indistinguishable from a
+/// token that never existed, so `rotate` would answer `NotFound` and threat
+/// T-05-03's detection would quietly stop working. The row is the evidence.
+/// The personal data on it is not evidence of anything, and it goes.
+///
+/// # The boundary is session liveness, not a clock
+///
+/// The other two scopes purge on a timestamp. This one purges on a FACT — the
+/// session is over — which is `NOT EXISTS (a live row in this chain)`. The
+/// decision is per CHAIN and not per row, and that is load-bearing rather than
+/// tidy: the row that carries the device context is the sign-in row, and it is
+/// itself `revoked_at IS NOT NULL` from the moment the session first rotates.
+/// A per-row predicate would therefore erase the device of every session about
+/// fifteen minutes into its life, leaving the listing full of unidentifiable
+/// entries. `a_rotated_but_live_session_keeps_its_device_context` is that test.
+///
+/// `cutoff` is recorded as `now` because that is the instant the liveness
+/// question was asked; `rows_deleted` counts rows SCRUBBED.
+async fn scrub_session_device_context(pg: &PgPool, now: DateTime<Utc>) -> PurgeRecord {
+    let started_at = Utc::now();
+
+    // Scrub and measure in ONE statement, for the reason `purge_token_vault`
+    // gives: a separate count would report on a set that could have changed.
+    let scrubbed = sqlx::query(
+        "WITH scrubbed AS (
+             UPDATE refresh_tokens r
+             SET client_ip = NULL, client_descriptor = NULL
+             WHERE (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+               AND NOT EXISTS (
+                   SELECT 1 FROM refresh_tokens live
+                   WHERE live.session_id = r.session_id
+                     AND live.revoked_at IS NULL
+                     AND live.expires_at > $1
+               )
+             RETURNING r.created_at
+         )
+         SELECT COUNT(*)::BIGINT AS n,
+                MIN(created_at)  AS oldest,
+                MAX(created_at)  AS newest
+         FROM scrubbed",
+    )
+    .bind(now)
+    .fetch_one(pg)
+    .await;
+
+    let row = match scrubbed {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!(
+                alert = "retention_purge_failed",
+                scope = SCOPE_SESSION_DEVICE_CONTEXT,
+                error = %e,
+                "session device-context scrub failed; IP addresses for ended \
+                 sessions are still on disk"
+            );
+            return PurgeRecord::failure(
+                SCOPE_SESSION_DEVICE_CONTEXT,
+                None,
+                now,
+                started_at,
+                &e.to_string(),
+            );
+        }
+    };
+
+    let rows_deleted: i64 = row.get("n");
+    let oldest: Option<DateTime<Utc>> = row.get("oldest");
+    let newest: Option<DateTime<Utc>> = row.get("newest");
+
+    // Re-derive the post-state with the SAME predicate. This is the number an
+    // auditor recomputes, and it must be zero.
+    let remaining: Result<i64, _> = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM refresh_tokens r
+         WHERE (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM refresh_tokens live
+               WHERE live.session_id = r.session_id
+                 AND live.revoked_at IS NULL
+                 AND live.expires_at > $1
+           )",
+    )
+    .bind(now)
+    .fetch_one(pg)
+    .await;
+
+    match remaining {
+        Ok(rows_remaining_past_cutoff) => PurgeRecord {
+            scope: SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
+            workspace_id: None,
+            cutoff: now,
+            rows_deleted,
+            oldest_deleted: oldest,
+            newest_deleted: newest,
+            rows_remaining_past_cutoff,
+            status: "ok".to_owned(),
+            error: None,
+            started_at,
+        },
+        Err(e) => PurgeRecord::failure(
+            SCOPE_SESSION_DEVICE_CONTEXT,
+            None,
+            now,
+            started_at,
+            &e.to_string(),
+        ),
     }
 }
 

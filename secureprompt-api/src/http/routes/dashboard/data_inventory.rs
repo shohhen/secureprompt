@@ -296,6 +296,27 @@ impl Retention {
             mechanism_detail: detail.to_owned(),
         }
     }
+
+    /// A class with a REAL enforcement mechanism whose window is not a number
+    /// of days.
+    ///
+    /// FU4 needed this and neither existing constructor could tell the truth
+    /// for it: `none` would deny an erasure that happens, and `days(n, …)`
+    /// would invent a fixed window where the boundary is an event — the
+    /// session ending — whose distance from now depends on when the person
+    /// last used it. `days: None` with a named mechanism is the shape the
+    /// `days` field's own documentation already anticipates, and the shape
+    /// `retention_days_without_an_enforcement_mechanism_is_never_reported`
+    /// admits: it forbids a NUMBER without a mechanism, not a mechanism
+    /// without a number.
+    fn bounded_by(window: &str, mechanism: &'static str, detail: &str) -> Self {
+        Self {
+            days: None,
+            window: window.to_owned(),
+            mechanism,
+            mechanism_detail: detail.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -742,6 +763,9 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1) AS c_refresh_tokens,
            (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1
               AND token_hash ~ '^[0-9a-f]+$' AND length(token_hash) = 64) AS v_refresh_tokens,
+           (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1
+              AND (client_ip IS NOT NULL OR client_descriptor IS NOT NULL))
+             AS c_session_device_context,
            (SELECT count(*) FROM workspace_budgets WHERE workspace_id = $1) AS c_workspace_budgets,
            (SELECT count(*) FROM token_vault_entries WHERE workspace_id = $1) AS c_token_vault_entries,
            (SELECT count(*) FROM token_vault_entries WHERE workspace_id = $1
@@ -1349,9 +1373,53 @@ async fn get_data_inventory(
         retention: Retention::none(
             "NOTHING DELETES THESE ROWS. `expires_at` and `revoked_at` are honoured at READ \
              time, so an expired or rotated token stops working — but the row itself is kept \
-             forever, one per refresh per user, and `retention.purge` does not cover this \
-             table. Reported as `none` deliberately: `expires_at` is a validity check, not a \
-             deletion, and presenting it as a retention window would be a false assurance.",
+             forever, one per refresh per user, and `retention.purge` does not delete from \
+             this table. Reported as `none` deliberately: `expires_at` is a validity check, \
+             not a deletion, and presenting it as a retention window would be a false \
+             assurance. The `session_device_context` class below covers the FU4 columns on \
+             these same rows, which ARE erased on a schedule — the rows are not.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
+    // FU4. Declared SEPARATELY from `refresh_tokens` rather than folded into
+    // it, because the two differ on both axes an auditor reads: sensitivity
+    // (credential material vs. personal data) and retention (never vs. erased
+    // when the session ends). One entry could only have told one of those two
+    // truths.
+    artifacts.push(ArtifactClass {
+        class: "session_device_context".to_owned(),
+        store: "postgres",
+        location: "refresh_tokens.client_ip + refresh_tokens.client_descriptor".to_owned(),
+        description: "The device that opened each session: the IP address as seen at sign-in, \
+                      and a coarse client descriptor. Recorded once per session, on the \
+                      sign-in row only — never re-recorded when the token rotates.",
+        sensitivity: "personal_data",
+        // Rows CARRYING device context, not rows in the table. The two differ,
+        // and the smaller number is the one that describes this class.
+        row_count: Some(pg.n("c_session_device_context")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Stored in the clear, and bounded rather than verbatim. The raw `User-Agent` is \
+             NOT kept: it is reduced to `{browser} on {os}` drawn from a closed vocabulary, so \
+             no byte of that header reaches this column and the version/build detail that \
+             makes a User-Agent a fingerprint is discarded. `client_ip` is written only when \
+             the value parses as an IP address, and is re-rendered from the parse. CHECK \
+             constraints on the table bound both independently of the code.",
+        ),
+        retention: Retention::bounded_by(
+            "until the session ends, then the next purge run",
+            mechanism::WORKER_PURGE,
+            "`retention.purge`, scope `refresh_tokens.device_context`, daily at 04:00. It \
+             SCRUBS these two columns to NULL on every session with no live refresh row \
+             left — it does not delete the row, because a deleted row would make a replayed \
+             refresh token indistinguishable from one that never existed and would silently \
+             disable replay detection. The upper bound on how long an address is held is \
+             therefore the refresh-token lifetime (default 30 days) from the session's last \
+             use, plus up to 24h until the next run. The decision is made per rotation CHAIN, \
+             not per row.",
         ),
         governed_by: None,
         enabled: None,
