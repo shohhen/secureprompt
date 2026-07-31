@@ -41,3 +41,7 @@ pub mod secure_mode;
 // WS4-3 — admin-initiated session revocation.
 #[path = "session_revocation_tests.rs"]
 pub mod session_revocation;
+
+// FU4 — listing the sessions a user holds, and ending ONE of them.
+#[path = "session_listing_tests.rs"]
+pub mod session_listing;
