@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::AdminActor,
     db::budget_repo::BudgetBehavior,
     http::{
         api_error_response,
@@ -150,6 +151,18 @@ async fn put_budget(
     // Role gate — admin only (LIM-02).
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
+    // P1A — a budget is the spend control, and raising a limit or switching
+    // enforcement from `block` to `warn` is the change that turns up on an
+    // invoice three weeks later with nobody's name on it. The repository takes
+    // the "before" inside its own transaction and writes the diff there, so
+    // the record cannot describe a change that a concurrent PUT undid.
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let row = state
         .budgets
         .upsert(
@@ -157,6 +170,7 @@ async fn put_budget(
             body.daily_token_limit,
             body.monthly_token_limit,
             body.behavior,
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
