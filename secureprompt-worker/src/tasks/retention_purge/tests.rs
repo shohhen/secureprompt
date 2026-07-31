@@ -610,21 +610,46 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
          which session to end"
     );
 
-    // The proof-of-purge record. `rows_deleted` counts rows SCRUBBED for this
-    // scope; the post-check must be able to recompute zero.
-    let rows = audit_rows(&pool, outcome.run_id, "refresh_tokens.device_context").await?;
-    assert_eq!(rows.len(), 1, "one audit row for the device-context scope");
+    // The proof-of-purge trail. `rows_deleted` counts rows SCRUBBED for this
+    // scope, and it is attributed to the workspace whose people's addresses
+    // were erased — read from THAT workspace's armed scope, which is also the
+    // only lens from which the number can be re-derived by anyone but a DBA.
+    let mine = audit_rows_for_workspace(
+        &pool,
+        outcome.run_id,
+        SCOPE_SESSION_DEVICE_CONTEXT,
+        workspace_id,
+    )
+    .await?;
     assert_eq!(
-        rows[0].get::<i64, _>("rows_deleted"),
+        mine.len(),
+        1,
+        "one audit row for this workspace's device-context scrub"
+    );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_deleted"),
         2,
         "exactly the two ended sessions"
     );
     assert_eq!(
-        rows[0].get::<i64, _>("rows_remaining_past_cutoff"),
+        mine[0].get::<i64, _>("rows_remaining_past_cutoff"),
         0,
         "no ended session may still be carrying device context"
     );
-    assert_eq!(rows[0].get::<String, _>("status"), "ok");
+    assert_eq!(mine[0].get::<String, _>("status"), "ok");
+
+    // And the census: the one global record that says the scope RAN, written
+    // whether or not any workspace had work. It carries no counts of its own —
+    // the per-workspace records do — so `total_deleted()` cannot double-count.
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the run must write exactly one global census record for the \
+         device-context scope"
+    );
+    assert_eq!(census[0].get::<String, _>("status"), "ok");
+    assert_eq!(census[0].get::<i64, _>("rows_deleted"), 0);
     Ok(())
 }
 
@@ -988,19 +1013,25 @@ async fn audit_rows_for_workspace(
     Ok(rows)
 }
 
-/// The run's ONE global record for the capture scope — the census that says the
+/// The run's ONE global record for a sweeping scope — the census that says the
 /// sweep happened at all. `workspace_id IS NULL`, so a bare read sees it under
 /// either role.
-async fn capture_sweep_census(
+///
+/// Taken as a PARAMETER rather than fixed to the capture scope, because P1J
+/// gives `refresh_tokens.device_context` a census of exactly the same shape and
+/// two mechanisms that only look alike are how a second one drifts from the
+/// first.
+async fn sweep_census(
     pool: &PgPool,
     run_id: Uuid,
+    scope: &str,
 ) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
     sqlx::query(
         "SELECT * FROM retention_purge_audit
          WHERE run_id = $1 AND scope = $2 AND workspace_id IS NULL",
     )
     .bind(run_id)
-    .bind(SCOPE_CONTENT_CAPTURES)
+    .bind(scope)
     .fetch_all(pool)
     .await
 }
@@ -1189,7 +1220,7 @@ async fn a_capture_sweep_with_nothing_to_do_still_records_the_scope(
     // THE CENSUS. This is what makes "nothing to do" distinguishable from "I
     // could not see anything": the scope is named in the trail on every run,
     // whether or not any workspace had work.
-    let census = capture_sweep_census(&pool, outcome.run_id).await?;
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES).await?;
     assert_eq!(
         census.len(),
         1,
@@ -1333,7 +1364,7 @@ async fn a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly(
          retention that governs it"
     );
 
-    let census = capture_sweep_census(&pool, outcome.run_id).await?;
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES).await?;
     assert_eq!(
         census.len(),
         1,
@@ -1352,6 +1383,477 @@ async fn a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly(
             .is_some_and(|e| e.contains("workspaces")),
         "the recorded error must name what could not be read, got {:?}",
         census[0].get::<Option<String>, _>("error")
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// P1J — the FU4 device-context scrub under a non-bypassing role
+// ===========================================================================
+//
+// # The failure being measured, and why it is worse than the capture sweep's
+//
+// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration 002.
+// Migration 032 rewrote its `workspace_isolation` policy with `NULLIF`, so an
+// unscoped read of it does not raise `22P02` — it answers the EMPTY SET.
+//
+// `scrub_session_device_context` ran BOTH of its statements on a bare pool. The
+// UPDATE therefore matched zero rows, which is not an error, and the record it
+// produced was `rows_deleted = 0`, `rows_remaining_past_cutoff = 0`,
+// `status = 'ok'` — BYTE-IDENTICAL to the record a run with genuinely nothing
+// to scrub writes. The IP address and the `{browser} on {os}` descriptor
+// migration 027 puts on every sign-in row stayed on disk, and
+// `GET /v1/data-inventory` went on declaring them erased when the session ends.
+//
+// The second half is what makes it the worst shape in this workstream.
+// `rows_remaining_past_cutoff` is the field migration 023 offers as the one an
+// auditor re-derives — "a job that lied about `rows_deleted` still has to face
+// a `rows_remaining_past_cutoff` that anyone can recompute". It was recomputed
+// through the SAME filter that produced the zero it was checking, so it agreed.
+// A compliance attestation whose own verification step confirms its error is
+// worse than one that merely lies, because the check designed to catch it
+// AGREES.
+//
+// The three tests below are, in order: the context survives while the job says
+// `ok` AND the recount confirms zero; "nothing to scrub" is recorded and is
+// distinguishable; "I could not see" is recorded and is NOT success.
+//
+// All fixture PII is synthetic.
+
+/// Premise asserted by every test here: the low-privilege pool really is
+/// filtered on the table the scrub reads and writes. Without it a role that
+/// turned out to bypass RLS would keep all three green while measuring nothing.
+async fn assert_session_rows_are_policed(low: &PgPool) {
+    assert!(
+        row_security_active(low, "refresh_tokens")
+            .await
+            .expect("row_security_active probe"),
+        "premise: row security is not active on refresh_tokens for this \
+         connection, so the scrub below runs unfiltered and measures nothing"
+    );
+}
+
+/// `rows_remaining_past_cutoff`, RE-DERIVED BY THE TEST — a second connection,
+/// armed to the workspace, running the predicate the job records against.
+///
+/// This is the whole point of the P1J change and it is deliberately NOT a call
+/// into the job's own code. The defect was that the job's post-delete recount
+/// went through the same blind filter as the delete, so the two agreed on zero;
+/// a check that shares the failure is not a check. Callers pair the number this
+/// returns with the number the job WROTE and require them to match, with a
+/// control row proving this scope is not itself blind.
+async fn ended_sessions_still_carrying_context(
+    pool: &PgPool,
+    workspace_id: Uuid,
+) -> sqlx::Result<i64> {
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM refresh_tokens r
+         WHERE r.workspace_id = $1
+           AND (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM refresh_tokens live
+               WHERE live.session_id = r.session_id
+                 AND live.workspace_id = r.workspace_id
+                 AND live.revoked_at IS NULL
+                 AND live.expires_at > NOW()
+           )",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Every `rows_remaining_past_cutoff` this run recorded for one scope, so a
+/// test can say "no record of this scope reports a single row still carrying
+/// device context" rather than picking one row and hoping it is the right one.
+fn recorded_remaining(outcome: &PurgeOutcome, scope: &str) -> Vec<i64> {
+    outcome
+        .records
+        .iter()
+        .filter(|r| r.scope == scope)
+        .map(|r| r.rows_remaining_past_cutoff)
+        .collect()
+}
+
+/// THE DEFECT. FU4's device context on an ENDED session must be gone after a
+/// run under a role that cannot bypass RLS — and the number the record offers
+/// for checking that must not be able to agree with the wrong answer.
+///
+/// `all_ok()` is asserted BEFORE the privacy assertion, deliberately: since
+/// migration 032 this scope's failure mode is SILENCE, not an error, so the RED
+/// this test was written against reads "the job reported success, the address is
+/// still on disk, and the recount says there is nothing left" rather than "the
+/// job errored". A test that expected an error here would be testing the
+/// pre-032 world.
+///
+/// MEASURED RED, under `secureprompt_runner`, before the fix:
+///   all_ok() = true; recorded rows_remaining_past_cutoff = [0];
+///   independently re-derived from the workspace's armed scope = 2;
+///   the expired session still reading (1, 1).
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn session_device_context_is_scrubbed_under_a_non_bypassing_role(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+
+    let expired = insert_session(&pool, workspace_id, user_id, -1, false).await?;
+    let revoked = insert_session(&pool, workspace_id, user_id, 24, true).await?;
+    let live = insert_session(&pool, workspace_id, user_id, 24, false).await?;
+
+    // ── PRE-STATE, from a scope that WOULD see it. Without these, "the context
+    // is gone" is satisfied by never having written any.
+    for (name, session) in [("expired", expired), ("revoked", revoked), ("live", live)] {
+        assert_eq!(
+            device_context_of(&pool, workspace_id, session).await?,
+            (1, 1),
+            "premise: the {name} session must carry device context before the run"
+        );
+    }
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+        2,
+        "premise: exactly the two ended sessions are eligible. This is the \
+         number the job's own record has to match afterwards, so a wrong \
+         premise here would make the comparison meaningless."
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    // ── PREMISE: the pool the job runs on sees NOTHING through a bare read.
+    // This is the mechanism of the defect, and it is also why every assertion
+    // in this test is armed: on this connection `(0, 0)` is what "the row does
+    // not exist", "the row was deleted" and "the context was scrubbed" all
+    // look like.
+    let blind: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM refresh_tokens WHERE session_id = $1")
+            .bind(expired)
+            .fetch_one(&low)
+            .await?;
+    assert_eq!(
+        blind, 0,
+        "premise: a BARE read on the job's own pool must see nothing here. If \
+         it sees the row, this connection is not filtered and the test below \
+         proves nothing about RLS."
+    );
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // ── The silent-success half. This assertion PASSED before the fix and that
+    // is the point: the job never signalled anything.
+    assert!(
+        outcome.all_ok(),
+        "the purge reported a failure: {:?}. Since migration 032 the failure \
+         mode of this scope is silence, so an error here is a different bug.",
+        outcome.records
+    );
+
+    // ── THE SELF-CONFIRMATION. The number the job WROTE, against the same
+    // number re-derived on a different connection from a scope proven above to
+    // see these rows. Before the fix the job wrote 0 and the truth was 2, and
+    // nothing in the audit trail disagreed with the job.
+    let independent = ended_sessions_still_carrying_context(&pool, workspace_id).await?;
+    let recorded = recorded_remaining(&outcome, SCOPE_SESSION_DEVICE_CONTEXT);
+    assert!(
+        !recorded.is_empty(),
+        "premise: the run recorded no `{SCOPE_SESSION_DEVICE_CONTEXT}` record \
+         at all, so there is no number to check: {:?}",
+        outcome.records
+    );
+    assert!(
+        recorded.iter().all(|&n| n == independent),
+        "the proof-of-purge recount and an independent re-derivation of the \
+         SAME predicate disagree: the trail says {recorded:?} rows are still \
+         past the boundary, a scope that can see them says {independent}. \
+         Recomputing the check through the same filter that produced the number \
+         it is meant to check is what made this defect self-confirming."
+    );
+    assert_eq!(
+        independent, 0,
+        "ended sessions are still carrying device context after a run that \
+         reported `ok`. Under a non-bypassing role the bare-pool UPDATE matched \
+         zero rows — which is not an error — so the IP addresses stayed on disk \
+         and `GET /v1/data-inventory` went on declaring them erased."
+    );
+
+    // ── POST-STATE, per session, from a scope that WOULD see it.
+    for (name, session) in [("expired", expired), ("revoked", revoked)] {
+        let (total, with_context) = device_context_of(&pool, workspace_id, session).await?;
+        assert_eq!(
+            with_context, 0,
+            "the {name} session's device context must be erased once the \
+             session is over"
+        );
+        assert_eq!(
+            total, 1,
+            "...but the ROW must survive: deleting it would turn a replayed \
+             refresh token into a plain 401 and lose the replay detection \
+             migration 002 describes"
+        );
+    }
+    // POSITIVE CONTROL. Must DIFFER from the two above, or this test would pass
+    // for a job that emptied the column on every row it could reach.
+    assert_eq!(
+        device_context_of(&pool, workspace_id, live).await?,
+        (1, 1),
+        "a LIVE session must keep the context that makes it identifiable in the \
+         listing"
+    );
+
+    // ── The trail, attributed to the tenant whose people's addresses were
+    // erased. Read from THAT workspace's armed scope — the lens from which the
+    // number above can be re-derived by the tenant themselves.
+    let mine = audit_rows_for_workspace(
+        &pool,
+        outcome.run_id,
+        SCOPE_SESSION_DEVICE_CONTEXT,
+        workspace_id,
+    )
+    .await?;
+    assert_eq!(
+        mine.len(),
+        1,
+        "exactly one proof-of-purge record for this workspace's device-context \
+         scrub. Zero is the silent gap: the scrub either did not happen or left \
+         no evidence that it did."
+    );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_deleted"),
+        2,
+        "exactly the two ended sessions"
+    );
+    assert_eq!(mine[0].get::<i64, _>("rows_remaining_past_cutoff"), 0);
+    assert_eq!(mine[0].get::<String, _>("status"), "ok");
+    Ok(())
+}
+
+/// "NOTHING TO SCRUB", recorded as such.
+///
+/// One workspace holds a LIVE session only and another holds no session at all.
+/// A run must report success, write the census record that says the scope RAN,
+/// and write NO per-workspace record for either — because neither had anything
+/// to say, and the census is what makes that absence readable.
+///
+/// STATED PLAINLY: the `all_ok()` and "the live context survives" halves of this
+/// test passed before the fix, because a job that scrubs nothing scrubs nothing
+/// wrongly. It is the CONTROL on the census — the counterpart run whose record
+/// must say `ok` where
+/// `a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly`'s says
+/// `error`. Without the pair, `ok` would be a constant.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_device_context_scrub_with_nothing_to_do_still_records_the_scope(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let with_live = seed_workspace(&pool).await?;
+    let empty = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, with_live).await?;
+    let live = insert_session(&pool, with_live, user_id, 24, false).await?;
+
+    // ── PREMISE PAIR. The control first, so the absence below means absence.
+    assert_eq!(
+        device_context_of(&pool, with_live, live).await?,
+        (1, 1),
+        "premise/control: the live session's row must be VISIBLE from its own \
+         armed scope, or the zeroes below prove nothing"
+    );
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, with_live).await?,
+        0,
+        "premise: nothing in this workspace is eligible — the only session is \
+         live"
+    );
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, empty).await?,
+        0,
+        "premise: the second workspace holds no sessions at all"
+    );
+    assert_ne!(
+        with_live, empty,
+        "premise: the two fixtures must be different workspaces"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    let outcome = run(&low, &ch_client()).await;
+
+    assert!(
+        outcome.all_ok(),
+        "a run with nothing eligible must still succeed: {:?}",
+        outcome.records
+    );
+    assert_eq!(
+        device_context_of(&pool, with_live, live).await?,
+        (1, 1),
+        "the scrub erased a LIVE session's device context on a run that had \
+         nothing to do"
+    );
+
+    // THE CENSUS. This is what makes "nothing to scrub" distinguishable from "I
+    // could not see anything": the scope is named in the trail on every run.
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the run must write exactly one global census record for the \
+         device-context scope. Zero means the trail simply OMITS the scope, and \
+         an absence is harder to notice than a row that says nothing happened."
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "ok",
+        "the scrub could reach every workspace, so its census must say so"
+    );
+    assert_eq!(
+        census[0].get::<i64, _>("rows_deleted"),
+        0,
+        "the census scrubs nothing itself; the per-workspace records carry the \
+         counts and total_deleted() must not double-count them"
+    );
+
+    // No per-workspace record for either — read from THEIR armed scopes, so
+    // these absences are absences.
+    for (name, workspace_id) in [("with a live session", with_live), ("empty", empty)] {
+        let rows = audit_rows_for_workspace(
+            &pool,
+            outcome.run_id,
+            SCOPE_SESSION_DEVICE_CONTEXT,
+            workspace_id,
+        )
+        .await?;
+        assert!(
+            rows.is_empty(),
+            "the {name} workspace had nothing to scrub and nothing left over, \
+             so it must not get a proof-of-purge record, got {} of them",
+            rows.len()
+        );
+    }
+    Ok(())
+}
+
+/// "I COULD NOT SEE ANYTHING" is NOT success, for this scope too.
+///
+/// The scrub reaches every tenant by enumerating `workspaces`, which is sound
+/// only because that table is not policed. This test arms it — the future
+/// migration `enumerate_workspaces` warns about — and requires the run to FAIL
+/// rather than visit zero workspaces and report `ok`.
+///
+/// It is the exact counterpart of the test above: same code path, same role, and
+/// the census record must DIFFER.
+///
+/// PREMISES: the workspace IS enumerable before arming and is NOT after (the
+/// before/after pair is what makes the second reading mean "hidden"), and there
+/// really was work to do — an ended session still carrying an address — so `ok`
+/// would be a lie rather than a technicality.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+    let ended = insert_session(&pool, workspace_id, user_id, -1, false).await?;
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    // ── PREMISE: there is real work.
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+        1,
+        "premise: one ended session must be carrying device context, or `ok` \
+         would be an honest answer"
+    );
+
+    // ── PREMISE/CONTROL: the enumeration WORKS before the table is armed.
+    let visible_before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_before.contains(&workspace_id),
+        "premise: the low-privilege pool must be able to enumerate workspaces \
+         BEFORE the table is armed, or the empty reading afterwards is not \
+         caused by what this test thinks"
+    );
+
+    // The future migration. No policy at all, so ENABLE alone is default-deny
+    // for a non-owner; FORCE covers the case where the connecting role owns the
+    // table, which it does when DATABASE_URL is already the runner.
+    sqlx::raw_sql(
+        "ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&pool)
+    .await?;
+
+    assert!(
+        row_security_active(&low, "workspaces").await?,
+        "premise: arming workspaces did not make row security active for the \
+         low-privilege pool, so the enumeration below is not actually filtered"
+    );
+    let visible_after: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_after.is_empty(),
+        "premise: the armed table must hide every workspace from this pool, \
+         got {visible_after:?}"
+    );
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // THE POINT. Visiting zero workspaces because it cannot read them is not
+    // success.
+    assert!(
+        !outcome.all_ok(),
+        "the purge reported SUCCESS while it could not see a single workspace. \
+         An ended session was still carrying an IP address, so this run did \
+         nothing and said it was fine: {:?}",
+        outcome.records
+    );
+
+    // FAIL CLOSED, and the row is untouched rather than half-scrubbed.
+    assert_eq!(
+        device_context_of(&pool, workspace_id, ended).await?,
+        (1, 1),
+        "the ended session's row must be exactly as it was — a scrub that \
+         cannot enumerate its tenants must change nothing"
+    );
+
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the failure must still be recorded — a run that could not see is the \
+         one an auditor most needs in the trail"
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "error",
+        "the census must DIFFER from the succeeding run's; a constant `ok` \
+         would make the record worthless"
+    );
+    assert!(
+        census[0]
+            .get::<Option<String>, _>("error")
+            .is_some_and(|e| e.contains("workspaces")),
+        "the recorded error must name what could not be read, got {:?}",
+        census[0].get::<Option<String>, _>("error")
+    );
+
+    // And the recount must NOT report zero-remaining on a run that saw nothing.
+    // `PurgeRecord::failure` records -1 precisely so that "I did not measure"
+    // cannot be read as "there is nothing left".
+    let recorded = recorded_remaining(&outcome, SCOPE_SESSION_DEVICE_CONTEXT);
+    assert!(
+        recorded.iter().all(|&n| n < 0),
+        "a run that could not enumerate its tenants must not publish a \
+         rows_remaining_past_cutoff an auditor would read as `all clear`, got \
+         {recorded:?}"
     );
     Ok(())
 }
