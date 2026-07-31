@@ -240,35 +240,59 @@ async fn the_creating_scope_does_not_outlive_the_transaction(pool: PgPool) {
         "premise: the seeded rule must exist"
     );
 
-    // Every connection in the pool, unarmed, must see nothing. `min_connections
-    // (2)` plus this loop makes it very unlikely we only ever probe a
-    // connection the creating transaction never touched.
+    // Every connection in the pool, unarmed, must fail to reach the row.
+    // `min_connections(2)` plus this loop makes it very unlikely we only ever
+    // probe a connection the creating transaction never touched.
     for probe in 0..8 {
         let leaked: Option<String> =
             sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
                 .fetch_one(&low)
                 .await
                 .expect("GUC probe");
-        assert!(
-            leaked.is_none() || leaked.as_deref() == Some(""),
-            "probe {probe}: app.current_workspace_id survived the creating \
-             transaction as {leaked:?}. `set_config(..., true)` is required — \
-             a session-level `false` leaks the new workspace's scope onto the \
-             next checkout of this pooled connection."
+        assert_ne!(
+            leaked.as_deref(),
+            Some(ws.id.to_string().as_str()),
+            "probe {probe}: app.current_workspace_id still names the workspace \
+             the creating transaction made. `set_config(..., true)` is \
+             required — a session-level `false` leaves that scope on the \
+             pooled connection for whatever statement is handed it next, which \
+             would turn this fix into a cross-tenant read."
         );
 
-        let names: Vec<String> =
+        // MEASURED, and worth stating because it is not what one expects:
+        // Postgres does not UNSET a `SET LOCAL` custom GUC at COMMIT, it resets
+        // it to the EMPTY STRING. (`psql`: `[<NULL>]` before, `[]` after both
+        // COMMIT and ROLLBACK.) So on a connection that has served at least one
+        // scoped transaction, `current_setting('app.current_workspace_id',
+        // true)::uuid` is `''::uuid` and an unscoped query on an armed table
+        // raises `22P02 invalid input syntax for type uuid: ""` instead of
+        // silently returning the empty set.
+        //
+        // That is the LOUD half of the failure mode `db::scope`'s header
+        // describes, and it is why both branches are accepted here — what must
+        // never happen is the third possibility, the row coming back.
+        let unscoped: Result<Vec<String>, sqlx::Error> =
             sqlx::query_scalar("SELECT name FROM policy_rules WHERE workspace_id = $1")
                 .bind(ws.id)
                 .fetch_all(&low)
-                .await
-                .expect("unscoped read must succeed and return nothing");
-        assert!(
-            names.is_empty(),
-            "probe {probe}: an UNSCOPED read on a non-bypassing role returned \
-             {names:?}. RLS is not filtering this pool and every other \
-             assertion in this file is vacuous."
-        );
+                .await;
+
+        match unscoped {
+            Ok(names) => assert!(
+                names.is_empty(),
+                "probe {probe}: an UNSCOPED read on a non-bypassing role \
+                 returned {names:?}. RLS is not filtering this pool and every \
+                 other assertion in this file is vacuous."
+            ),
+            Err(e) => {
+                let text = e.to_string();
+                assert!(
+                    text.contains("invalid input syntax for type uuid"),
+                    "probe {probe}: the unscoped read failed for a reason other \
+                     than the reset-to-empty-string GUC: {text}"
+                );
+            }
+        }
     }
 }
 

@@ -57,13 +57,46 @@ pub async fn begin_scoped(
         .begin()
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+    arm_scope(&mut tx, workspace_id).await?;
+    Ok(tx)
+}
+
+/// Arm `app.current_workspace_id` on a transaction that is ALREADY OPEN, and
+/// verify it took.
+///
+/// [`begin_scoped`] is the shape almost every caller wants and delegates here.
+/// This entry point exists for the one case `begin_scoped` cannot serve: a
+/// transaction whose scope is not knowable at `BEGIN`, because the workspace it
+/// names is CREATED inside that same transaction.
+///
+/// `WorkspaceRepository::create_with_owner` is that case. It inserts
+/// `workspaces`, then `users`, then the seeded `policy_rules` row — and
+/// `policy_rules` is armed while `workspaces` is not, so the scope can only be
+/// set once `gen_random_uuid()` has handed back the new workspace's id. The
+/// three inserts must stay in ONE transaction (a duplicate email has to roll
+/// the workspace back), so re-opening a scoped transaction is not available.
+///
+/// `true` on `set_config` — transaction-local, never session-local. A
+/// session-local `false` would leave the newly created workspace's scope on the
+/// pooled connection for whatever statement is handed it next, converting a
+/// write rejection into a cross-tenant read.
+/// `the_creating_scope_does_not_outlive_the_transaction` in
+/// `tests/rls_workspace_creation.rs` is the test that fails if this changes.
+///
+/// # Errors
+/// Returns `ApiError::Database` when the GUC cannot be set, and
+/// `ApiError::Internal` carrying [`SCOPE_NOT_ARMED`] when it does not read
+/// back.
+pub async fn arm_scope(
+    tx: &mut Transaction<'static, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ApiError> {
     sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
         .bind(workspace_id.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
-    scope_is_armed(&mut tx, workspace_id).await?;
-    Ok(tx)
+    scope_is_armed(tx, workspace_id).await
 }
 
 /// Read `app.current_workspace_id` back and require it to be `workspace_id`.
