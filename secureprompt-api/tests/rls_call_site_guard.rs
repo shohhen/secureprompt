@@ -149,22 +149,33 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     // TRUE, records `[token_vault_entries, refresh_tokens.device_context]`,
     // and a 30-day-old capture still on disk under a 7-day retention.
     //
-    // The `refresh_tokens` entry below is the SAME defect in the same file and
-    // is deliberately still here: `scrub_session_device_context` was out of
-    // scope for P1H and is unchanged.
-    (
-        "secureprompt-worker/src/tasks/retention_purge.rs",
-        "refresh_tokens",
-        2,
-        "REAL DEFECT. Cross-tenant BY DESIGN: `scrub_session_device_context` erases client \
-         IP and device strings for ENDED sessions across every workspace. \
-         Under a non-bypassing role the UPDATE matches zero rows, so the IP \
-         addresses stay on disk indefinitely — and the second statement, the \
-         re-derivation an auditor recomputes and which `must be zero`, is \
-         filtered by the SAME predicate and also returns zero. Both halves \
-         lie consistently and the job reports status `ok`. Fix: loop over \
-         `workspaces` arming the scope per workspace, as migrations 019/020 do.",
-    ),
+    // ALSO FIXED and therefore GONE (P1J):
+    // `secureprompt-worker/src/tasks/retention_purge.rs` / `refresh_tokens`,
+    // TWO statements — the FU4 device-context scrub's UPDATE and the recount
+    // beside it. `scrub_session_device_context` now enumerates `workspaces` and
+    // scrubs each one inside a scope-armed, read-back transaction, with the
+    // recount in a SECOND armed transaction over committed state. This guard is
+    // what proved the site was gone: it failed `allowlist says 2, found 0`
+    // before this entry was deleted.
+    //
+    // Its reason string was RIGHT, including the second half — which is the
+    // only allowlist reason on this branch that understated nothing. Recorded
+    // here because the entry does not survive to say it: under
+    // `secureprompt_runner` the UPDATE matched zero rows, which is not an
+    // error, so the IP addresses stayed on disk; and the recount — the field
+    // migration 023 offers as the one an auditor re-derives — was filtered by
+    // the SAME predicate, returned zero, and AGREED. The emitted record was
+    // `rows_deleted = 0`, `rows_remaining_past_cutoff = 0`, `status = 'ok'`:
+    // byte-identical to a genuine no-op's, with the check designed to catch the
+    // error confirming it.
+    //
+    // MEASURED under the runner role before the fix, in
+    // `session_device_context_is_scrubbed_under_a_non_bypassing_role`: two
+    // ended sessions still reading `(1, 1)`, `all_ok()` TRUE, the trail
+    // reporting `[0]` rows past the boundary, and an independent re-derivation
+    // from the workspace's own armed scope answering 2. The suggested fix in
+    // the entry ("loop over `workspaces` arming the scope per workspace") is
+    // what was done.
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
         "retention_purge_audit",

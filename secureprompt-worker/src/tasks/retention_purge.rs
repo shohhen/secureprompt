@@ -57,17 +57,37 @@
 //! captured plaintext was never purged, and the trail did not even mention the
 //! scope.
 //!
-//! Two things fix that and both are load-bearing. The sweep now enumerates
-//! `workspaces` (not policed, and it CHECKS that before trusting it) and reads
-//! each workspace's settings inside a transaction armed to that workspace and
-//! read back, so `no settings row` is a fact rather than a blind spot. And it
-//! writes ONE global census record per run, always, whose `status` says
-//! whether it could see — so a run that swept zero workspaces because it was
-//! blind records `error` and makes `all_ok()` false, while a run that swept
-//! them and found nothing to do records `ok`. The pair
+//! Two things fix that and both are load-bearing. A sweep enumerates
+//! `workspaces` (not policed, and it CHECKS that before trusting it) and does
+//! its work per workspace inside a transaction armed to that workspace and read
+//! back, so `nothing to do` is a fact rather than a blind spot. And it writes
+//! ONE global census record per run, always, whose `status` says whether it
+//! could see — so a run that swept zero workspaces because it was blind records
+//! `error` and makes `all_ok()` false, while a run that swept them and found
+//! nothing to do records `ok`. Each sweeping scope has that pair under the
+//! runner role:
 //! `a_capture_sweep_with_nothing_to_do_still_records_the_scope` /
-//! `a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly` measures
-//! both, under the runner role.
+//! `a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly`, and
+//! `a_device_context_scrub_with_nothing_to_do_still_records_the_scope` /
+//! `a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly`.
+//!
+//! # What `rows_remaining_past_cutoff` is, now that it has been wrong
+//!
+//! `refresh_tokens` is armed too, and migration 032 gave it the same `NULLIF`
+//! treatment, so the device-context scrub had the identical defect with one
+//! extra turn of the screw: BOTH its statements ran on a bare pool, so the
+//! post-delete recount — the field migration 023 offers as the one an auditor
+//! re-derives — was recomputed through the SAME filter that produced the zero
+//! it was checking, and AGREED. The record emitted was byte-identical to a
+//! genuine no-op's while two ended sessions kept their IP addresses.
+//!
+//! The number is a SELF-RECOUNT and is documented as one on
+//! [`PurgeRecord::rows_remaining_past_cutoff`]. It catches a job that miscounted
+//! what it deleted; it cannot catch a job that could not see. What covers that
+//! is `status` and the census. What the per-workspace records buy is that the
+//! number is now re-derivable by anyone who can arm that workspace's scope —
+//! the tenant included — instead of only by someone who can see every tenant at
+//! once.
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row as _};
@@ -101,8 +121,21 @@ pub struct PurgeRecord {
     /// comparison across two different clocks.
     pub oldest_deleted: Option<DateTime<Utc>>,
     pub newest_deleted: Option<DateTime<Utc>>,
-    /// Recomputed AFTER deleting, with the same cutoff. The field an auditor
-    /// can independently re-derive. Should be 0.
+    /// Recomputed AFTER deleting, with the same cutoff. Should be 0.
+    ///
+    /// WHAT IT IS AND IS NOT, because getting this wrong is what made P1J's
+    /// defect self-confirming. It is a SELF-RECOUNT: the same process, on the
+    /// same connection, through the same row-level-security filter as the
+    /// delete. It therefore catches a job that MISCOUNTED what it deleted, and
+    /// it cannot catch a job that could not SEE the rows — a filter that hides
+    /// them hides them from both statements, and the two then agree on zero.
+    ///
+    /// Two things make it worth recording anyway. Every read that produces it
+    /// now happens inside a scope that is armed and READ BACK, so a scope that
+    /// did not take raises instead of answering nothing; and the per-workspace
+    /// records are re-derivable by anyone who can arm that workspace's scope —
+    /// the tenant included — rather than only by a DBA. What covers "could not
+    /// see" is `status` and the per-run census record, not this number.
     pub rows_remaining_past_cutoff: i64,
     pub status: String,
     pub error: Option<String>,
@@ -165,7 +198,7 @@ pub async fn run(pg: &PgPool, ch: &clickhouse::Client) -> PurgeOutcome {
 
     records.push(purge_token_vault(pg, now).await);
     records.extend(purge_content_captures(pg, ch, now).await);
-    records.push(scrub_session_device_context(pg, now).await);
+    records.extend(scrub_session_device_context(pg, now).await);
 
     for record in &records {
         if let Err(e) = write_audit(pg, run_id, record).await {
@@ -291,21 +324,144 @@ async fn purge_token_vault(pg: &PgPool, now: DateTime<Utc>) -> PurgeRecord {
 /// fifteen minutes into its life, leaving the listing full of unidentifiable
 /// entries. `a_rotated_but_live_session_keeps_its_device_context` is that test.
 ///
+/// # Why a loop over workspaces, and why the recount is a SECOND transaction
+///
+/// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration
+/// 002, and migration 032 rewrote its `workspace_isolation` policy with
+/// `NULLIF` so that an unscoped statement FILTERS rather than raising. Both of
+/// this function's statements used to run on a bare pool. MEASURED under
+/// `secureprompt_runner`, before this change, with two ended sessions carrying
+/// an address: the UPDATE matched zero rows — not an error — the recount
+/// answered zero through the same filter, and the record written was
+/// `rows_deleted = 0`, `rows_remaining_past_cutoff = 0`, `status = 'ok'`:
+/// byte-identical to the record a genuine no-op writes, with the field an
+/// auditor is invited to re-derive AGREEING with the wrong answer.
+///
+/// So this takes `tasks::api_key_rotation::run`'s shape and
+/// [`purge_content_captures`]'s, and rejects the same two shortcuts for the
+/// same reasons: a policy admitting a cross-tenant sweep would hang off a GUC
+/// any holder of the connection can set, widening the table for every statement
+/// in the process rather than this one; and a `BYPASSRLS` worker role removes
+/// the boundary from every query the worker makes, including ones written later
+/// by someone who does not know the role is privileged.
+///
+/// The RECOUNT runs in its own armed transaction, after the scrub has
+/// COMMITTED. It costs one round-trip and buys two things: the number describes
+/// committed state — what someone re-deriving it would actually see — rather
+/// than the scrub's own in-flight snapshot, and it arms and reads back a second
+/// time, so it cannot inherit a scope the first transaction established.
+///
 /// `cutoff` is recorded as `now` because that is the instant the liveness
 /// question was asked; `rows_deleted` counts rows SCRUBBED.
-async fn scrub_session_device_context(pg: &PgPool, now: DateTime<Utc>) -> PurgeRecord {
+async fn scrub_session_device_context(pg: &PgPool, now: DateTime<Utc>) -> Vec<PurgeRecord> {
     let started_at = Utc::now();
 
-    // Scrub and measure in ONE statement, for the reason `purge_token_vault`
-    // gives: a separate count would report on a set that could have changed.
-    let scrubbed = sqlx::query(
+    let workspaces = match enumerate_workspaces(pg).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!(
+                alert = "retention_purge_failed",
+                scope = SCOPE_SESSION_DEVICE_CONTEXT,
+                error = %e,
+                "could not enumerate workspaces; no session device context was \
+                 erased anywhere and this run is recorded as FAILED"
+            );
+            return vec![census_record(
+                SweepCensus::new(SCOPE_SESSION_DEVICE_CONTEXT, DEVICE_CONTEXT_CONSEQUENCE),
+                now,
+                started_at,
+                Some(&e.to_string()),
+            )];
+        }
+    };
+
+    let mut census = SweepCensus {
+        enumerated: workspaces.len(),
+        ..SweepCensus::new(SCOPE_SESSION_DEVICE_CONTEXT, DEVICE_CONTEXT_CONSEQUENCE)
+    };
+    let mut records = Vec::new();
+    for workspace_id in workspaces {
+        match scrub_one_workspace_device_context(pg, workspace_id, now, started_at).await {
+            Ok(record) => {
+                census.swept += 1;
+                // A workspace with nothing scrubbed and nothing left over has
+                // nothing to say, and the census already records that it WAS
+                // visited — so it gets no record of its own, exactly as an
+                // unconfigured workspace gets none from the capture sweep.
+                // `rows_remaining_past_cutoff > 0` is in the condition because
+                // a row that arrived between the UPDATE and the recount is the
+                // one case an auditor most needs in the trail.
+                if record.rows_deleted > 0 || record.rows_remaining_past_cutoff > 0 {
+                    records.push(record);
+                }
+            }
+            Err(e) => {
+                census.unreadable += 1;
+                tracing::error!(
+                    alert = "retention_purge_failed",
+                    scope = SCOPE_SESSION_DEVICE_CONTEXT,
+                    %workspace_id,
+                    error = %e,
+                    "could not scrub this workspace's session device context; \
+                     the IP addresses on its ended sessions are still on disk"
+                );
+                records.push(PurgeRecord::failure(
+                    SCOPE_SESSION_DEVICE_CONTEXT,
+                    Some(workspace_id),
+                    now,
+                    started_at,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    tracing::info!(
+        scope = SCOPE_SESSION_DEVICE_CONTEXT,
+        enumerated = census.enumerated,
+        swept = census.swept,
+        unreadable = census.unreadable,
+        "retention.purge device-context scrub"
+    );
+    records.push(census_record(census, now, started_at, None));
+    records
+}
+
+/// One workspace's ended sessions, scrubbed inside that workspace's armed
+/// scope.
+///
+/// The `workspace_id = $2` predicates are NOT redundant with the policy, and
+/// leaving them out was measured to be wrong in the direction that reads as
+/// success. A SUPERUSER bypasses row-level security, so without them the first
+/// workspace's UPDATE would scrub the whole deployment and every later
+/// workspace would report zero — one tenant's record claiming another tenant's
+/// rows. With them the statement means the same thing under both roles, which
+/// is also what lets the superuser test suites measure anything.
+///
+/// `live.workspace_id = r.workspace_id` is there for the same reason: a session
+/// chain never spans workspaces, so the join is semantically identical either
+/// way, but under a bypassing role the subquery would otherwise scan the whole
+/// table and the two roles would be evaluating different statements.
+async fn scrub_one_workspace_device_context(
+    pg: &PgPool,
+    workspace_id: Uuid,
+    now: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+) -> Result<PurgeRecord, sqlx::Error> {
+    // ── Transaction 1: scrub and measure in ONE statement, for the reason
+    // `purge_token_vault` gives — a separate count would report on a set that
+    // could have changed.
+    let mut tx = begin_armed(pg, workspace_id, DEVICE_CONTEXT_SCOPE_NOT_ARMED).await?;
+    let row = sqlx::query(
         "WITH scrubbed AS (
              UPDATE refresh_tokens r
              SET client_ip = NULL, client_descriptor = NULL
-             WHERE (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+             WHERE r.workspace_id = $2
+               AND (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
                AND NOT EXISTS (
                    SELECT 1 FROM refresh_tokens live
                    WHERE live.session_id = r.session_id
+                     AND live.workspace_id = r.workspace_id
                      AND live.revoked_at IS NULL
                      AND live.expires_at > $1
                )
@@ -317,70 +473,47 @@ async fn scrub_session_device_context(pg: &PgPool, now: DateTime<Utc>) -> PurgeR
          FROM scrubbed",
     )
     .bind(now)
-    .fetch_one(pg)
-    .await;
-
-    let row = match scrubbed {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::error!(
-                alert = "retention_purge_failed",
-                scope = SCOPE_SESSION_DEVICE_CONTEXT,
-                error = %e,
-                "session device-context scrub failed; IP addresses for ended \
-                 sessions are still on disk"
-            );
-            return PurgeRecord::failure(
-                SCOPE_SESSION_DEVICE_CONTEXT,
-                None,
-                now,
-                started_at,
-                &e.to_string(),
-            );
-        }
-    };
-
+    .bind(workspace_id)
+    .fetch_one(&mut *tx)
+    .await?;
     let rows_deleted: i64 = row.get("n");
     let oldest: Option<DateTime<Utc>> = row.get("oldest");
     let newest: Option<DateTime<Utc>> = row.get("newest");
+    tx.commit().await?;
 
-    // Re-derive the post-state with the SAME predicate. This is the number an
-    // auditor recomputes, and it must be zero.
-    let remaining: Result<i64, _> = sqlx::query_scalar(
+    // ── Transaction 2: re-derive the post-state with the SAME predicate, over
+    // COMMITTED state, in a scope armed and read back again.
+    let mut tx = begin_armed(pg, workspace_id, DEVICE_CONTEXT_SCOPE_NOT_ARMED).await?;
+    let rows_remaining_past_cutoff: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::BIGINT FROM refresh_tokens r
-         WHERE (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+         WHERE r.workspace_id = $2
+           AND (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
            AND NOT EXISTS (
                SELECT 1 FROM refresh_tokens live
                WHERE live.session_id = r.session_id
+                 AND live.workspace_id = r.workspace_id
                  AND live.revoked_at IS NULL
                  AND live.expires_at > $1
            )",
     )
     .bind(now)
-    .fetch_one(pg)
-    .await;
+    .bind(workspace_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
-    match remaining {
-        Ok(rows_remaining_past_cutoff) => PurgeRecord {
-            scope: SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
-            workspace_id: None,
-            cutoff: now,
-            rows_deleted,
-            oldest_deleted: oldest,
-            newest_deleted: newest,
-            rows_remaining_past_cutoff,
-            status: "ok".to_owned(),
-            error: None,
-            started_at,
-        },
-        Err(e) => PurgeRecord::failure(
-            SCOPE_SESSION_DEVICE_CONTEXT,
-            None,
-            now,
-            started_at,
-            &e.to_string(),
-        ),
-    }
+    Ok(PurgeRecord {
+        scope: SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
+        workspace_id: Some(workspace_id),
+        cutoff: now,
+        rows_deleted,
+        oldest_deleted: oldest,
+        newest_deleted: newest,
+        rows_remaining_past_cutoff,
+        status: "ok".to_owned(),
+        error: None,
+        started_at,
+    })
 }
 
 // ── (b) ClickHouse: captured content past the CURRENT retention ───────────
@@ -403,8 +536,8 @@ struct CaptureStats {
 /// precondition is CHECKED rather than commented, and its failure is recorded.
 const WORKSPACES_ARE_POLICED: &str =
     "row security is active on `workspaces` for this connection, so enumerating \
-     it would return a filtered list and the capture sweep would silently skip \
-     every workspace it cannot see";
+     it would return a filtered list and any sweep built on it would silently \
+     skip every workspace it cannot see";
 
 /// The refusal recorded when one workspace's settings transaction did not take
 /// the scope. Same shape and the same reason as [`SCOPE_NOT_ARMED`] below and
@@ -413,21 +546,84 @@ const SETTINGS_SCOPE_NOT_ARMED: &str =
     "the retention-settings transaction could not be scoped to this workspace, \
      so its captured content was not purged";
 
-/// What one capture sweep saw, as opposed to what it deleted.
+/// The refusal recorded when one workspace's device-context transaction did not
+/// take the scope. Same shape and reason as [`SETTINGS_SCOPE_NOT_ARMED`].
+const DEVICE_CONTEXT_SCOPE_NOT_ARMED: &str =
+    "the device-context transaction could not be scoped to this workspace, so \
+     the IP addresses on its ended sessions were not erased";
+
+/// What a workspace the capture sweep could not reach did not get.
+const CAPTURES_CONSEQUENCE: &str = "their captured content was not purged";
+
+/// What a workspace the device-context scrub could not reach did not get.
+const DEVICE_CONTEXT_CONSEQUENCE: &str = "the IP addresses on their ended sessions were not erased";
+
+/// What one sweep SAW, as opposed to what it deleted.
 ///
 /// This is the answer to "was there nothing to do, or could I not see
 /// anything?", and it exists because the two used to be the same observation.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// Both sweeping scopes share this type rather than each growing one of their
+/// own: `refresh_tokens.device_context` has exactly the shape
+/// `request_content_captures` has, and two mechanisms that only look alike are
+/// how the second drifts from the first.
+#[derive(Debug, Clone, Copy)]
 struct SweepCensus {
+    /// The scope this census is about — one of the `SCOPE_*` constants.
+    scope: &'static str,
+    /// What a workspace this sweep could not reach did NOT get, in the words
+    /// the audit row will carry.
+    consequence: &'static str,
     /// Workspaces the sweep enumerated and looked at.
     enumerated: usize,
-    /// Of those, the ones with a `workspace_raw_capture` row — read from a
-    /// transaction armed to that workspace, so `no row` means no row.
-    configured: usize,
-    /// Workspaces whose settings could not be read at all. Any non-zero value
-    /// makes the census record `status = 'error'`, which makes
+    /// Of those, the ones the sweep actually acted on — read from a transaction
+    /// armed to that workspace, so `nothing to do` means nothing to do.
+    swept: usize,
+    /// Workspaces the sweep could not reach at all. Any non-zero value makes
+    /// the census record `status = 'error'`, which makes
     /// [`PurgeOutcome::all_ok`] false and the job record itself as FAILED.
     unreadable: usize,
+}
+
+impl SweepCensus {
+    const fn new(scope: &'static str, consequence: &'static str) -> Self {
+        Self {
+            scope,
+            consequence,
+            enumerated: 0,
+            swept: 0,
+            unreadable: 0,
+        }
+    }
+}
+
+/// Open a transaction, arm it to `workspace_id`, and READ THE SETTING BACK
+/// before handing it over.
+///
+/// The read-back is the whole point and it is not ceremony. `set_config`
+/// succeeding does not prove the GUC holds the value the policy will filter by,
+/// and since migration 033 a statement whose scope did not take does not raise
+/// — it answers the empty set, or reports `UPDATE 0`. `not_armed` is the
+/// refusal recorded when it did not take; each caller supplies its own so the
+/// audit row says which sweep lost which workspace.
+async fn begin_armed<'p>(
+    pg: &'p PgPool,
+    workspace_id: Uuid,
+    not_armed: &'static str,
+) -> Result<sqlx::Transaction<'p, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let armed: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if armed.as_deref() != Some(workspace_id.to_string().as_str()) {
+        return Err(sqlx::Error::Protocol(not_armed.to_owned()));
+    }
+    Ok(tx)
 }
 
 /// Enumerate every tenant, refusing to do so blind.
@@ -463,19 +659,7 @@ async fn read_capture_retention(
     pg: &PgPool,
     workspace_id: Uuid,
 ) -> Result<Option<i32>, sqlx::Error> {
-    let mut tx = pg.begin().await?;
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(workspace_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-    let armed: Option<String> =
-        sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
-            .fetch_one(&mut *tx)
-            .await?;
-    if armed.as_deref() != Some(workspace_id.to_string().as_str()) {
-        return Err(sqlx::Error::Protocol(SETTINGS_SCOPE_NOT_ARMED.to_owned()));
-    }
-
+    let mut tx = begin_armed(pg, workspace_id, SETTINGS_SCOPE_NOT_ARMED).await?;
     let retention_days: Option<i32> = sqlx::query_scalar(
         "SELECT retention_days FROM workspace_raw_capture WHERE workspace_id = $1",
     )
@@ -513,23 +697,22 @@ fn census_record(
     enumeration_error: Option<&str>,
 ) -> PurgeRecord {
     if let Some(error) = enumeration_error {
-        return PurgeRecord::failure(SCOPE_CONTENT_CAPTURES, None, now, started_at, error);
+        return PurgeRecord::failure(census.scope, None, now, started_at, error);
     }
     if census.unreadable > 0 {
         return PurgeRecord::failure(
-            SCOPE_CONTENT_CAPTURES,
+            census.scope,
             None,
             now,
             started_at,
             &format!(
-                "{} of {} workspaces' retention settings could not be read, so \
-                 their captured content was not purged",
-                census.unreadable, census.enumerated
+                "{} of {} workspaces could not be swept, so {}",
+                census.unreadable, census.enumerated, census.consequence
             ),
         );
     }
     PurgeRecord {
-        scope: SCOPE_CONTENT_CAPTURES.to_owned(),
+        scope: census.scope.to_owned(),
         workspace_id: None,
         cutoff: now,
         rows_deleted: 0,
@@ -590,7 +773,7 @@ async fn purge_content_captures(
                  anywhere and this run is recorded as FAILED"
             );
             return vec![census_record(
-                SweepCensus::default(),
+                SweepCensus::new(SCOPE_CONTENT_CAPTURES, CAPTURES_CONSEQUENCE),
                 now,
                 started_at,
                 Some(&e.to_string()),
@@ -600,7 +783,7 @@ async fn purge_content_captures(
 
     let mut census = SweepCensus {
         enumerated: workspaces.len(),
-        ..SweepCensus::default()
+        ..SweepCensus::new(SCOPE_CONTENT_CAPTURES, CAPTURES_CONSEQUENCE)
     };
     let mut records = Vec::new();
     for workspace_id in workspaces {
@@ -613,7 +796,7 @@ async fn purge_content_captures(
             // blind spot, so it gets no record of its own.
             Ok(None) => {}
             Ok(Some(retention_days)) => {
-                census.configured += 1;
+                census.swept += 1;
                 records.push(
                     purge_one_workspace_captures(ch, workspace_id, retention_days, now, started_at)
                         .await,
@@ -643,7 +826,7 @@ async fn purge_content_captures(
     tracing::info!(
         scope = SCOPE_CONTENT_CAPTURES,
         enumerated = census.enumerated,
-        configured = census.configured,
+        swept = census.swept,
         unreadable = census.unreadable,
         "retention.purge capture sweep"
     );

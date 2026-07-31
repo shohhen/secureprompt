@@ -1857,3 +1857,90 @@ async fn a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly(
     );
     Ok(())
 }
+
+/// Two tenants, and each record names the rows that are actually its own.
+///
+/// This is the test the `r.workspace_id = $2` predicates in
+/// `scrub_one_workspace_device_context` exist for, and it runs on the crate's
+/// OWN pool rather than through `low_privilege_pool` — deliberately, because
+/// that is the pool whose privileges differ between the two gate jobs. Under
+/// `DATABASE_URL=…secureprompt@…` it is a SUPERUSER and bypasses row-level
+/// security entirely, so the explicit predicate is the ONLY thing keeping the
+/// first workspace's UPDATE from scrubbing the whole deployment and every later
+/// workspace from reporting zero. Under `…secureprompt_runner@…` the policy
+/// does that work and the predicate is redundant. The statement has to mean the
+/// same thing either way, and this is what measures that it does.
+///
+/// MEASURED with `r.workspace_id = $2` removed from the UPDATE, under the
+/// superuser DATABASE_URL: `exactly this workspace's one ended session` failed
+/// with left 2, right 1 — one tenant's proof-of-purge record claiming the other
+/// tenant's rows.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn each_workspaces_device_scrub_is_recorded_against_its_own_tenant(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let first = seed_workspace(&pool).await?;
+    let second = seed_workspace(&pool).await?;
+    let first_user = seed_user(&pool, first).await?;
+    let second_user = seed_user(&pool, second).await?;
+
+    let first_ended = insert_session(&pool, first, first_user, -1, false).await?;
+    let first_live = insert_session(&pool, first, first_user, 24, false).await?;
+    let second_ended = insert_session(&pool, second, second_user, -1, false).await?;
+    let second_live = insert_session(&pool, second, second_user, 24, false).await?;
+
+    // ── PREMISE. One eligible session EACH, so a record claiming two is a
+    // record that crossed the boundary and a record claiming zero is one that
+    // never reached its tenant.
+    for (name, workspace_id) in [("first", first), ("second", second)] {
+        assert_eq!(
+            ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+            1,
+            "premise: the {name} workspace must have exactly one eligible session"
+        );
+    }
+    assert_ne!(first, second, "premise: two distinct tenants");
+
+    let outcome = run(&pool, &ch_client()).await;
+    assert!(
+        outcome.all_ok(),
+        "the purge reported a failure: {:?}",
+        outcome.records
+    );
+
+    for (name, workspace_id, ended, live) in [
+        ("first", first, first_ended, first_live),
+        ("second", second, second_ended, second_live),
+    ] {
+        let rows = audit_rows_for_workspace(
+            &pool,
+            outcome.run_id,
+            SCOPE_SESSION_DEVICE_CONTEXT,
+            workspace_id,
+        )
+        .await?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the {name} workspace must have exactly one device-context record of \
+             its own"
+        );
+        assert_eq!(
+            rows[0].get::<i64, _>("rows_deleted"),
+            1,
+            "exactly this workspace's one ended session"
+        );
+        assert_eq!(rows[0].get::<i64, _>("rows_remaining_past_cutoff"), 0);
+        assert_eq!(
+            device_context_of(&pool, workspace_id, ended).await?,
+            (1, 0),
+            "the {name} workspace's ended session must be scrubbed, row intact"
+        );
+        assert_eq!(
+            device_context_of(&pool, workspace_id, live).await?,
+            (1, 1),
+            "the {name} workspace's LIVE session must keep its device context"
+        );
+    }
+    Ok(())
+}
