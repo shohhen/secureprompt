@@ -6,8 +6,10 @@
 //! - `  behavior TEXT CHECK('block'|'warn'|'flag'),`
 //! - `  updated_at TIMESTAMPTZ)`
 //!
-//! RLS is enforced via the standard `set_config('app.current_workspace_id', ...)` template
-//! used throughout Phase 1–5 repositories.
+//! RLS is enforced by opening every transaction through
+//! [`crate::db::scope::begin_scoped`], which sets `app.current_workspace_id`
+//! and READS IT BACK — the same seam every other repository in this module
+//! uses, so a scope that did not arm fails loudly instead of reading nothing.
 
 use chrono::{DateTime, Utc};
 use secureprompt_common::errors::ApiError;
@@ -86,20 +88,26 @@ impl BudgetRepository {
     ///
     /// Returns `None` when no row exists (the workspace has no explicit budget).
     ///
+    /// # Why the read goes through `begin_scoped` and not a bare `set_config`
+    ///
+    /// `None` here does not mean "unknown", it means NO LIMIT — the caller has
+    /// nothing to enforce and the request is allowed to spend. That is the
+    /// "absence means permissive" shape, and `workspace_budgets` is under FORCE
+    /// ROW LEVEL SECURITY (migration 001, swept by 033). Under a role that does
+    /// not bypass RLS an unarmed scope makes the predicate NULL for every row,
+    /// the SELECT returns nothing, and a workspace that configured a hard
+    /// `block` limit reads back as unlimited. Nothing raises, and "this
+    /// workspace set no budget" is a completely ordinary answer.
+    ///
+    /// `begin_scoped` reads the setting back, so that becomes a recorded
+    /// failure. `upsert` below already did this; the read did not, which is the
+    /// wrong way round — the write was the loud half.
+    ///
     /// # Errors
-    /// Returns `ApiError::Database` on SQL failure.
+    /// Returns `ApiError::Database` on SQL failure, and `ApiError::Internal`
+    /// when the tenancy scope does not arm.
     pub async fn get(&self, workspace_id: Uuid) -> Result<Option<WorkspaceBudgetRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id).await?;
 
         let row = sqlx::query(
             "SELECT workspace_id, daily_token_limit, monthly_token_limit, behavior, updated_at

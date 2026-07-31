@@ -7,6 +7,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+use crate::db::scope::begin_scoped;
 
 #[derive(Debug, Clone)]
 pub struct ProviderRow {
@@ -55,21 +56,10 @@ impl ProviderRepository {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<ProviderRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        // Equivalent to `SET LOCAL app.current_workspace_id = $1`, but parameter-safe.
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Explicit tenant filter — the runtime DB role is a superuser that
-        // bypasses RLS, so this WHERE (not the set_config above) is the real
+        // bypasses RLS, so this WHERE (not `begin_scoped` above) is the real
         // isolation boundary. Do not remove.
         let rows = sqlx::query(
             "SELECT id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at, config
@@ -130,17 +120,7 @@ impl ProviderRepository {
         config: serde_json::Value,
         actor: &AdminActor,
     ) -> Result<ProviderRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, config, created_at, updated_at)
@@ -233,17 +213,7 @@ impl ProviderRepository {
         }
 
         // Simpler approach: full-replace with explicit params.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Fetch current to fill unset fields.
         let current = sqlx::query(
@@ -364,17 +334,7 @@ impl ProviderRepository {
         provider_id: Uuid,
         actor: &AdminActor,
     ) -> Result<(), ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let deleted = sqlx::query(
             "DELETE FROM providers WHERE id = $1 AND workspace_id = $2
@@ -424,17 +384,7 @@ impl ProviderRepository {
         workspace_id: WorkspaceId,
         provider_id: Uuid,
     ) -> Result<Vec<ModelRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
@@ -473,17 +423,7 @@ impl ProviderRepository {
         provider_id: Uuid,
         name: &str,
     ) -> Result<ModelRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Validate provider belongs to this workspace.
         let provider_row = sqlx::query(
@@ -568,17 +508,7 @@ impl ProviderRepository {
         provider_id: Uuid,
         name: &str,
     ) -> Result<(), ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Soft-delete: mark excluded rather than removing the row, so the
         // additive upstream sync knows NOT to re-add this model. A hard DELETE
@@ -617,17 +547,7 @@ impl ProviderRepository {
         if names.is_empty() {
             return Ok(0);
         }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let result = sqlx::query(
             "UPDATE models SET excluded = TRUE
@@ -653,17 +573,7 @@ impl ProviderRepository {
         workspace_id: WorkspaceId,
         provider_id: Uuid,
     ) -> Result<Vec<String>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let rows = sqlx::query(
             "SELECT name FROM models
@@ -679,18 +589,7 @@ impl ProviderRepository {
     }
 
     pub async fn list_models(&self, workspace_id: WorkspaceId) -> Result<Vec<ModelRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        // Equivalent to `SET LOCAL app.current_workspace_id = $1`, but parameter-safe.
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let rows = sqlx::query(
             "SELECT id, workspace_id, provider_id, name, created_at
@@ -723,17 +622,7 @@ impl ProviderRepository {
         workspace_id: WorkspaceId,
         model_name: &str,
     ) -> Result<Vec<ResolvedModelTarget>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let rows = sqlx::query(
             "SELECT models.id AS model_id,

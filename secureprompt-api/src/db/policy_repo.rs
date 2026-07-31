@@ -4,6 +4,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+use crate::db::scope::begin_scoped;
 
 #[derive(Debug, Clone)]
 pub struct PolicyRuleRow {
@@ -34,21 +35,10 @@ impl PolicyRepository {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<PolicyRuleRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        // Equivalent to `SET LOCAL app.current_workspace_id = $1`, but parameter-safe.
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Explicit tenant filter — the runtime DB role is a superuser that
-        // bypasses RLS, so this WHERE (not the set_config above) is the real
+        // bypasses RLS, so this WHERE (not `begin_scoped` above) is the real
         // isolation boundary. Do not remove.
         let rows = sqlx::query(
             "SELECT id, workspace_id, name, priority, conditions, action, action_params,
@@ -93,17 +83,7 @@ impl PolicyRepository {
         workspace_id: WorkspaceId,
         rule_id: Uuid,
     ) -> Result<PolicyRuleRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "SELECT id, workspace_id, name, priority, conditions, action, action_params,
@@ -156,17 +136,7 @@ impl PolicyRepository {
         dry_run: bool,
         actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "INSERT INTO policy_rules
@@ -238,17 +208,7 @@ impl PolicyRepository {
         dry_run: bool,
         actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // The BEFORE half of the audit diff, locked so nothing moves between
         // this read and the UPDATE below. Once the UPDATE runs these values are
@@ -357,17 +317,7 @@ impl PolicyRepository {
         rule_id: Uuid,
         actor: &AdminActor,
     ) -> Result<(), ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // RETURNING the descriptive columns: after this commits, the audit
         // row is the only surviving description of the rule that was removed.
@@ -430,17 +380,7 @@ impl PolicyRepository {
         enabled: bool,
         actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // The prior value, locked, because `UPDATE ... RETURNING` yields the
         // NEW one and "it is now false" does not say which way it moved.
@@ -507,17 +447,7 @@ impl PolicyRepository {
         dry_run: bool,
         actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // The prior value, locked, because `UPDATE ... RETURNING` yields the
         // NEW one and "it is now false" does not say which way it moved.
@@ -578,17 +508,7 @@ impl PolicyRepository {
         priority: i32,
         exclude_id: Option<Uuid>,
     ) -> Result<bool, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = if let Some(excl) = exclude_id {
             sqlx::query(

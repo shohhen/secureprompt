@@ -6,6 +6,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+use crate::db::scope::begin_scoped;
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
@@ -46,24 +47,15 @@ impl ApiKeyRepository {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<ApiKeyRow>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
-
-        // Equivalent to `SET LOCAL app.current_workspace_id = $1`, but parameter-safe.
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| ApiError::Database(error.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Explicit tenant filter. RLS on api_keys is a defence-in-depth second
         // layer only — the runtime connects as a Postgres SUPERUSER, which
         // bypasses RLS unconditionally (FORCE ROW LEVEL SECURITY does not stop a
         // superuser), so this WHERE is the actual isolation boundary. Do not
-        // remove it in reliance on the set_config above.
+        // remove it in reliance on `begin_scoped` above: that arms and VERIFIES
+        // the policy's setting, which is a different guarantee from the policy
+        // being in force.
         let rows = sqlx::query(
             "SELECT id, workspace_id, name, key_hash, created_at, revoked_at, assigned_user_id
              FROM api_keys
@@ -113,17 +105,7 @@ impl ApiKeyRepository {
         user_id: Uuid,
         kms: &dyn KmsBackend,
     ) -> Result<Option<String>, ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "SELECT key_ciphertext
@@ -225,17 +207,7 @@ impl ApiKeyRepository {
             (None, _) => None,
         };
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at,
@@ -303,17 +275,7 @@ impl ApiKeyRepository {
         key_id: Uuid,
         actor: &AdminActor,
     ) -> Result<(), ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let revoked = sqlx::query(
             "UPDATE api_keys SET revoked_at = NOW(), status = 'revoked'
@@ -375,17 +337,7 @@ impl ApiKeyRepository {
         key_id: Uuid,
         actor: &AdminActor,
     ) -> Result<(String, chrono::DateTime<chrono::Utc>), ApiError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
-
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         // Fetch the key — only active or rotating keys can be rotated.
         let row = sqlx::query(
@@ -496,6 +448,33 @@ impl ApiKeyRepository {
     /// PITFALL 8: filters on `status IN ('active', 'rotating')` with grace
     /// check, NOT `revoked_at IS NULL`. Rotating keys in their grace window
     /// are still valid for authentication.
+    ///
+    /// # Why this one is scoped harder than the rest of the file, not softer
+    ///
+    /// The SELECT below has NO `workspace_id` predicate. Every other statement
+    /// in this repository names the tenant in its own `WHERE` and treats RLS as
+    /// defence in depth; here the `workspace_isolation` policy IS the filter,
+    /// which is why the loop exists at all — it walks the workspaces and lets
+    /// the policy decide which one the presented hash belongs to.
+    ///
+    /// So a scope that does not arm is not a degraded answer here, it is the
+    /// wrong answer: under a non-bypassing role the policy predicate is NULL
+    /// for every row, the lookup returns nothing, the loop runs out and a VALID
+    /// key is rejected with 401. That direction is fail-closed and therefore
+    /// will not page anyone; it will present as "the gateway stopped accepting
+    /// our key" with nothing in the logs. [`begin_scoped`] turns it into a
+    /// recorded failure.
+    ///
+    /// # The cost, measured rather than asserted
+    ///
+    /// This is the hot authentication path and [`begin_scoped`] adds a
+    /// statement: the loop body goes from four round trips per workspace
+    /// (BEGIN, set_config, SELECT, COMMIT/ROLLBACK) to five. The added
+    /// statement is `SELECT current_setting('app.current_workspace_id', true)`,
+    /// measured with `pgbench -n -c 1 -t 3000` over TCP loopback against the
+    /// compose Postgres 16: 0.016 ms average. Against the pre-existing shape of
+    /// this method — one `workspaces` scan plus a transaction PER WORKSPACE —
+    /// that is not the term worth optimising, and the loop itself is.
     pub async fn authenticate_api_key(
         &self,
         presented_key: &str,
@@ -509,17 +488,7 @@ impl ApiKeyRepository {
 
         for workspace in workspace_rows {
             let workspace_id: Uuid = workspace.get("id");
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|error| ApiError::Database(error.to_string()))?;
-
-            sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-                .bind(workspace_id.to_string())
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| ApiError::Database(error.to_string()))?;
+            let mut tx = begin_scoped(&self.pool, workspace_id).await?;
 
             // Accept: status = 'active'
             // Accept: status = 'rotating' AND within grace window
