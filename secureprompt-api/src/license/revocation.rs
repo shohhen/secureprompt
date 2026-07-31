@@ -284,8 +284,9 @@ pub async fn run_poller(state: Arc<LicenseState>, deps: Arc<dyn PollerDeps>, int
         ticker.tick().await; // the first tick is immediate — check promptly at startup
         let snapshot = state.snapshot();
         let lic_id = match poll_tick(state.is_revoked(), snapshot.lic_id.as_deref()) {
-            PollTick::Idle(IdleReason::AlreadyRevoked) => return,
-            PollTick::Idle(IdleReason::NoLicenseId) => continue,
+            // WS4-4: idle, do NOT return. The tick is at the top of the loop,
+            // so `continue` re-arms rather than spins.
+            PollTick::Idle(_) => continue,
             PollTick::Check(id) => id,
         };
         let (verdict, issued_at) = deps.check_status(&lic_id).await;

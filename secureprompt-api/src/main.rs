@@ -315,63 +315,23 @@ async fn main() -> anyhow::Result<()> {
         // Part D — capture db for freshness persistence of verified assertions.
         let poller_db = state.db.clone();
         if let Some(vk) = poller_vk {
-            tokio::spawn(async move {
-                use secureprompt_api::license::freshness_store;
-                use secureprompt_api::license::revocation::RevocationVerdict;
-                let client = reqwest::Client::new();
-                let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
-                tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
-                loop {
-                    t.tick().await; // first tick is immediate — check promptly at startup
-                    if st.is_revoked() {
-                        // WS4-4: idle, do NOT return. The poller used to exit
-                        // here because a revocation was terminal for the
-                        // process. It no longer is — an admin can supersede it
-                        // live via PUT /v1/license — and a poller that had
-                        // already exited would leave the replacement license
-                        // unpolled until the next restart, i.e. allowlisting
-                        // the recovery route would have quietly disabled
-                        // revocation checking. `continue` re-arms on the next
-                        // tick (the tick is at the top of the loop, so this
-                        // does not spin).
-                        continue;
-                    }
-                    // lic_id is only present while the local file verifies (Valid).
-                    let lic_id = match st.snapshot().lic_id {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    let (verdict, issued_at) = secureprompt_api::license::revocation::check(
-                        &client, &server_url, &lic_id, &vk,
-                    ).await;
-                    // Part D — record the assertion in Postgres and advance in-memory atoms.
-                    let now = chrono::Utc::now().timestamp();
-                    match verdict {
-                        RevocationVerdict::Revoked => {
-                            // Record WHICH license was revoked, so a different
-                            // one can supersede it without a restart.
-                            st.mark_revoked(&lic_id);
-                            tracing::error!(lic_id, "license REVOKED by vendor — gateway is now fail-closed (403); install a replacement via PUT /v1/license");
-                            continue;
-                        }
-                        RevocationVerdict::Active => {
-                            // issued_at: Some(_) only when the server returned a sig-verified assertion.
-                            let _ = freshness_store::record(&poller_db, &lic_id, issued_at, now).await;
-                            if let Ok(Some(row)) = freshness_store::load(&poller_db, &lic_id).await {
-                                st.observe_freshness(row.last_assertion_at, row.highwater_at);
-                            }
-                            tracing::debug!(lic_id, "revocation check: license active");
-                        }
-                        // Unknown already logged inside check() — bump highwater only (no assertion credit).
-                        RevocationVerdict::Unknown => {
-                            let _ = freshness_store::record(&poller_db, &lic_id, None, now).await;
-                            if let Ok(Some(row)) = freshness_store::load(&poller_db, &lic_id).await {
-                                st.observe_freshness(row.last_assertion_at, row.highwater_at);
-                            }
-                        }
-                    }
-                }
-            });
+            tracing::info!(server_url, interval_secs = secs, "online revocation checks enabled");
+            // The loop body lives in `license::revocation` so its control flow
+            // is reachable from a test — see `run_poller` there and the WS4-4
+            // note on why a revocation must NOT end the poller. `LiveDeps` is
+            // the only part of a tick that touches the outside world.
+            let deps: std::sync::Arc<dyn secureprompt_api::license::revocation::PollerDeps> =
+                std::sync::Arc::new(secureprompt_api::license::revocation::LiveDeps {
+                    client: reqwest::Client::new(),
+                    server_url,
+                    vk,
+                    db: poller_db,
+                });
+            tokio::spawn(secureprompt_api::license::revocation::run_poller(
+                st,
+                deps,
+                std::time::Duration::from_secs(secs),
+            ));
         } else {
             tracing::warn!("online revocation checks configured but vendor key is absent/invalid — poller disabled");
         }
