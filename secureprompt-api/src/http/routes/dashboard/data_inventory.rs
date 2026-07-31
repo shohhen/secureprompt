@@ -714,10 +714,31 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 /// Read every per-workspace Postgres count.
 ///
 /// Runs inside a transaction that sets `app.current_workspace_id` first.
-/// `api_keys`, `providers`, `models`, `policy_rules`, `audit_events_meta`,
-/// `refresh_tokens` and `workspace_budgets` carry FORCE ROW LEVEL SECURITY
-/// with `USING (workspace_id = current_setting('app.current_workspace_id',
-/// true)::uuid)`. When that GUC is unset the predicate is NULL for every row,
+///
+/// SIXTEEN tables carry FORCE ROW LEVEL SECURITY, measured from `pg_class` /
+/// `pg_policies` against a fully migrated database rather than read off the
+/// migrations: `admin_audit`, `api_keys`, `audit_events_meta`,
+/// `audit_export_pages`, `audit_exports`, `models`, `policy_rules`,
+/// `providers`, `raw_capture_audit`, `refresh_tokens`,
+/// `retention_purge_audit`, `session_revocation_audit`, `workspace_budgets`,
+/// `workspace_raw_capture`, `workspace_secure_mode` and
+/// `workspace_sidecar_policy`. This list was last stale by nine tables; it
+/// grows whenever a migration arms another one (025, 026, 028, 030, 031), so
+/// re-measure rather than trust it.
+///
+/// Fifteen of them use `workspace_isolation`,
+/// `USING (workspace_id = current_setting('app.current_workspace_id',
+/// true)::uuid)`. `retention_purge_audit` is the deliberate exception and
+/// carries `workspace_isolation_or_global`, which also admits
+/// `workspace_id IS NULL` — migration 030's header says why, and the
+/// `WHERE workspace_id = $1` below excludes those global rows from this
+/// workspace's inventory regardless.
+///
+/// `users` is NOT in that list and is counted below unprotected by RLS —
+/// see Part 2 of migration 031's header for the measured defect and why
+/// arming it is a DB-role-split change rather than a one-line policy.
+///
+/// When that GUC is unset the predicate is NULL for every row,
 /// so a bare count returns ZERO — see the header of migration 020, which
 /// measured exactly that. It looks fine on developer machines today only
 /// because the compose role is a superuser and superusers bypass RLS; under
