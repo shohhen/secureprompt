@@ -2,10 +2,20 @@
 //!
 //! `require` reads both session gates from Redis in one round trip
 //! (`jti_blacklist:{jti}` and the WS4-3 `session_revoked:{user_id}` watermark).
-//! On ANY error from that read it falls back to `AppState.auth_cache`, a
-//! per-pod `DashMap` with a 5-minute TTL, and serves the request. The two
-//! mechanisms that terminate a session both live in Redis, so the fallback
-//! serves a session that neither mechanism can be consulted about.
+//! Before FU3, ANY error from that read fell back to `AppState.auth_cache` — a
+//! per-pod `DashMap` with a 5-minute TTL — and served the request. Both
+//! mechanisms that end a session live in Redis, so the fallback served
+//! sessions neither mechanism could be consulted about, silently.
+//!
+//! What these tests pin, in the WS2-3 `block`/`degrade_with_alert` vocabulary:
+//!
+//!   * admin revocation fails CLOSED, on every pod, read from
+//!     `session_revocation_audit` rather than from Redis;
+//!   * both stores unreachable fails CLOSED;
+//!   * a warm session with only the jti blacklist unreadable DEGRADES —
+//!     served, alerted, counted, and marked on the response;
+//!   * the window is 60 s, does not renew itself, and grants only the role the
+//!     presented token carries.
 //!
 //! These tests drive the REAL failure: a pod whose `redis.url` points at a
 //! port nothing is listening on, sharing its `auth_cache` with a sibling pod
@@ -26,7 +36,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use secureprompt_api::{
     app_state::AppState,
     http::build_router,
-    http::middleware::jwt_auth::{CachedAuthEntry, Claims},
+    http::middleware::jwt_auth::{CachedAuthEntry, Claims, DEGRADED_AUTH_CACHE_TTL_SECS},
     ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
@@ -512,4 +522,361 @@ async fn the_fallback_does_not_grant_a_role_the_presented_token_lacks(db: PgPool
         "the degraded path must authorize the role the PRESENTED token carries, \
          not a higher one left in the cache by an earlier token"
     );
+}
+
+// ── The degraded path is observable, and bounded ──────────────────────────
+
+/// Every action the gate takes must reach Prometheus with bounded labels, in
+/// the WS2-3 vocabulary. Without a counter, a deployment can run for hours on
+/// the degraded path and nobody finds out.
+#[sqlx::test]
+async fn every_auth_gate_action_is_counted_for_prometheus(db: PgPool) {
+    let ws = seed_workspace(&db).await;
+    let pair = pod_pair(&db);
+    let token = make_jwt(ws.id, ws.viewer, "viewer");
+
+    // PREMISE: a healthy request touches the counter for nothing at all.
+    assert_eq!(
+        authenticated_read(&pair.live.app, &token).await.status(),
+        StatusCode::OK
+    );
+    for (reason, action) in [
+        ("logout_unverifiable", "degrade_with_alert"),
+        ("no_warm_session", "block"),
+        ("revoked_durably", "block"),
+    ] {
+        assert_eq!(
+            pair.live
+                .state
+                .metrics
+                .auth_gate_engaged_count(reason, action),
+            0,
+            "premise: a fully verified request must not increment {reason}/{action}"
+        );
+    }
+    assert_redis_is_unreachable(&pair.dead).await;
+
+    // A served-but-unverifiable answer.
+    assert_eq!(
+        authenticated_read(&pair.dead.app, &token).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        pair.dead
+            .state
+            .metrics
+            .auth_gate_engaged_count("logout_unverifiable", "degrade_with_alert"),
+        1,
+        "serving a session the gateway could not check must be counted"
+    );
+
+    // A refusal, on a pod that has never seen this user.
+    let cold = build_pod(db.clone(), dead_url("redis"), Arc::new(DashMap::new()));
+    assert_eq!(
+        authenticated_read(&cold.app, &token).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a pod with no warm entry has nothing to serve and must refuse"
+    );
+    assert_eq!(
+        cold.state
+            .metrics
+            .auth_gate_engaged_count("no_warm_session", "block"),
+        1,
+        "a refusal must be counted too — block and degrade are both signals"
+    );
+
+    // And the exposition really carries the series, with the label names an
+    // alert rule would match on.
+    let exposed = cold.state.metrics.render_prometheus();
+    assert!(
+        exposed.contains(
+            "secureprompt_auth_gate_engaged_total{reason=\"no_warm_session\",action=\"block\"} 1"
+        ),
+        "the counter must appear in /metrics; got:\n{exposed}"
+    );
+}
+
+/// The window has to be bounded by something a reader can find. An entry older
+/// than `DEGRADED_AUTH_CACHE_TTL_SECS` is no longer servable, and the age is
+/// arranged rather than slept — the TTL seam is a pure function over seconds
+/// precisely so this needs no 60-second test.
+///
+/// The Redis failure is still real: this pod's `redis.url` is a dead port.
+#[sqlx::test]
+async fn a_cached_session_older_than_the_window_is_refused(db: PgPool) {
+    let ws = seed_workspace(&db).await;
+    let pair = pod_pair(&db);
+    let token = make_jwt(ws.id, ws.viewer, "viewer");
+
+    // PREMISE + CONTROL: warmed normally, the same request is served.
+    assert_eq!(
+        authenticated_read(&pair.live.app, &token).await.status(),
+        StatusCode::OK
+    );
+    assert_redis_is_unreachable(&pair.dead).await;
+    assert_eq!(
+        authenticated_read(&pair.dead.app, &token).await.status(),
+        StatusCode::OK,
+        "control: a fresh entry IS served, so the refusal below is the age"
+    );
+
+    // Age the existing entry past the window, changing nothing else.
+    let entry = pair
+        .cache
+        .get(&ws.viewer)
+        .expect("the warm entry written by the healthy path")
+        .clone();
+    pair.cache.insert(
+        ws.viewer,
+        CachedAuthEntry {
+            cached_at: entry
+                .cached_at
+                .checked_sub(std::time::Duration::from_secs(
+                    DEGRADED_AUTH_CACHE_TTL_SECS + 1,
+                ))
+                .expect("the host has been up longer than the auth window"),
+            ..entry
+        },
+    );
+
+    assert_eq!(
+        authenticated_read(&pair.dead.app, &token).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a session cached longer ago than the degraded window must not be \
+         served — the window is what makes the fail-open bounded"
+    );
+}
+
+/// A user who keeps sending requests through the outage must not thereby keep
+/// their session alive forever. The degraded path serves from the entry; it
+/// must not re-write it.
+#[sqlx::test]
+async fn the_degraded_path_does_not_extend_its_own_window(db: PgPool) {
+    let ws = seed_workspace(&db).await;
+    let pair = pod_pair(&db);
+    let token = make_jwt(ws.id, ws.viewer, "viewer");
+
+    assert_eq!(
+        authenticated_read(&pair.live.app, &token).await.status(),
+        StatusCode::OK
+    );
+    assert_redis_is_unreachable(&pair.dead).await;
+
+    // Age the entry to the middle of the window, then spend three requests in
+    // it. If the degraded path refreshed `cached_at`, the age would fall back
+    // to ~0 and the window would restart on every request.
+    let aged_by = DEGRADED_AUTH_CACHE_TTL_SECS / 2;
+    let entry = pair.cache.get(&ws.viewer).expect("warm entry").clone();
+    pair.cache.insert(
+        ws.viewer,
+        CachedAuthEntry {
+            cached_at: entry
+                .cached_at
+                .checked_sub(std::time::Duration::from_secs(aged_by))
+                .expect("the host has been up longer than the auth window"),
+            ..entry
+        },
+    );
+
+    for _ in 0..3 {
+        assert_eq!(
+            authenticated_read(&pair.dead.app, &token).await.status(),
+            StatusCode::OK,
+            "premise: each request really is being served on the degraded path"
+        );
+    }
+
+    let age_after = pair
+        .cache
+        .get(&ws.viewer)
+        .expect("the entry must still be there")
+        .age_secs();
+    assert!(
+        age_after >= aged_by,
+        "the degraded path reset the entry's age ({age_after}s < {aged_by}s), so \
+         an active session would never age out of the window"
+    );
+}
+
+/// The premise the whole `LogoutUnverifiable` degrade rests on.
+///
+/// Degrading on the jti blacklist is only defensible if a logout attempted
+/// while Redis is down cannot report success — otherwise a user would watch
+/// their session end and it would not have. `dashboard::auth::logout` returns
+/// the Redis error rather than swallowing it, so the answer is never 204.
+#[sqlx::test]
+async fn logout_during_a_redis_outage_does_not_report_success(db: PgPool) {
+    let ws = seed_workspace(&db).await;
+    let pair = pod_pair(&db);
+    let token = make_jwt(ws.id, ws.viewer, "viewer");
+
+    let logout = |app: axum::Router, token: String| async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/logout")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router runs")
+        .status()
+    };
+
+    // PREMISE + CONTROL THAT MUST DIFFER: with Redis up, this exact call
+    // answers 204. So a non-204 below is the outage and not a broken route.
+    assert_eq!(
+        logout(pair.live.app.clone(), token.clone()).await,
+        StatusCode::NO_CONTENT,
+        "premise: logout succeeds against a live Redis"
+    );
+    assert_redis_is_unreachable(&pair.dead).await;
+
+    // Warm the shared cache again so the request reaches the HANDLER on the
+    // degraded path — otherwise the auth layer would refuse first and this
+    // would prove nothing about logout.
+    let fresh = make_jwt(ws.id, ws.viewer, "viewer");
+    assert_eq!(
+        authenticated_read(&pair.live.app, &fresh).await.status(),
+        StatusCode::OK,
+        "premise: the cache is warm, so logout reaches its handler"
+    );
+
+    let during_outage = logout(pair.dead.app.clone(), fresh).await;
+    assert_ne!(
+        during_outage,
+        StatusCode::NO_CONTENT,
+        "a logout that could not be recorded must not report success — the \
+         degraded jti policy depends on this"
+    );
+    assert!(
+        during_outage.is_server_error(),
+        "and it must surface as a server error the caller can retry, got \
+         {during_outage}"
+    );
+}
+
+// ── The durable read, from a role that cannot bypass RLS ──────────────────
+
+const RLS_ROLE: &str = "secureprompt_runner";
+const RLS_PASSWORD: &str = "secureprompt";
+
+async fn ensure_low_privilege_role(pool: &PgPool) {
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {RLS_ROLE}
+                 LOGIN PASSWORD '{RLS_PASSWORD}'
+                 NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+         END $$;"
+    ))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "could not create the {RLS_ROLE} role ({e}). In CI this role is \
+             created by scripts/ci/create-nonsuperuser-role.sh; locally the \
+             connecting role needs CREATEROLE."
+        )
+    });
+
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+    ))
+    .execute(pool)
+    .await
+    .expect("grants on the test database");
+}
+
+/// `session_revocation_audit` has FORCE ROW LEVEL SECURITY and a policy whose
+/// predicate is NULL for every row when `app.current_workspace_id` is unset —
+/// an unbound SELECT returns the EMPTY SET and reports no error. A watermark
+/// read that hit that trap would answer "never revoked" for every user, and the
+/// fail-closed behaviour this whole suite asserts would be silently off.
+///
+/// The `#[sqlx::test]` pool is a BYPASSRLS superuser and cannot observe the
+/// mistake, so the read is repeated here through a NOSUPERUSER/NOBYPASSRLS
+/// connection — the shape `session_revocation_tests.rs` established.
+#[sqlx::test]
+async fn the_durable_watermark_survives_row_level_security(db: PgPool) {
+    use secureprompt_api::db::session_revocation_repo::SessionRevocationRepository;
+
+    let ws = seed_workspace(&db).await;
+    let actor_pod = build_pod(db.clone(), live_redis_url(), Arc::new(DashMap::new()));
+    let admin = make_jwt(ws.id, ws.admin, "admin");
+    assert_eq!(
+        revoke(&actor_pod.app, &admin, ws.viewer).await,
+        StatusCode::OK
+    );
+
+    // PREMISE: the superuser pool sees the row, so anything the low-privilege
+    // pool cannot see is RLS and not an empty table.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM session_revocation_audit WHERE target_user_id = $1",
+    )
+    .bind(ws.viewer)
+    .fetch_one(&db)
+    .await
+    .expect("premise count");
+    assert_eq!(rows, 1, "premise: exactly one revocation row exists");
+
+    ensure_low_privilege_role(&db).await;
+    let options = (*db.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+    let low_privilege: PgPool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .expect("low-privilege pool");
+
+    // PREMISE: this connection really is powerless, or the assertion below
+    // proves nothing.
+    let (superuser, bypass): (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(&low_privilege)
+            .await
+            .expect("identity probe");
+    assert!(!superuser, "premise: the probe role is a SUPERUSER");
+    assert!(!bypass, "premise: the probe role has BYPASSRLS");
+
+    // PREMISE: unbound, the table really does read as empty — the trap is live.
+    let unbound: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
+        .fetch_one(&low_privilege)
+        .await
+        .expect("an unbound read succeeds, which is the whole problem");
+    assert_eq!(
+        unbound, 0,
+        "premise: with the GUC unset the policy hides every row and reports \
+         no error"
+    );
+
+    let repo = SessionRevocationRepository::new(low_privilege.clone());
+    let watermark = repo
+        .latest_watermark(ws.id, ws.viewer)
+        .await
+        .expect("the durable read must succeed under RLS");
+    assert!(
+        watermark.is_some(),
+        "the durable watermark read must bind the workspace GUC; without it \
+         RLS returns the empty set and every user reads as never-revoked"
+    );
+
+    // CONTROL THAT MUST DIFFER: a user nobody revoked reads as None through
+    // the same connection, so `Some` above is the row and not a constant.
+    assert_eq!(
+        repo.latest_watermark(ws.id, ws.other)
+            .await
+            .expect("read succeeds"),
+        None,
+        "control: an unrevoked user must read as no-watermark"
+    );
+
+    forget_watermark(ws.viewer).await;
 }
