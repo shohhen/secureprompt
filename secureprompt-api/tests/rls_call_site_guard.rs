@@ -115,15 +115,34 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          PLAINTEXT PROMPTS are never purged and the record still says `ok`. \
          Same fix: drive it from a loop over `workspaces` with the scope armed.",
     ),
+    // The reason string here was WRONG until P1G, and wrong in the direction
+    // that stops the next reader looking. It said "the worker's startup
+    // key-cache warm READS every workspace's keys" and "fails CLOSED". There
+    // is no key-cache warm anywhere in the worker — `grep -rn api_keys
+    // secureprompt-worker/src` returns this statement and nothing else. It is
+    // a WRITE: the 03:00 rotation-cleanup UPDATE, moved out of `main.rs`'s
+    // cron closure into `tasks/api_key_rotation.rs` so a test can drive it.
     (
-        "secureprompt-worker/src/main.rs",
+        "secureprompt-worker/src/tasks/api_key_rotation.rs",
         "api_keys",
         1,
-        "REAL DEFECT, least severe. Cross-tenant BY DESIGN: the worker's \
-         startup key-cache warm reads every workspace's keys. Under a \
-         non-bypassing role it loads nothing; that direction fails CLOSED \
-         (requests miss the cache and fall through to a scoped lookup) which \
-         is why it is last in this list.",
+        "REAL DEFECT. Cross-tenant BY DESIGN: one nightly sweep moves every \
+         workspace's grace-expired `'rotating'` keys to `'revoked'`. MEASURED \
+         under `SET ROLE secureprompt_runner`: unarmed the UPDATE reports \
+         `UPDATE 0` and does NOT error, armed it reports `UPDATE 1`. An \
+         unarmed UPDATE matching nothing is indistinguishable from one with \
+         nothing to do, so the cron logs `rows_affected=0` and records \
+         `ok = true` forever. \
+         WHAT IT DOES NOT DO — also measured — is keep the key usable: \
+         `authenticate_api_key` re-derives the same boundary in its own WHERE \
+         (`rotated_at + grace > NOW()`), the exact complement of this \
+         predicate, so the key stops authenticating at the boundary either \
+         way. What rots is the RECORD: `status` stays `'rotating'` and \
+         `revoked_at` stays NULL, so `GET /v1/keys` shows a dead credential \
+         as never-revoked and a re-rotation of it takes `rotate`'s idempotent \
+         branch forever — 200 OK, `grace_expires_at` in the past, no new key, \
+         no admin-audit row. Fix: loop over `workspaces` arming the scope per \
+         workspace, as `retention_purge::write_audit` does.",
     ),
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
