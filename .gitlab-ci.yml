@@ -497,6 +497,13 @@ test:rls-nonsuperuser:
     - cargo test -p secureprompt-api --test rls_call_site_guard -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test migration_020_rls -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test dashboard -- --test-threads=4 --nocapture
+    # P1F. The suite that pins migration 033's invariant: an unscoped read of an
+    # armed table is INVISIBLE, not `22P02 invalid input syntax for type uuid:
+    # ""`. It builds its own probe connection from the test database's connect
+    # options with the username replaced, so it exercises the same non-bypassing
+    # role under EITHER `DATABASE_URL` — measured 5/5 here and 5/5 in `test:`,
+    # and 1 passed / 4 failed identically under both before 033.
+    - cargo test -p secureprompt-api --test rls_unscoped_read_is_invisible -- --test-threads=4 --nocapture
     # P1G. Both suites drive the code under test through a pool that asserts
     # `rolsuper = false`, `rolbypassrls = false` and
     # `row_security_active('api_keys')` on the wire, and every read-back arms
