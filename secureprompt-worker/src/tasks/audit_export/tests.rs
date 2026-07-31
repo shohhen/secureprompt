@@ -24,6 +24,7 @@
 use super::*;
 use secureprompt_common::audit_export::{verify_export, VerifyError};
 use secureprompt_common::tasks::{task_types, TaskEnvelope};
+use serde_json::Value;
 use sqlx::{PgPool, Row as _};
 
 // ── Environment ───────────────────────────────────────────────────────────
@@ -1142,5 +1143,440 @@ async fn the_model_column_reaches_the_export_verbatim(pool: PgPool) -> sqlx::Res
          data-inventory entry for `audit_export_pages` says so; got:\n{body}"
     );
 
+    Ok(())
+}
+
+// ── FU1 — the control plane ───────────────────────────────────────────────
+//
+// `audit.export` read `request_events` and nothing else, so an auditor could
+// obtain WHAT REQUESTS HAPPENED but not WHAT ADMINISTRATORS DID: who revoked
+// whose access, who switched raw content capture on, what a purge run deleted.
+// Migration 026's own header disclosed that gap rather than hiding it. These
+// tests are the acceptance criterion for closing it.
+
+/// The three Postgres control-plane audit rows one call to
+/// [`seed_control_plane`] wrote, by identity, so the assertions compare
+/// against known ids rather than against whatever the export happened to hold.
+struct ControlSeed {
+    raw_capture: Uuid,
+    purge: Uuid,
+    revocation: Uuid,
+}
+
+impl ControlSeed {
+    fn ids(&self) -> [Uuid; 3] {
+        [self.raw_capture, self.purge, self.revocation]
+    }
+}
+
+/// `raw_capture_audit` carries a foreign key to `workspaces`, so a tenant has
+/// to exist before it can have a control-plane trail.
+async fn seed_workspace(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'synthetic-workspace')")
+        .bind(workspace_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// One row in each of the three control-plane audit tables, inside `window()`.
+///
+/// Every value is synthetic (Constraint 5): documentation-shaped email local
+/// parts, invented scope names, and UUIDs generated per call so concurrent
+/// runs cannot collide.
+async fn seed_control_plane(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    minute: i64,
+) -> sqlx::Result<ControlSeed> {
+    let (from, _) = window();
+    let at = from + chrono::Duration::minutes(minute);
+    let seed = ControlSeed {
+        raw_capture: Uuid::new_v4(),
+        purge: Uuid::new_v4(),
+        revocation: Uuid::new_v4(),
+    };
+
+    sqlx::query(
+        "INSERT INTO raw_capture_audit \
+         (id, workspace_id, actor_user_id, actor_email, enabled_before, enabled_after, \
+          retention_days_before, retention_days_after, created_at) \
+         VALUES ($1, $2, $3, 'synthetic-admin@example.invalid', false, true, 30, 7, $4)",
+    )
+    .bind(seed.raw_capture)
+    .bind(workspace_id)
+    .bind(Uuid::new_v4())
+    .bind(at)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO retention_purge_audit \
+         (id, run_id, scope, workspace_id, cutoff, rows_deleted, oldest_deleted, \
+          newest_deleted, rows_remaining_past_cutoff, status, error, started_at, completed_at) \
+         VALUES ($1, $2, 'synthetic_scope', $3, $4, 7, $5, $6, 0, 'ok', NULL, $7, $8)",
+    )
+    .bind(seed.purge)
+    .bind(Uuid::new_v4())
+    .bind(workspace_id)
+    .bind(at)
+    .bind(at - chrono::Duration::days(40))
+    .bind(at - chrono::Duration::days(31))
+    .bind(at - chrono::Duration::seconds(2))
+    .bind(at + chrono::Duration::seconds(1))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO session_revocation_audit \
+         (id, workspace_id, actor_user_id, actor_email, actor_role, target_user_id, \
+          target_email, target_role, revoked_before_unix, refresh_tokens_revoked, created_at) \
+         VALUES ($1, $2, $3, 'synthetic-admin@example.invalid', 'admin', $4, \
+                 'synthetic-target@example.invalid', 'member', $5, 4, $6)",
+    )
+    .bind(seed.revocation)
+    .bind(workspace_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(at.timestamp())
+    .bind(at + chrono::Duration::seconds(2))
+    .execute(pool)
+    .await?;
+
+    Ok(seed)
+}
+
+/// The control-plane trail as a SEPARATE query, written from
+/// `docs/audit-export-format.md`'s statement of which table and which instant
+/// column each event type comes from — not from the job's own SQL, so a bug in
+/// the job cannot cancel itself out here.
+///
+/// Returns `(event_id, source_table)` in the export's documented order.
+async fn live_control_rows(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<Vec<(Uuid, String)>> {
+    let (from, to) = window();
+    let rows = sqlx::query(
+        "SELECT id, 'raw_capture_audit' AS src, created_at AS at \
+           FROM raw_capture_audit \
+          WHERE workspace_id = $1 AND created_at >= $2 AND created_at < $3 \
+         UNION ALL \
+         SELECT id, 'retention_purge_audit', completed_at \
+           FROM retention_purge_audit \
+          WHERE workspace_id = $1 AND completed_at >= $2 AND completed_at < $3 \
+         UNION ALL \
+         SELECT id, 'session_revocation_audit', created_at \
+           FROM session_revocation_audit \
+          WHERE workspace_id = $1 AND created_at >= $2 AND created_at < $3 \
+         ORDER BY at ASC, src ASC, id ASC",
+    )
+    .bind(workspace_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<Uuid, _>("id"), r.get::<String, _>("src")))
+        .collect())
+}
+
+/// Every JSONL object on the pages the manifest assigns to `section`.
+fn section_objects(manifest: &serde_json::Value, pages: &[Vec<u8>], section: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        let page_number = index + 1;
+        let belongs = manifest["pages"]
+            .as_array()
+            .map(|entries| {
+                entries.iter().any(|e| {
+                    e["page"].as_u64() == Some(page_number as u64)
+                        && e["section"].as_str() == Some(section)
+                })
+            })
+            .unwrap_or(false);
+        if !belongs {
+            continue;
+        }
+        for line in String::from_utf8_lossy(page).lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_str::<Value>(line).expect("jsonl line is an object"));
+        }
+    }
+    out
+}
+
+/// **The gap this task closes.** The signed export must carry the Postgres
+/// control-plane audit trail as well as the ClickHouse request log, must SAY
+/// which of the two each page belongs to, and must carry exactly this
+/// workspace's rows.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn an_export_carries_the_control_plane_audit_trail(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    seed_workspace(&pool, workspace_id).await?;
+    seed_workspace(&pool, other).await?;
+    let mine = seed_control_plane(&pool, workspace_id, 5).await?;
+    let theirs = seed_control_plane(&pool, other, 6).await?;
+
+    // PREMISE: both tenants really do have a trail in the window, so a missing
+    // tenancy predicate would show up below as extra rows rather than as an
+    // empty comparison on both sides.
+    let expected = live_control_rows(&pool, workspace_id).await?;
+    assert_eq!(expected.len(), 3, "premise: three control events for me");
+    assert_eq!(
+        live_control_rows(&pool, other).await?.len(),
+        3,
+        "premise: three control events for the other tenant"
+    );
+
+    let export_id = Uuid::new_v4();
+    seed_export_row(&pool, export_id, workspace_id, "jsonl", 5_000).await?;
+    let outcome = run_with(
+        &pool,
+        &ch_client(),
+        &envelope(export_id, workspace_id, "jsonl", 5_000),
+        Ok(test_key()),
+        MAX_EXPORT_ROWS,
+        Utc::now(),
+    )
+    .await;
+    let stored = load_export(&pool, export_id).await?;
+    assert!(
+        outcome.ok(),
+        "the export must complete; error: {:?}",
+        stored.error
+    );
+
+    let manifest: Value = serde_json::from_str(
+        stored
+            .manifest_json
+            .as_deref()
+            .expect("a complete export has a manifest"),
+    )
+    .expect("manifest is json");
+
+    // 1. The artifact must SAY it carries both planes, per page.
+    let sections: Vec<String> = manifest["sections"]
+        .as_array()
+        .map(|s| {
+            s.iter()
+                .filter_map(|e| e["section"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        sections.iter().any(|s| s == "request_events"),
+        "the manifest must declare the data-plane section; got {sections:?}"
+    );
+    assert!(
+        sections.iter().any(|s| s == "control_plane_events"),
+        "the manifest must declare the control-plane section — an auditor \
+         holding this export has to be able to tell that administrative \
+         actions are in it; got {sections:?}"
+    );
+
+    // 2. And carry it: exactly the live query's rows, in the same order.
+    let pages = load_pages(&pool, export_id).await?;
+    let exported = section_objects(&manifest, &pages, "control_plane_events");
+    let got: Vec<(Uuid, String)> = exported
+        .iter()
+        .map(|o| {
+            (
+                o["event_id"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("event_id"),
+                o["source_table"].as_str().expect("source_table").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got, expected,
+        "the exported control-plane rows must equal the live query for this \
+         window, in the same order"
+    );
+
+    // 3. No other tenant's control events, at any depth in the bytes.
+    let all = String::from_utf8_lossy(&pages.concat()).into_owned();
+    for id in mine.ids() {
+        assert!(
+            all.contains(&id.to_string()),
+            "my control event {id} must be in the export"
+        );
+    }
+    for id in theirs.ids() {
+        assert!(
+            !all.contains(&id.to_string()),
+            "another tenant's control event {id} must never appear"
+        );
+    }
+
+    Ok(())
+}
+
+// ── The control plane is Postgres, and Postgres has RLS ───────────────────
+
+const RLS_ROLE: &str = "secureprompt_runner";
+const RLS_PASSWORD: &str = "secureprompt";
+
+/// A pool onto the SAME `#[sqlx::test]` database as a role that is NOT a
+/// superuser and does NOT have BYPASSRLS.
+///
+/// This exists because `#[sqlx::test]` connects as a BYPASSRLS superuser, so
+/// no ordinary test in this suite can observe an RLS defect — a missing
+/// `set_config` would be invisible, and the export would be signed over an
+/// empty control plane that looks exactly like "this workspace did nothing".
+/// Same construction, and the same reason, as
+/// `secureprompt-api/tests/audit_export.rs`.
+async fn low_privilege_pool(pool: &PgPool) -> PgPool {
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {RLS_ROLE}
+                 LOGIN PASSWORD '{RLS_PASSWORD}'
+                 NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+         END $$;"
+    ))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("could not create the {RLS_ROLE} role ({e})"));
+
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+    ))
+    .execute(pool)
+    .await
+    .expect("grants on the test database");
+
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+    let low = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("low-privilege pool");
+
+    // PREMISE: without these two assertions the test below would keep passing
+    // while exercising no RLS at all.
+    let row = sqlx::query(
+        "SELECT current_user::text AS who, rolsuper, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&low)
+    .await
+    .expect("identity probe");
+    assert_eq!(row.get::<String, _>("who"), RLS_ROLE);
+    assert!(
+        !row.get::<bool, _>("rolsuper"),
+        "premise: the probe role is a SUPERUSER, so this test proves nothing"
+    );
+    assert!(
+        !row.get::<bool, _>("rolbypassrls"),
+        "premise: the probe role has BYPASSRLS, so this test proves nothing"
+    );
+    low
+}
+
+/// The export produced by a role that CANNOT bypass RLS still carries this
+/// workspace's control plane, and still carries only this workspace's.
+///
+/// Both halves matter. `session_revocation_audit` is under FORCE ROW LEVEL
+/// SECURITY keyed on `app.current_workspace_id`; with that GUC unset the
+/// policy predicate is NULL, the read returns the EMPTY SET and SUCCEEDS. An
+/// export signed over that emptiness is the worst outcome this control has —
+/// a valid signature over a false claim that no administrator did anything.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn the_control_plane_read_is_tenant_scoped_under_real_rls(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    seed_workspace(&pool, workspace_id).await?;
+    seed_workspace(&pool, other).await?;
+    let mine = seed_control_plane(&pool, workspace_id, 11).await?;
+    let theirs = seed_control_plane(&pool, other, 12).await?;
+
+    let low = low_privilege_pool(&pool).await;
+
+    // PREMISE: the silent zero is REAL on this connection. With the GUC unset
+    // the RLS-armed table hides rows the superuser pool can see, and the read
+    // still succeeds.
+    let unscoped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&low)
+            .await?;
+    let as_superuser: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(as_superuser, 1, "premise: the revocation row exists");
+    assert_eq!(
+        unscoped, 0,
+        "premise: an unscoped read must return the empty set, which is the \
+         failure mode the export has to be immune to"
+    );
+
+    let export_id = Uuid::new_v4();
+    seed_export_row(&pool, export_id, workspace_id, "jsonl", 5_000).await?;
+    let outcome = run_with(
+        &low,
+        &ch_client(),
+        &envelope(export_id, workspace_id, "jsonl", 5_000),
+        Ok(test_key()),
+        MAX_EXPORT_ROWS,
+        Utc::now(),
+    )
+    .await;
+    let stored = load_export(&pool, export_id).await?;
+    assert!(
+        outcome.ok(),
+        "the export must complete under a non-superuser role; error: {:?}",
+        stored.error
+    );
+
+    let manifest: Value =
+        serde_json::from_str(stored.manifest_json.as_deref().expect("manifest")).expect("json");
+    let pages = load_pages(&pool, export_id).await?;
+    let exported = section_objects(&manifest, &pages, "control_plane_events");
+    let got: Vec<(Uuid, String)> = exported
+        .iter()
+        .map(|o| {
+            (
+                o["event_id"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("event_id"),
+                o["source_table"].as_str().expect("source_table").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        live_control_rows(&pool, workspace_id).await?,
+        "a role that cannot bypass RLS must still export this workspace's \
+         whole control plane — not the empty set the unset GUC would yield"
+    );
+
+    let all = String::from_utf8_lossy(&pages.concat()).into_owned();
+    for id in mine.ids() {
+        assert!(all.contains(&id.to_string()), "my control event {id}");
+    }
+    for id in theirs.ids() {
+        assert!(
+            !all.contains(&id.to_string()),
+            "another tenant's control event {id} must never appear"
+        );
+    }
+
+    low.close().await;
     Ok(())
 }
