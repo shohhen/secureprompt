@@ -123,6 +123,35 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     // `grace_expires_at` already in the past, no new key, no admin-audit row.
     // `secureprompt-api/tests/rls_api_key_grace_window.rs` and
     // `tasks::api_key_rotation::tests` pin both halves.
+    //
+    // ALSO FIXED and therefore GONE (P1H):
+    // `secureprompt-worker/src/tasks/retention_purge.rs` /
+    // `workspace_raw_capture`, one statement — the bare-pool
+    // `SELECT workspace_id, retention_days` that told the capture purge what
+    // each tenant's CURRENT retention is. `purge_content_captures` now
+    // enumerates `workspaces` and reads each workspace's setting inside a
+    // scope-armed, read-back transaction, so nothing of it remains on a bare
+    // pool. This guard is what proved the site was gone: it failed
+    // `allowlist says 1, found 0` before this entry was deleted.
+    //
+    // Its reason string was RIGHT about the consequence and WRONG about the
+    // severity, in the direction that understates it. It ended
+    // "...so the run reports success AND the proof-of-purge trail simply omits
+    // the scope" — which was correct, and was itself a correction of an
+    // earlier tail claiming "the record still says `ok`". What it did not say
+    // is that the omission was TOTAL: `records` was empty, so `all_ok()` was
+    // an `all(...)` over the EMPTY SET, `total_deleted()` was 0, and
+    // `main.rs`'s `record_job("retention_purge", …, ok = true)` fired on a run
+    // in which captured plaintext prompts — the most sensitive rows this
+    // product stores — were retained indefinitely with no alert of any kind.
+    // MEASURED under `secureprompt_runner` before the fix, in
+    // `captured_plaintext_is_purged_under_a_non_bypassing_role`: `all_ok()`
+    // TRUE, records `[token_vault_entries, refresh_tokens.device_context]`,
+    // and a 30-day-old capture still on disk under a 7-day retention.
+    //
+    // The `refresh_tokens` entry below is the SAME defect in the same file and
+    // is deliberately still here: `scrub_session_device_context` was out of
+    // scope for P1H and is unchanged.
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
         "refresh_tokens",
@@ -135,26 +164,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          filtered by the SAME predicate and also returns zero. Both halves \
          lie consistently and the job reports status `ok`. Fix: loop over \
          `workspaces` arming the scope per workspace, as migrations 019/020 do.",
-    ),
-    (
-        "secureprompt-worker/src/tasks/retention_purge.rs",
-        "workspace_raw_capture",
-        1,
-        "REAL DEFECT. Cross-tenant BY DESIGN: reads every workspace's CURRENT retention \
-         setting to decide what captured content to purge. Under a \
-         non-bypassing role it returns no rows, which this code cannot \
-         distinguish from `no workspace has enabled capture`, so captured \
-         PLAINTEXT PROMPTS are never purged. \
-         The tail of this reason said `and the record still says ok`. It is \
-         worse than that, re-derived against the code in P1G: \
-         `purge_content_captures` builds one record PER SETTINGS ROW, so an \
-         empty read produces an EMPTY vector and there is no \
-         `request_content_captures` record at all. `PurgeOutcome::all_ok` is \
-         `records.iter().all(...)`, which is true over the empty set, so the \
-         run reports success AND the proof-of-purge trail simply omits the \
-         scope for that run — an absence, which is harder to notice than a \
-         row falsely claiming `ok`. \
-         Same fix: drive it from a loop over `workspaces` with the scope armed.",
     ),
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
