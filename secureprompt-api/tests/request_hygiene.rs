@@ -390,6 +390,106 @@ async fn a_streaming_response_still_streams_with_the_hygiene_layers_installed(
     Ok(())
 }
 
+/// The deadline cannot cut a stream that OUTLIVES it.
+///
+/// The end-to-end test above finishes in milliseconds, so it would pass
+/// whether or not `TimeoutLayer` bounds the response body — it proves the
+/// stream works, not that a long one survives. This asserts the property
+/// directly, against a deadline far SHORTER than the stream: tower-http's
+/// `TimeoutLayer` races the sleep against production of the response HEAD
+/// only, and once the handler has returned `Sse`, the body streams
+/// unsupervised.
+///
+/// The POSITIVE CONTROL is the second half: the SAME layer, the same 150 ms,
+/// against a slow NON-streaming handler, must answer 504. Without it, "the
+/// stream survived" would also be the result if the layer were inert.
+#[tokio::test]
+async fn the_inbound_deadline_does_not_cut_a_stream_that_outlives_it() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use axum::Router;
+    use std::convert::Infallible;
+    use std::time::Duration;
+    use tower_http::timeout::TimeoutLayer;
+
+    const DEADLINE: Duration = Duration::from_millis(150);
+    const FRAME_GAP: Duration = Duration::from_millis(80);
+    const FRAMES: u8 = 5; // 400 ms of streaming under a 150 ms deadline
+
+    let streaming: Router = Router::new()
+        .route(
+            "/slow-stream",
+            get(|| async {
+                Sse::new(futures_util::stream::unfold(0u8, |n| async move {
+                    if n >= FRAMES {
+                        return None;
+                    }
+                    tokio::time::sleep(FRAME_GAP).await;
+                    Some((
+                        Ok::<_, Infallible>(Event::default().data(format!("frame-{n}"))),
+                        n + 1,
+                    ))
+                }))
+            }),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            DEADLINE,
+        ));
+
+    let response = streaming
+        .oneshot(
+            Request::builder()
+                .uri("/slow-stream")
+                .body(Body::empty())
+                .expect("request must build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a stream must not be refused by the inbound deadline"
+    );
+    let body = support::response_text(response).await;
+    assert!(
+        body.contains("frame-0") && body.contains(&format!("frame-{}", FRAMES - 1)),
+        "every frame must arrive, including the ones emitted long after the \
+         {DEADLINE:?} deadline; body={body}"
+    );
+
+    // POSITIVE CONTROL — the same deadline, a slow handler that is NOT a
+    // stream, must be cut.
+    let buffered: Router = Router::new()
+        .route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(FRAME_GAP * u32::from(FRAMES)).await;
+                "finished"
+            }),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            DEADLINE,
+        ));
+
+    let cut = buffered
+        .oneshot(
+            Request::builder()
+                .uri("/slow")
+                .body(Body::empty())
+                .expect("request must build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        cut.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "the deadline must actually be live and short — otherwise the stream \
+         above survived a layer that does nothing"
+    );
+}
+
 // ── Log capture ───────────────────────────────────────────────────────────
 
 /// An in-memory `MakeWriter` so a test can read what the subscriber wrote.
