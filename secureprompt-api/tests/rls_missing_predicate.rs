@@ -52,6 +52,8 @@
 //! see them — because `assert!(rows.is_empty())` is satisfied by an empty
 //! table, a failed fixture and a broken reader indifferently.
 
+use secureprompt_api::db::admin_audit_repo::AdminActor;
+use secureprompt_api::db::api_key_repo::{hash_api_key, ApiKeyRepository};
 use secureprompt_api::db::provider_repo::ProviderRepository;
 use secureprompt_common::types::WorkspaceId;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -514,4 +516,217 @@ async fn resolve_model_targets_keeps_the_tenancy_predicate_on_both_joined_tables
              through the join: {leaked:?}"
         ),
     }
+}
+
+// ===========================================================================
+// 5 — the one statement left unfixed, and the reason, EXECUTED
+// ===========================================================================
+
+/// `create_model`'s revive branch issues `UPDATE models SET excluded = FALSE
+/// WHERE id = $1` — no tenancy predicate, and the one entry on
+/// `tests/tenancy_predicate_guard.rs`'s allowlist.
+///
+/// The reason given there is that `id` cannot name a foreign row: it comes
+/// from a SELECT in the SAME transaction that is itself filtered on
+/// `workspace_id`, and the method refuses before reaching either statement
+/// unless the provider belongs to the caller's workspace. That is a claim
+/// about running code, so it is made here rather than in the allowlist's
+/// prose. Fourteen comments asserting guarantees have proved false on this
+/// branch; an allowlist reason nobody executed is how the fifteenth happens.
+///
+/// Two separate refusals are checked, because they fail differently: naming a
+/// foreign PROVIDER, and naming a foreign provider's excluded MODEL by name.
+#[sqlx::test]
+async fn create_model_cannot_revive_a_foreign_workspaces_excluded_model(pool: PgPool) {
+    let world = world(&pool).await;
+
+    let workspace_a = seed_workspace(&pool, "revive A").await;
+    let workspace_b = seed_workspace(&pool, "revive B").await;
+    let provider_a = seed_provider_with_model(&pool, workspace_a, "a", "model-a").await;
+    let provider_b = seed_provider_with_model(&pool, workspace_b, "b", "model-b").await;
+    exclude_model(&pool, workspace_b, "model-b").await;
+
+    let repo = ProviderRepository::new(pool.clone());
+
+    // POSITIVE CONTROL: the revive branch WORKS for the owning workspace, or
+    // the refusals below are satisfied by a method that refuses everything.
+    exclude_model(&pool, workspace_a, "model-a").await;
+    repo.create_model(WorkspaceId(workspace_a), provider_a, "model-a")
+        .await
+        .expect("positive control: A must be able to revive its OWN excluded model");
+    let revived = repo
+        .list_models_for_provider(WorkspaceId(workspace_a), provider_a)
+        .await
+        .expect("A's models after revive");
+    assert_eq!(
+        revived.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        vec!["model-a"],
+        "positive control: the revive must actually clear `excluded`"
+    );
+
+    // The refusal: A names B's provider. `create_model` validates the provider
+    // against `WHERE id = $1 AND workspace_id = $2` before anything else.
+    let refused = repo
+        .create_model(WorkspaceId(workspace_a), provider_b, "model-b")
+        .await;
+    assert!(
+        refused.is_err(),
+        "create_model accepted a provider id belonging to another workspace; \
+         the `UPDATE ... WHERE id = $1` below it would then be reachable with \
+         a foreign row's id, and the guard's allowlist entry is false. World: \
+         {world:?}"
+    );
+
+    // And B's row is untouched — the refusal is not merely a returned error.
+    let still_excluded: bool = sqlx::query_scalar(
+        "SELECT excluded FROM models WHERE workspace_id = $1 AND name = 'model-b'",
+    )
+    .bind(workspace_b)
+    .fetch_one(&pool)
+    .await
+    .expect("B's row must still be readable to be checked");
+    assert!(
+        still_excluded,
+        "workspace B's excluded model was revived by a call made from \
+         workspace A"
+    );
+}
+
+/// `ApiKeyRepository::rotate`'s second write is
+/// `UPDATE api_keys SET status = 'rotating', ... WHERE id = $3` — no tenancy
+/// predicate, and the second entry on `tests/tenancy_predicate_guard.rs`'s
+/// allowlist.
+///
+/// The reason given there is that `key_id` cannot name a foreign row by the
+/// time that statement runs: the method opens with
+/// `SELECT ... WHERE id = $1 AND workspace_id = $2 AND status IN ('active',
+/// 'rotating') FOR UPDATE` and returns `NotFound` when it matches nothing, so
+/// the row is both validated and LOCKED in the same transaction. That is a
+/// claim about running code, so it is made here.
+///
+/// Rotation is the highest-consequence write on this table — it issues a
+/// credential and puts the old one on a grace clock — so the check is that A
+/// cannot start one on B's key, and that B's key is untouched afterwards.
+#[sqlx::test]
+async fn rotate_refuses_a_foreign_workspaces_api_key(pool: PgPool) {
+    let world = world(&pool).await;
+    assert!(
+        is_armed(&pool, "api_keys").await,
+        "premise: `api_keys` armed"
+    );
+
+    let workspace_a = seed_workspace(&pool, "rotate A").await;
+    let workspace_b = seed_workspace(&pool, "rotate B").await;
+    let key_a = seed_api_key(&pool, workspace_a, "key-a").await;
+    let key_b = seed_api_key(&pool, workspace_b, "key-b").await;
+
+    let repo = ApiKeyRepository::new(pool.clone());
+    let actor = AdminActor {
+        workspace_id: workspace_a,
+        user_id: None,
+        email: None,
+        role: Some("admin".to_owned()),
+    };
+
+    // POSITIVE CONTROL: rotation WORKS for A's own key, or the refusal below
+    // is satisfied by a method that refuses everything. A real rotation also
+    // INSERTS a successor row, which is what makes the row count in B a
+    // meaningful check rather than a count that never moves.
+    assert_eq!(
+        keys_in(&pool, workspace_a).await,
+        1,
+        "premise: A starts at 1 key"
+    );
+    repo.rotate(WorkspaceId(workspace_a), key_a, &actor)
+        .await
+        .expect("positive control: A must be able to rotate its OWN key");
+    assert_eq!(
+        key_status(&pool, workspace_a, key_a).await,
+        "rotating",
+        "positive control: A's own key must actually reach 'rotating'"
+    );
+    assert_eq!(
+        keys_in(&pool, workspace_a).await,
+        2,
+        "positive control: a real rotation inserts the successor row, so the \
+         count in B below can distinguish 'no insert happened' from 'inserts \
+         never happen'"
+    );
+
+    let refused = repo.rotate(WorkspaceId(workspace_a), key_b, &actor).await;
+    assert!(
+        refused.is_err(),
+        "rotate accepted an api-key id belonging to another workspace. The \
+         `UPDATE ... WHERE id = $3` beneath the FOR UPDATE gate would then be \
+         reachable with a foreign row's id, and the guard's allowlist entry is \
+         false. World: {world:?}"
+    );
+
+    // And B's key is untouched — the refusal is not merely a returned error.
+    assert_eq!(
+        key_status(&pool, workspace_b, key_b).await,
+        "active",
+        "workspace B's api key was put on a rotation clock by a call made \
+         from workspace A"
+    );
+
+    // The sibling statement the guard's INSERT rule does NOT flag:
+    // `INSERT INTO api_keys ... SELECT $1, workspace_id, ... FROM api_keys
+    // WHERE id = $3`. Its inner SELECT is unfiltered and rests on the same FOR
+    // UPDATE gate, so the allowlist entry claims a refused rotation mints no
+    // successor. This is that claim, executed.
+    assert_eq!(
+        keys_in(&pool, workspace_b).await,
+        1,
+        "the refused rotation still minted a successor credential in workspace \
+         B — the INSERT's `SELECT ... FROM api_keys WHERE id = $3` copied a \
+         foreign row"
+    );
+}
+
+/// One `active` api key, seeded through the owning workspace's armed scope.
+async fn seed_api_key(pool: &PgPool, workspace_id: Uuid, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut tx = scoped_tx(pool, workspace_id).await;
+    sqlx::query(
+        "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at, status)
+         VALUES ($1, $2, $3, $4, NOW(), 'active')",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(name)
+    .bind(hash_api_key(&format!("sp_{}", Uuid::new_v4().simple())))
+    .execute(&mut *tx)
+    .await
+    .expect("api key seed");
+    tx.commit().await.expect("api key seed commit");
+    id
+}
+
+/// One key's `status`, read through the OWNING workspace's armed scope so the
+/// read works under either `DATABASE_URL`.
+async fn key_status(pool: &PgPool, workspace_id: Uuid, key_id: Uuid) -> String {
+    let mut tx = scoped_tx(pool, workspace_id).await;
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM api_keys WHERE id = $1 AND workspace_id = $2")
+            .bind(key_id)
+            .bind(workspace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the key must be readable from its own workspace to be checked");
+    tx.commit().await.expect("status read commit");
+    status
+}
+
+/// How many api-key rows one workspace holds, read through its OWN armed
+/// scope so the count works under either `DATABASE_URL`.
+async fn keys_in(pool: &PgPool, workspace_id: Uuid) -> i64 {
+    let mut tx = scoped_tx(pool, workspace_id).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE workspace_id = $1")
+        .bind(workspace_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("key count");
+    tx.commit().await.expect("count commit");
+    n
 }
