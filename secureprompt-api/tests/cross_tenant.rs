@@ -133,6 +133,18 @@ async fn workspace_a_cannot_see_workspace_b_keys(pool: PgPool) -> sqlx::Result<(
         .await
         .expect("workspace A query must succeed");
 
+    // PREMISE: the list is not empty. Without this the filter below is taken
+    // over nothing and `is_empty()` is satisfied by a repository that returned
+    // no rows at all — which is exactly what an unarmed read of an RLS-armed
+    // table does under a role that cannot bypass RLS. The claim this test
+    // makes is "A's result contains no B rows", and that is only a claim about
+    // tenancy if A's result contains A's rows.
+    assert!(
+        !keys_a.is_empty(),
+        "premise: workspace A must have api_keys of its own, or the \
+         leak check below is taken over an empty list"
+    );
+
     let ws_b_uuid = Uuid::parse_str(WS_B_UUID).unwrap();
     let b_keys_in_a_result: Vec<_> = keys_a
         .iter()
@@ -293,13 +305,16 @@ async fn seed_user(
 /// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration
 /// 002, so this INSERT is refused with
 /// `42501 new row violates row-level security policy for table
-/// "refresh_tokens"` whenever the connecting role cannot bypass RLS. It only
-/// appeared to work because the `workspace_a` / `workspace_b` fixtures leave a
-/// SESSION-level `app.current_workspace_id` on whichever pooled connection ran
-/// them — so which workspace this function could write depended on which
-/// connection the pool happened to hand out. `begin_scoped` is
-/// transaction-local and names the workspace explicitly, so it is deterministic
-/// under both roles.
+/// "refresh_tokens"` whenever the connecting role cannot bypass RLS.
+///
+/// A previous version of this comment blamed the `.sql` fixtures for leaving a
+/// SESSION-level `app.current_workspace_id` on a pooled connection. READ AND
+/// MEASURED: that is not what happens. `sqlx-core-0.8.6`'s `setup_test_db`
+/// applies fixtures on a DEDICATED connection and calls `conn.close()` before
+/// the test's pool is constructed, so no fixture setting ever reaches the
+/// pool. This INSERT was simply unarmed, and only worked because the compose
+/// role bypasses RLS. `begin_scoped` names the workspace explicitly and reads
+/// it back, so it is correct under both roles.
 async fn seed_refresh_row(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> sqlx::Result<()> {
     let mut tx = begin_scoped(pool, workspace_id)
         .await
