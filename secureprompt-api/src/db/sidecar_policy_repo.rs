@@ -8,24 +8,25 @@
 //! [`crate::db::secure_mode_repo::SecureModeRepository`]: `get` returns the
 //! default when no row exists, `upsert` writes one row per workspace.
 //!
-//! ## Why `workspace_sidecar_policy` has no row-level security
+//! ## Row-level security
 //!
-//! Migration 018's header says FORCE RLS alone would make every read return
-//! zero rows — true, because the RLS policy this codebase uses keys off
-//! `current_setting('app.current_workspace_id')` and neither method here sets
-//! it. But that is only half the picture, and the correction belongs
-//! somewhere it can be revised without changing a migration's checksum, so it
-//! lives here rather than in the .sql:
+//! Migration 018 shipped this table without any, and this module used to
+//! explain why: both methods bind the authenticated `workspace_id`, "so there
+//! is no cross-tenant read to prevent". Measured from a NOSUPERUSER /
+//! NOBYPASSRLS role armed to another workspace, there was: the table was
+//! readable and its rows overwritable across tenants, so one tenant could
+//! flip another's fail-open/fail-closed choice. Binding `workspace_id` in
+//! these queries protected these queries.
 //!
-//! The codebase's actual pattern is RLS **plus** a `set_config` on the same
-//! connection (see [`crate::db::budget_repo`]), which is a few lines of work,
-//! not impossible. RLS is omitted here for a weaker reason than the migration
-//! implies: both methods below bind the authenticated `workspace_id`
-//! explicitly, so there is no cross-tenant read to prevent, and matching
-//! `workspace_secure_mode` (007, also un-RLS'd) keeps the two per-workspace
-//! settings tables consistent. Adding RLS to both together is a reasonable
-//! follow-up; adding it to only this one would be inconsistency for its own
-//! sake.
+//! Migration 030 arms it with the standard `workspace_isolation` policy. The
+//! "FORCE RLS alone would make every read return zero rows" that 018's header
+//! warns about is real and is exactly why every method here goes through
+//! [`crate::db::scope::begin_scoped`]: it sets `app.current_workspace_id`
+//! transaction-locally and READS IT BACK, so an unarmed transaction fails
+//! loudly instead of answering nothing. Without that, an unset GUC would make
+//! [`Self::get_effective`] silently revert a workspace that chose
+//! `degrade_with_alert` back to `block` — fail-closed, so nothing would page,
+//! and the gateway would simply stop honouring a choice its operator made.
 
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use serde_json::json;
@@ -103,20 +104,29 @@ impl SidecarPolicyRepository {
     /// as a policy in its own right.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the query fails.
+    /// Returns `ApiError::Database` when the query fails and
+    /// `ApiError::Internal` when the tenancy scope does not arm — the latter
+    /// in preference to returning `None`, which the caller would read as
+    /// "this workspace never chose".
     pub async fn get(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Option<SidecarUnavailablePolicy>, ApiError> {
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
         let row = sqlx::query(
             "SELECT sidecar_unavailable
              FROM workspace_sidecar_policy
              WHERE workspace_id = $1",
         )
         .bind(workspace_id.0)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
 
         Ok(row
             .map(|r| SidecarUnavailablePolicy::from_db(&r.get::<String, _>("sidecar_unavailable"))))
@@ -165,8 +175,10 @@ impl SidecarPolicyRepository {
         deployment_default: SidecarUnavailablePolicy,
         actor: &AdminActor,
     ) -> Result<SidecarUnavailablePolicy, ApiError> {
-        // `admin_audit` is under FORCE RLS even though this table is not, so
-        // the transaction has to be scoped for the audit INSERT to be accepted.
+        // Both `admin_audit` (028) and this table (030) are under FORCE RLS,
+        // so the transaction has to be scoped for either write to be accepted.
+        // When this line was written only `admin_audit` was armed; 030 closed
+        // the other half.
         let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let before = sqlx::query(

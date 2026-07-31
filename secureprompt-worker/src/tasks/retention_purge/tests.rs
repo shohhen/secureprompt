@@ -13,7 +13,7 @@
 //! All fixture PII is synthetic.
 
 use super::*;
-use sqlx::{PgPool, Row as _};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// The gateway's own analytics database, so the ClickHouse assertions run

@@ -536,7 +536,74 @@ fn unix_to_utc(secs: u32) -> Option<DateTime<Utc>> {
 
 // ── proof-of-purge ────────────────────────────────────────────────────────
 
+/// The refusal recorded when the tenancy GUC did not take, matching
+/// `tasks::audit_export`'s constant of the same name.
+const SCOPE_NOT_ARMED: &str =
+    "the proof-of-purge transaction could not be scoped to the record's workspace, so \
+     nothing was written";
+
+/// Append one scope's proof-of-purge row.
+///
+/// Migration 030 put FORCE ROW LEVEL SECURITY on `retention_purge_audit` with
+/// a policy that admits `workspace_id IS NULL OR workspace_id =
+/// current_setting('app.current_workspace_id', true)::uuid`. That shape is
+/// what this function has to satisfy, and the two row shapes need different
+/// things from it:
+///
+///   * GLOBAL scopes (`token_vault_entries`, `refresh_tokens.device_context`)
+///     carry `workspace_id IS NULL`, which the policy admits with nothing
+///     armed. They go straight onto the pool.
+///   * PER-WORKSPACE scopes (`request_content_captures`) are rejected unless
+///     the GUC is armed to THAT row's workspace. A single run covers many
+///     workspaces, so the scope is armed per record rather than per run.
+///
+/// The scope is armed and READ BACK, for the same reason
+/// `db::scope::begin_scoped` does it on the API side: an unarmed transaction
+/// must fail loudly. Here the loud failure is real either way — an unarmed
+/// INSERT is refused with 42501 — but the read-back names the cause instead of
+/// leaving the caller to infer it from a policy violation.
+///
+/// MEASURED before 030 was accompanied by this change: with the table armed
+/// and the write left on a bare pool, the per-workspace INSERT failed
+/// `42501 new row violates row-level security policy for table
+/// "retention_purge_audit"`, while both global INSERTs succeeded. `run()`
+/// logs that failure as `retention_purge_audit_write_failed` and CONTINUES —
+/// so the purge would have happened and its evidence would not exist.
 async fn write_audit(pg: &PgPool, run_id: Uuid, record: &PurgeRecord) -> Result<(), sqlx::Error> {
+    let Some(workspace_id) = record.workspace_id else {
+        // Global scope. `workspace_id IS NULL` satisfies the policy on its
+        // own, and there is no workspace to arm the GUC to.
+        return insert_audit_row(pg, run_id, record).await;
+    };
+
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let armed: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if armed.as_deref() != Some(workspace_id.to_string().as_str()) {
+        return Err(sqlx::Error::Protocol(SCOPE_NOT_ARMED.to_owned()));
+    }
+
+    insert_audit_row(&mut *tx, run_id, record).await?;
+    tx.commit().await
+}
+
+/// The INSERT itself, over whichever executor [`write_audit`] chose — the pool
+/// for a global scope, the scoped transaction for a per-workspace one. One
+/// copy of the column list, so the two paths cannot drift.
+async fn insert_audit_row<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    record: &PurgeRecord,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query(
         "INSERT INTO retention_purge_audit
              (id, run_id, scope, workspace_id, cutoff, rows_deleted,
@@ -556,7 +623,7 @@ async fn write_audit(pg: &PgPool, run_id: Uuid, record: &PurgeRecord) -> Result<
     .bind(&record.status)
     .bind(record.error.as_deref())
     .bind(record.started_at)
-    .execute(pg)
+    .execute(executor)
     .await
     .map(|_| ())
 }
