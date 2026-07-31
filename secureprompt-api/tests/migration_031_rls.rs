@@ -32,7 +32,9 @@
 //! it does not, the connection is not RLS-subject and the tenancy assertions
 //! that follow are measuring nothing.
 
-use sqlx::postgres::{PgConnectOptions, PgConnection};
+use secureprompt_api::db::secure_mode_repo::SecureModeRepository;
+use secureprompt_common::types::WorkspaceId;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, Row};
 use uuid::Uuid;
 
@@ -189,6 +191,49 @@ async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
     conn
 }
 
+/// A POOL onto the same `#[sqlx::test]` database as `RLS_ROLE`, for driving a
+/// repository rather than raw SQL. Same premise assertions, same reason.
+///
+/// `max_connections(4)` / `min_connections(2)`: more than one, so a repository
+/// that armed the scope outside its transaction has a real chance of reading
+/// on a different connection and failing here.
+async fn low_privilege_pool(pool: &PgPool) -> PgPool {
+    ensure_low_privilege_role(pool).await;
+
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+
+    let low = PgPoolOptions::new()
+        .max_connections(4)
+        .min_connections(2)
+        .connect_with(options)
+        .await
+        .expect("low-privilege pool onto the test database");
+
+    let row = sqlx::query(
+        "SELECT current_user::text AS who, rolsuper, rolbypassrls
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&low)
+    .await
+    .expect("identity probe");
+
+    let who: String = row.get("who");
+    assert_eq!(who, RLS_ROLE, "premise: connected as the wrong role");
+    assert!(
+        !row.get::<bool, _>("rolsuper"),
+        "premise: {who} is a SUPERUSER, so it bypasses RLS and this test proves nothing"
+    );
+    assert!(
+        !row.get::<bool, _>("rolbypassrls"),
+        "premise: {who} has BYPASSRLS, so it bypasses RLS and this test proves nothing"
+    );
+
+    low
+}
+
 /// Point the connection's RLS predicate at one workspace, and read it back.
 async fn arm_scope(conn: &mut PgConnection, workspace_id: Uuid) {
     sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
@@ -243,15 +288,23 @@ async fn assert_positive_control(conn: &mut PgConnection, own: &str, foreign: &s
 // `users` — email and password_hash
 // ===========================================================================
 
-/// THE FINDING. Workspace B's `email` and `password_hash` read from
-/// workspace A's armed scope.
+/// THE OPEN DEFECT, recorded as a measurement rather than a claim.
 ///
-/// `users` carries a NOT NULL `workspace_id` and is the system of record for
-/// dashboard credentials. It is in no arming list in the schema, so the only
-/// tenancy control on it is whatever `WHERE workspace_id = $n` each individual
-/// query happens to carry — and eleven production query sites carry none.
+/// **This test asserts that a leak IS PRESENT. It is not an approval of it.**
+/// Migration 031 deliberately does not arm `users`, and this test is the
+/// tripwire that fires the moment somebody does, because arming the table is
+/// only the first of roughly twenty-two changes and the other twenty-one break
+/// authentication if they are skipped. The reasoning is in the header of
+/// `migrations/031_arm_rls_on_workspace_secure_mode.sql`, Part 2.
+///
+/// What is measured here, from a scope armed to workspace A with the
+/// `policy_rules` positive control isolated on the same connection: workspace
+/// B's `users` row comes back in full, `email` and `password_hash` together.
+///
+/// When `users` is finally armed, this test fails on its FIRST assertion —
+/// which is the intended signal, and the failure message names the work.
 #[sqlx::test]
-async fn users_credentials_are_isolated_from_a_foreign_armed_scope(pool: PgPool) {
+async fn users_is_not_armed_and_this_is_the_open_defect(pool: PgPool) {
     let workspace_a = seed_workspace(&pool, "Users RLS A").await;
     let workspace_b = seed_workspace(&pool, "Users RLS B").await;
 
@@ -261,11 +314,40 @@ async fn users_credentials_are_isolated_from_a_foreign_armed_scope(pool: PgPool)
     seed_rule(&pool, workspace_a, "control-a").await;
     seed_rule(&pool, workspace_b, "control-b").await;
 
+    // THE TRIPWIRE. Deliberately the first assertion, so that arming `users`
+    // is reported as "you have work to do" and not as a confusing cross-tenant
+    // failure further down.
+    let flags = rls_flags(&pool, "users").await;
+    assert_eq!(
+        flags,
+        (false, false),
+        "`users` has gained row-level security. That is the right destination, \
+         but arming the table is one of ~22 changes and the rest are not \
+         optional:\n\
+         \x20 * `UserRepository::find_by_email_with_role` is the PRE-AUTH \
+         login lookup — by email, before any workspace is known. Under a \
+         workspace policy it returns zero rows and EVERY LOGIN in the \
+         deployment silently fails. It needs a SECURITY DEFINER function \
+         (see `security_definer_escapes_force_rls_only_if_its_owner_bypasses` \
+         below for the ownership constraint).\n\
+         \x20 * `UserRepository::count_total_users` and \
+         `internal.rs::build_signed_attestation` count users DEPLOYMENT-WIDE \
+         for license seats; a per-workspace count evades the seat cap and \
+         publishes a signed 0.\n\
+         \x20 * ~18 sites (`/v1/users`, `/v1/me/profile`, session revocation, \
+         admin-audit actor attribution, the 2FA state machine, the openai \
+         `device_mac` write) already say `WHERE workspace_id = $n` but run on \
+         the BARE POOL with no GUC. RLS filters independently of the WHERE \
+         clause, so each becomes a silent zero.\n\
+         Read migrations/031_arm_rls_on_workspace_secure_mode.sql Part 2, then \
+         delete this test."
+    );
+
     let mut conn = low_privilege_connection(&pool).await;
     arm_scope(&mut conn, workspace_a).await;
     assert_positive_control(&mut conn, "control-a", "control-b").await;
 
-    // The read an attacker with the application role would run.
+    // The read an attacker holding the application role would run.
     let leaked: Vec<(String, String)> =
         sqlx::query_as("SELECT email, password_hash FROM users WHERE workspace_id = $1")
             .bind(workspace_b)
@@ -273,16 +355,231 @@ async fn users_credentials_are_isolated_from_a_foreign_armed_scope(pool: PgPool)
             .await
             .expect("cross-tenant users read");
 
-    let flags = rls_flags(&pool, "users").await;
+    assert_eq!(
+        leaked,
+        vec![("owner@b.example".to_owned(), "$argon2id$BBBB".to_owned())],
+        "the cross-tenant credential read is the measurement this test exists \
+         to keep visible. The positive control above passed, so a change here \
+         is a change in `users`, not in the connection."
+    );
+}
+
+// ===========================================================================
+// The REPOSITORY path onto `workspace_secure_mode`
+// ===========================================================================
+
+/// Arming the table is only half of the change; the other half is that the
+/// read sets `app.current_workspace_id`. This is the half no `#[sqlx::test]`
+/// can see, because the compose role is a SUPERUSER and bypasses RLS
+/// unconditionally — so `SecureModeRepository::get` reading on the bare pool
+/// is fine TODAY and becomes a silent zero the moment the DB role-split lands.
+///
+/// A silent zero here is not a hidden row. `get` resolves "no row" to
+/// `SecureModeRow::default()`, whose `enabled` is `false`, and
+/// `pipeline::service` treats that as "secure mode off" and proceeds with
+/// policy-only behaviour. A workspace that switched redaction ON would have it
+/// silently switched OFF, with nothing logged.
+///
+/// A POOL rather than a single connection, deliberately: `set_config(..., true)`
+/// is transaction-local and a pool hands successive statements to different
+/// connections, so a repository that armed the scope outside its transaction
+/// would pass a single-connection test and fail here.
+///
+/// The NEGATIVE CONTROL is the second workspace, which really has no row and
+/// must resolve to the default. Without it, "A reads back enabled/strict"
+/// would also be satisfied by a repository that ignored `workspace_id`.
+#[sqlx::test]
+async fn secure_mode_repo_get_survives_a_non_bypassing_role(pool: PgPool) {
+    let workspace_a = seed_workspace(&pool, "Secure Mode Repo A").await;
+    let workspace_b = seed_workspace(&pool, "Secure Mode Repo B").await;
+
+    seed_secure_mode(&pool, workspace_a, "strict").await;
+
+    // PREMISE: the row is on disk and migration 031 armed the table, so the
+    // read below really passes through a policy.
+    assert_eq!(
+        rls_flags(&pool, "workspace_secure_mode").await,
+        (true, true),
+        "premise: migration 031 must have armed this table, or the \
+         low-privilege pool reads everything and this test measures nothing"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    let repo = SecureModeRepository::new(low);
+
+    let row = repo
+        .get(WorkspaceId(workspace_a))
+        .await
+        .expect("reading a workspace's own secure-mode config must not error");
     assert!(
-        leaked.is_empty(),
-        "CROSS-TENANT CREDENTIAL LEAK: a scope armed to workspace A read {} \
-         row(s) of workspace B's users, including the password hash: \
-         {leaked:?}. `users` has (rowsecurity, forcerowsecurity) = {flags:?} \
-         — it is in no RLS arming list in any migration. The positive control \
-         above passed, so this is a property of the `users` table and not of \
-         this connection.",
-        leaked.len()
+        row.enabled && row.level == "strict",
+        "workspace A's stored secure-mode config must survive the read, got \
+         enabled={} level={:?}. Reading back the default here is the silent \
+         zero: redaction would be off for a workspace that turned it on, and \
+         `pipeline::service` would log nothing.",
+        row.enabled,
+        row.level
+    );
+
+    // NEGATIVE CONTROL: a workspace with no row really does resolve to the
+    // default, so the assertion above is about the stored row and not about
+    // the repository returning a constant.
+    let absent = repo
+        .get(WorkspaceId(workspace_b))
+        .await
+        .expect("a workspace with no row must resolve, not error");
+    assert!(
+        !absent.enabled && absent.level == "standard",
+        "a workspace that never chose must still read as the default, got \
+         enabled={} level={:?}",
+        absent.enabled,
+        absent.level
+    );
+}
+
+// ===========================================================================
+// The constraint that decides HOW `users` can eventually be armed
+// ===========================================================================
+
+/// `SECURITY DEFINER` is the standard PostgreSQL answer for the pre-auth login
+/// lookup, and it does NOT work by itself under `FORCE ROW LEVEL SECURITY`.
+///
+/// This is measured rather than asserted because migration 031's header states
+/// it as the open question that defers arming `users`, and a header claiming a
+/// database behaviour nobody ran is how the circular justification on
+/// `workspace_secure_mode` came about in the first place.
+///
+/// Both directions are measured on the same scratch table, so neither result
+/// can be an artefact of the fixture:
+///   * owner WITHOUT `BYPASSRLS` — the definer function is still filtered by
+///     the policy, and a login lookup through it would return nothing;
+///   * owner WITH `BYPASSRLS` — the same function body now sees every row.
+///
+/// The consequence for the `users` design: which role owns that function, and
+/// whether it carries `BYPASSRLS`, is a DB role-split decision. Today's
+/// compose role is a SUPERUSER, so a definer function written now would appear
+/// to work and would break when the role-split lands.
+#[sqlx::test]
+async fn security_definer_escapes_force_rls_only_if_its_owner_bypasses(pool: PgPool) {
+    let workspace_a = seed_workspace(&pool, "Definer A").await;
+    let workspace_b = seed_workspace(&pool, "Definer B").await;
+
+    // A scratch table armed exactly like every `workspace_isolation` table in
+    // this schema, so the result transfers to `users`.
+    sqlx::raw_sql(
+        "CREATE TABLE p1d_definer_probe (
+             workspace_id UUID NOT NULL,
+             secret       TEXT NOT NULL
+         );
+         ALTER TABLE p1d_definer_probe ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE p1d_definer_probe FORCE ROW LEVEL SECURITY;
+         CREATE POLICY workspace_isolation ON p1d_definer_probe
+             USING (workspace_id = current_setting('app.current_workspace_id', true)::uuid);",
+    )
+    .execute(&pool)
+    .await
+    .expect("scratch table armed like the real ones");
+
+    for (workspace, secret) in [(workspace_a, "secret-a"), (workspace_b, "secret-b")] {
+        sqlx::query("INSERT INTO p1d_definer_probe (workspace_id, secret) VALUES ($1, $2)")
+            .bind(workspace)
+            .bind(secret)
+            .execute(&pool)
+            .await
+            .expect("probe row insert");
+    }
+
+    // The shape a login lookup would have: no workspace predicate, because the
+    // caller does not know one yet.
+    sqlx::raw_sql(
+        "CREATE FUNCTION p1d_lookup_all() RETURNS SETOF TEXT
+             LANGUAGE sql
+             SECURITY DEFINER
+             SET search_path = pg_catalog, public
+         AS $$ SELECT secret FROM public.p1d_definer_probe ORDER BY secret $$;",
+    )
+    .execute(&pool)
+    .await
+    .expect("SECURITY DEFINER lookup function");
+
+    ensure_low_privilege_role(&pool).await;
+
+    // A NOLOGIN role that exists only to own the function in the second half.
+    // Roles are cluster-global while `#[sqlx::test]` databases are per-test,
+    // so this races with sibling tests and must tolerate losing the race.
+    sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             CREATE ROLE p1d_definer_owner NOLOGIN BYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+             WHEN unique_violation THEN NULL;
+         END $$;
+         GRANT SELECT ON p1d_definer_probe TO p1d_definer_owner;",
+    )
+    .execute(&pool)
+    .await
+    .expect("bypassing owner role");
+
+    // PREMISE: the two candidate owners really differ in the one attribute
+    // this test is about. Without this the two halves could differ for some
+    // other reason and the test would be measuring nothing.
+    let bypass: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT rolname::text, rolbypassrls FROM pg_roles
+         WHERE rolname IN ('secureprompt_runner', 'p1d_definer_owner')
+         ORDER BY rolname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("owner attribute probe");
+    assert_eq!(
+        bypass,
+        vec![
+            ("p1d_definer_owner".to_owned(), true),
+            ("secureprompt_runner".to_owned(), false),
+        ],
+        "premise: the two function owners must differ in BYPASSRLS and nothing else"
+    );
+
+    // ── Half 1: owner does NOT bypass RLS ────────────────────────────────
+    sqlx::raw_sql("ALTER FUNCTION p1d_lookup_all() OWNER TO secureprompt_runner")
+        .execute(&pool)
+        .await
+        .expect("hand the function to the non-bypassing role");
+
+    let mut conn = low_privilege_connection(&pool).await;
+    arm_scope(&mut conn, workspace_a).await;
+
+    let filtered: Vec<String> = sqlx::query_scalar("SELECT * FROM p1d_lookup_all()")
+        .fetch_all(&mut conn)
+        .await
+        .expect("definer call under a non-bypassing owner");
+    assert_eq!(
+        filtered,
+        vec!["secret-a".to_owned()],
+        "SECURITY DEFINER did NOT escape the policy: FORCE ROW LEVEL SECURITY \
+         applies to the function's owner too. A login lookup written this way \
+         would see only the workspace the session happens to be armed to — and \
+         the pre-auth path is armed to none, so it would see nothing."
+    );
+
+    // ── Half 2: same function body, owner WITH BYPASSRLS ─────────────────
+    sqlx::raw_sql("ALTER FUNCTION p1d_lookup_all() OWNER TO p1d_definer_owner")
+        .execute(&pool)
+        .await
+        .expect("hand the function to the bypassing role");
+
+    let unfiltered: Vec<String> = sqlx::query_scalar("SELECT * FROM p1d_lookup_all()")
+        .fetch_all(&mut conn)
+        .await
+        .expect("definer call under a bypassing owner");
+    assert_eq!(
+        unfiltered,
+        vec!["secret-a".to_owned(), "secret-b".to_owned()],
+        "with a BYPASSRLS owner the identical function body sees every row. \
+         This is the mechanism a `users` login lookup would rely on, and it is \
+         why the function's OWNERSHIP is a role-split decision rather than \
+         something migration 031 could settle."
     );
 }
 
