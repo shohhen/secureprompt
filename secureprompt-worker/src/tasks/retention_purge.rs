@@ -45,6 +45,29 @@
 //! purge, and neither must abort the run silently: a failed scope still
 //! writes an audit row, with `status = 'error'` and the message, so the gap
 //! is visible in the same place the successes are.
+//!
+//! # "Nothing to do" and "I could not see anything" are different answers
+//!
+//! Migration 030 armed `workspace_raw_capture` and migration 033 made an
+//! unscoped read of an armed table INVISIBLE — `Ok(vec![])`, not `22P02`. The
+//! capture sweep read that table on a bare pool, so under a NOSUPERUSER /
+//! NOBYPASSRLS role it saw no settings at all, built one record PER SETTINGS
+//! ROW and therefore built NONE, and [`PurgeOutcome::all_ok`] — an `all(...)`
+//! over the empty set — was vacuously true. The job reported success, the
+//! captured plaintext was never purged, and the trail did not even mention the
+//! scope.
+//!
+//! Two things fix that and both are load-bearing. The sweep now enumerates
+//! `workspaces` (not policed, and it CHECKS that before trusting it) and reads
+//! each workspace's settings inside a transaction armed to that workspace and
+//! read back, so `no settings row` is a fact rather than a blind spot. And it
+//! writes ONE global census record per run, always, whose `status` says
+//! whether it could see — so a run that swept zero workspaces because it was
+//! blind records `error` and makes `all_ok()` false, while a run that swept
+//! them and found nothing to do records `ok`. The pair
+//! `a_capture_sweep_with_nothing_to_do_still_records_the_scope` /
+//! `a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly` measures
+//! both, under the runner role.
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row as _};
@@ -371,6 +394,184 @@ struct CaptureStats {
     newest: u32,
 }
 
+/// The refusal recorded when the sweep's ONE bare-pool read is itself policed.
+///
+/// The enumeration below is sound only because `workspaces` is not under row
+/// level security. If a migration ever arms it, the enumeration stops being a
+/// list of every tenant and becomes a silent empty set — the same shape as the
+/// defect this whole function was rewritten to remove, one level up. So the
+/// precondition is CHECKED rather than commented, and its failure is recorded.
+const WORKSPACES_ARE_POLICED: &str =
+    "row security is active on `workspaces` for this connection, so enumerating \
+     it would return a filtered list and the capture sweep would silently skip \
+     every workspace it cannot see";
+
+/// The refusal recorded when one workspace's settings transaction did not take
+/// the scope. Same shape and the same reason as [`SCOPE_NOT_ARMED`] below and
+/// `tasks::api_key_rotation`'s constant of that name.
+const SETTINGS_SCOPE_NOT_ARMED: &str =
+    "the retention-settings transaction could not be scoped to this workspace, \
+     so its captured content was not purged";
+
+/// What one capture sweep saw, as opposed to what it deleted.
+///
+/// This is the answer to "was there nothing to do, or could I not see
+/// anything?", and it exists because the two used to be the same observation.
+#[derive(Debug, Default, Clone, Copy)]
+struct SweepCensus {
+    /// Workspaces the sweep enumerated and looked at.
+    enumerated: usize,
+    /// Of those, the ones with a `workspace_raw_capture` row — read from a
+    /// transaction armed to that workspace, so `no row` means no row.
+    configured: usize,
+    /// Workspaces whose settings could not be read at all. Any non-zero value
+    /// makes the census record `status = 'error'`, which makes
+    /// [`PurgeOutcome::all_ok`] false and the job record itself as FAILED.
+    unreadable: usize,
+}
+
+/// Enumerate every tenant, refusing to do so blind.
+///
+/// `workspaces` carries no `workspace_id` and no policy, which is what lets the
+/// one cross-tenant read this job needs stay on a bare pool. MEASURED both
+/// ways: `SELECT row_security_active('public.workspaces')` answers `false` for
+/// the runner role on the current schema, and `true` in
+/// `a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly`, which arms
+/// the table and requires the run to fail.
+async fn enumerate_workspaces(pg: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
+    let policed: bool = sqlx::query_scalar("SELECT row_security_active('public.workspaces')")
+        .fetch_one(pg)
+        .await?;
+    if policed {
+        return Err(sqlx::Error::Protocol(WORKSPACES_ARE_POLICED.to_owned()));
+    }
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces")
+        .fetch_all(pg)
+        .await
+}
+
+/// One workspace's CURRENT retention, read inside a transaction armed to that
+/// workspace and READ BACK before the SELECT runs.
+///
+/// The read-back is the difference between this and the bare-pool read it
+/// replaces. `set_config` succeeding does not prove the GUC holds the value the
+/// policy will filter by — and if it does not, migration 030's
+/// `workspace_isolation` predicate is NULL for every row and the SELECT
+/// answers `Ok(None)`, indistinguishable from a workspace that never switched
+/// capture on. `Ok(None)` from this function means the row is genuinely absent.
+async fn read_capture_retention(
+    pg: &PgPool,
+    workspace_id: Uuid,
+) -> Result<Option<i32>, sqlx::Error> {
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let armed: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if armed.as_deref() != Some(workspace_id.to_string().as_str()) {
+        return Err(sqlx::Error::Protocol(SETTINGS_SCOPE_NOT_ARMED.to_owned()));
+    }
+
+    let retention_days: Option<i32> = sqlx::query_scalar(
+        "SELECT retention_days FROM workspace_raw_capture WHERE workspace_id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(retention_days)
+}
+
+/// The CENSUS row: one global record per run saying whether the sweep could
+/// see, written whether or not any workspace had work.
+///
+/// It is `workspace_id IS NULL` on purpose, and that is load-bearing twice
+/// over. Migration 030's `workspace_isolation_or_global` policy admits a NULL
+/// row with nothing armed, so this is the one record of this scope that can
+/// always be written — including on the runs where arming a scope is exactly
+/// what failed. And it is the record whose ABSENCE used to be the symptom:
+/// `purge_content_captures` built one record per settings row, so a read that
+/// returned nothing produced nothing, `PurgeOutcome::all_ok` was
+/// `all(...)` over the empty set — true — and the trail simply omitted the
+/// scope for that run.
+///
+/// `rows_deleted` is 0 by construction: the census deletes nothing itself and
+/// the per-workspace records carry the counts, so
+/// [`PurgeOutcome::total_deleted`] must not double-count them.
+/// `rows_remaining_past_cutoff` is 0 for the same reason — the census has no
+/// cutoff of its own to re-derive against, and the per-workspace records carry
+/// the number an auditor recomputes. The workspace counts live in the
+/// `retention.purge capture sweep` log line, not in columns that mean rows.
+fn census_record(
+    census: SweepCensus,
+    now: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    enumeration_error: Option<&str>,
+) -> PurgeRecord {
+    if let Some(error) = enumeration_error {
+        return PurgeRecord::failure(SCOPE_CONTENT_CAPTURES, None, now, started_at, error);
+    }
+    if census.unreadable > 0 {
+        return PurgeRecord::failure(
+            SCOPE_CONTENT_CAPTURES,
+            None,
+            now,
+            started_at,
+            &format!(
+                "{} of {} workspaces' retention settings could not be read, so \
+                 their captured content was not purged",
+                census.unreadable, census.enumerated
+            ),
+        );
+    }
+    PurgeRecord {
+        scope: SCOPE_CONTENT_CAPTURES.to_owned(),
+        workspace_id: None,
+        cutoff: now,
+        rows_deleted: 0,
+        oldest_deleted: None,
+        newest_deleted: None,
+        rows_remaining_past_cutoff: 0,
+        status: "ok".to_owned(),
+        error: None,
+        started_at,
+    }
+}
+
+/// Sweep captured content in every workspace, once per workspace, with that
+/// workspace's scope armed.
+///
+/// # Why a loop and not one statement, and why not a wider policy
+///
+/// The sweep is cross-tenant by design — it is one nightly job for the whole
+/// deployment — but "cross-tenant" is not a reason to give the job a
+/// cross-tenant VIEW of `workspace_raw_capture`.
+/// `tasks::api_key_rotation::run` solved the identical shape and rejected the
+/// same two shortcuts for the same reasons: a policy admitting the sweep would
+/// hang off a GUC that any holder of the same connection can set, widening the
+/// table for every statement in the process rather than this one; and a
+/// `BYPASSRLS` worker role removes the boundary from every query the worker
+/// makes, including ones written later by someone who does not know the role is
+/// privileged. This does neither. The widest read it adds is
+/// `SELECT id FROM workspaces` — a list of tenant UUIDs the worker already
+/// holds the credentials to obtain.
+///
+/// # Failure is per workspace and it is LOUD
+///
+/// One workspace erroring does not abort the others; it produces that
+/// workspace's own `status = 'error'` record AND increments the census's
+/// `unreadable`, which turns the census record into a failure and makes
+/// [`PurgeOutcome::all_ok`] false. The silent-success path this replaces is the
+/// whole defect.
+///
+/// It also fails CLOSED with respect to deletion, which is the older invariant
+/// and still holds: an unreadable settings row must never be interpreted as
+/// "retention is zero, delete everything", so a workspace whose settings could
+/// not be read is SKIPPED, not purged with a default.
 async fn purge_content_captures(
     pg: &PgPool,
     ch: &clickhouse::Client,
@@ -378,43 +579,75 @@ async fn purge_content_captures(
 ) -> Vec<PurgeRecord> {
     let started_at = Utc::now();
 
-    // The retention each workspace has configured RIGHT NOW — not the value
-    // that was in force when the rows were written. That difference is the
-    // entire point of this scope.
-    let settings = sqlx::query("SELECT workspace_id, retention_days FROM workspace_raw_capture")
-        .fetch_all(pg)
-        .await;
-
-    let settings = match settings {
-        Ok(rows) => rows,
+    let workspaces = match enumerate_workspaces(pg).await {
+        Ok(ids) => ids,
         Err(e) => {
             tracing::error!(
                 alert = "retention_purge_failed",
                 scope = SCOPE_CONTENT_CAPTURES,
                 error = %e,
-                "could not read workspace retention settings; skipping capture purge"
+                "could not enumerate workspaces; captured content was not purged \
+                 anywhere and this run is recorded as FAILED"
             );
-            // Fail CLOSED with respect to deletion: an unreadable settings
-            // table must never be interpreted as "retention is zero, delete
-            // everything".
-            return vec![PurgeRecord::failure(
-                SCOPE_CONTENT_CAPTURES,
-                None,
+            return vec![census_record(
+                SweepCensus::default(),
                 now,
                 started_at,
-                &e.to_string(),
+                Some(&e.to_string()),
             )];
         }
     };
 
-    let mut records = Vec::with_capacity(settings.len());
-    for row in settings {
-        let workspace_id: Uuid = row.get("workspace_id");
-        let retention_days: i32 = row.get("retention_days");
-        records.push(
-            purge_one_workspace_captures(ch, workspace_id, retention_days, now, started_at).await,
-        );
+    let mut census = SweepCensus {
+        enumerated: workspaces.len(),
+        ..SweepCensus::default()
+    };
+    let mut records = Vec::new();
+    for workspace_id in workspaces {
+        // The retention this workspace has configured RIGHT NOW — not the
+        // value that was in force when the rows were written. That difference
+        // is the entire point of this scope.
+        match read_capture_retention(pg, workspace_id).await {
+            // Capture was never switched on here. Nothing to purge, and — read
+            // back from an armed transaction — that is a fact rather than a
+            // blind spot, so it gets no record of its own.
+            Ok(None) => {}
+            Ok(Some(retention_days)) => {
+                census.configured += 1;
+                records.push(
+                    purge_one_workspace_captures(ch, workspace_id, retention_days, now, started_at)
+                        .await,
+                );
+            }
+            Err(e) => {
+                census.unreadable += 1;
+                tracing::error!(
+                    alert = "retention_purge_failed",
+                    scope = SCOPE_CONTENT_CAPTURES,
+                    %workspace_id,
+                    error = %e,
+                    "could not read this workspace's retention settings; its \
+                     captured content was NOT purged"
+                );
+                records.push(PurgeRecord::failure(
+                    SCOPE_CONTENT_CAPTURES,
+                    Some(workspace_id),
+                    now,
+                    started_at,
+                    &e.to_string(),
+                ));
+            }
+        }
     }
+
+    tracing::info!(
+        scope = SCOPE_CONTENT_CAPTURES,
+        enumerated = census.enumerated,
+        configured = census.configured,
+        unreadable = census.unreadable,
+        "retention.purge capture sweep"
+    );
+    records.push(census_record(census, now, started_at, None));
     records
 }
 
@@ -550,12 +783,17 @@ const SCOPE_NOT_ARMED: &str =
 /// what this function has to satisfy, and the two row shapes need different
 /// things from it:
 ///
-///   * GLOBAL scopes (`token_vault_entries`, `refresh_tokens.device_context`)
-///     carry `workspace_id IS NULL`, which the policy admits with nothing
-///     armed. They go straight onto the pool.
-///   * PER-WORKSPACE scopes (`request_content_captures`) are rejected unless
-///     the GUC is armed to THAT row's workspace. A single run covers many
-///     workspaces, so the scope is armed per record rather than per run.
+///   * GLOBAL records carry `workspace_id IS NULL`, which the policy admits
+///     with nothing armed. They go straight onto the pool. Both
+///     `token_vault_entries` and `refresh_tokens.device_context` are wholly of
+///     this shape, and so is the ONE census record
+///     [`purge_content_captures`] writes per run — deliberately, because it is
+///     the record that has to survive a run in which arming a scope is what
+///     failed.
+///   * PER-WORKSPACE records (the rest of `request_content_captures`, one per
+///     configured workspace) are rejected unless the GUC is armed to THAT
+///     row's workspace. A single run covers many workspaces, so the scope is
+///     armed per record rather than per run.
 ///
 /// The scope is armed and READ BACK, for the same reason
 /// `db::scope::begin_scoped` does it on the API side: an unarmed transaction
