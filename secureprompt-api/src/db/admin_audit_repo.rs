@@ -85,6 +85,17 @@ pub enum AdminAuditAction {
     PolicyRuleEnabledChanged,
     PolicyRuleDryRunChanged,
     UserCreated,
+    // P1A — migration 029. The four surfaces FU5 named as unreached.
+    TwoFactorEnrollmentStarted,
+    TwoFactorEnabled,
+    TwoFactorDisabled,
+    LicenseActivated,
+    LicenseCleared,
+    BudgetUpdated,
+    SecureModeUpdated,
+    SidecarPolicyUpdated,
+    LoginSucceeded,
+    SecondFactorVerified,
 }
 
 impl AdminAuditAction {
@@ -102,6 +113,16 @@ impl AdminAuditAction {
         Self::PolicyRuleEnabledChanged,
         Self::PolicyRuleDryRunChanged,
         Self::UserCreated,
+        Self::TwoFactorEnrollmentStarted,
+        Self::TwoFactorEnabled,
+        Self::TwoFactorDisabled,
+        Self::LicenseActivated,
+        Self::LicenseCleared,
+        Self::BudgetUpdated,
+        Self::SecureModeUpdated,
+        Self::SidecarPolicyUpdated,
+        Self::LoginSucceeded,
+        Self::SecondFactorVerified,
     ];
 
     /// The stored `action`, which is also the exported `event_type` verbatim.
@@ -124,6 +145,16 @@ impl AdminAuditAction {
             Self::PolicyRuleEnabledChanged => "policy_rule.enabled_changed",
             Self::PolicyRuleDryRunChanged => "policy_rule.dry_run_changed",
             Self::UserCreated => "user.created",
+            Self::TwoFactorEnrollmentStarted => "two_factor.enrollment_started",
+            Self::TwoFactorEnabled => "two_factor.enabled",
+            Self::TwoFactorDisabled => "two_factor.disabled",
+            Self::LicenseActivated => "license.activated",
+            Self::LicenseCleared => "license.cleared",
+            Self::BudgetUpdated => "budget.updated",
+            Self::SecureModeUpdated => "secure_mode.updated",
+            Self::SidecarPolicyUpdated => "sidecar_policy.updated",
+            Self::LoginSucceeded => "auth.login_succeeded",
+            Self::SecondFactorVerified => "auth.second_factor_verified",
         }
     }
 
@@ -143,7 +174,24 @@ impl AdminAuditAction {
             | Self::PolicyRuleDeleted
             | Self::PolicyRuleEnabledChanged
             | Self::PolicyRuleDryRunChanged => "policy_rule",
-            Self::UserCreated => "user",
+            // The acted-on object is a person's account — their own, for the
+            // self-service 2FA and login actions. `target_user_id` is filled
+            // as well, so these land in the export's existing user columns.
+            Self::UserCreated
+            | Self::TwoFactorEnrollmentStarted
+            | Self::TwoFactorEnabled
+            | Self::TwoFactorDisabled
+            | Self::LoginSucceeded
+            | Self::SecondFactorVerified => "user",
+            // The license is deployment-wide and has no UUID of its own;
+            // `target_label` carries the vendor's `lic_id`, which is what a
+            // revocation is a verdict about.
+            Self::LicenseActivated | Self::LicenseCleared => "license",
+            // These settings have no id of their own — the workspace IS the
+            // object, so `target_id` is the workspace id.
+            Self::BudgetUpdated | Self::SecureModeUpdated | Self::SidecarPolicyUpdated => {
+                "workspace"
+            }
         }
     }
 }
@@ -222,6 +270,43 @@ impl AdminAuditEntry {
             target_role: None,
             detail: json!({}),
         }
+    }
+
+    /// An entry for an object that has a NAME but no UUID of its own.
+    ///
+    /// P1A needs exactly one: the deployment's license, whose identity is the
+    /// vendor-issued `lic_id` string — the value a revocation is a verdict
+    /// about. Putting it in `target_label` rather than inventing a UUID keeps
+    /// `target_id` meaning "the primary key of a row in this database", which
+    /// is what every other action's `target_id` means.
+    #[must_use]
+    pub fn on_named_object(action: AdminAuditAction, label: Option<String>) -> Self {
+        Self {
+            action,
+            target_id: None,
+            target_label: label,
+            target_user_id: None,
+            target_email: None,
+            target_role: None,
+            detail: json!({}),
+        }
+    }
+
+    /// An entry whose target is the acting principal's own account.
+    ///
+    /// The self-service actions — 2FA enrolment, confirmation and reset, and
+    /// login — have actor and target equal. Spelling that out here rather than
+    /// at four call sites keeps `target_user_id` populated, which is what puts
+    /// these rows in the export's existing user columns instead of burying the
+    /// principal in `detail`.
+    #[must_use]
+    pub fn on_own_account(
+        action: AdminAuditAction,
+        user_id: Uuid,
+        email: &str,
+        role: &str,
+    ) -> Self {
+        Self::on_object(action, user_id, None).targeting_user(user_id, email, role)
     }
 
     /// Attach the action-specific facts.

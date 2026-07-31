@@ -386,12 +386,15 @@ pub const CONTROL_COLUMNS: &[(&str, &str)] = &[
          this workspace stores raw prompt/response content, or for how long), \
          `retention.purge` (a scheduled purge run reported what it deleted for \
          this workspace), `session.revoked` (an administrator terminated a \
-         user's sessions), or one of the FU5 `admin_audit` actions listed in \
+         user's sessions), or one of the `admin_audit` actions listed in \
          this section's coverage note — `api_key.*`, `provider_credential.*`, \
-         `policy_rule.*` and `user.created`. The `admin_audit` values are the \
-         `action` column passed through VERBATIM, so this vocabulary grows with \
-         the product rather than with a translation table somebody has to \
-         remember to extend.",
+         `policy_rule.*`, `user.created` (FU5) and `two_factor.*`, `license.*`, \
+         `budget.updated`, `secure_mode.updated`, `sidecar_policy.updated`, \
+         `auth.login_succeeded` and `auth.second_factor_verified` (P1A). The \
+         `admin_audit` values are the `action` column passed through VERBATIM, \
+         so this vocabulary grows with the product rather than with a \
+         translation table somebody has to remember to extend — P1A's ten \
+         actions reached this export with no change to the export code at all.",
     ),
     (
         "source_table",
@@ -458,13 +461,31 @@ pub const CONTROL_COLUMNS: &[(&str, &str)] = &[
          `policy_rule.deleted` have `priority`, `rule_action`, `enabled` and \
          `dry_run`; `policy_rule.updated` has `changed` plus \
          `conditions_changed` and `action_params_changed`; the two toggles have \
-         `before` and `after`; `user.created` has `role_granted`. `changed` is \
+         `before` and `after`; `user.created` has `role_granted`. The P1A \
+         actions carry: `two_factor.enrollment_started` — `backup_codes_issued` \
+         (how many single-use recovery credentials now exist) and \
+         `reenrollment`; `two_factor.disabled` — `verified_with` (`totp` or \
+         `backup_code`, which factor authorised the reset); `license.activated` \
+         — `status`, `expires_at`, `feature_count`, `source_before` and \
+         `source_after` (each `db`, `env` or `none`), with the vendor `lic_id` \
+         in `target_label`; `license.cleared` — `status_after` and \
+         `source_after`; `budget.updated` and `secure_mode.updated` — \
+         `changed`, in the same shape as `policy_rule.updated`; \
+         `sidecar_policy.updated` — `before` and `after`; \
+         `auth.login_succeeded` — `method` (`password` or `oidc`) and `outcome` \
+         (`session_issued`, `second_factor_required` or `enrolment_required`); \
+         `auth.second_factor_verified` — `verified_with`. `changed` is \
          an object holding ONLY the fields that actually moved, each as \
          `{before, after}`, so an edit does not read as though it rewrote \
          everything. NO SECRET APPEARS ANYWHERE IN `detail`, BY CONSTRUCTION: \
          every value is built from a typed column the product already stores, \
-         and an API key, a provider credential, a password and a TOTP secret \
-         are never among them — nor is any prefix or hash of one. Where a value \
+         and an API key, a provider credential, a password, a TOTP secret, a \
+         2FA backup code and the signed license token are never among them — \
+         nor is any prefix or hash of one. A login event carries neither the \
+         client address nor any form of the User-Agent, including the reduced \
+         `{browser} on {os}` descriptor a SESSION row holds: that descriptor is \
+         ERASED when the session ends, and this table is never purged, so a \
+         copy here would undo the erasure permanently. Where a value \
          is unbounded administrator-authored text — a policy rule's match \
          conditions, a provider's config blob — only WHETHER it changed is \
          reported, never its contents.",
@@ -492,36 +513,56 @@ pub const REQUEST_COVERAGE: &str =
 /// "every administrative action" would be reading a floor as a ceiling. Listing
 /// what is missing is the same rule the data plane follows for `/v1/redact`.
 ///
-/// FU5 moved twelve actions from the "not audited" list into the covered list.
-/// The remaining gaps are named individually rather than summarised, and
+/// FU5 moved twelve actions from the "not audited" list into the covered list
+/// and P1A moved ten more. The remaining gaps are named individually rather
+/// than summarised, and
 /// `admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places` fails if a
 /// newly audited action is not named in this string — so this prose cannot fall
 /// behind the code without a red test.
 pub const CONTROL_COVERAGE: &str =
     "AUDITED ADMINISTRATIVE ACTIONS ONLY. This section carries every row of \
      `raw_capture_audit` (WS3-1), `retention_purge_audit` (WS3-4), \
-     `session_revocation_audit` (WS4-3) and `admin_audit` (FU5) whose instant \
+     `session_revocation_audit` (WS4-3) and `admin_audit` (FU5, extended by \
+     P1A) whose instant \
      falls in the window and whose `workspace_id` is this workspace's. The \
      audited actions are, in full: `raw_capture.changed`, `retention.purge`, \
      `session.revoked`, `api_key.created`, `api_key.revoked`, \
      `api_key.rotated`, `provider_credential.created`, \
      `provider_credential.updated`, `provider_credential.deleted`, \
      `policy_rule.created`, `policy_rule.updated`, `policy_rule.deleted`, \
-     `policy_rule.enabled_changed`, `policy_rule.dry_run_changed` and \
-     `user.created`. It is NOT a complete record of administrative activity, \
+     `policy_rule.enabled_changed`, `policy_rule.dry_run_changed`, \
+     `user.created`, `two_factor.enrollment_started`, `two_factor.enabled`, \
+     `two_factor.disabled`, `license.activated`, `license.cleared`, \
+     `budget.updated`, `secure_mode.updated`, `sidecar_policy.updated`, \
+     `auth.login_succeeded` and `auth.second_factor_verified`. It is NOT a \
+     complete record of administrative activity, \
      and must not be read as one. The following are NOT audited into any table \
-     and therefore appear NOWHERE in this export: every dashboard login, \
-     successful or failed, and every OIDC sign-in; enrolling, verifying, \
-     disabling or resetting 2FA and regenerating backup codes; activating a \
-     license; changing secure-mode, sidecar-failure or budget settings; \
+     and therefore appear NOWHERE in this export: every FAILED or refused \
+     dashboard login, whether the email named an account or not; creating a \
+     workspace through public signup; logging out; \
      reassigning an API key to a different member; and adding, removing or \
      excluding a provider's models. Their absence here is not evidence they did \
-     not happen. Two further limits on what IS carried: a repeated \
+     not happen. THE FAILED-LOGIN GAP IS DELIBERATE AND ITS SHAPE MATTERS: an \
+     attempt against an email that names no account has no workspace to be \
+     recorded under, so auditing only the attempts that DO resolve would make \
+     the absence of a row mean `no such account`. Rather than ship an \
+     account-existence oracle inside a compliance artifact, this product \
+     records neither, and the two refusals are indistinguishable in the trail. \
+     If your control objective is `every failed authentication attempt is \
+     recorded`, this artifact does not meet it. Three further limits on what IS \
+     carried: a repeated \
      `POST /v1/keys/{id}/rotate` inside the grace window is idempotent, changes \
-     nothing and writes no second `api_key.rotated` row; and a failed or \
+     nothing and writes no second `api_key.rotated` row; a settings PUT that \
+     moves no field — the same budget, secure mode or sidecar policy submitted \
+     again — likewise writes nothing, so this section holds CHANGES and not \
+     form submissions; and a failed or \
      refused action — a 403, or a 404 for an object that does not exist — is \
      never recorded, so this section describes actions that TOOK EFFECT rather \
-     than attempts. Rows of `retention_purge_audit` whose `workspace_id` is NULL — \
+     than attempts. `auth.login_succeeded` is the one exception to `took \
+     effect` and says so in its own `outcome` field: it is written when the \
+     FIRST factor verified, and `second_factor_required` or \
+     `enrolment_required` mean the password was correct and no session was \
+     issued. Rows of `retention_purge_audit` whose `workspace_id` is NULL — \
      purge scopes that are not per-workspace, such as the token vault — are \
      excluded because they are not this tenant's records; the section's source \
      block reports how many such rows fell in the window so their exclusion is \
