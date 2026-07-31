@@ -12,13 +12,31 @@
 //! object is a MANIFEST that carries a per-page SHA-256 and a hash CHAIN over
 //! those digests in order, seeded from the export's own header. Every test
 //! here corresponds to one link in that argument.
+//!
+//! # FU1: a second class of attacker
+//!
+//! Since schema version 2 an export carries two planes — the ClickHouse
+//! request log and the Postgres control-plane audit trail — as two sections of
+//! one chain. That adds an attack the earlier tests do not reach, because the
+//! attacker is the party who HOLDS THE SIGNING KEY: the gateway operator can
+//! hand over an export with the control-plane section removed and RE-SIGN the
+//! shorter manifest, and every signature check then passes. [`resign`] is that
+//! attacker, and the four tests that use it —
+//! `an_export_with_the_control_plane_removed_fails_verification`,
+//! `a_page_relabelled_into_the_other_section_fails_verification`,
+//! `a_moved_section_boundary_fails_verification` and
+//! `a_section_row_count_that_its_pages_do_not_sum_to_fails_verification` —
+//! measure the STRUCTURAL checks, the only ones that can catch them.
 
 use secureprompt_common::audit_export::{
-    build_manifest, render_page, verify_export, AuditRow, ExportFormat, VerifyError,
+    build_manifest, control_section, no_expiry_for, render_page, request_section, retention_for,
+    verify_export, AuditRow, ControlRow, ExportFormat, SourceRetention, VerifyError,
+    CONTROL_SOURCE_TABLES, EVENT_RAW_CAPTURE_CHANGED, EVENT_SESSION_REVOKED, SECTION_CONTROL_PLANE,
 };
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, TimeZone, Utc};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -70,15 +88,74 @@ fn row(n: u32) -> AuditRow {
     }
 }
 
-/// Three pages of two rows each — the smallest shape in which "a row was
-/// removed from the MIDDLE" is a distinct case from "the export was truncated".
-fn pages_of(format: ExportFormat) -> Vec<Vec<u8>> {
-    (0..3)
+/// One synthetic control-plane row. `n` picks the event type so the fixture
+/// exercises more than one shape of `detail`.
+fn control(n: u32) -> ControlRow {
+    if n % 2 == 0 {
+        ControlRow {
+            event_id: Uuid::from_u128(0x1000 + u128::from(n)),
+            workspace_id: ws(),
+            occurred_at: at(n),
+            event_type: EVENT_SESSION_REVOKED.into(),
+            source_table: "session_revocation_audit".into(),
+            actor_user_id: Some(Uuid::from_u128(0x2000 + u128::from(n))),
+            actor_email: Some("synthetic-admin@example.invalid".into()),
+            actor_role: Some("admin".into()),
+            target_user_id: Some(Uuid::from_u128(0x3000 + u128::from(n))),
+            target_email: Some("synthetic-target@example.invalid".into()),
+            target_role: Some("member".into()),
+            detail: serde_json::json!({
+                "revoked_before_unix": 1_780_000_000_i64 + i64::from(n),
+                "refresh_tokens_revoked": n,
+            }),
+        }
+    } else {
+        ControlRow {
+            event_id: Uuid::from_u128(0x1000 + u128::from(n)),
+            workspace_id: ws(),
+            occurred_at: at(n),
+            event_type: EVENT_RAW_CAPTURE_CHANGED.into(),
+            source_table: "raw_capture_audit".into(),
+            actor_user_id: Some(Uuid::from_u128(0x2000 + u128::from(n))),
+            actor_email: Some("synthetic-admin@example.invalid".into()),
+            actor_role: None,
+            target_user_id: None,
+            target_email: None,
+            target_role: None,
+            detail: serde_json::json!({
+                "enabled_before": false,
+                "enabled_after": true,
+                "retention_days_before": 30,
+                "retention_days_after": 7,
+            }),
+        }
+    }
+}
+
+fn control_sources() -> Vec<SourceRetention> {
+    CONTROL_SOURCE_TABLES
+        .iter()
+        .map(|t| no_expiry_for(t))
+        .collect()
+}
+
+/// Four pages: two data-plane pages of two rows, then two control-plane pages
+/// of one row.
+///
+/// The smallest shape in which every case this suite has to separate is
+/// distinct: "a row removed from the MIDDLE" (page 2) is not "the export was
+/// truncated"; a page dropped from the control plane (page 3) is not a page
+/// dropped from the data plane; and the section boundary falls between pages 2
+/// and 3, so a chain that did not span it would be caught.
+fn pages_of(format: ExportFormat) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let data = (0..2)
         .map(|p| {
             let rows: Vec<AuditRow> = (0..2).map(|i| row(p * 2 + i)).collect();
             render_page(&rows, format)
         })
-        .collect()
+        .collect();
+    let control = (0..2).map(|p| render_page(&[control(p)], format)).collect();
+    (data, control)
 }
 
 struct Export {
@@ -89,7 +166,7 @@ struct Export {
 }
 
 fn export(format: ExportFormat, key: &SigningKey) -> Export {
-    let pages = pages_of(format);
+    let (data, control) = pages_of(format);
     let signed = build_manifest(
         Uuid::from_u128(0xfeed),
         ws(),
@@ -97,12 +174,20 @@ fn export(format: ExportFormat, key: &SigningKey) -> Export {
         at(59),
         format,
         2,
-        &pages,
-        &[2u32, 2, 2],
+        &[
+            request_section(
+                data.clone(),
+                vec![2, 2],
+                vec![retention_for(at(0), at(59), at(59))],
+            ),
+            control_section(control.clone(), vec![1, 1], control_sources()),
+        ],
         at(59),
         key,
     )
     .expect("manifest");
+    let mut pages = data;
+    pages.extend(control);
     Export {
         manifest_json: signed.manifest_json,
         signature_b64: signed.signature_b64,
@@ -114,6 +199,18 @@ fn export(format: ExportFormat, key: &SigningKey) -> Export {
 fn check(e: &Export) -> Result<(), VerifyError> {
     let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
     verify_export(&e.manifest_json, &e.signature_b64, &e.public_key_b64, &refs).map(|_| ())
+}
+
+/// Re-serialise a mutated manifest and re-sign it with `key`.
+///
+/// This is the attacker who HOLDS THE SIGNING KEY — the gateway operator, the
+/// party an auditor is checking. Every test that uses it is asking whether a
+/// structural check catches something the signature cannot, because the
+/// signature over a re-signed document is valid by construction.
+fn resign(manifest: &serde_json::Value, key: &SigningKey) -> (String, String) {
+    let json = serde_json::to_string(manifest).expect("manifest json");
+    let signature = key.sign(json.as_bytes());
+    (json, B64.encode(signature.to_bytes()))
 }
 
 // ── The positive control ──────────────────────────────────────────────────
@@ -167,20 +264,235 @@ fn a_row_removed_from_the_middle_page_fails_verification() {
     }
 }
 
+/// A row removed from a CONTROL-PLANE page. Same attack, other plane — the
+/// digest chain does not care which store a page came from, and this is the
+/// test that says so rather than assuming it.
+#[test]
+fn a_row_removed_from_a_control_plane_page_fails_verification() {
+    for format in [ExportFormat::Csv, ExportFormat::Jsonl] {
+        let mut e = export(format, &key_a());
+
+        // Premise: page 3 really is the first control-plane page and really
+        // does carry a row.
+        let manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+        assert_eq!(
+            manifest["pages"][2]["section"].as_str(),
+            Some(SECTION_CONTROL_PLANE),
+            "premise: page 3 must be a control-plane page"
+        );
+        assert_eq!(manifest["pages"][2]["rows"].as_u64(), Some(1));
+
+        let before = e.pages[2].clone();
+        let text = String::from_utf8(before.clone()).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        let tampered: String = lines[..lines.len() - 1].join("\n") + "\n";
+        assert_ne!(
+            tampered.as_bytes(),
+            before.as_slice(),
+            "premise: the mutation must change bytes"
+        );
+        e.pages[2] = tampered.into_bytes();
+
+        assert_eq!(
+            check(&e),
+            Err(VerifyError::PageDigestMismatch { page: 3 }),
+            "{}: an administrative action removed from page 3 must be caught",
+            format.as_str()
+        );
+    }
+}
+
 /// A WHOLE page dropped. This is the case a per-page signature cannot catch:
-/// the two remaining pages are untouched and would each verify individually.
+/// the remaining pages are untouched and would each verify individually.
 #[test]
 fn a_whole_page_removed_fails_verification() {
     let mut e = export(ExportFormat::Jsonl, &key_a());
-    assert_eq!(e.pages.len(), 3, "premise: three pages before removal");
+    assert_eq!(e.pages.len(), 4, "premise: four pages before removal");
     e.pages.remove(1);
     assert_eq!(
         check(&e),
         Err(VerifyError::PageCountMismatch {
-            expected: 3,
-            got: 2
+            expected: 4,
+            got: 3
         })
     );
+}
+
+/// **The whole control plane removed, by someone holding the signing key.**
+///
+/// This is the failure the gap was: an export that carries only what requests
+/// happened, handed over as the audit trail. The signature cannot catch it —
+/// the operator re-signs — so `verify_export` refuses any manifest whose
+/// section list is not exactly the two this schema version requires. "Nothing
+/// was silently omitted" is therefore a CHECK, not a promise in a document.
+#[test]
+fn an_export_with_the_control_plane_removed_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+
+    // Premise: the genuine export really does declare both planes, so the
+    // rejection below is the removal's doing.
+    assert_eq!(
+        manifest["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .filter_map(|s| s["section"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["request_events", "control_plane_events"]
+    );
+
+    // Drop the control section and its two pages, then rewrite every count so
+    // the document is internally consistent — an attacker who does less than
+    // this is caught by a check that predates this task.
+    manifest["sections"] = serde_json::json!([manifest["sections"][0].clone()]);
+    manifest["pages"] =
+        serde_json::json!([manifest["pages"][0].clone(), manifest["pages"][1].clone()]);
+    manifest["total_pages"] = serde_json::json!(2);
+    manifest["total_rows"] = serde_json::json!(4);
+    manifest["chain_root"] = manifest["pages"][1]["chain"].clone();
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages[..2].iter().map(Vec::as_slice).collect();
+
+    // Positive control: the SAME re-signing machinery, applied to an unaltered
+    // manifest, produces something that verifies — so the failure below is the
+    // missing section and not a broken re-signature.
+    let (honest_json, honest_signature) = resign(
+        &serde_json::from_str::<serde_json::Value>(&e.manifest_json).expect("json"),
+        &key_a(),
+    );
+    let all: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert!(
+        verify_export(&honest_json, &honest_signature, &e.public_key_b64, &all).is_ok(),
+        "positive control: a re-signed but unaltered export must still verify"
+    );
+
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::SectionSetUnexpected)
+    );
+}
+
+/// A page RELABELLED into the other section, again by the key holder. The
+/// bytes and the digests are untouched; only the label moved. It is caught
+/// because every page's section is cross-checked against the range of the
+/// section that owns its number.
+#[test]
+fn a_page_relabelled_into_the_other_section_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    assert_eq!(
+        manifest["pages"][1]["section"].as_str(),
+        Some("request_events"),
+        "premise: page 2 is a data-plane page before relabelling"
+    );
+    manifest["pages"][1]["section"] = serde_json::json!(SECTION_CONTROL_PLANE);
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::PageSectionMismatch { page: 2 })
+    );
+}
+
+/// The section BOUNDARY moved, so the control plane appears to start a page
+/// later than it does and one of its pages is read as data-plane. Caught as a
+/// gap in the partition of `1..=total_pages`.
+#[test]
+fn a_moved_section_boundary_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    assert_eq!(manifest["sections"][1]["first_page"].as_u64(), Some(3));
+    manifest["sections"][1]["first_page"] = serde_json::json!(4);
+    manifest["sections"][1]["pages"] = serde_json::json!(1);
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::SectionPagesNotContiguous { section_index: 1 })
+    );
+}
+
+/// A section's declared row count edited to hide a row. `total_rows` still
+/// sums, because the attacker moved the row between the two sections' totals;
+/// the per-section sum is what catches it.
+#[test]
+fn a_section_row_count_that_its_pages_do_not_sum_to_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    assert_eq!(manifest["sections"][1]["rows"].as_u64(), Some(2));
+    manifest["sections"][1]["rows"] = serde_json::json!(1);
+    manifest["sections"][0]["rows"] = serde_json::json!(5);
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::SectionRowCountMismatch { section_index: 0 })
+    );
+}
+
+/// An archived version-1 export — data plane only — is REFUSED by name, not
+/// reported as malformed. The distinction matters to the person holding it: a
+/// version they need another tool for is not a tampered artifact.
+#[test]
+fn a_schema_version_1_manifest_is_refused_by_version_not_as_malformed() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    manifest["schema_version"] = serde_json::json!(1);
+    // A real v1 manifest also lacks `sections`, which is what would otherwise
+    // make this a deserialization failure.
+    manifest.as_object_mut().expect("object").remove("sections");
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::UnsupportedSchemaVersion { got: 1 })
+    );
+}
+
+/// Each section states its own retention, and for the same window the two
+/// disagree — ClickHouse `request_events` has a 90-day TTL, the three Postgres
+/// audit tables have none. An export that reported one verdict would be
+/// telling an auditor something false about half of itself.
+#[test]
+fn each_section_carries_its_own_per_source_retention() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    let manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+
+    let data_sources = manifest["sections"][0]["sources"]
+        .as_array()
+        .expect("data sources");
+    assert_eq!(data_sources.len(), 1);
+    assert_eq!(
+        data_sources[0]["source_table"].as_str(),
+        Some("request_events")
+    );
+    assert_eq!(data_sources[0]["ttl_days"].as_u64(), Some(90));
+    assert!(data_sources[0]["boundary"].is_string());
+
+    let control_sources = manifest["sections"][1]["sources"]
+        .as_array()
+        .expect("control sources");
+    assert_eq!(
+        control_sources
+            .iter()
+            .filter_map(|s| s["source_table"].as_str())
+            .collect::<Vec<_>>(),
+        CONTROL_SOURCE_TABLES.to_vec(),
+        "every control-plane relation must state its own retention"
+    );
+    for source in control_sources {
+        assert!(
+            source["ttl_days"].is_null(),
+            "a Postgres audit table has no TTL; got {source}"
+        );
+        assert_eq!(source["window_status"].as_str(), Some("no_expiry"));
+    }
 }
 
 /// Pages reordered. The chain is over digests IN ORDER, so a swap breaks it
@@ -203,7 +515,7 @@ fn pages_reordered_fail_verification() {
 #[test]
 fn a_page_from_another_export_cannot_be_spliced_in() {
     let e = export(ExportFormat::Jsonl, &key_a());
-    let other_pages = (0..3)
+    let other_pages = (0..2)
         .map(|p| {
             let rows: Vec<AuditRow> = (0..2).map(|i| row(100 + p * 2 + i)).collect();
             render_page(&rows, ExportFormat::Jsonl)
@@ -233,7 +545,6 @@ fn a_manifest_edited_to_match_a_tampered_export_fails_the_signature() {
     e.pages[1] = b"{}\n".to_vec();
 
     // Recompute an honest manifest over the tampered pages...
-    let rows_per_page = vec![2u32, 1, 2];
     let honest = build_manifest(
         Uuid::from_u128(0xfeed),
         ws(),
@@ -241,8 +552,14 @@ fn a_manifest_edited_to_match_a_tampered_export_fails_the_signature() {
         at(59),
         ExportFormat::Jsonl,
         2,
-        &e.pages,
-        &rows_per_page,
+        &[
+            request_section(
+                e.pages[..2].to_vec(),
+                vec![2, 1],
+                vec![retention_for(at(0), at(59), at(59))],
+            ),
+            control_section(e.pages[2..].to_vec(), vec![1, 1], control_sources()),
+        ],
         at(59),
         &key_b(),
     )
