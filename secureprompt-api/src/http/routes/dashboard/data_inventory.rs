@@ -1350,8 +1350,9 @@ async fn get_data_inventory(
              filters on it, so an expired entry stops resolving immediately. The ROWS are \
              deleted by the worker's `retention.purge` job (daily 04:00), which writes a \
              `retention_purge_audit` record with the cutoff, the deleted range, and a \
-             recount taken after the delete. Before WS3-4 that job was a no-op stub and \
-             these rows accumulated forever.",
+             recount taken after the delete — read that class's note for what the recount \
+             does and does not establish. Before WS3-4 that job was a no-op stub and these \
+             rows accumulated forever.",
         ),
         governed_by: None,
         enabled: None,
@@ -1472,7 +1473,11 @@ async fn get_data_inventory(
              disable replay detection. The upper bound on how long an address is held is \
              therefore the refresh-token lifetime (default 30 days) from the session's last \
              use, plus up to 24h until the next run. The decision is made per rotation CHAIN, \
-             not per row.",
+             not per row. The scrub runs once per workspace inside a transaction scoped to \
+             that workspace, so this workspace's run leaves a `retention_purge_audit` row \
+             carrying THIS workspace's id and count; a run that could not reach a workspace \
+             records `status = error` on the run's global census row rather than a zero \
+             that reads as `nothing to erase`.",
         ),
         governed_by: None,
         enabled: None,
@@ -1623,18 +1628,35 @@ async fn get_data_inventory(
         class: "retention_purge_audit".to_owned(),
         store: "postgres",
         location: "retention_purge_audit".to_owned(),
-        description: "Proof-of-purge records: one row per scope per `retention.purge` run, \
-                      with the cutoff, rows deleted, the deleted range, and a recount taken \
-                      after the delete.",
+        description: "Proof-of-purge records: one row per scope per `retention.purge` run \
+                      — and, for the scopes that sweep tenant by tenant, one row per \
+                      workspace plus a global census row saying how many workspaces the \
+                      run could reach. Each carries the cutoff, rows deleted, the deleted \
+                      range, and a recount taken after the delete.",
         sensitivity: "audit_trail",
         row_count: Some(pg.n("c_retention_purge_audit")),
         row_count_status: "counted",
         row_count_detail: None,
         encryption: Encryption::plain(
-            "Counts and timestamps only. NOTE what this table does NOT prove: it is \
+            "Counts and timestamps only. NOTE what this table does NOT prove, and READ THIS \
+             BEFORE CITING `rows_remaining_past_cutoff` AT ANYONE. (1) It is \
              self-attestation written by the purge process into a database that same \
              process can modify, and a logical DELETE is not an assurance that the bytes \
-             are irrecoverable from backups or unmerged parts.",
+             are irrecoverable from backups or unmerged parts. (2) The recount is a \
+             SELF-recount, not an independent check: the job re-runs its own \
+             `what still violates the policy` query on the same connection, through the \
+             same row-level-security filter as the delete. It therefore catches a job that \
+             MISCOUNTED what it deleted, and it CANNOT catch a job that could not SEE the \
+             rows — a filter that hides them hides them from both statements and the two \
+             then agree on zero. That is not hypothetical: it is exactly what the \
+             `refresh_tokens.device_context` scope did under a role that does not bypass \
+             row-level security, emitting `rows_deleted = 0, \
+             rows_remaining_past_cutoff = 0, status = ok` while ended sessions kept their \
+             IP addresses. What covers `could not see` is `status` and the per-run census \
+             row, not this number. (3) A per-workspace row CAN be re-derived by anyone who \
+             can scope a connection to that workspace, the tenant included; a row with \
+             `workspace_id IS NULL` covers every tenant at once and can only be re-derived \
+             by someone who can see them all.",
         ),
         retention: Retention::none(
             "Append-only and never purged, by design. Rows whose `workspace_id` is this \
