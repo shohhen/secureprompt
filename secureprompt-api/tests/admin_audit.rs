@@ -640,7 +640,7 @@ async fn the_policy_rule_lifecycle_is_audited_with_what_changed(pool: PgPool) {
         Some(json!({
             "name": "mask-emails",
             "priority": 20,
-            "action": "block",
+            "action": "deny",
             "enabled": true,
             "dry_run": false
         })),
@@ -657,8 +657,8 @@ async fn the_policy_rule_lifecycle_is_audited_with_what_changed(pool: PgPool) {
     );
     assert_eq!(
         updated.detail["changed"]["rule_action"]["after"],
-        json!("block"),
-        "an enforcement action moving from redact to block is the whole point \
+        json!("deny"),
+        "an enforcement action moving from redact to deny is the whole point \
          of auditing policy edits"
     );
     assert!(

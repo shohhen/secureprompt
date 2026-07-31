@@ -784,7 +784,8 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM audit_exports WHERE workspace_id = $1) AS c_audit_exports,
            (SELECT count(*) FROM audit_export_pages WHERE workspace_id = $1) AS c_audit_export_pages,
            (SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1)
-             AS c_session_revocation_audit",
+             AS c_session_revocation_audit,
+           (SELECT count(*) FROM admin_audit WHERE workspace_id = $1) AS c_admin_audit",
         cred_sealed = pg_sealed("encrypted_credential"),
         vault_sealed = pg_sealed("mapping_ciphertext"),
     );
@@ -1630,6 +1631,56 @@ async fn get_data_inventory(
              far back it reaches. A COPY of these rows therefore also lives in \
              `audit_export_pages` for every window that has been exported, and an \
              erasure request must reach that table too.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
+    // FU5 — migration 028. Every audited administrative action in this
+    // workspace, in one table.
+    artifacts.push(ArtifactClass {
+        class: "admin_audit".to_owned(),
+        store: "postgres",
+        location: "admin_audit".to_owned(),
+        description: "Append-only record of the administrative actions FU5 audits: API \
+                      key create/revoke/rotate, provider credential create/update/delete, \
+                      policy rule create/update/delete and enabled/dry-run toggles, and \
+                      user creation. Each row says who acted, on which object, what \
+                      changed and when. Written in the SAME transaction as the action it \
+                      records, so the action and its record commit together or neither \
+                      does. NOT a complete record of administrative activity: dashboard \
+                      login, 2FA enrolment/reset and license activation are still \
+                      unaudited, and their absence here is not evidence they did not \
+                      happen.",
+        sensitivity: "audit_trail",
+        row_count: Some(pg.n("c_admin_audit")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Identifiers, the acting administrator's email and role as they read at the \
+             time, the acted-on object's own name, and a JSONB `detail` of bounded \
+             action-specific facts (a priority, an enabled flag, a provider type, a \
+             grace-window instant, and before/after pairs for the fields that moved). \
+             NO SECRET IS STORED: not an API key or any prefix of one, not a provider \
+             credential in plaintext or ciphertext, not a password or its hash, not a \
+             TOTP secret or backup code — `tests/admin_audit.rs` dumps every column of \
+             every row to text and searches it. DELIBERATELY ABSENT for the reason \
+             `session_revocation_audit` gives: IP address, User-Agent and any free-text \
+             reason. The object's NAME is the one administrator-supplied string admitted, \
+             because without it a deleted object's audit row names only a UUID that \
+             resolves to nothing; it is truncated to 200 characters and the database \
+             REFUSES anything longer.",
+        ),
+        retention: Retention::none(
+            "Append-only and never purged, by design, like `raw_capture_audit`, \
+             `retention_purge_audit` and `session_revocation_audit`. `retention.purge` \
+             does not cover this table and is not intended to — an audit trail with a \
+             retention window is an audit trail with a deadline. Everything written here \
+             is kept forever, which is why what may enter is bounded so tightly. These \
+             rows ARE carried by `audit.export` as part of the `control_plane_events` \
+             section, so a COPY of them also lives in `audit_export_pages` for every \
+             window that has been exported, and an erasure request must reach that table \
+             too.",
         ),
         governed_by: None,
         enabled: None,

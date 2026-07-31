@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::AdminActor,
     db::{
         session_repo::SessionRepository,
         session_revocation_repo::{
@@ -143,8 +144,21 @@ async fn create_user(
         }
     }
 
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let row = repo
-        .create_user(ctx.workspace_id, &body.email, &body.password, &body.role)
+        .create_user(
+            ctx.workspace_id,
+            &body.email,
+            &body.password,
+            &body.role,
+            &actor,
+        )
         .await
         .map_err(api_error_response)?;
 

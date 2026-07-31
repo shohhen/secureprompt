@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::AdminActor,
     db::api_key_repo::ApiKeyRepository,
     http::{
         api_error_response,
@@ -158,8 +159,15 @@ async fn create_key(
         .user_id
         .as_ref()
         .map(|_| state.kms.as_ref());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let (record, plaintext) = repo
-        .create(ctx.workspace_id, &body.name, body.user_id, kms)
+        .create(ctx.workspace_id, &body.name, body.user_id, kms, &actor)
         .await
         .map_err(api_error_response)?;
 
@@ -188,7 +196,14 @@ async fn revoke_key(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = ApiKeyRepository::new(state.db.clone());
-    repo.revoke(ctx.workspace_id, key_id)
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+    repo.revoke(ctx.workspace_id, key_id, &actor)
         .await
         .map_err(|e| {
             api_error_response(match e {
@@ -212,8 +227,15 @@ async fn rotate_key(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = ApiKeyRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let (new_plaintext, grace_expires_at) = repo
-        .rotate(ctx.workspace_id, key_id)
+        .rotate(ctx.workspace_id, key_id, &actor)
         .await
         .map_err(api_error_response)?;
 

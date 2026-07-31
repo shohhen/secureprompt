@@ -6,6 +6,8 @@ use secureprompt_common::{
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+
 #[derive(Debug, Clone)]
 pub struct ProviderRow {
     pub id: Uuid,
@@ -108,6 +110,15 @@ impl ProviderRepository {
     /// credential string (e.g. Vertex's `{"region": "...", "project": "..."}`).
     /// Pass `serde_json::json!({})` for provider types that don't need it.
     ///
+    /// FU5: writes a `provider_credential.created` audit row in the SAME
+    /// transaction. Adding a provider is the act of giving the gateway the
+    /// ability to spend money and ship prompts to a third party, and it was
+    /// unaudited.
+    ///
+    /// The credential itself never enters the audit row — not the plaintext,
+    /// which this method never sees, and not the ciphertext, which is a
+    /// decryptable copy of a live secret. Only WHETHER one was supplied.
+    ///
     /// # Errors
     /// Returns `ApiError::Database` on SQL failure.
     pub async fn create_provider(
@@ -117,6 +128,7 @@ impl ProviderRepository {
         provider_type: &str,
         encrypted_credential: Option<String>,
         config: serde_json::Value,
+        actor: &AdminActor,
     ) -> Result<ProviderRow, ApiError> {
         let mut tx = self
             .pool
@@ -145,6 +157,22 @@ impl ProviderRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        let provider_id: Uuid = row.get("id");
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::ProviderCredentialCreated,
+                provider_id,
+                Some(name.to_owned()),
+            )
+            .with_detail(serde_json::json!({
+                "provider_type": provider_type,
+                "credential_present": encrypted_credential.is_some(),
+            })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -166,6 +194,16 @@ impl ProviderRepository {
     /// `Some(None)` clears it. Passing `None` for `config` leaves the stored
     /// config unchanged; passing `Some(value)` replaces it wholesale.
     ///
+    /// FU5: writes a `provider_credential.updated` audit row in the same
+    /// transaction, carrying a DIFF rather than the word "updated".
+    ///
+    /// The diff names only the fields that actually moved, and only the
+    /// non-secret ones by value. A credential change is reported as the boolean
+    /// `credential_replaced`: comparing ciphertexts would be meaningless anyway
+    /// (AES-GCM re-encrypts the same plaintext to different bytes each time),
+    /// and the security-relevant fact is that the credential was replaced, not
+    /// what it was replaced with.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the provider does not exist in this
     /// workspace. Returns `ApiError::Database` on SQL failure.
@@ -177,6 +215,7 @@ impl ProviderRepository {
         provider_type: Option<&str>,
         encrypted_credential: Option<Option<String>>,
         config: Option<serde_json::Value>,
+        actor: &AdminActor,
     ) -> Result<ProviderRow, ApiError> {
         // Build the SET clause dynamically based on which fields were provided.
         let mut sets: Vec<String> = vec!["updated_at = NOW()".to_owned()];
@@ -218,6 +257,17 @@ impl ProviderRepository {
         .map_err(|e| ApiError::Database(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("provider {provider_id} not found")))?;
 
+        // Captured BEFORE the UPDATE overwrites them — the "before" half of
+        // the audit diff cannot be recovered afterwards.
+        let old_name: String = current.get("name");
+        let old_type: String = current.get("provider_type");
+        let old_config: serde_json::Value = current.get("config");
+        // Read before `encrypted_credential` is consumed below. Both are facts
+        // about the REQUEST, not about the secret: whether one was supplied,
+        // and whether the stored one was explicitly cleared.
+        let credential_replaced = matches!(encrypted_credential, Some(Some(_)));
+        let credential_cleared = matches!(encrypted_credential, Some(None));
+
         let new_name: String = name.map(String::from).unwrap_or_else(|| current.get("name"));
         let new_type: String = provider_type.map(String::from).unwrap_or_else(|| current.get("provider_type"));
         let new_cred: Option<String> = match encrypted_credential {
@@ -247,6 +297,40 @@ impl ProviderRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        let mut changed = serde_json::Map::new();
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "name",
+            serde_json::json!(old_name),
+            serde_json::json!(new_name),
+        );
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "provider_type",
+            serde_json::json!(old_type),
+            serde_json::json!(new_type),
+        );
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::ProviderCredentialUpdated,
+                provider_id,
+                Some(new_name.clone()),
+            )
+            .with_detail(serde_json::json!({
+                "changed": serde_json::Value::Object(changed),
+                "credential_replaced": credential_replaced,
+                "credential_cleared": credential_cleared,
+                // The config blob is provider-type-specific and
+                // administrator-supplied, so WHETHER it moved is recorded and
+                // its contents are not — the rule migration 028's header sets
+                // for a table that is never purged.
+                "config_changed": old_config != new_config,
+            })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -265,6 +349,12 @@ impl ProviderRepository {
 
     /// Delete a provider by ID within the workspace.
     ///
+    /// FU5: writes a `provider_credential.deleted` audit row in the same
+    /// transaction. The DELETE now RETURNS the name and type, because after it
+    /// commits the audit row is the ONLY surviving description of what was
+    /// deleted — a line naming a UUID that resolves to nothing months later
+    /// fails the one job an audit record has.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the provider does not exist.
     /// Returns `ApiError::Database` on SQL failure.
@@ -272,6 +362,7 @@ impl ProviderRepository {
         &self,
         workspace_id: WorkspaceId,
         provider_id: Uuid,
+        actor: &AdminActor,
     ) -> Result<(), ApiError> {
         let mut tx = self
             .pool
@@ -285,24 +376,42 @@ impl ProviderRepository {
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        let result = sqlx::query(
-            "DELETE FROM providers WHERE id = $1 AND workspace_id = $2",
+        let deleted = sqlx::query(
+            "DELETE FROM providers WHERE id = $1 AND workspace_id = $2
+             RETURNING name, provider_type",
         )
         .bind(provider_id)
         .bind(workspace_id.0)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // Decided before the audit write and before the commit, so a delete
+        // that matched nothing leaves no row claiming it deleted something.
+        let Some(deleted) = deleted else {
+            return Err(ApiError::NotFound(format!(
+                "provider {provider_id} not found"
+            )));
+        };
+        let name: String = deleted.get("name");
+        let provider_type: String = deleted.get("provider_type");
+
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::ProviderCredentialDeleted,
+                provider_id,
+                Some(name),
+            )
+            .with_detail(serde_json::json!({ "provider_type": provider_type })),
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound(format!(
-                "provider {provider_id} not found"
-            )));
-        }
         Ok(())
     }
 

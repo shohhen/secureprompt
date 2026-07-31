@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::AdminActor,
     db::provider_repo::ProviderRepository,
     http::{
         api_error_response,
@@ -199,6 +200,13 @@ async fn create_provider(
         .map_err(api_error_response)?;
 
     let repo = ProviderRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let record = repo
         .create_provider(
             ctx.workspace_id,
@@ -206,6 +214,7 @@ async fn create_provider(
             &body.provider_type,
             encrypted,
             body.config.clone().unwrap_or_else(|| serde_json::json!({})),
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
@@ -266,6 +275,13 @@ async fn update_provider(
     };
 
     let repo = ProviderRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let record = repo
         .update_provider(
             ctx.workspace_id,
@@ -274,6 +290,7 @@ async fn update_provider(
             body.provider_type.as_deref(),
             encrypted_update,
             body.config.clone(),
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
@@ -321,7 +338,14 @@ async fn delete_provider(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = ProviderRepository::new(state.db.clone());
-    repo.delete_provider(ctx.workspace_id, provider_id)
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+    repo.delete_provider(ctx.workspace_id, provider_id, &actor)
         .await
         .map_err(api_error_response)?;
 

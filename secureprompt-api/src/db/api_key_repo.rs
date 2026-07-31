@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
     pub id: Uuid,
@@ -174,12 +176,22 @@ impl ApiKeyRepository {
     /// Returns `ApiError::Database` on any SQL failure.
     /// Returns `ApiError::Internal` when AES-GCM encryption fails (bad
     /// provider key — should never happen with a 32-byte key).
+    /// FU5: writes an `api_key.created` audit row in the SAME transaction as
+    /// the key. `actor` is assembled from the authenticated context by the
+    /// handler; the record and the credential commit together or neither does.
+    ///
+    /// DELIBERATELY NOT AUDITED: any part of the key material. Not the
+    /// plaintext, not its hash, and not the eight-character prefix the
+    /// dashboard displays — a prefix of a live credential is still a piece of a
+    /// live credential, and this table is never purged. The key's `id` and
+    /// `name` identify it completely for an auditor.
     pub async fn create(
         &self,
         workspace_id: WorkspaceId,
         name: &str,
         assigned_user_id: Option<Uuid>,
         kms: Option<&dyn KmsBackend>,
+        actor: &AdminActor,
     ) -> Result<(ApiKeyRow, String), ApiError> {
         // Generate: "sp_" + 48 random alphanumeric chars = 51 chars total.
         let suffix: String = rand::thread_rng()
@@ -242,6 +254,24 @@ impl ApiKeyRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        let key_id: Uuid = row.get("id");
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::ApiKeyCreated,
+                key_id,
+                Some(name.to_owned()),
+            )
+            .with_detail(serde_json::json!({
+                // Whether the key was bound to one member or is a
+                // workspace-wide key. A bearer credential nobody owns is a
+                // different risk from one issued to a named person.
+                "assigned_user_id": assigned_user_id,
+            })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -263,10 +293,15 @@ impl ApiKeyRepository {
     /// # Errors
     /// Returns `ApiError::NotFound` when the key does not exist in this
     /// workspace. Returns `ApiError::Database` on any SQL failure.
+    /// FU5: writes an `api_key.revoked` audit row in the same transaction.
+    /// The UPDATE now RETURNS `name`, which serves two purposes at once — it
+    /// still distinguishes "no row matched" (the 404 below) and it supplies the
+    /// audit label, so the record names the key after the key is gone.
     pub async fn revoke(
         &self,
         workspace_id: WorkspaceId,
         key_id: Uuid,
+        actor: &AdminActor,
     ) -> Result<(), ApiError> {
         let mut tx = self
             .pool
@@ -280,23 +315,35 @@ impl ApiKeyRepository {
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        let result = sqlx::query(
+        let revoked = sqlx::query(
             "UPDATE api_keys SET revoked_at = NOW(), status = 'revoked'
-             WHERE id = $1 AND workspace_id = $2 AND status IN ('active', 'rotating')",
+             WHERE id = $1 AND workspace_id = $2 AND status IN ('active', 'rotating')
+             RETURNING name",
         )
         .bind(key_id)
         .bind(workspace_id.0)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // The 404 is decided BEFORE the audit write and before the commit, so
+        // a revocation that matched nothing leaves no row claiming it did.
+        let Some(revoked) = revoked else {
+            return Err(ApiError::NotFound(format!("api key {key_id} not found")));
+        };
+        let name: String = revoked.get("name");
+
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(AdminAuditAction::ApiKeyRevoked, key_id, Some(name)),
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound(format!("api key {key_id} not found")));
-        }
         Ok(())
     }
 
@@ -313,10 +360,20 @@ impl ApiKeyRepository {
     /// # Errors
     /// Returns `ApiError::NotFound` if the key does not exist or is already revoked.
     /// Returns `ApiError::Database` on SQL failures.
+    /// FU5: writes an `api_key.rotated` audit row in the same transaction —
+    /// but ONLY on the branch that actually issues a new key.
+    ///
+    /// The `'rotating'` branch below is idempotent by design (D-18): it changes
+    /// no state and re-reports the rotation already in progress. Auditing it
+    /// would put a second "the key was rotated" row in the trail for an event
+    /// that did not happen, and an audit trail that inflates its own event
+    /// count is worse than one that is merely incomplete. A repeated rotate
+    /// call within the grace window is therefore NOT recorded.
     pub async fn rotate(
         &self,
         workspace_id: WorkspaceId,
         key_id: Uuid,
+        actor: &AdminActor,
     ) -> Result<(String, chrono::DateTime<chrono::Utc>), ApiError> {
         let mut tx = self
             .pool
@@ -332,7 +389,7 @@ impl ApiKeyRepository {
 
         // Fetch the key — only active or rotating keys can be rotated.
         let row = sqlx::query(
-            "SELECT id, status, rotated_at, rotation_grace_secs, successor_key_prefix
+            "SELECT id, name, status, rotated_at, rotation_grace_secs, successor_key_prefix
              FROM api_keys
              WHERE id = $1 AND workspace_id = $2 AND status IN ('active', 'rotating')
              FOR UPDATE",
@@ -408,6 +465,23 @@ impl ApiKeyRepository {
         let rotated_at: DateTime<Utc> = rotated_row.get("rotated_at");
         let grace_secs: i32 = rotated_row.get("rotation_grace_secs");
         let grace_expires_at = rotated_at + chrono::Duration::seconds(i64::from(grace_secs));
+
+        let key_name: String = row.get("name");
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(AdminAuditAction::ApiKeyRotated, key_id, Some(key_name))
+                .with_detail(serde_json::json!({
+                    // The rotated key stays valid until this instant. That
+                    // window IS the residual risk of a rotation, so an auditor
+                    // asking "was the compromised key still usable at 14:05?"
+                    // can answer from this row alone. No key material: neither
+                    // the new plaintext nor the successor prefix appears here.
+                    "grace_expires_at": grace_expires_at,
+                    "grace_secs": grace_secs,
+                })),
+        )
+        .await?;
 
         tx.commit()
             .await

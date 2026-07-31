@@ -7,6 +7,9 @@ use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+use crate::db::scope::begin_scoped;
+
 #[derive(Debug, Clone)]
 pub struct UserRow {
     pub id: Uuid,
@@ -138,14 +141,32 @@ impl UserRepository {
 
     /// Create a new user in the workspace with an Argon2id-hashed password.
     /// Returns `ApiError::Conflict` if the email is already taken.
+    ///
+    /// FU5: writes a `user.created` audit row in the SAME transaction as the
+    /// account. Creating a user is granting access, and the role granted is the
+    /// whole security content of the event.
+    ///
+    /// This method previously ran a bare `INSERT` against the pool. It now runs
+    /// inside [`begin_scoped`], for a reason that is not cosmetic: `users` has
+    /// no row-level security, but `admin_audit` does, and an INSERT into an
+    /// RLS-protected table with `app.current_workspace_id` unset is REJECTED.
+    /// `begin_scoped` also reads the setting back, so a transaction that failed
+    /// to arm fails loudly here rather than silently later.
+    ///
+    /// The password never reaches the audit row — neither the plaintext nor the
+    /// Argon2 hash, which is an offline-attackable artifact and has no business
+    /// in a table that is never purged.
     pub async fn create_user(
         &self,
         workspace_id: WorkspaceId,
         email: &str,
         plaintext_password: &str,
         role: &str,
+        actor: &AdminActor,
     ) -> Result<UserRow, ApiError> {
         let hash = hash_password(plaintext_password)?;
+
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
 
         let row = sqlx::query(
             "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
@@ -158,7 +179,7 @@ impl UserRepository {
         .bind(email)
         .bind(&hash)
         .bind(role)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|error| {
             let msg = error.to_string();
@@ -169,7 +190,25 @@ impl UserRepository {
             }
         })?;
 
-        Ok(row_to_user(row))
+        let created = row_to_user(row);
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::UserCreated,
+                created.id,
+                Some(created.email.clone()),
+            )
+            .targeting_user(created.id, &created.email, role)
+            .with_detail(serde_json::json!({ "role_granted": role })),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| ApiError::Database(error.to_string()))?;
+
+        Ok(created)
     }
 
     /// Deployment-wide user count (users has no RLS — global count is intended,

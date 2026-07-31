@@ -1,3 +1,4 @@
+pub mod admin_audit_repo;
 pub mod api_key_repo;
 pub mod budget_repo;
 pub mod license_repo;
