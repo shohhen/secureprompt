@@ -268,11 +268,34 @@ impl UserRepository {
     /// makes this atomic: a mid-way failure rolls back rather than leaving
     /// a fresh secret paired with stale codes.
     ///
+    /// P1A folded the backup-code INSERT in here too, and audits the whole
+    /// thing as one action. The handler used to write the secret and the codes
+    /// through two independent calls, so a failure between them left an account
+    /// holding a fresh secret and no recovery codes; and neither call left any
+    /// record that a second factor had been re-issued. Both are now one
+    /// transaction with the audit row, so `two_factor.enrollment_started` and
+    /// the credentials it describes commit together or not at all.
+    ///
+    /// The `hashes` are Argon2 hashes of the backup codes — the plaintext codes
+    /// never reach this repository and never reach the audit row.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` if `user_id` doesn't exist,
-    /// `ApiError::Database` for pool/query/transaction failures.
-    pub async fn set_totp_secret(&self, user_id: Uuid, encrypted: &[u8]) -> Result<(), ApiError> {
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
+    /// `ApiError::Database` for pool/query/transaction failures, and
+    /// `ApiError::Internal` if the tenancy scope does not arm (see
+    /// [`crate::db::scope`]).
+    pub async fn enroll_totp(
+        &self,
+        user_id: Uuid,
+        encrypted: &[u8],
+        hashes: &[String],
+        actor: &AdminActor,
+        entry: &AdminAuditEntry,
+    ) -> Result<(), ApiError> {
+        // `begin_scoped` rather than a bare `begin`: `admin_audit` is under
+        // FORCE RLS keyed on `app.current_workspace_id`, and the read-back
+        // refuses a transaction whose scope did not take.
+        let mut tx = begin_scoped(&self.pool, actor.workspace_id).await?;
 
         let result = sqlx::query(
             "UPDATE users
@@ -297,23 +320,55 @@ impl UserRepository {
             .await
             .map_err(db_err)?;
 
+        if !hashes.is_empty() {
+            sqlx::query(
+                "INSERT INTO user_backup_codes (id, user_id, code_hash, created_at)
+                 SELECT gen_random_uuid(), $1, code_hash, NOW()
+                 FROM UNNEST($2::text[]) AS code_hash",
+            )
+            .bind(user_id)
+            .bind(hashes)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+
+        admin_audit_repo::write(&mut tx, actor, entry).await?;
+
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
     /// Mark enrollment complete after the first valid code is verified.
     ///
+    /// P1A: this is the instant 2FA actually becomes real — until a code
+    /// verifies, the account is still password-only — so this and not
+    /// `enroll_totp` is where `two_factor.enabled` is written, in the same
+    /// transaction as the column it describes.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` if `user_id` doesn't exist,
-    /// `ApiError::Database` for pool/query failures.
-    pub async fn confirm_totp(&self, user_id: Uuid) -> Result<(), ApiError> {
+    /// `ApiError::Database` for pool/query failures, and `ApiError::Internal`
+    /// if the tenancy scope does not arm.
+    pub async fn confirm_totp(
+        &self,
+        user_id: Uuid,
+        actor: &AdminActor,
+        entry: &AdminAuditEntry,
+    ) -> Result<(), ApiError> {
+        let mut tx = begin_scoped(&self.pool, actor.workspace_id).await?;
+
         let result = sqlx::query("UPDATE users SET totp_confirmed_at = NOW() WHERE id = $1")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        require_row(result, user_id)?;
 
-        require_row(result, user_id)
+        admin_audit_repo::write(&mut tx, actor, entry).await?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
     }
 
     /// Turn TOTP off: clears the secret, confirmation, replay state, and
@@ -321,11 +376,22 @@ impl UserRepository {
     /// transaction so a mid-way failure can't leave orphaned backup codes
     /// for a user with no secret.
     ///
+    /// P1A: this is the account-recovery step an attacker performs after
+    /// taking a password, so `two_factor.disabled` is written in the same
+    /// transaction. "The second factor was removed at 03:12, using a backup
+    /// code" is the line an incident review looks for and there was none.
+    ///
     /// # Errors
     /// Returns `ApiError::NotFound` if `user_id` doesn't exist,
-    /// `ApiError::Database` for pool/query/transaction failures.
-    pub async fn disable_totp(&self, user_id: Uuid) -> Result<(), ApiError> {
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
+    /// `ApiError::Database` for pool/query/transaction failures, and
+    /// `ApiError::Internal` if the tenancy scope does not arm.
+    pub async fn disable_totp(
+        &self,
+        user_id: Uuid,
+        actor: &AdminActor,
+        entry: &AdminAuditEntry,
+    ) -> Result<(), ApiError> {
+        let mut tx = begin_scoped(&self.pool, actor.workspace_id).await?;
 
         let result = sqlx::query(
             "UPDATE users
@@ -351,6 +417,8 @@ impl UserRepository {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+
+        admin_audit_repo::write(&mut tx, actor, entry).await?;
 
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -420,32 +488,11 @@ impl UserRepository {
         Ok(record.get::<i32, _>("totp_failed_attempts"))
     }
 
-    /// Insert pre-hashed backup codes (10 per enrollment). `hashes` are
-    /// Argon2 PHC strings produced by the caller via `hash_password` —
-    /// the repo stores hashes only, never plaintext codes.
-    ///
-    /// # Errors
-    /// Returns `ApiError::Database` for pool/query failures.
-    pub async fn insert_backup_codes(
-        &self,
-        user_id: Uuid,
-        hashes: &[String],
-    ) -> Result<(), ApiError> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        sqlx::query(
-            "INSERT INTO user_backup_codes (id, user_id, code_hash, created_at)
-             SELECT gen_random_uuid(), $1, code_hash, NOW()
-             FROM UNNEST($2::text[]) AS code_hash",
-        )
-        .bind(user_id)
-        .bind(hashes)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
+    // `insert_backup_codes` used to live here. P1A folded it into
+    // `enroll_totp`: it had exactly one caller, which invoked it immediately
+    // after `set_totp_secret` on a separate connection, so a failure between
+    // the two left an account with a fresh secret and no recovery codes. The
+    // INSERT is now a statement inside `enroll_totp`'s transaction.
 
     /// Consume a single-use backup code: Argon2-verifies `code_plain`
     /// against every unused hash for the user, and atomically marks the
