@@ -436,8 +436,11 @@ impl PipelineService {
         // WS4-5 — adopt the id the HTTP layer already gave the caller, so the
         // audit row this request writes is reachable from the caller's copy
         // and from the log line. Falls back to a fresh id for call sites with
-        // no middleware above them.
-        let request_id = request.request_id.unwrap_or_else(RequestId::new);
+        // no middleware above them: `RequestId::default()` is defined as
+        // `RequestId::new()` in the `uuid_newtype!` macro, i.e. a fresh v4 and
+        // NOT the nil uuid, so this is the same fallback the pipeline has
+        // always used.
+        let request_id = request.request_id.unwrap_or_default();
         // WS3-1 — the workspace's raw-content capture opt-in, resolved once
         // for the whole request (including the two fail-closed exits below,
         // which each write an audit row).
