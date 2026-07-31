@@ -201,7 +201,7 @@ async fn token_flow(pool: PgPool) -> sqlx::Result<()> {
 /// for the same reasoning.
 #[sqlx::test]
 async fn refresh_rotation(pool: PgPool) -> sqlx::Result<()> {
-    let _seeded = fixtures::seed_two_workspaces(&pool).await?;
+    let seeded = fixtures::seed_two_workspaces(&pool).await?;
     let (_state, router) = build_app(pool.clone());
 
     let login = post_json(
@@ -233,16 +233,18 @@ async fn refresh_rotation(pool: PgPool) -> sqlx::Result<()> {
     // Old row has revoked_at IS NOT NULL; new row is active.
     let old_hash = hash_refresh_token(&old_refresh);
     let new_hash = hash_refresh_token(new_refresh);
-    let old_row =
-        sqlx::query("SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1")
-            .bind(&old_hash)
-            .fetch_one(&pool)
-            .await?;
-    let new_row =
-        sqlx::query("SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1")
-            .bind(&new_hash)
-            .fetch_one(&pool)
-            .await?;
+    // Read from INSIDE workspace A's armed scope — the visibility the product
+    // has. On the bare pool under a non-bypassing role `refresh_tokens` is
+    // filtered to nothing and both `fetch_one`s raise `RowNotFound`.
+    let mut scope = fixtures::scoped(&pool, seeded.workspace_a).await;
+    let old_row = sqlx::query("SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1")
+        .bind(&old_hash)
+        .fetch_one(&mut *scope)
+        .await?;
+    let new_row = sqlx::query("SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1")
+        .bind(&new_hash)
+        .fetch_one(&mut *scope)
+        .await?;
     let old_revoked: Option<chrono::DateTime<chrono::Utc>> = old_row.get("revoked_at");
     let new_revoked: Option<chrono::DateTime<chrono::Utc>> = new_row.get("revoked_at");
     assert!(old_revoked.is_some(), "old refresh must be revoked");
@@ -298,12 +300,33 @@ async fn refresh_replay_detect(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(replay_body["error"]["code"], "invalid_credentials");
 
     // All active refresh rows for viewer_a must now be revoked.
+    let mut scope = fixtures::scoped(&pool, seeded.workspace_a).await;
+
+    // PREMISE / CONTROL for the absence-claim below: this scope can see the
+    // viewer's refresh rows at all. Same table, same user, same transaction —
+    // only `revoked_at IS NULL` differs between the two counts, so a zero
+    // below is the revocation and not a reader that cannot see. On the bare
+    // pool under `secureprompt_runner` this read returns 0 for BOTH counts and
+    // the assertion passes while proving nothing.
+    let all_rows: i64 = sqlx::query(
+        "SELECT COUNT(*)::bigint AS c FROM refresh_tokens WHERE user_id = $1",
+    )
+    .bind(seeded.viewer_a)
+    .fetch_one(&mut *scope)
+    .await?
+    .get("c");
+    assert!(
+        all_rows >= 2,
+        "premise: the login and the legitimate rotation must have left at \
+         least two refresh rows visible to this scope, saw {all_rows}"
+    );
+
     let active: i64 = sqlx::query(
         "SELECT COUNT(*)::bigint AS c FROM refresh_tokens
          WHERE user_id = $1 AND revoked_at IS NULL",
     )
     .bind(seeded.viewer_a)
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await?
     .get("c");
     assert_eq!(active, 0, "replay must revoke all active refresh rows");
@@ -471,6 +494,7 @@ async fn expired_refresh(pool: PgPool) -> sqlx::Result<()> {
     // Manually insert a refresh row whose expires_at is already in the past.
     let raw_token = "refresh-expired-test-fixture-0000000000";
     let hash = hash_refresh_token(raw_token);
+    let mut seed_scope = fixtures::scoped(&pool, seeded.workspace_a).await;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, expires_at, created_at)
@@ -480,8 +504,9 @@ async fn expired_refresh(pool: PgPool) -> sqlx::Result<()> {
     .bind(seeded.admin_a)
     .bind(seeded.workspace_a)
     .bind(&hash)
-    .execute(&pool)
+    .execute(&mut *seed_scope)
     .await?;
+    seed_scope.commit().await?;
 
     let response = post_json(
         &router,

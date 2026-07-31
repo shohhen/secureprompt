@@ -492,12 +492,20 @@ async fn get_secure_mode_reports_capture_off_by_default(pool: PgPool) {
 
     // Premise: the workspace has never chosen. A stored row would make this
     // test assert the row's contents, not the DEFAULT.
-    let rows: i64 =
+    // Read from INSIDE the workspace's armed scope. `workspace_raw_capture` is
+    // ENABLE + FORCE ROW LEVEL SECURITY (migration 030), so an unscoped read
+    // under a non-bypassing role is filtered to zero — which would satisfy
+    // this premise because the reader cannot see rather than because no row
+    // was written. Measured: this assertion PASSED under `secureprompt_runner`
+    // on the bare pool while proving nothing.
+    let rows: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT COUNT(*) FROM workspace_raw_capture WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert_eq!(rows, 0, "test premise: no stored capture choice");
 
     let token = make_jwt(ws_id, "admin");
@@ -551,12 +559,14 @@ async fn enabling_capture_requires_admin(pool: PgPool) {
     }
 
     // Nothing was stored by the rejected attempts.
-    let enabled: Option<bool> =
+    let enabled: Option<bool> = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT enabled FROM workspace_raw_capture WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert!(
         enabled.is_none(),
         "a rejected PUT must not have written a settings row, got {enabled:?}"
@@ -571,12 +581,18 @@ async fn enabling_capture_requires_admin(pool: PgPool) {
     let body = json_body(resp).await;
     assert_eq!(body["capture_raw_content"], true);
 
-    let enabled: bool =
+    // The CONTROL read for `enabled.is_none()` above: the identical statement,
+    // on the identical table, from the identical armed scope — differing only
+    // in that this time an admin made the call. That is what makes the earlier
+    // `None` the role gate rather than a reader that cannot see.
+    let enabled: bool = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT enabled FROM workspace_raw_capture WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert!(enabled, "the admin's PUT must have been persisted");
 }
 
@@ -588,12 +604,14 @@ async fn enabling_capture_writes_an_audit_row_naming_the_actor(pool: PgPool) {
 
     // Premise: nothing is in the audit table yet, so a row found afterwards
     // is definitely ours.
-    let before: i64 =
+    let before: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT COUNT(*) FROM raw_capture_audit WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert_eq!(before, 0, "test premise: empty audit trail");
 
     let resp = build_app(pool.clone())
@@ -605,6 +623,10 @@ async fn enabling_capture_writes_an_audit_row_naming_the_actor(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Same armed scope that reported the empty trail above, re-opened. The
+    // pair "0 before, this row after" is what makes the premise a statement
+    // about the table rather than about the reader.
+    let mut audit_scope = super::fixtures::scoped(&pool, ws_id).await;
     let (actor_user_id, actor_email, enabled_before, enabled_after, days_after): (
         Option<Uuid>,
         Option<String>,
@@ -617,7 +639,7 @@ async fn enabling_capture_writes_an_audit_row_naming_the_actor(pool: PgPool) {
          FROM raw_capture_audit WHERE workspace_id = $1",
     )
     .bind(ws_id)
-    .fetch_one(&pool)
+    .fetch_one(&mut *audit_scope)
     .await
     .unwrap();
 
@@ -646,12 +668,14 @@ async fn unrelated_secure_mode_changes_do_not_touch_the_capture_audit(pool: PgPo
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let rows: i64 =
+    let rows: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT COUNT(*) FROM raw_capture_audit WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert_eq!(rows, 0, "a level change is not a capture change");
 
     // POSITIVE CONTROL: a capture change on the same workspace DOES append.
@@ -660,12 +684,14 @@ async fn unrelated_secure_mode_changes_do_not_touch_the_capture_audit(pool: PgPo
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let rows: i64 =
+    let rows: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws_id).await;
         sqlx::query_scalar("SELECT COUNT(*) FROM raw_capture_audit WHERE workspace_id = $1")
             .bind(ws_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .unwrap();
+            .unwrap()
+    };
     assert_eq!(rows, 1, "a capture change must append exactly one row");
 }
 
