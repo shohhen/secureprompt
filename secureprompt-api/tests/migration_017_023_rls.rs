@@ -37,6 +37,20 @@
 //!     plaintext row survives. 022's correctness is load-bearing on that
 //!     table having no RLS, which is why a test asserts it.
 //!
+//! WHAT 018/021/023 TURNED OUT TO BE. "Pure DDL with no RLS-sensitive
+//! statement to no-op" was true of the migrations and false of the tables they
+//! created. `workspace_sidecar_policy`, `workspace_raw_capture`,
+//! `raw_capture_audit` and `retention_purge_audit` shipped with NO row-level
+//! security at all, and this suite's first three versions of the tests below
+//! PINNED that as expected behaviour — measured, from an armed foreign scope:
+//! another tenant's rows were readable and writable. `raw_capture_audit` is a
+//! source of the signed compliance export, so the only thing keeping one
+//! tenant's audit rows out of another tenant's attestation was an
+//! application-level `WHERE workspace_id = $1`.
+//!
+//! Migration 030 arms all four. The tests below now assert the boundary
+//! instead of the breach.
+//!
 //! SCOPE. Running the FULL suite as `secureprompt_runner` produces ~85
 //! failures of the form `new row violates row-level security policy for table
 //! "policy_rules"`, originating in `workspace_repo`'s default-rule seeding:
@@ -143,6 +157,26 @@ async fn updated_at_of(pool: &PgPool, rule_id: Uuid) -> String {
         .fetch_one(pool)
         .await
         .expect("rule must still exist")
+}
+
+/// Every policy on a table as `(policyname, qual)`, ordered by name.
+///
+/// `qual` is Postgres's own rendering of the USING expression, so a test that
+/// compares it is reading the catalog rather than restating the migration.
+async fn policies_of(pool: &PgPool, table: &str) -> Vec<(String, String)> {
+    sqlx::query(
+        "SELECT policyname::text AS name, qual::text AS qual
+         FROM pg_policies
+         WHERE schemaname = 'public' AND tablename = $1
+         ORDER BY policyname",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| panic!("policy probe for {table}: {e}"))
+    .into_iter()
+    .map(|r| (r.get("name"), r.get("qual")))
+    .collect()
 }
 
 /// `(rowsecurity, forcerowsecurity)` straight out of the catalog.
@@ -553,42 +587,52 @@ async fn migration_018_applies_under_a_non_superuser_role(pool: PgPool) {
     );
 }
 
-/// 018's `workspace_sidecar_policy` has NO row-level security. The migration
-/// header says so deliberately; this test makes the CONSEQUENCE measurable
-/// rather than a claim, because a table that carries `workspace_id` and no
-/// RLS is exactly the shape a reader assumes is protected.
+/// TENANCY for `workspace_sidecar_policy` (018), armed by migration 030.
 ///
-/// The positive control is `policy_rules` on the SAME connection in the SAME
-/// scope: it IS isolated. So the cross-tenant read below is a property of the
-/// table, not of the connection.
+/// 018 shipped this table with no row-level security at all — its header calls
+/// that deliberate — so until 030 another tenant's scope could read AND write
+/// its rows. This test asserts the boundary on both halves.
+///
+/// Three things stop it being vacuous:
+///   * the premise assertions inside `low_privilege_connection`;
+///   * `policy_rules` on the SAME connection in the SAME scope is the POSITIVE
+///     CONTROL for the read, and workspace A's OWN row is the positive control
+///     for the write — without them, "B is invisible / unwritable" would also
+///     be satisfied by a connection that can see and write nothing at all;
+///   * B's row is re-read through the privileged pool afterwards, so a blocked
+///     UPDATE is told apart from an UPDATE that ran and changed nothing.
 #[sqlx::test]
-async fn migration_018_table_has_no_rls_so_another_scope_can_read_and_write_it(pool: PgPool) {
+async fn workspace_sidecar_policy_is_isolated_from_another_workspaces_scope(pool: PgPool) {
     let workspace_a = seed_workspace(&pool, "Sidecar Tenant A").await;
     let workspace_b = seed_workspace(&pool, "Sidecar Tenant B").await;
     let rule_a = seed_rule(&pool, workspace_a, "Rule A", LEGACY_NINE).await;
     seed_rule(&pool, workspace_b, "Rule B", LEGACY_NINE).await;
-    sqlx::query(
-        "INSERT INTO workspace_sidecar_policy (workspace_id, sidecar_unavailable)
-         VALUES ($1, 'degrade_with_alert')",
-    )
-    .bind(workspace_b)
-    .execute(&pool)
-    .await
-    .expect("workspace B chooses degrade");
 
-    assert_eq!(
-        rls_flags(&pool, "workspace_sidecar_policy").await,
-        (false, false),
-        "018 states `NO ROW-LEVEL SECURITY` in its header. If that has changed, \
-         the reasoning in the header and in src/db/sidecar_policy_repo.rs is \
-         stale and the rest of this test is asserting the wrong thing."
-    );
+    for (workspace, mode) in [(workspace_a, "block"), (workspace_b, "degrade_with_alert")] {
+        sqlx::query(
+            "INSERT INTO workspace_sidecar_policy (workspace_id, sidecar_unavailable)
+             VALUES ($1, $2)",
+        )
+        .bind(workspace)
+        .bind(mode)
+        .execute(&pool)
+        .await
+        .expect("a workspace chooses its sidecar policy");
+    }
+
+    // PREMISE: both rows really are on disk. Otherwise "A cannot see B's row"
+    // would be satisfied by there being no row to see.
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM workspace_sidecar_policy")
+        .fetch_one(&pool)
+        .await
+        .expect("row count through the privileged pool");
+    assert_eq!(stored, 2, "premise: two rows must exist before scoping");
 
     let mut conn = low_privilege_connection(&pool).await;
     arm_scope(&mut conn, workspace_a).await;
 
     // POSITIVE CONTROL first: on this very connection, in this very scope, an
-    // RLS-protected table IS isolated.
+    // already-RLS-protected table IS isolated.
     let rules: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM policy_rules")
         .fetch_all(&mut conn)
         .await
@@ -597,35 +641,92 @@ async fn migration_018_table_has_no_rls_so_another_scope_can_read_and_write_it(p
         rules,
         vec![rule_a],
         "premise: policy_rules must be isolated on this connection, otherwise \
-         the cross-tenant read below proves nothing about the table"
+         the assertions below prove nothing about the table"
     );
 
-    let leaked: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM workspace_sidecar_policy")
-        .fetch_all(&mut conn)
-        .await
-        .expect("sidecar policy under scope A");
+    let visible: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT workspace_id FROM workspace_sidecar_policy ORDER BY workspace_id",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("sidecar policy under scope A");
     assert_eq!(
-        leaked,
-        vec![workspace_b],
-        "MEASURED, not a defect claim: `workspace_sidecar_policy` has no RLS, \
-         so workspace A's scope reads workspace B's row. Today the only guard \
-         is that every query in src/db/sidecar_policy_repo.rs binds the \
-         authenticated workspace_id — verified by reading it. This assertion \
-         exists so that stops being an unwritten assumption."
+        visible,
+        vec![workspace_a],
+        "workspace A's scope must see its OWN row and ONLY its own row. Seeing \
+         both is the pre-030 defect; seeing neither would mean the scope did \
+         not arm."
     );
 
-    let overwritten = sqlx::query(
+    // WRITE half, cross-tenant: rejected.
+    let cross = sqlx::query(
         "UPDATE workspace_sidecar_policy SET sidecar_unavailable = 'block' WHERE workspace_id = $1",
     )
     .bind(workspace_b)
     .execute(&mut conn)
     .await
-    .expect("update under scope A");
+    .expect("an UPDATE filtered out by RLS is not an error, it matches nothing");
     assert_eq!(
-        overwritten.rows_affected(),
+        cross.rows_affected(),
+        0,
+        "workspace A's scope must not be able to overwrite workspace B's \
+         fail-open/fail-closed choice"
+    );
+
+    // WRITE half, own-tenant: the positive control. Without it, `0` above is
+    // equally satisfied by a connection that cannot write at all.
+    let own = sqlx::query(
+        "UPDATE workspace_sidecar_policy SET sidecar_unavailable = 'degrade_with_alert'
+         WHERE workspace_id = $1",
+    )
+    .bind(workspace_a)
+    .execute(&mut conn)
+    .await
+    .expect("own-scope update");
+    assert_eq!(
+        own.rows_affected(),
         1,
-        "and it is writable across tenants too — the same absence, on the \
-         loud half"
+        "premise: the armed scope must still be able to write its OWN row"
+    );
+
+    // And B's row is untouched ON DISK — a blocked UPDATE, not one that ran.
+    let b_mode: String = sqlx::query_scalar(
+        "SELECT sidecar_unavailable FROM workspace_sidecar_policy WHERE workspace_id = $1",
+    )
+    .bind(workspace_b)
+    .fetch_one(&pool)
+    .await
+    .expect("B's row read through the privileged pool");
+    assert_eq!(
+        b_mode, "degrade_with_alert",
+        "B's stored choice must survive verbatim"
+    );
+
+    // INSERTing a row FOR B from A's scope is the loud half of the same rule:
+    // a policy stated with USING only supplies WITH CHECK as well.
+    let forged = sqlx::query(
+        "INSERT INTO workspace_sidecar_policy (workspace_id, sidecar_unavailable)
+         VALUES ($1, 'degrade_with_alert')
+         ON CONFLICT (workspace_id) DO UPDATE SET sidecar_unavailable = 'degrade_with_alert'",
+    )
+    .bind(seed_workspace(&pool, "Sidecar Tenant C").await)
+    .execute(&mut conn)
+    .await;
+    let error = forged.expect_err("inserting a row for another workspace must be refused");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "the refusal must be the RLS one, not a constraint violation standing \
+         in for it. Got: {error}"
+    );
+
+    // Last, the mechanism. Stated after the behaviour so that a regression
+    // fails on what a tenant can actually reach, not on a catalog flag.
+    assert_eq!(
+        rls_flags(&pool, "workspace_sidecar_policy").await,
+        (true, true),
+        "migration 030 must ENABLE and FORCE row-level security here. ENABLE \
+         alone exempts the table OWNER, which under the DB role-split is the \
+         migration role, so FORCE is not decoration."
     );
 }
 
@@ -754,44 +855,59 @@ async fn migration_021_applies_under_a_non_superuser_role(pool: PgPool) {
     );
 }
 
-/// 021's two tables carry `workspace_id` and NO row-level security. The
-/// header calls that deliberate and points at `src/db/raw_capture_repo.rs`,
-/// which does bind the workspace on every statement — verified by reading it.
+/// TENANCY for 021's two tables, armed by migration 030.
 ///
-/// This test pins the CONSEQUENCE, because one consumer reasons otherwise:
-/// `secureprompt-worker/src/tasks/audit_export.rs::fetch_control_rows` reads
-/// `raw_capture_audit` inside `begin_scoped` and its doc-comment says it
-/// "runs inside a transaction opened by begin_scoped, so the RLS-armed table
-/// is readable". `raw_capture_audit` is not RLS-armed; that export is
-/// tenant-safe only because the query also binds `WHERE workspace_id = $1`.
-/// If anyone ever removes that predicate trusting the scope, this test says
-/// what actually protects the row.
+/// `raw_capture_audit` is the one that matters most. It is a SOURCE of the
+/// signed compliance export: `secureprompt-worker/src/tasks/audit_export.rs::
+/// fetch_control_rows` reads it inside `begin_scoped`, and until 030 its
+/// doc-comment's claim that "the RLS-armed table is readable" was false — the
+/// table had no RLS, and the only thing keeping one tenant's audit rows out of
+/// another tenant's signed attestation was the query's own
+/// `WHERE workspace_id = $1`. This test makes the database enforce it too, so
+/// that removing that predicate stops being a one-line tenancy breach.
+///
+/// The positive controls are `policy_rules` (read) and workspace A's own rows
+/// (read and write): without them, "B is invisible" would also be satisfied by
+/// a connection that can see nothing at all.
 #[sqlx::test]
-async fn migration_021_audit_table_has_no_rls_so_another_scope_can_read_it(pool: PgPool) {
+async fn migration_021_tables_are_isolated_from_another_workspaces_scope(pool: PgPool) {
     let workspace_a = seed_workspace(&pool, "Capture Tenant A").await;
     let workspace_b = seed_workspace(&pool, "Capture Tenant B").await;
     let rule_a = seed_rule(&pool, workspace_a, "Rule A", LEGACY_NINE).await;
 
-    let audit_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO raw_capture_audit
-            (id, workspace_id, actor_user_id, actor_email, enabled_before, enabled_after,
-             retention_days_before, retention_days_after)
-         VALUES ($1, $2, NULL, 'admin@tenant-b.example', false, true, 30, 90)",
-    )
-    .bind(audit_id)
-    .bind(workspace_b)
-    .execute(&pool)
-    .await
-    .expect("workspace B turns capture on");
+    for (workspace, email) in [
+        (workspace_a, "admin@tenant-a.example"),
+        (workspace_b, "admin@tenant-b.example"),
+    ] {
+        sqlx::query("INSERT INTO workspace_raw_capture (workspace_id, enabled) VALUES ($1, true)")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .expect("a workspace turns capture on");
 
-    for table in ["workspace_raw_capture", "raw_capture_audit"] {
-        assert_eq!(
-            rls_flags(&pool, table).await,
-            (false, false),
-            "{table} was expected to carry no RLS, per 021's header"
-        );
+        sqlx::query(
+            "INSERT INTO raw_capture_audit
+                (id, workspace_id, actor_user_id, actor_email, enabled_before, enabled_after,
+                 retention_days_before, retention_days_after)
+             VALUES ($1, $2, NULL, $3, false, true, 30, 90)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace)
+        .bind(email)
+        .execute(&pool)
+        .await
+        .expect("and the change is audited");
     }
+
+    // PREMISE: both tenants' rows really are on disk.
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM raw_capture_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("audit row count through the privileged pool");
+    assert_eq!(
+        stored, 2,
+        "premise: two audit rows must exist before scoping"
+    );
 
     let mut conn = low_privilege_connection(&pool).await;
     arm_scope(&mut conn, workspace_a).await;
@@ -807,18 +923,82 @@ async fn migration_021_audit_table_has_no_rls_so_another_scope_can_read_it(pool:
         "premise: policy_rules must be isolated"
     );
 
-    let leaked: Vec<String> = sqlx::query_scalar("SELECT actor_email FROM raw_capture_audit")
+    let visible: Vec<String> = sqlx::query_scalar("SELECT actor_email FROM raw_capture_audit")
         .fetch_all(&mut conn)
         .await
         .expect("raw_capture_audit under scope A");
     assert_eq!(
-        leaked,
-        vec!["admin@tenant-b.example".to_owned()],
-        "workspace A's scope read workspace B's audit row, including the \
-         actor's email address. Only the explicit `WHERE workspace_id = $1` in \
-         raw_capture_repo.rs and audit_export.rs keeps that out of the wrong \
-         tenant's compliance export."
+        visible,
+        vec!["admin@tenant-a.example".to_owned()],
+        "workspace A's scope must read its OWN audit row and no other. Reading \
+         B's — including the actor's email address — is what fed the wrong \
+         tenant's signed compliance export before 030."
     );
+
+    let settings: Vec<Uuid> =
+        sqlx::query_scalar("SELECT workspace_id FROM workspace_raw_capture ORDER BY workspace_id")
+            .fetch_all(&mut conn)
+            .await
+            .expect("workspace_raw_capture under scope A");
+    assert_eq!(
+        settings,
+        vec![workspace_a],
+        "the settings table must be isolated on the same terms as its audit trail"
+    );
+
+    // WRITE half: appending an audit row that CLAIMS to be workspace B's is
+    // the forgery this table exists to make impossible.
+    let forged = sqlx::query(
+        "INSERT INTO raw_capture_audit
+            (id, workspace_id, actor_user_id, actor_email, enabled_before, enabled_after,
+             retention_days_before, retention_days_after)
+         VALUES ($1, $2, NULL, 'attacker@tenant-a.example', true, false, 90, 30)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(workspace_b)
+    .execute(&mut conn)
+    .await;
+    let error = forged.expect_err("appending to another workspace's audit trail must be refused");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "the refusal must be the RLS one, not a constraint violation standing \
+         in for it. Got: {error}"
+    );
+
+    // POSITIVE CONTROL for the write half: A's own append still works.
+    sqlx::query(
+        "INSERT INTO raw_capture_audit
+            (id, workspace_id, actor_user_id, actor_email, enabled_before, enabled_after,
+             retention_days_before, retention_days_after)
+         VALUES ($1, $2, NULL, 'admin@tenant-a.example', true, false, 90, 30)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(workspace_a)
+    .execute(&mut conn)
+    .await
+    .expect("premise: the armed scope must still be able to append its OWN audit row");
+
+    // B's trail is intact ON DISK — one row, its own.
+    let b_rows: Vec<String> =
+        sqlx::query_scalar("SELECT actor_email FROM raw_capture_audit WHERE workspace_id = $1")
+            .bind(workspace_b)
+            .fetch_all(&pool)
+            .await
+            .expect("B's trail read through the privileged pool");
+    assert_eq!(
+        b_rows,
+        vec!["admin@tenant-b.example".to_owned()],
+        "B's audit trail must be exactly what B wrote"
+    );
+
+    // Last, the mechanism.
+    for table in ["workspace_raw_capture", "raw_capture_audit"] {
+        assert_eq!(
+            rls_flags(&pool, table).await,
+            (true, true),
+            "migration 030 must ENABLE and FORCE row-level security on {table}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -1015,7 +1195,7 @@ async fn migration_022_would_abort_if_token_vault_entries_gained_rls(pool: PgPoo
 }
 
 // ===========================================================================
-// 023 — CORRECT. Pure DDL; the table cannot adopt `workspace_isolation`.
+// 023 — Pure DDL. Armed by 030, but NOT with the standard policy.
 // ===========================================================================
 
 /// 023 applies as a NOSUPERUSER/NOBYPASSRLS role and its three indexes exist.
@@ -1071,36 +1251,177 @@ async fn migration_023_applies_under_a_non_superuser_role(pool: PgPool) {
     .expect("a zero-row purge must still be recordable");
 }
 
-/// WHY 023 HAS NO ROW-LEVEL SECURITY, executed rather than argued.
+/// The `retention_purge_audit` INSERT the purge job issues, for one scope.
 ///
-/// `retention_purge_audit.workspace_id` is NULLABLE by design — the token
-/// vault is purged globally, so those rows carry NULL, and
-/// `audit_export.rs::fetch_control_rows` counts them separately as
-/// deliberately-excluded. The schema's standard policy is
-/// `workspace_id = current_setting('app.current_workspace_id', true)::uuid`,
-/// which is NULL — never true — for exactly those rows. Applying it would
-/// make the purge job unable to record its own global scopes.
+/// A closure factory rather than a helper function because both tests below
+/// need it bound to a different `workspace_id` several times on the same
+/// connection.
+fn purge_row(
+    workspace_id: Option<Uuid>,
+) -> sqlx::query::Query<'static, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(
+        "INSERT INTO retention_purge_audit
+            (id, run_id, scope, workspace_id, cutoff, rows_deleted,
+             rows_remaining_past_cutoff, status, started_at)
+         VALUES ($1, $2, 'token_vault_entries', $3, NOW(), 7, 0, 'ok', NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(workspace_id)
+}
+
+/// TENANCY for `retention_purge_audit`, armed by migration 030 with a policy
+/// that is DELIBERATELY NOT the standard one.
 ///
-/// This test is the tripwire for anyone who "fixes" 023 by adding the usual
-/// policy: it shows the global insert being REJECTED, and the per-workspace
-/// insert succeeding in the same breath, so the failure cannot be mistaken
-/// for the table being unwritable in general.
+/// `workspace_id` is NULLABLE here by design: the token vault and the session
+/// device-context scrub are purged globally, so those rows carry NULL. The
+/// schema's standard predicate —
+/// `workspace_id = current_setting('app.current_workspace_id', true)::uuid` —
+/// is NULL, never true, for exactly those rows, so arming this table with it
+/// would silently drop the purge audit trail's global half (and, on the read
+/// side, would zero the excluded-row COUNT that
+/// `audit_export.rs::fetch_control_rows` puts in the signed manifest). 030
+/// therefore adds `workspace_id IS NULL OR ...`.
+///
+/// This test measures all four consequences on ONE armed connection: another
+/// tenant's row is invisible and un-writable, the caller's own row is both,
+/// and the global rows stay readable and writable.
+#[sqlx::test]
+async fn retention_purge_audit_isolates_tenants_and_still_admits_global_scopes(pool: PgPool) {
+    let workspace_a = seed_workspace(&pool, "Purge Tenant A").await;
+    let workspace_b = seed_workspace(&pool, "Purge Tenant B").await;
+    let rule_a = seed_rule(&pool, workspace_a, "Rule A", LEGACY_NINE).await;
+
+    for scope in [Some(workspace_a), Some(workspace_b), None] {
+        purge_row(scope)
+            .execute(&pool)
+            .await
+            .expect("the purge job records one row per scope");
+    }
+
+    // PREMISE: all three rows really are on disk.
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM retention_purge_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("row count through the privileged pool");
+    assert_eq!(stored, 3, "premise: two scoped rows and one global row");
+
+    let mut conn = low_privilege_connection(&pool).await;
+    arm_scope(&mut conn, workspace_a).await;
+
+    // POSITIVE CONTROL: RLS bites on this connection.
+    let rules: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM policy_rules")
+        .fetch_all(&mut conn)
+        .await
+        .expect("policy_rules under scope A");
+    assert_eq!(
+        rules,
+        vec![rule_a],
+        "premise: policy_rules must be isolated"
+    );
+
+    let visible: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT workspace_id FROM retention_purge_audit ORDER BY workspace_id NULLS FIRST",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("retention_purge_audit under scope A");
+    assert_eq!(
+        visible,
+        vec![None, Some(workspace_a)],
+        "the armed scope must see the GLOBAL row and its OWN row, and not \
+         workspace B's. Seeing B's is the pre-030 defect; losing the global \
+         row is the mistake 030's non-standard policy exists to avoid."
+    );
+
+    // The number `fetch_control_rows` puts in the signed manifest as
+    // `excluded_rows`. Under the standard policy this would be a silent 0.
+    let excluded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_purge_audit WHERE workspace_id IS NULL")
+            .fetch_one(&mut conn)
+            .await
+            .expect("the export's own exclusion count, on the armed connection");
+    assert_eq!(
+        excluded, 1,
+        "the export reports how many global purge rows it EXCLUDED. A policy \
+         that hides them turns that disclosure into a false zero."
+    );
+
+    // WRITES. The purge job writes global rows with no scope armed at all, so
+    // that must stay possible; a scoped row for the armed workspace must too;
+    // a scoped row for ANOTHER workspace must not.
+    purge_row(None)
+        .execute(&mut conn)
+        .await
+        .expect("the purge job's GLOBAL scope row must remain writable");
+    purge_row(Some(workspace_a))
+        .execute(&mut conn)
+        .await
+        .expect("premise: a row for the armed scope must be writable");
+
+    let forged = purge_row(Some(workspace_b)).execute(&mut conn).await;
+    let error =
+        forged.expect_err("writing a purge record attributed to another workspace must be refused");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "the refusal must be the RLS one, not a constraint violation standing \
+         in for it. Got: {error}"
+    );
+
+    // B's trail is intact ON DISK: still exactly the one row B's run wrote.
+    let b_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_purge_audit WHERE workspace_id = $1")
+            .bind(workspace_b)
+            .fetch_one(&pool)
+            .await
+            .expect("B's rows read through the privileged pool");
+    assert_eq!(
+        b_rows, 1,
+        "B's proof-of-purge trail must be exactly its own"
+    );
+
+    // Last, the mechanism.
+    assert_eq!(
+        rls_flags(&pool, "retention_purge_audit").await,
+        (true, true),
+        "migration 030 must ENABLE and FORCE row-level security here"
+    );
+}
+
+/// WHY 030 DOES NOT GIVE `retention_purge_audit` THE STANDARD POLICY,
+/// executed rather than argued.
+///
+/// The tripwire for anyone who "tidies" 030 by making all four tables use the
+/// same `workspace_isolation` predicate: it shows the purge job's global row
+/// being REJECTED, and the per-workspace insert succeeding in the same breath,
+/// so the failure cannot be mistaken for the table being unwritable in
+/// general. A rejected global INSERT is the LOUD half; the silent half — the
+/// global rows vanishing from the export's excluded-row count — is covered by
+/// the test above.
 #[sqlx::test]
 async fn retention_purge_audit_cannot_adopt_the_standard_workspace_policy(pool: PgPool) {
     let workspace = seed_workspace(&pool, "Purge Tenant").await;
 
+    // PREMISE: as SHIPPED, the table is armed with the OR-global policy. If
+    // that name or predicate changes, this counterfactual is swapping out
+    // something other than what it thinks it is.
     assert_eq!(
-        rls_flags(&pool, "retention_purge_audit").await,
-        (false, false),
-        "023 ships this table without RLS. If that changed, the purge job's \
-         global scopes need re-checking against the new policy."
+        policies_of(&pool, "retention_purge_audit").await.len(),
+        1,
+        "premise: 030 ships exactly one policy on this table"
+    );
+    let (shipped_name, shipped_qual) = policies_of(&pool, "retention_purge_audit").await[0].clone();
+    assert_eq!(shipped_name, "workspace_isolation_or_global");
+    assert!(
+        shipped_qual.contains("IS NULL"),
+        "premise: the shipped predicate must be the one that admits global \
+         rows. Got: {shipped_qual}"
     );
 
     ensure_low_privilege_role(&pool).await;
     sqlx::raw_sql(
         "ALTER TABLE retention_purge_audit OWNER TO secureprompt_runner;
-         ALTER TABLE retention_purge_audit ENABLE ROW LEVEL SECURITY;
-         ALTER TABLE retention_purge_audit FORCE ROW LEVEL SECURITY;
+         DROP POLICY workspace_isolation_or_global ON retention_purge_audit;
          CREATE POLICY workspace_isolation ON retention_purge_audit
              USING (workspace_id = current_setting('app.current_workspace_id', true)::uuid);",
     )
@@ -1111,33 +1432,61 @@ async fn retention_purge_audit_cannot_adopt_the_standard_workspace_policy(pool: 
     let mut conn = low_privilege_connection(&pool).await;
     arm_scope(&mut conn, workspace).await;
 
-    let insert = |workspace_id: Option<Uuid>| {
-        sqlx::query(
-            "INSERT INTO retention_purge_audit
-                (id, run_id, scope, workspace_id, cutoff, rows_deleted,
-                 rows_remaining_past_cutoff, status, started_at)
-             VALUES ($1, $2, 'token_vault_entries', $3, NOW(), 7, 0, 'ok', NOW())",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(workspace_id)
-    };
-
     // POSITIVE CONTROL: a per-workspace row for the armed scope goes in.
-    insert(Some(workspace))
+    purge_row(Some(workspace))
         .execute(&mut conn)
         .await
         .expect("a scoped purge record must still be writable under the policy");
 
-    let global = insert(None).execute(&mut conn).await;
+    let global = purge_row(None).execute(&mut conn).await;
     let error = global.expect_err(
         "the purge job's GLOBAL scope row (workspace_id IS NULL) must be \
          rejected by the standard workspace_isolation policy — that is why \
-         023 does not carry it",
+         030 does not give this table that policy",
     );
     assert!(
         error.to_string().contains("row-level security"),
         "the rejection must be the RLS one, not a constraint violation \
          standing in for it. Got: {error}"
     );
+}
+
+// ===========================================================================
+// 030 — the arming migration itself.
+// ===========================================================================
+
+/// Migration 030's whole surface, read out of the catalog.
+///
+/// The three behavioural tests above each cover one table. This one exists so
+/// that DROPPING a table from 030's list is red even if someone also deletes
+/// the test that covered it, and so the exact predicate is pinned rather than
+/// inferred from behaviour.
+#[sqlx::test]
+async fn migration_030_arms_four_tables_with_two_deliberately_different_policies(pool: PgPool) {
+    const STANDARD: &str =
+        "(workspace_id = (current_setting('app.current_workspace_id'::text, true))::uuid)";
+    const OR_GLOBAL: &str = "((workspace_id IS NULL) OR (workspace_id = \
+                             (current_setting('app.current_workspace_id'::text, true))::uuid))";
+
+    for (table, policy, qual) in [
+        ("workspace_sidecar_policy", "workspace_isolation", STANDARD),
+        ("workspace_raw_capture", "workspace_isolation", STANDARD),
+        ("raw_capture_audit", "workspace_isolation", STANDARD),
+        (
+            "retention_purge_audit",
+            "workspace_isolation_or_global",
+            OR_GLOBAL,
+        ),
+    ] {
+        assert_eq!(
+            rls_flags(&pool, table).await,
+            (true, true),
+            "{table} must carry ENABLE and FORCE row level security after 030"
+        );
+        assert_eq!(
+            policies_of(&pool, table).await,
+            vec![(policy.to_owned(), qual.to_owned())],
+            "{table}'s policy is what decides which rows a tenant reaches"
+        );
+    }
 }
