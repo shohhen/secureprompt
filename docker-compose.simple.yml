@@ -28,7 +28,13 @@ services:
       context: .
       dockerfile: secureprompt-api/Dockerfile
     command: ["--migrate-only"]
-    restart: on-failure
+    # BOUNDED. This profile has no healthcheck, so `db-migrate` retries instead
+    # of waiting on a condition — but an unbounded `on-failure` turns a genuine
+    # failure (a wrong SECUREPROMPT_APP_DB_PASSWORD, a CREATE-on-public grant
+    # the migration role cannot revoke) into a silent infinite loop while `api`
+    # waits on `service_completed_successfully` with no timeout and nothing
+    # surfaced. Five attempts, then stop and show the exit code.
+    restart: on-failure:5
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}
