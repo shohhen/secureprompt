@@ -40,7 +40,6 @@ secureprompt-api/src/ml_sidecar/client.rs
 secureprompt-api/src/observability/metrics.rs
 secureprompt-api/src/pipeline/service.rs
 secureprompt-api/src/pipeline/tests.rs
-secureprompt-api/src/policy/tests.rs
 secureprompt-api/src/providers/credential_test.rs
 secureprompt-api/src/providers/mod.rs
 secureprompt-api/src/providers/openai_compat.rs
