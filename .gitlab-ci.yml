@@ -230,6 +230,29 @@ static-checks:
       fi
       echo "OK: no bitnami/ image references found."
 
+# ---------------------------------------------------------------------------
+# helm-render — MR7 C1/I2/M3. RENDER the chart and assert the properties the DB
+# role split rests on.
+#
+# Three of the six Criticals in the MR7 review were found by rendering, not by
+# reading: nothing in this pipeline had ever run `helm template`. `helm lint`
+# exists only in the manual `deploy` job, and lint does not look at container
+# fields at all, so "the owner credential reaches no serving container" was
+# asserted in prose and checked by nobody.
+#
+# alpine/helm ships helm as the entrypoint; `entrypoint: [""]` gets a shell,
+# and bash is a 2 MB apk away.
+# ---------------------------------------------------------------------------
+helm-render:
+  stage: lint
+  image:
+    name: alpine/helm:3.16.2
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache bash >/dev/null
+  script:
+    - bash scripts/ci/check-helm-migration-initcontainer.sh
+
 # ===========================================================================
 # Stage: test
 # ===========================================================================

@@ -56,16 +56,39 @@ An initContainer re-runs on every pod start, is idempotent, and makes
 "container did not start" the failure mode rather than "container started
 against the wrong schema".
 
-CONCURRENCY: sqlx 0.8.6 sets `locking: true` by default (sqlx-core
-migrate/migrator.rs:53), so several replicas' initContainers serialise on a
-Postgres advisory lock rather than racing. The tracking-table bootstrap path
-around it is `CREATE TABLE IF NOT EXISTS` plus `INSERT ... ON CONFLICT DO
-NOTHING`, which is idempotent independently of that lock.
+CONCURRENCY — CORRECTED. This block previously claimed that "sqlx 0.8.6 sets
+`locking: true` by default, so several replicas' initContainers serialise on a
+Postgres advisory lock rather than racing". That was FALSE of the migration
+step as a whole. sqlx's lock covers `MIGRATOR.run` and is RELEASED before it
+returns; `ALTER ROLE ... PASSWORD` ran after that, unserialised, against the
+cluster-global `pg_authid`. MEASURED on postgres:16: 4 of 8 concurrent
+migration steps failed with `XX000 tuple concurrently updated`, and this
+template renders TWO of them at chart defaults (five at api.replicaCount=3 /
+worker.replicaCount=2).
+
+What makes it safe now is `MIGRATION_STEP_LOCK_KEY` in
+secureprompt-api/src/db/migrations.rs: the binary holds one advisory lock
+across the WHOLE step, on the same connection it does the work on. Pinned by
+`concurrent_migration_steps_all_succeed` in tests/db_role_split.rs, which goes
+red if the lock is removed. The tracking-table bootstrap is additionally
+idempotent on its own (`CREATE TABLE IF NOT EXISTS`, `INSERT ... ON CONFLICT
+DO NOTHING`).
 */}}
 {{- define "secureprompt.dbMigrateInitContainer" -}}
 - name: db-migrate
   image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
-  imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+  # Its OWN policy, deliberately not `.Values.api.image.pullPolicy`
+  # (IfNotPresent). The 0.1.x tags are mutable — values.yaml says exactly that
+  # three lines below the worker image — so IfNotPresent can serve a
+  # node-cached PRE-SPLIT image here. That binary has no argument parsing at
+  # all: `--migrate-only` is ignored, the full API `main` runs,
+  # `JwtConfig::from_env` fails because this container is given only
+  # DATABASE_URL, and the pod sits in Init:CrashLoopBackOff forever. The
+  # compose path guards the same hazard with `--build`; this is the Helm
+  # equivalent. Defaults to Always; values-airgap.yaml sets Never, which is
+  # safe there because the operator side-loads an exact image on purpose —
+  # IfNotPresent is the one value that must never appear.
+  imagePullPolicy: {{ .Values.migration.image.pullPolicy | default "Always" }}
   args: ["--migrate-only"]
   env:
     # The OWNER/MIGRATOR role. Mounted ONLY here.

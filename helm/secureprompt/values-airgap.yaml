@@ -29,6 +29,12 @@ alertmanager:
     tag: "v0.27.0"
     pullPolicy: Never
 
+# The db-migrate initContainer. Never, like everything else here: the operator
+# side-loads an exact image on purpose, so there is no registry to pull from.
+migration:
+  image:
+    pullPolicy: Never
+
 api:
   image:
     repository: secureprompt/api

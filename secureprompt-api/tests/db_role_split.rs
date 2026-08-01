@@ -828,26 +828,26 @@ async fn concurrent_migration_steps_all_succeed(pool: PgPool) {
         .await
         .expect("pool wide enough to run the migration step concurrently");
 
+    // `join_all` rather than `tokio::spawn`: sqlx's `Acquire`/`Executor` impls
+    // for `&mut PgConnection` are not higher-ranked, so the migration step's
+    // future cannot be proved `Send` and will not spawn (sqlx#2941). Joining
+    // them on one task is concurrency enough — every one of these blocks on
+    // network I/O, so the ALTER ROLEs still overlap at the server, which is
+    // where the race is. MEASURED before the fix: 4 of 8 failed.
     let password = app_probe_password();
-    let mut running = Vec::with_capacity(CONCURRENCY);
-    for _ in 0..CONCURRENCY {
+    let steps = (0..CONCURRENCY).map(|_| {
         let step_pool = racing.clone();
         let password = password.clone();
-        running.push(tokio::spawn(async move {
+        async move {
             secureprompt_api::db::migrations::run_migration_step(&step_pool, Some(&password)).await
-        }));
-    }
-
-    let mut failures: Vec<String> = Vec::new();
-    for handle in running {
-        match handle
-            .await
-            .expect("the migration step task must not panic")
-        {
-            Ok(()) => {}
-            Err(e) => failures.push(e.to_string()),
         }
-    }
+    });
+
+    let failures: Vec<String> = futures_util::future::join_all(steps)
+        .await
+        .into_iter()
+        .filter_map(|outcome| outcome.err().map(|e| e.to_string()))
+        .collect();
 
     racing.close().await;
 
