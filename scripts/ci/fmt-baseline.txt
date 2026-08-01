@@ -7,7 +7,6 @@
 secureprompt-api/src/analytics/dashboard_reader.rs
 secureprompt-api/src/app_state.rs
 secureprompt-api/src/auth/totp.rs
-secureprompt-api/src/db/api_key_repo.rs
 secureprompt-api/src/db/license_repo.rs
 secureprompt-api/src/db/provider_repo.rs
 secureprompt-api/src/db/secure_mode_repo.rs

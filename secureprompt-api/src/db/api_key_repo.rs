@@ -362,8 +362,8 @@ impl ApiKeyRepository {
         if status == "rotating" {
             // Idempotent: rotation already in progress — return existing successor info (D-18).
             let rotated_at: DateTime<Utc> = row.get("rotated_at");
-            let grace_expires_at = rotated_at
-                + chrono::Duration::seconds(i64::from(rotation_grace_secs));
+            let grace_expires_at =
+                rotated_at + chrono::Duration::seconds(i64::from(rotation_grace_secs));
             let successor_prefix: Option<String> = row.get("successor_key_prefix");
             // Return prefix + "..." so caller can confirm which key was issued without
             // exposing the full secret.
@@ -493,10 +493,31 @@ impl ApiKeyRepository {
             // Accept: status = 'active'
             // Accept: status = 'rotating' AND within grace window
             // Reject: status = 'revoked' (even if revoked_at IS NULL from pre-migration data)
+            // Reject: revoked_at IS NOT NULL, whatever `status` says.
+            //
+            // The last line is not belt-and-braces, it closes an auth bypass.
+            // `status` is a column migration 006 ADDS with `DEFAULT 'active'`,
+            // and 006's back-fill —
+            //   `UPDATE api_keys SET status='revoked' WHERE revoked_at IS NOT NULL ...`
+            // — is a bare UPDATE against a table `001_init.sql:78` armed with
+            // FORCE RLS five migrations earlier. Under any role without
+            // BYPASSRLS it matches zero rows, reports `UPDATE 0` and exits 0,
+            // so a key an administrator revoked before 006 ran keeps
+            // `status = 'active'` and, on the pre-existing predicate, kept
+            // authenticating. Measured in `tests/migration_006_rls.rs`;
+            // `035_repair_api_key_revocation_status.sql` repairs the DATA, and
+            // this predicate makes the answer independent of whether any
+            // particular database ever got that migration.
+            //
+            // It cannot reject a rotating key: `rotate` never writes
+            // `revoked_at` (only `revoke` does, and it sets `status` in the
+            // same statement), so `revoked_at IS NOT NULL` is exactly the set
+            // that must never authenticate.
             let row = sqlx::query(
                 "SELECT id, workspace_id, name, assigned_user_id
                  FROM api_keys
                  WHERE key_hash = $1
+                   AND revoked_at IS NULL
                    AND (
                      status = 'active'
                      OR (
