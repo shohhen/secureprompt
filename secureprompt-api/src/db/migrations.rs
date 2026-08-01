@@ -194,3 +194,103 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The runtime role the deployment serves as. Named in `001_init.sql`,
+/// constrained by `034_app_role_runtime_grants.sql`, and connected with by the
+/// `DATABASE_URL` that `docker-compose.yml` and the Helm chart hand the API and
+/// the worker.
+pub const RUNTIME_ROLE: &str = "secureprompt_app";
+
+/// Set a role's login password.
+///
+/// `ALTER ROLE ... PASSWORD` accepts no bind parameter, so the statement has to
+/// be built as text. It is built BY THE SERVER — `format('%I', $1)` for the
+/// identifier and `format('%L', $2)` for the literal — rather than by string
+/// concatenation here, so a password containing a quote is quoted correctly
+/// instead of ending the literal. The resulting statement is never logged: it
+/// contains the credential.
+///
+/// This exists because there is nowhere else the runtime password can come
+/// from. `001_init.sql` creates the role with a fixed placeholder, and a
+/// migration cannot read a deployment's environment.
+pub async fn set_role_password(pool: &PgPool, role: &str, password: &str) -> anyhow::Result<()> {
+    let statement: String = sqlx::query_scalar(
+        "SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', $1::text, $2::text)",
+    )
+    .bind(role)
+    .bind(password)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::raw_sql(&statement).execute(pool).await?;
+
+    tracing::info!(role, "runtime role password set");
+    Ok(())
+}
+
+/// The whole of `--migrate-only`: apply the schema as the owner, then make the
+/// runtime role usable.
+///
+/// Refuses outright if the connected role cannot migrate. Without that check
+/// `--migrate-only` pointed at the runtime URL would apply nothing and exit 0,
+/// and the first sign of trouble would be the API refusing to boot against a
+/// schema this step was supposed to have prepared.
+pub async fn run_migration_step(pool: &PgPool, app_password: Option<&str>) -> anyhow::Result<()> {
+    if schema_authority(pool).await? != SchemaAuthority::Owner {
+        let who: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(pool)
+            .await?;
+        anyhow::bail!(
+            "--migrate-only is connected as `{who}`, which has no CREATE on \
+             schema public and therefore cannot apply migrations. Point \
+             DATABASE_URL at the owner/migrator role for this step."
+        );
+    }
+
+    apply_as_owner(pool).await?;
+
+    if let Some(password) = app_password {
+        set_role_password(pool, RUNTIME_ROLE, password).await?;
+    }
+
+    assert_runtime_role_is_powerless(pool).await?;
+    Ok(())
+}
+
+/// The mandated powerless-assertion, in the same shape as
+/// `scripts/ci/create-nonsuperuser-role.sh` and the closing block of
+/// `034_app_role_runtime_grants.sql`.
+///
+/// Repeated here rather than left to the migration because this is the last
+/// thing that runs before a deployment starts serving, and because 034 only
+/// executes when it is pending — on a database already at head it is a no-op,
+/// so its assertion would never run again. A role that acquired SUPERUSER or
+/// BYPASSRLS after 034 was applied would otherwise go unnoticed forever, and a
+/// deployment that enforces no tenancy at all reports nothing by itself.
+pub async fn assert_runtime_role_is_powerless(pool: &PgPool) -> anyhow::Result<()> {
+    let privileged: Option<bool> =
+        sqlx::query_scalar("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(RUNTIME_ROLE)
+            .fetch_optional(pool)
+            .await?;
+
+    match privileged {
+        None => anyhow::bail!(
+            "role `{RUNTIME_ROLE}` does not exist after the migrations ran. \
+             The application has nothing to connect as."
+        ),
+        Some(true) => anyhow::bail!(
+            "role `{RUNTIME_ROLE}` has SUPERUSER or BYPASSRLS. Every row-level \
+             security policy in this schema would be inert at runtime, and \
+             nothing else would report it. Refusing to complete the migration \
+             step."
+        ),
+        Some(false) => {
+            tracing::info!(
+                role = RUNTIME_ROLE,
+                "runtime role verified NOSUPERUSER and NOBYPASSRLS"
+            );
+            Ok(())
+        }
+    }
+}

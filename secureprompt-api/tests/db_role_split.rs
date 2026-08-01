@@ -462,3 +462,98 @@ async fn boot_as_the_runtime_role_refuses_a_schema_with_no_tracking_table(pool: 
 
     probe.close().await;
 }
+
+// ===========================================================================
+// The migration step itself.
+// ===========================================================================
+
+/// A role used only to exercise password setting. NOT `secureprompt_app`:
+/// roles are cluster-global while `#[sqlx::test]` databases are per-test, so a
+/// test that set a DIFFERENT password on the shared runtime role would race
+/// every other test in this file that connects as it.
+const PASSWORD_PROBE_ROLE: &str = "sp_password_probe";
+
+/// Deliberately awkward. `ALTER ROLE ... PASSWORD` cannot take a bind
+/// parameter, so the statement has to be built as text — and the only safe way
+/// to build it is to let the server quote it (`format('%L', $1)`). A password
+/// containing a single quote, a double quote and a backslash is what tells the
+/// difference between that and string concatenation.
+const PROBE_PASSWORD: &str = "a'b\"c\\d e";
+
+/// The migration step must set the runtime role's password, because there is
+/// nowhere else it can come from: `001_init.sql` creates `secureprompt_app`
+/// with a fixed placeholder, and a migration cannot read a deployment's
+/// environment.
+///
+/// The assertion is a successful CONNECTION with the new password, not a
+/// catalog read. `pg_authid.rolpassword` is a SCRAM verifier — comparing it
+/// would prove only that some bytes changed.
+#[sqlx::test]
+async fn setting_the_runtime_role_password_lets_it_connect(pool: PgPool) {
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {PASSWORD_PROBE_ROLE} LOGIN NOSUPERUSER NOCREATEDB
+                 NOCREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+             WHEN unique_violation THEN NULL;
+         END $$;"
+    ))
+    .execute(&pool)
+    .await
+    .expect("probe role");
+
+    secureprompt_api::db::migrations::set_role_password(&pool, PASSWORD_PROBE_ROLE, PROBE_PASSWORD)
+        .await
+        .expect("the migration step must be able to set the runtime password");
+
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(PASSWORD_PROBE_ROLE)
+        .password(PROBE_PASSWORD);
+
+    let mut conn = PgConnection::connect_with(&options).await.expect(
+        "the password the migration step set must be the password the runtime \
+         role can connect with — otherwise the app URL and the role disagree \
+         and the deployment cannot start",
+    );
+
+    let who: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut conn)
+        .await
+        .expect("identity probe");
+    assert_eq!(who, PASSWORD_PROBE_ROLE);
+
+    conn.close().await.ok();
+}
+
+/// `--migrate-only` pointed at the runtime role would apply nothing and report
+/// success — the operator would then start the API against a schema that was
+/// never migrated, and only find out from the API's own refusal. Catch it in
+/// the step that was supposed to do the work.
+#[sqlx::test]
+async fn the_migration_step_refuses_a_role_that_cannot_migrate(pool: PgPool) {
+    let probe = app_role_pool(&pool).await;
+
+    let err = secureprompt_api::db::migrations::run_migration_step(&probe, None)
+        .await
+        .expect_err("--migrate-only as a non-owner role must not report success")
+        .to_string();
+
+    assert!(
+        err.contains("CREATE"),
+        "the refusal must say what the role is missing. Got: {err}"
+    );
+
+    probe.close().await;
+}
+
+/// The ordinary path: as the owner, the step migrates and reports success.
+/// Positive control for the refusal above.
+#[sqlx::test]
+async fn the_migration_step_succeeds_as_the_owner(pool: PgPool) {
+    secureprompt_api::db::migrations::run_migration_step(&pool, None)
+        .await
+        .expect("the migration step must succeed as the owner role");
+}
