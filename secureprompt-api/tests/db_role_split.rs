@@ -67,12 +67,31 @@ use sqlx::{Connection, PgPool, Row};
 /// asserted-powerless by `034_app_role_runtime_grants.sql`.
 const APP_ROLE: &str = "secureprompt_app";
 
-/// Password used only to open a probe connection from this suite. Migration 001
-/// creates the role with a placeholder password; deployments set a real one out
-/// of band (`scripts/db/setup-app-role.sh`, or `secureprompt-api --migrate-only`
-/// with `SECUREPROMPT_APP_DB_PASSWORD`). It is written once per test binary —
-/// see `APP_PASSWORD_SET` for why writing it per-test is not safe.
-const APP_PROBE_PASSWORD: &str = "app_probe_password";
+/// Fallback password for the probe connection, used when the environment does
+/// not say what the runtime role's password should be. Migration 001 creates
+/// the role with a placeholder; deployments set a real one out of band
+/// (`scripts/db/setup-app-role.sh`, or `secureprompt-api --migrate-only` with
+/// `SECUREPROMPT_APP_DB_PASSWORD`).
+const APP_PROBE_PASSWORD_FALLBACK: &str = "app_probe_password";
+
+/// The password this suite puts on the runtime role.
+///
+/// `secureprompt_app` is CLUSTER-GLOBAL while `#[sqlx::test]` databases are
+/// per-test, so `ALTER ROLE secureprompt_app WITH PASSWORD` reaches everything
+/// else on the same Postgres — including the compose `api` and `worker`, which
+/// under the role split now connect as exactly this role. Before the split
+/// nothing connected as it and the write was harmless; now `cargo test` would
+/// lock a running stack out of its own database until `db-migrate` re-ran.
+///
+/// So when the environment says what the password is, use THAT: the write
+/// becomes a no-op rewrite of the same value instead of a rotation. The
+/// fallback only applies where nothing else is using the role.
+fn app_probe_password() -> String {
+    std::env::var("SECUREPROMPT_APP_DB_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| APP_PROBE_PASSWORD_FALLBACK.to_string())
+}
 
 /// `ALTER ROLE` rewrites one row of the cluster-global `pg_authid`. Several
 /// tests in this file need the runtime role to have a known password, they run
@@ -90,10 +109,11 @@ static APP_PASSWORD_SET: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::cons
 async fn ensure_app_role_password(pool: &PgPool) {
     APP_PASSWORD_SET
         .get_or_init(|| async {
-            sqlx::raw_sql(&format!(
-                "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
-            ))
-            .execute(pool)
+            secureprompt_api::db::migrations::set_role_password(
+                pool,
+                APP_ROLE,
+                &app_probe_password(),
+            )
             .await
             .expect("set a known password on the runtime role for this probe");
         })
@@ -114,7 +134,7 @@ async fn app_role_connection(pool: &PgPool) -> PgConnection {
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
         .username(APP_ROLE)
-        .password(APP_PROBE_PASSWORD);
+        .password(&app_probe_password());
 
     let mut conn = PgConnection::connect_with(&options)
         .await
@@ -344,7 +364,7 @@ async fn app_role_pool(pool: &PgPool) -> PgPool {
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
         .username(APP_ROLE)
-        .password(APP_PROBE_PASSWORD);
+        .password(&app_probe_password());
 
     let probe = PgPoolOptions::new()
         .max_connections(1)
@@ -773,6 +793,71 @@ async fn the_migration_step_succeeds_as_the_owner(pool: PgPool) {
     secureprompt_api::db::migrations::run_migration_step(&pool, None)
         .await
         .expect("the migration step must succeed as the owner role");
+}
+
+/// PROVED IN REVIEW, AND RENDERED: the Helm chart puts the `--migrate-only`
+/// initContainer on the api Deployment **and** the worker Deployment, so every
+/// `helm install`/`helm upgrade` starts at least two of these concurrently
+/// (five at `api.replicaCount=3` / `worker.replicaCount=2` — measured by
+/// `helm template`). Compose has the same shape whenever anything restarts the
+/// one-shot while another is mid-flight.
+///
+/// `MIGRATOR.run` takes a Postgres advisory lock (sqlx 0.8.6 sets
+/// `locking: true` by default), but it RELEASES it before returning — and
+/// `set_role_password` runs after that. `ALTER ROLE ... PASSWORD` rewrites one
+/// row of the cluster-global `pg_authid`, and concurrent writers get
+/// `XX000 tuple concurrently updated`. MEASURED in review: 6 of 8 concurrent
+/// `ALTER ROLE` statements failed.
+///
+/// The consequence is not cosmetic. An initContainer exiting non-zero is
+/// `Init:Error`/`CrashLoopBackOff`, and `helm upgrade --wait`/`--atomic` (or
+/// any Argo/Flux health gate) sees a failed rollout and can roll the release
+/// back — on the security-critical path.
+///
+/// The password used is the one this suite already puts on the role, so this
+/// test writes the same value every other test here relies on.
+#[sqlx::test]
+async fn concurrent_migration_steps_all_succeed(pool: PgPool) {
+    const CONCURRENCY: usize = 8;
+
+    // `#[sqlx::test]`'s own pool is too small to hold this many in flight.
+    let options: PgConnectOptions = (*pool.connect_options()).clone();
+    let racing = PgPoolOptions::new()
+        .max_connections(CONCURRENCY as u32)
+        .connect_with(options)
+        .await
+        .expect("pool wide enough to run the migration step concurrently");
+
+    let password = app_probe_password();
+    let mut running = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let step_pool = racing.clone();
+        let password = password.clone();
+        running.push(tokio::spawn(async move {
+            secureprompt_api::db::migrations::run_migration_step(&step_pool, Some(&password)).await
+        }));
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for handle in running {
+        match handle
+            .await
+            .expect("the migration step task must not panic")
+        {
+            Ok(()) => {}
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+
+    racing.close().await;
+
+    assert!(
+        failures.is_empty(),
+        "{} of {CONCURRENCY} concurrent migration steps failed. Every one of \
+         them is an initContainer exiting non-zero on a rollout that was \
+         supposed to be idempotent. Failures: {failures:#?}",
+        failures.len()
+    );
 }
 
 /// A role can be powerless on paper and not in practice.
