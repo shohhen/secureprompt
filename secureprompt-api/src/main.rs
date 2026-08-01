@@ -10,15 +10,76 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-use secureprompt_api::db::migrations::ensure_pg_migrations;
+use secureprompt_api::db::migrations::{ensure_pg_migrations, run_migration_step};
+
+/// The default DATABASE_URL. Points at the OWNER/MIGRATOR role, because a
+/// developer running the binary by hand against a fresh database needs it to
+/// create the schema. A deployment that has adopted the DB role split
+/// overrides this with the runtime role's URL for the serving processes, and
+/// keeps the owner URL only for `--migrate-only`.
+const DEFAULT_DATABASE_URL: &str = "postgres://secureprompt:secureprompt@localhost:5432/secureprompt";
+
+/// `secureprompt-api --migrate-only`: apply the Postgres schema as the
+/// owner/migrator role, provision the runtime role, and exit.
+///
+/// This is the whole reason the API no longer migrates its own database in the
+/// deployed shape. `sqlx::migrate!` needs `CREATE ON SCHEMA public` and table
+/// ownership (measured: 018/021/023 fail without CREATE; 022 fails with `must
+/// be owner of table token_vault_entries`), and the serving role must have
+/// neither, because a NOBYPASSRLS role is the only kind row-level security
+/// applies to. One connection cannot hold both sets of rights, so they are two
+/// steps.
+///
+/// Run as a one-shot before the API and worker start — a compose service with
+/// `service_completed_successfully`, a Kubernetes initContainer, or by hand.
+/// The serving containers then never hold the owner credential at all, which a
+/// second admin pool inside the API process could not have achieved.
+///
+/// Deliberately handled BEFORE `AppConfig` is built: this step needs
+/// DATABASE_URL and nothing else, so the migration service does not have to be
+/// given the JWT secret, the provider key or the ML sidecar token just to run
+/// DDL.
+async fn migrate_only() -> anyhow::Result<()> {
+    init_telemetry(&TelemetryConfig {
+        otel_enabled: false,
+        prometheus_enabled: false,
+        log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+    });
+
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.into());
+
+    // One connection: this process applies DDL and exits. Nothing serves.
+    let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+
+    // Absent means "leave the password alone" — correct for a deployment that
+    // manages the runtime role out of band (managed Postgres, an external
+    // secret manager), and for a re-run where the password has not changed.
+    let app_password = std::env::var("SECUREPROMPT_APP_DB_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if app_password.is_none() {
+        tracing::info!(
+            "SECUREPROMPT_APP_DB_PASSWORD unset — leaving the runtime role's \
+             password unchanged"
+        );
+    }
+
+    run_migration_step(&pool, app_password.as_deref()).await?;
+    pool.close().await;
+
+    tracing::info!("migration step complete");
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--migrate-only") {
+        return migrate_only().await;
+    }
+
     let config = AppConfig {
         database: DatabaseConfig {
-            url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://secureprompt:secureprompt@localhost:5432/secureprompt".into()
-            }),
+            url: std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.into()),
             max_connections: 10,
         },
         redis: RedisConfig {
