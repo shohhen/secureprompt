@@ -59,6 +59,28 @@
 -- central control, and it is the reason arming the table without moving the
 -- read onto `begin_scoped` would have been worse than leaving it unarmed.
 --
+-- CORRECTION (MR5 C1 / MR6 F3). The paragraph above is right about the
+-- HAZARD and was wrong about the REMEDY: moving the read onto `begin_scoped`
+-- turns the silent zero into an `Err`, and nothing more. Until the fix that
+-- carries this note, `pipeline::service` — the only consumer — resolved that
+-- `Err` back to `SecureModeRow::default()`, i.e. to `enabled: false`, at HTTP
+-- 200. The outcome was byte-for-byte the outcome described above; the only
+-- difference was one `warn!` line, so "having logged nothing" became "having
+-- logged something and done the same thing". The read-back is a NECESSARY
+-- half of the control, not the whole of it. The caller now refuses the
+-- request with 503 on any error from `SecureModeRepository::get`, which is
+-- what makes this migration's argument true. Pinned by
+-- `secureprompt-api/tests/secure_mode_read_failure.rs`.
+--
+-- IF THIS FILE'S CHECKSUM NOW MISMATCHES ON YOUR DATABASE. The note above was
+-- added after 031 had been applied on developer databases, so `sqlx migrate
+-- run` reports `migration 31 was previously applied but has been modified`.
+-- Every statement below is idempotent (`ENABLE`/`FORCE ROW LEVEL SECURITY`
+-- are no-ops when already set, the policy is created behind an
+-- `IF NOT EXISTS` probe, and `GRANT` is repeatable), so the repair is:
+--     DELETE FROM _sqlx_migrations WHERE version = 31;
+-- and re-run. Same procedure, and same reason, as the note in 034.
+--
 -- WHY A NEW MIGRATION RATHER THAN A FIX TO 007. 007 has run on real
 -- deployments. Editing it changes the recorded checksum without changing any
 -- deployed database, so databases that have the defect would keep it and
