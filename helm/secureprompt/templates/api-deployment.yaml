@@ -106,12 +106,29 @@ spec:
             # ML sidecar gets re-keyed promptly (default app value is 3600s).
             - name: SECUREPROMPT_LICENSE_RECHECK_SECS
               value: {{ .Values.license.recheckSecs | quote }}
+            {{- end }}
+            # Shared secret the gateway sends to the ML sidecar on EVERY call —
+            # /detect/ner, /detect/injection, /embed — not only the licensed
+            # POST /internal/model-key.
+            #
+            # MR1 review C4: this block used to sit inside the
+            # `if .Values.license.enabled` guard that now closes above, and the
+            # chart default is `license.enabled: false`. `config.rs:81` is
+            # `unwrap_or_default()`, so an unset var became
+            # `Authorization: Bearer ` — a 401 from the sidecar on every call,
+            # and, under WS2-3's fail-closed SidecarUnavailablePolicy::Block
+            # default, a 503 on every gateway request of a default install.
+            #
+            # It is NOT license-conditional because it is not license material:
+            # it authenticates the sidecar's HTTP surface, which exists in both
+            # modes. The secret is generated unconditionally in `secrets.yaml`.
+            # Rendered and asserted in both modes by
+            # `scripts/ci/check-helm-sidecar-token.sh`.
             - name: ML_SIDECAR_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: ml-sidecar-internal-token
-            {{- end }}
           # The API exposes no dedicated /health route; /metrics is unauthenticated,
           # stays open past the license gate, and returns 200 whenever the server
           # is up — so it doubles as the liveness/readiness target.

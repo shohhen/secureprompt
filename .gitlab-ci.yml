@@ -255,6 +255,12 @@ helm-render:
     - apk add --no-cache bash >/dev/null
   script:
     - bash scripts/ci/check-helm-migration-initcontainer.sh
+    # MR1 C4. The reviewer first recorded the sidecar-token wiring as SOUND —
+    # `grep` found the env var in all four templates — and withdrew it after
+    # rendering: two of the four sat inside an `if .Values.license.enabled`
+    # guard whose chart default is false. Same lesson as the check above, so
+    # it runs in the same job.
+    - bash scripts/ci/check-helm-sidecar-token.sh
 
 # ===========================================================================
 # Stage: test

@@ -33,16 +33,31 @@ spec:
             {{- end }}
             - name: QDRANT_URL
               value: "http://{{ include "secureprompt.fullname" . }}-qdrant:6333"
-            {{- if .Values.license.enabled }}
-            # Shared secret authenticating the gateway's POST /internal/model-key.
-            # The image bakes SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the sidecar
-            # only becomes ready after the gateway pushes the unwrapped key.
+            # Shared secret authenticating EVERY route this sidecar serves
+            # except /health, /ready and /metrics — including, but not limited
+            # to, the gateway's POST /internal/model-key.
+            #
+            # MR1 review C4: this block used to sit inside the
+            # `if .Values.license.enabled` guard below, and the chart
+            # default is `license.enabled: false`. `app/main.py` raises
+            # RuntimeError AT IMPORT when the var is unset, so a default
+            # `helm install` crash-looped this pod before it could serve
+            # /health, and the gateway (`config.rs:81` is
+            # `unwrap_or_default()`) sent an empty Bearer and 401ed forever —
+            # 503 on every gateway request under the fail-closed sidecar
+            # default. The secret is generated unconditionally in
+            # `secrets.yaml`, so the gating was the whole defect.
+            #
+            # It is NOT license-conditional because it is not license
+            # material: it authenticates the sidecar's own HTTP surface, which
+            # exists in both modes. Rendered and asserted in both modes by
+            # `scripts/ci/check-helm-sidecar-token.sh`.
             - name: ML_SIDECAR_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "secureprompt.fullname" . }}-secrets
                   key: ml-sidecar-internal-token
-            {{- else }}
+            {{- if not .Values.license.enabled }}
             # No license wired: there is no key to decrypt the XLM-R weights, so
             # disable the requirement and let the sidecar serve GLiNER/Presidio
             # only. Without this the image default (=true) would keep /ready at
