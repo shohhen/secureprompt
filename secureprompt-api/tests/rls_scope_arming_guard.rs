@@ -315,6 +315,36 @@ fn the_detector_actually_detects() {
         "a comment naming set_config('app.current_workspace_id') is prose, not an arming"
     );
 
+    // FLAGGED, and the reason `verifies` filters comments the way `arms`
+    // already does. PROSE CANNOT VERIFY.
+    //
+    // MEASURED, not imagined: a reviewer deleted the real
+    // `scope_is_armed(tx, workspace_id).await` from `db::scope::arm_scope` —
+    // the gate went RED, naming `db/scope.rs:107` — then added exactly the one
+    // `//` line below inside the window, and the gate went GREEN. The single
+    // compensating control the whole 033 sweep is justified by was gone and
+    // the guard that exists to prove it is present said nothing. A guard that
+    // a comment can switch off is not a guard.
+    //
+    // This is the same asymmetry, one level up, that the gate itself measures:
+    // naming a check is not performing one.
+    let commented_away = r#"
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+        // NOTE: the value is verified by reading
+        // current_setting('app.current_workspace_id', true) — see scope_is_armed.
+        Ok(())
+    "#;
+    assert_eq!(
+        scan(commented_away, "synthetic.rs").len(),
+        1,
+        "an arming whose only verification is a COMMENT naming \
+         current_setting/scope_is_armed must still be flagged"
+    );
+
     // NEGATIVE CONTROL 4 — DISTANCE. A read-back far below the arming does not
     // count, or the rule would be satisfied by any file that happens to
     // contain both tokens anywhere.
