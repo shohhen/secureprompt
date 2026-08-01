@@ -850,7 +850,205 @@ mod events_tests {
         for action in &["deny", "allow", "redact", "transform", "flag"] {
             let rule = make_rule(action, false);
             let event = from_rule(&rule);
-            assert_eq!(&event.action, action, "Event action must match rule action: {action}");
+            assert_eq!(
+                &event.action, action,
+                "Event action must match rule action: {action}"
+            );
         }
+    }
+}
+
+/// MR5 C2 — a local PAN must still satisfy a `CREDIT_CARD` policy rule.
+///
+/// `drop_generic_card_double_counts` (detection registry) suppresses the
+/// generic `credit_card` detection on a span an Uzbek local-card class
+/// already claimed with the identical value. Its doc claimed the change was
+/// observationally neutral outside `GET /v1/leak-report`:
+///
+/// > Redaction never saw the difference … but `GET /v1/leak-report` dedups
+/// > `per_class` on `(class, value)`
+///
+/// That was false. Policy evaluation runs BEFORE `apply_redaction` and
+/// filters on `detection_class`, so dropping the `CREDIT_CARD` detection
+/// removed the class a rule may be keyed on. A workspace whose enabled rules
+/// name `CREDIT_CARD` and not `UZCARD`/`HUMO` — the 15-entry list migration
+/// 017's back-fill leaves behind where it did not take, and anything an admin
+/// narrowed in the policy UI — stopped matching an unseparated local PAN
+/// altogether. The `redact_when_no_rules` net does not rescue a `deny`: it
+/// redacts, it does not refuse.
+///
+/// The detections here come from the REAL registry through the REAL merge,
+/// so this cannot pass on a hand-built `Detection` that has drifted from what
+/// the pipeline actually produces.
+///
+/// All fixture card numbers are synthetic.
+#[cfg(test)]
+mod local_card_class_filter_tests {
+    use crate::db::PolicyRuleRow;
+    use crate::detection::{detect_content, merge::merge_detections};
+    use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+    use chrono::Utc;
+    use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+    use uuid::Uuid;
+
+    /// Synthetic Uzcard PAN (IIN 8600), written unseparated — the one
+    /// spelling that reaches both card matchers on the same span, and so the
+    /// one the suppression pass acts on.
+    const LOCAL_PAN: &str = "Karta 8600123456789012";
+    /// Synthetic foreign PAN. No local matcher ever takes it, so the
+    /// suppression cannot touch it by construction — which is exactly why it
+    /// is a control here and NOT evidence about the local case.
+    const FOREIGN_PAN: &str = "Karta 4111111111111111";
+
+    /// What the policy engine actually receives: registry output put through
+    /// `merge_detections`, which is where regex classes are upper-cased.
+    fn pipeline_detections(content: &str) -> Vec<Detection> {
+        merge_detections(detect_content(content), Vec::new())
+    }
+
+    fn classes(content: &str) -> Vec<String> {
+        let mut found: Vec<String> = pipeline_detections(content)
+            .into_iter()
+            .map(|detection| detection.class)
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    fn rule_naming(classes: serde_json::Value, action: &str) -> PolicyRuleRow {
+        PolicyRuleRow {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "card-rule".to_owned(),
+            priority: 100,
+            conditions: serde_json::json!([
+                { "field": "detection_class", "op": "in", "value": classes }
+            ]),
+            action: action.to_owned(),
+            action_params: serde_json::json!({}),
+            enabled: true,
+            dry_run: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn eval_input<'a>(content: &'a str, detections: &'a [Detection]) -> PolicyEvaluationInput<'a> {
+        PolicyEvaluationInput {
+            request_id: RequestId::new(),
+            workspace_id: WorkspaceId::new(),
+            provider_name: "test-provider",
+            model: "test-model",
+            content,
+            detections,
+            fail_closed: false,
+        }
+    }
+
+    /// PREMISE, not the thing under test. If this ever fails, the
+    /// suppression pass has changed and the two assertions below are about a
+    /// world that no longer exists — which is a signal, not a pass.
+    #[test]
+    fn an_unseparated_local_pan_carries_only_the_local_class() {
+        assert_eq!(
+            classes(LOCAL_PAN),
+            vec!["UZCARD".to_owned()],
+            "the generic CREDIT_CARD detection is suppressed on this span; \
+             that suppression is the premise of this module"
+        );
+        assert_eq!(
+            classes(FOREIGN_PAN),
+            vec!["CREDIT_CARD".to_owned()],
+            "no local matcher takes a foreign PAN, so the generic class \
+             survives — the harness reaches the real registry"
+        );
+    }
+
+    /// THE DEFECT. A rule that names `CREDIT_CARD` must fire on a local PAN.
+    /// Before this fix it did not, and the PAN was forwarded in the clear.
+    #[test]
+    fn a_credit_card_rule_still_matches_an_unseparated_local_pan() {
+        let rule = rule_naming(serde_json::json!(["CREDIT_CARD"]), "deny");
+        let detections = pipeline_detections(LOCAL_PAN);
+        let input = eval_input(LOCAL_PAN, &detections);
+
+        assert!(
+            rule_matches(&rule, &input),
+            "a workspace rule naming CREDIT_CARD stopped matching an \
+             unseparated local PAN — an unredacted card number reaches the \
+             provider. Detections: {detections:?}"
+        );
+    }
+
+    /// The same for `humo` (IIN 9860), so the alias is not a one-off keyed to
+    /// the fixture above.
+    #[test]
+    fn a_credit_card_rule_still_matches_an_unseparated_humo_pan() {
+        let content = "Karta 9860123456789015";
+        assert_eq!(
+            classes(content),
+            vec!["HUMO".to_owned()],
+            "premise: the generic class is suppressed here too"
+        );
+
+        let rule = rule_naming(serde_json::json!(["CREDIT_CARD"]), "deny");
+        let detections = pipeline_detections(content);
+        let input = eval_input(content, &detections);
+        assert!(rule_matches(&rule, &input), "{detections:?}");
+    }
+
+    /// POSITIVE CONTROL — the harness can observe a rule matching at all.
+    #[test]
+    fn a_credit_card_rule_matches_a_foreign_pan() {
+        let rule = rule_naming(serde_json::json!(["CREDIT_CARD"]), "deny");
+        let detections = pipeline_detections(FOREIGN_PAN);
+        let input = eval_input(FOREIGN_PAN, &detections);
+        assert!(rule_matches(&rule, &input), "{detections:?}");
+    }
+
+    /// NEGATIVE CONTROL — the fix must be a card-specific alias, not "any
+    /// filter matches any detection". A rule naming an unrelated class must
+    /// still NOT fire on a card.
+    #[test]
+    fn an_unrelated_class_filter_does_not_match_a_local_pan() {
+        let rule = rule_naming(serde_json::json!(["EMAIL_ADDRESS"]), "deny");
+        let detections = pipeline_detections(LOCAL_PAN);
+        let input = eval_input(LOCAL_PAN, &detections);
+        assert!(
+            !rule_matches(&rule, &input),
+            "widening CREDIT_CARD to cover local cards must not widen every \
+             other class filter too: {detections:?}"
+        );
+    }
+
+    /// NEGATIVE CONTROL — the alias is one-directional. `CREDIT_CARD` is the
+    /// GENERIC class, so a rule naming it covers the specific local classes;
+    /// a rule naming `UZCARD` must NOT start covering a foreign PAN, which
+    /// would let a local-card rule silently claim cards it says nothing
+    /// about.
+    #[test]
+    fn a_uzcard_rule_does_not_match_a_foreign_pan() {
+        let rule = rule_naming(serde_json::json!(["UZCARD"]), "deny");
+        let detections = pipeline_detections(FOREIGN_PAN);
+        let input = eval_input(FOREIGN_PAN, &detections);
+        assert!(
+            !rule_matches(&rule, &input),
+            "the alias must widen the generic filter only: {detections:?}"
+        );
+    }
+
+    /// The `eq` operator carries the same alias as `in` — the policy UI emits
+    /// both, and a fix applied to only one spelling leaves the leak open for
+    /// the other.
+    #[test]
+    fn the_eq_operator_carries_the_alias_too() {
+        let mut rule = rule_naming(serde_json::json!(["CREDIT_CARD"]), "deny");
+        rule.conditions = serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "CREDIT_CARD" }
+        ]);
+        let detections = pipeline_detections(LOCAL_PAN);
+        let input = eval_input(LOCAL_PAN, &detections);
+        assert!(rule_matches(&rule, &input), "{detections:?}");
     }
 }
