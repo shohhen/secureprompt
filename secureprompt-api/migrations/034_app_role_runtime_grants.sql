@@ -136,6 +136,63 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 REVOKE CREATE ON SCHEMA public FROM secureprompt_app;
 
 -- ---------------------------------------------------------------------------
+-- 4b. And the same privilege held by PUBLIC, which the REVOKE above cannot
+--     reach.
+--
+-- MEASURED on postgres:16.14: with `GRANT CREATE ON SCHEMA public TO PUBLIC`
+-- in place, `REVOKE CREATE ... FROM secureprompt_app` is a NO-OP — it removes
+-- a grant the role does not individually hold — and the assertion below then
+-- raised, taking the whole deployment down: `--migrate-only` exits non-zero,
+-- compose's `db-migrate` never reaches `service_completed_successfully`, and
+-- neither `api` nor `worker` starts.
+--
+-- This is not an exotic state. `PUBLIC` holding `CREATE` on `public` is the
+-- DEFAULT for every database created before PostgreSQL 15; `pg_upgrade`
+-- preserves schema ACLs, so only a newly `initdb`'d PG15+ cluster drops it.
+-- It is also what an operator gets from `GRANT ALL ON SCHEMA public TO PUBLIC`.
+-- The chart and compose pin postgres:16, but a database restored from an older
+-- cluster carries the old ACL.
+--
+-- Conditional rather than unconditional because REVOKE requires ownership of
+-- the schema (or grant option), which the migration role is not guaranteed to
+-- have on managed Postgres. On a database that does not need the repair, the
+-- statement is never attempted and no privilege is required.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    public_holds_create BOOLEAN;
+BEGIN
+    -- grantee 0 is the pseudo-role PUBLIC. COALESCE onto acldefault() because
+    -- a NULL nspacl means "the built-in default", which for a schema created
+    -- before PG15 still includes the PUBLIC grant.
+    SELECT EXISTS (
+        SELECT 1
+          FROM pg_namespace n,
+               aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+         WHERE n.nspname = 'public'
+           AND a.grantee = 0
+           AND a.privilege_type = 'CREATE')
+      INTO public_holds_create;
+
+    IF public_holds_create THEN
+        BEGIN
+            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+            RAISE NOTICE
+                '034: revoked CREATE ON SCHEMA public from PUBLIC (the '
+                'pre-PostgreSQL-15 default). Any role that was relying on that '
+                'grant to create objects in schema public must now be granted '
+                'CREATE explicitly.';
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+                'CREATE ON SCHEMA public is granted to PUBLIC, which gives it '
+                'to secureprompt_app, and this migration role cannot revoke it '
+                '(it does not own schema public). Fix it as the schema owner '
+                'or a superuser: REVOKE CREATE ON SCHEMA public FROM PUBLIC;';
+        END;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- 5. The powerless-assertion, in the same shape as
 --    scripts/ci/create-nonsuperuser-role.sh.
 --
@@ -149,6 +206,7 @@ DO $$
 DECLARE
     privileged BOOLEAN;
     can_create BOOLEAN;
+    grantees   TEXT;
 BEGIN
     SELECT rolsuper OR rolbypassrls
       INTO privileged
@@ -166,9 +224,27 @@ BEGIN
       INTO can_create;
 
     IF can_create THEN
+        -- Name the grantee instead of guessing at it. The previous text here
+        -- said "it is probably a member of a role that holds it", which is the
+        -- ONE cause it provably cannot be: secureprompt_app is NOINHERIT, and
+        -- a NOINHERIT membership makes has_schema_privilege answer FALSE
+        -- (measured). That sent the operator to pg_auth_members, which is
+        -- empty, while the real grantee sat in pg_namespace.nspacl.
+        SELECT string_agg(DISTINCT
+                   CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(a.grantee) END, ', ')
+          INTO grantees
+          FROM pg_namespace n,
+               aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+         WHERE n.nspname = 'public'
+           AND a.privilege_type = 'CREATE';
+
         RAISE EXCEPTION
             'secureprompt_app still has CREATE on schema public after the '
-            'REVOKE above — it is probably a member of a role that holds it. '
-            'Refusing to complete the migration.';
+            'REVOKEs above. CREATE on schema public is currently held by: %. '
+            'Revoke it from whichever of those reaches secureprompt_app '
+            '(PUBLIC reaches every role). Refusing to complete the migration.',
+            COALESCE(grantees, '(nothing in pg_namespace.nspacl — the grant is '
+                               'reaching it some other way)');
     END IF;
 END $$;

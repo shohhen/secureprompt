@@ -100,6 +100,29 @@ BEGIN
     EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA public '
                    'GRANT USAGE, SELECT ON SEQUENCES TO %I', target);
     EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', target);
+
+    -- That REVOKE is a NO-OP against a grant held by PUBLIC, which is the
+    -- default for every database created before PostgreSQL 15 and survives
+    -- pg_upgrade. Without this the script would print its all-clear while the
+    -- runtime role could still create — and therefore own — tables.
+    -- grantee 0 is the pseudo-role PUBLIC.
+    IF EXISTS (SELECT 1
+                 FROM pg_namespace n,
+                      aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+                WHERE n.nspname = 'public'
+                  AND a.grantee = 0
+                  AND a.privilege_type = 'CREATE') THEN
+        BEGIN
+            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+            RAISE NOTICE 'revoked CREATE ON SCHEMA public from PUBLIC (pre-PG15 default)';
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+                'CREATE ON SCHEMA public is granted to PUBLIC, which gives it '
+                'to %, and this connection cannot revoke it. Re-run as the '
+                'owner of schema public: REVOKE CREATE ON SCHEMA public FROM '
+                'PUBLIC;', target;
+        END;
+    END IF;
 END $$;
 SQL
 
