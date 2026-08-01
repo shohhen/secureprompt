@@ -27,6 +27,37 @@
 //! trailing GRANT, the application silently loses access to the new table.
 //! `ALTER DEFAULT PRIVILEGES` is what closes that, and it is what this test
 //! measures.
+//!
+//! # Why this suite is NOT in `test:rls-nonsuperuser`
+//!
+//! Seven of these tests need to `ALTER ROLE secureprompt_app` — to give it a
+//! known password so they can connect as it. MEASURED on postgres:16: a
+//! CREATEROLE role may alter only roles it CREATED (it gets ADMIN OPTION on
+//! those implicitly, and on nothing else):
+//!
+//! ```text
+//! sp_admopt_creator creates a role, then alters it  -> ALTER ROLE
+//! sp_admopt_creator alters a role it did not create -> 42501 permission denied
+//! ```
+//!
+//! So under `DATABASE_URL=…secureprompt_runner…` the result depends on CLUSTER
+//! HISTORY rather than on anything this suite is about. MEASURED on a cluster
+//! where a superuser had created `secureprompt_app` first: **6 passed, 7
+//! failed**, every failure `permission denied to alter role`. On a cluster
+//! where the runner creates the role itself by running `001_init.sql` it would
+//! hold ADMIN OPTION and could — but that is a prediction from the rule above,
+//! not something measured here, and a job whose result turns on which role
+//! happened to create a cluster-global role is a flaky job either way.
+//!
+//! So this suite stays in the ordinary `test:` job, where the connection can
+//! administer the role, and `test:rls-nonsuperuser` keeps the suites whose
+//! subject is row visibility. The six that DO pass under the runner role are
+//! the six that only read the catalogue.
+//!
+//! This is not only a test concern: the same rule is why
+//! `secureprompt-api --migrate-only` cannot set the runtime password on a
+//! managed Postgres whose role an administrator created separately. That path
+//! is `scripts/db/setup-app-role.sh`, and the error message says so.
 
 use secureprompt_api::db::migrations::{ensure_pg_migrations, MIGRATOR};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};

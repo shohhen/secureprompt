@@ -222,7 +222,28 @@ pub async fn set_role_password(pool: &PgPool, role: &str, password: &str) -> any
     .fetch_one(pool)
     .await?;
 
-    sqlx::raw_sql(&statement).execute(pool).await?;
+    // MEASURED on postgres:16 — the failure worth naming. A CREATEROLE role may
+    // alter only roles it CREATED (it gets ADMIN OPTION on those implicitly):
+    //
+    //   creator creates a role, then alters it   -> ALTER ROLE
+    //   creator alters a role it did not create  -> 42501 permission denied
+    //     "the current user must have the CREATEROLE attribute and the ADMIN
+    //      option on the role"
+    //
+    // So this succeeds when the migration role is a superuser, or when it is
+    // the role that ran 001_init.sql on a fresh cluster and thus created
+    // `secureprompt_app`. It fails on managed Postgres where an administrator
+    // created the role separately — a deployment shape, not a bug, and the raw
+    // message does not tell the operator which of the two to fix.
+    sqlx::raw_sql(&statement).execute(pool).await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not set the password on role `{role}`: {e}. In Postgres 16 a \
+             CREATEROLE role may only alter roles it created. Either run this \
+             step as a superuser, or provision the role out of band with \
+             scripts/db/setup-app-role.sh and leave SECUREPROMPT_APP_DB_PASSWORD \
+             unset so this step does not try."
+        )
+    })?;
 
     tracing::info!(role, "runtime role password set");
     Ok(())
