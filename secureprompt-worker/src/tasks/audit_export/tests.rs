@@ -1143,6 +1143,164 @@ async fn re_running_the_same_export_replaces_rather_than_appends(pool: PgPool) -
     Ok(())
 }
 
+/// Insert one `audit_export_pages` row directly, bypassing the worker.
+///
+/// Used only to set up the disagreement between `export_id` and
+/// `workspace_id` that the product itself never creates — see
+/// [`the_page_wipe_does_not_cross_a_workspace_boundary`]. Deliberately NOT a
+/// general fixture: every other test writes its pages by running the job.
+async fn forge_page(
+    pool: &PgPool,
+    export_id: Uuid,
+    workspace_id: Uuid,
+    page_number: i32,
+    body: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_export_pages \
+         (export_id, workspace_id, page_number, row_count, sha256, body) \
+         VALUES ($1, $2, $3, 0, 'forged', $4)",
+    )
+    .bind(export_id)
+    .bind(workspace_id)
+    .bind(page_number)
+    .bind(body)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn page_workspaces(pool: &PgPool, export_id: Uuid) -> sqlx::Result<Vec<(i32, Uuid)>> {
+    let rows = sqlx::query(
+        "SELECT page_number, workspace_id FROM audit_export_pages \
+         WHERE export_id = $1 ORDER BY page_number ASC",
+    )
+    .bind(export_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<i32, _>("page_number"), r.get("workspace_id")))
+        .collect())
+}
+
+/// The at-least-once page wipe is confined to the export's OWN workspace.
+///
+/// `persist()` clears the previous attempt's pages before writing the new
+/// ones. That DELETE named `export_id` alone, in a module where every other
+/// statement carries `AND workspace_id = $n`, and against a table whose own
+/// migration (025) states the posture in as many words: "The WHERE clause in
+/// the handler is still the filter — this is defence in depth (Global
+/// Constraint 3)". The RLS policy is not the filter, and cannot be: the
+/// compose role is a SUPERUSER and bypasses every policy, so on the deployed
+/// configuration nothing stood between that statement and another tenant's
+/// pages but a UUID.
+///
+/// **Not reachable over HTTP, and this test does not pretend otherwise.**
+/// `export_id` comes from the task payload and `workspace_id` from the
+/// envelope, both written by the API's create handler, so no request makes
+/// them disagree. The fixture FORGES the disagreement — that is what
+/// `forge_page` is named for. This pins the defence-in-depth layer rather
+/// than arguing for it, which is the whole reason the layer is there.
+///
+/// TWO rows, differing in the only dimension the DELETE can filter on:
+///
+///   * page 99, workspace A — the export's own stale page. The wipe MUST take
+///     it, or the test would also pass against a DELETE that never ran.
+///   * page 98, workspace B — the same `export_id`, another tenant. The wipe
+///     MUST NOT take it.
+///
+/// The page NUMBERS differ only because `PRIMARY KEY (export_id, page_number)`
+/// forbids two rows from colliding; `page_number` appears in no predicate on
+/// either side of the fix, so `workspace_id` is what separates the two
+/// outcomes.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn the_page_wipe_does_not_cross_a_workspace_boundary(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_a = Uuid::new_v4();
+    let workspace_b = Uuid::new_v4();
+    let export_id = Uuid::new_v4();
+
+    seed_events(
+        workspace_a,
+        &[Seed {
+            request_id: Uuid::new_v4(),
+            minute: 52,
+            model: "gpt-4o-mini",
+            final_action: "allow",
+            cost_usd: 0.07,
+            api_key_name: None,
+        }],
+    )
+    .await;
+    seed_export_row(&pool, export_id, workspace_a, "csv", 100).await?;
+
+    forge_page(&pool, export_id, workspace_a, 99, "stale-own-workspace").await?;
+    forge_page(&pool, export_id, workspace_b, 98, "another-tenants-page").await?;
+
+    // PREMISE: both rows are on disk, under different workspaces, before the
+    // job runs. Without this the survival assertion below could pass because
+    // the row was never written.
+    let before = page_workspaces(&pool, export_id).await?;
+    assert_eq!(
+        before,
+        vec![(98, workspace_b), (99, workspace_a)],
+        "premise: one page per workspace must exist before the run"
+    );
+
+    run_with(
+        &pool,
+        &ch_client(),
+        &envelope(export_id, workspace_a, "csv", 100),
+        Ok(test_key()),
+        MAX_EXPORT_ROWS,
+        Utc::now(),
+    )
+    .await;
+
+    // PREMISE: the job actually completed, so `persist()` — and its DELETE —
+    // really ran. A refused export deletes nothing and would make the
+    // survival assertion vacuous.
+    let stored = load_export(&pool, export_id).await?;
+    assert_eq!(
+        stored.status, STATUS_COMPLETE,
+        "premise: the export must complete for persist() to have run; error={:?}",
+        stored.error
+    );
+
+    let after = page_workspaces(&pool, export_id).await?;
+
+    // POSITIVE CONTROL: the wipe happened. Page 99 belonged to this export's
+    // own workspace and is gone.
+    assert!(
+        !after.iter().any(|(page, _)| *page == 99),
+        "the export's own stale page must be wiped, or this test is measuring \
+         a DELETE that never ran; rows now {after:?}"
+    );
+
+    // THE CLAIM: the other tenant's page is untouched.
+    assert!(
+        after.contains(&(98, workspace_b)),
+        "the page wipe crossed a workspace boundary: workspace {workspace_b}'s \
+         page 98 was deleted by an export belonging to workspace \
+         {workspace_a}. `DELETE FROM audit_export_pages WHERE export_id = $1` \
+         must also carry `AND workspace_id = $2`; rows now {after:?}"
+    );
+
+    // And every surviving page of this export other than the foreign one
+    // belongs to A — the fresh write is scoped as it always was.
+    for (page, workspace) in &after {
+        if *page == 98 {
+            continue;
+        }
+        assert_eq!(
+            *workspace, workspace_a,
+            "page {page} was written under the wrong workspace"
+        );
+    }
+
+    Ok(())
+}
+
 /// `model` reaches the export VERBATIM — it is not bounded against the
 /// workspace model catalogue the way the leak report's `by_model` is.
 ///
