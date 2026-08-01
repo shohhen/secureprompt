@@ -321,25 +321,66 @@ pub struct JwtConfig {
     pub refresh_ttl_secs: u64,
 }
 
-/// Sentinel values shipped in `.env.example` and comparable templates.
+/// Generic words that are a placeholder ONLY when they are the whole secret.
 ///
 /// WS1-3: booting with one of these means the deployment is running on a
 /// secret that is public knowledge — `.env.example` sets
 /// `SECUREPROMPT_JWT_SECRET=CHANGEME`, and an operator who copies it to
 /// `.env` and forgets to edit gets a gateway whose tokens anyone can forge.
 /// Compared case-insensitively after trimming.
-const PLACEHOLDER_SECRETS: &[&str] = &[
+///
+/// These stay EXACT-match deliberately. A real passphrase or base64 key can
+/// contain "secret", "password", "todo" or "xxx" as a substring, and a boot
+/// gate that rejects a genuine credential is an outage an operator cannot
+/// diagnose from the message. `substring_widening_does_not_reject_real_secrets`
+/// pins that direction.
+const PLACEHOLDER_SECRETS_EXACT: &[&str] = &[
+    "secret",
+    "password",
+    "placeholder",
+    "todo",
+    "xxx",
+    // The literal base64 `docker-compose.yml` shipped for KMS_FILE_KEY,
+    // lowercased to match the normalisation below. Not a marker anything else
+    // would contain, so it is listed here rather than as a substring.
+    "c2vjdxjlchjvbxb0lwrldi1rbxmta2v5ltmyynl0zxm=",
+];
+
+/// Markers that mean "this value came from a template" wherever they appear.
+///
+/// MR1 review I1. The gate used to be exact-match only, and the values this
+/// repository ACTUALLY runs on were not among them — `docker-compose.yml`
+/// supplied its own fallbacks, so the env var was never unset and never
+/// equalled `CHANGEME`:
+///
+/// ```text
+/// SECUREPROMPT_JWT_SECRET:   ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}
+/// SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:-dev-provider-key-changeme-in-prod}
+/// NEXTAUTH_SECRET:           ${NEXTAUTH_SECRET:-changeme-dev-only}
+/// ```
+///
+/// `docker compose up` with no `.env` booted on a JWT signing key committed to
+/// this repository. `secureprompt-ml/app/config.py` makes exactly this
+/// argument for its own compose default and adds it to its copy of the list;
+/// the argument was never back-ported here, where the stakes (JWT forgery,
+/// provider-key decryption) are higher.
+///
+/// Substring rather than exact match because the compose defaults DECORATE the
+/// marker (`dev-jwt-secret-` … `-in-prod-1`), so enumerating them would need a
+/// new entry every time someone edits a compose default — which is the drift
+/// that produced the finding. None of these can occur in `openssl rand -hex 32`
+/// output, and none is an ordinary English word.
+///
+/// `scripts/ci/check-compose-secret-fallbacks.sh` closes the same hole from the
+/// other side: a credential with any `${VAR:-...}` default fails CI, so a new
+/// published secret cannot appear without one of the two gates seeing it.
+const PLACEHOLDER_SECRET_MARKERS: &[&str] = &[
     "changeme",
     "change_me",
     "change-me",
     "changethis",
     "change_this",
     "change-this",
-    "secret",
-    "password",
-    "placeholder",
-    "todo",
-    "xxx",
     "your-secret-here",
     "your_secret_here",
     "replaceme",
@@ -353,7 +394,13 @@ const PLACEHOLDER_SECRETS: &[&str] = &[
 /// Returns a human-readable error when `value` is a known placeholder.
 fn reject_placeholder_secret(var: &str, value: &str) -> Result<(), String> {
     let normalized = value.trim().to_ascii_lowercase();
-    if PLACEHOLDER_SECRETS.contains(&normalized.as_str()) {
+
+    let matched = PLACEHOLDER_SECRETS_EXACT.contains(&normalized.as_str())
+        || PLACEHOLDER_SECRET_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker));
+
+    if matched {
         return Err(format!(
             "{var} is set to the placeholder value {value:?} — refusing to boot. \
              Generate a real secret (for example `openssl rand -hex 32`) and set {var}."

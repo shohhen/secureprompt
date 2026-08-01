@@ -209,6 +209,10 @@ static-checks:
     - bash scripts/ci/check-no-dangerous-html.sh
     # AUTH-07: .env.example carries CHANGEME sentinels, never a real secret.
     - bash scripts/ci/check-env-hygiene.sh
+    # MR1 I1. check-env-hygiene.sh guards .env.example; this guards the compose
+    # files, where the actual defect was — a `${VAR:-...}` fallback meant the
+    # boot gate never saw a placeholder because the var was never unset.
+    - bash scripts/ci/check-compose-secret-fallbacks.sh
     # MR7 I1: no runbook may route an upgrade through `init-env.sh --force`,
     # which rotates the AES key for stored provider credentials.
     - bash scripts/ci/check-upgrade-path-is-nondestructive.sh

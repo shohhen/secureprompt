@@ -37,7 +37,7 @@ services:
     restart: on-failure:5
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
-      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}
+      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
     depends_on:
       - postgres
 
@@ -47,7 +47,7 @@ services:
       dockerfile: secureprompt-api/Dockerfile
     environment:
       # RUNTIME role: NOSUPERUSER, NOBYPASSRLS, owns nothing.
-      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: debug
       # WS2-3. This profile deliberately ships NO ML sidecar, so the gateway

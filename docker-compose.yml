@@ -54,9 +54,14 @@ services:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       # The password this step sets on the runtime role, and the same value the
       # api/worker URLs below are built from — so the two cannot disagree.
-      # Dev default matches the (equally hardcoded) owner password above; set it
-      # in .env for anything you would not throw away.
-      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}
+      #
+      # REQUIRED, not defaulted (MR1 review I1). It used to fall back to the
+      # literal `secureprompt`, which meant `docker compose up` with no .env
+      # brought up a stack whose runtime database credential is committed to
+      # this repository. `scripts/init-env.sh` generates a real one; the
+      # `:?` makes compose refuse to start rather than publish a credential.
+      # `scripts/ci/check-compose-secret-fallbacks.sh` keeps it that way.
+      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:
@@ -195,7 +200,7 @@ services:
       # table and cannot create one — so the RLS policies on this schema
       # actually apply to it. Migrations are applied by `db-migrate` above,
       # which is the only service holding the owner credential.
-      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       ML_SIDECAR_URL: http://secureprompt-ml:8080
@@ -205,8 +210,8 @@ services:
       ML_SIDECAR_TIMEOUT_MS: ${ML_SIDECAR_TIMEOUT_MS:-30000}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
-      SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:-dev-jwt-secret-changeme-in-prod-1}
-      SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:-dev-provider-key-changeme-in-prod}
+      SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:?SECUREPROMPT_JWT_SECRET must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
+      SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:?SECUREPROMPT_PROVIDER_KEY must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       # Browser-facing CORS allowlist. Dashboard runs on host port 3003; the
       # API default is only localhost:3000, so the new origin must be listed.
       SECUREPROMPT_CORS_ORIGINS: ${SECUREPROMPT_CORS_ORIGINS:-http://localhost:3003}
@@ -216,7 +221,7 @@ services:
       # returns the tokenized prompt + provider invocation body as the
       # assistant message instead. Override per-deployment in `.env`.
       SECUREPROMPT_CHAT_DEBUG_MODE: ${SECUREPROMPT_CHAT_DEBUG_MODE:-false}
-      KMS_FILE_KEY: ${KMS_FILE_KEY:-c2VjdXJlcHJvbXB0LWRldi1rbXMta2V5LTMyYnl0ZXM=}
+      KMS_FILE_KEY: ${KMS_FILE_KEY:?KMS_FILE_KEY must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       # License chain: the gateway reads the vendor Ed25519 public key, the
       # 32-byte KEK, and the compact license token entirely from env vars.
       # Populate via .env / Docker secrets / your CI. Empty defaults below
@@ -260,7 +265,7 @@ services:
       # table and cannot create one — so the RLS policies on this schema
       # actually apply to it. Migrations are applied by `db-migrate` above,
       # which is the only service holding the owner credential.
-      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       CLICKHOUSE_URL: http://clickhouse:8123
@@ -293,7 +298,7 @@ services:
       # Host port remapped to 3003 (sp-admin-web owns 3000).
       # NEXTAUTH_URL must match the browser-facing URL or auth callbacks break.
       NEXTAUTH_URL: http://localhost:3003
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme-dev-only}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       API_URL: http://api:8080
       ML_SIDECAR_URL: http://secureprompt-ml:8080
       # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.

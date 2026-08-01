@@ -86,6 +86,12 @@ NEXTAUTH="$(gen)"
 # the password `db-migrate` sets on `secureprompt_app` from this one variable, so
 # generating it here cannot leave the role and the URL disagreeing.
 APP_DB_PASSWORD="$(gen)"
+# MR1 review I1: docker-compose.yml used to default KMS_FILE_KEY to the literal
+# base64 of "secureprompt-dev-kms-key-32bytes", published in this repository, so
+# every unconfigured stack encrypted its file vault under a key anyone can read.
+# It is now REQUIRED there, so it must be generated here. Format is fixed by
+# secureprompt-common/src/kms.rs: base64-standard of EXACTLY 32 decoded bytes.
+KMS_FILE_KEY="$(openssl rand 32 | base64)"
 
 # --fill-missing: append the keys this .env does not have, and stop. Every
 # existing assignment is left byte-for-byte alone — that is the entire point,
@@ -114,6 +120,7 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fill ML_SIDECAR_INTERNAL_TOKEN    "$ML_TOKEN"
     fill NEXTAUTH_SECRET              "$NEXTAUTH"
     fill SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
+    fill KMS_FILE_KEY                 "$KMS_FILE_KEY"
 
     if [[ "${#added[@]}" -eq 0 ]]; then
         echo "$TARGET already has every key this script manages. Nothing changed."
@@ -143,6 +150,7 @@ replace SECUREPROMPT_PROVIDER_KEY "$PROVIDER_KEY"
 replace ML_SIDECAR_INTERNAL_TOKEN "$ML_TOKEN"
 replace NEXTAUTH_SECRET           "$NEXTAUTH"
 replace SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
+replace KMS_FILE_KEY                 "$KMS_FILE_KEY"
 
 echo "Wrote $TARGET with freshly generated secrets."
 echo
