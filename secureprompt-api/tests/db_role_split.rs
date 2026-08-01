@@ -28,7 +28,8 @@
 //! `ALTER DEFAULT PRIVILEGES` is what closes that, and it is what this test
 //! measures.
 
-use sqlx::postgres::{PgConnectOptions, PgConnection};
+use secureprompt_api::db::migrations::{ensure_pg_migrations, MIGRATOR};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, Row};
 
 /// The runtime role. Created by `001_init.sql`; granted, constrained and
@@ -278,4 +279,186 @@ async fn every_table_in_the_schema_is_reachable_by_the_runtime_role(pool: PgPool
         "{APP_ROLE} cannot SELECT from: {unreachable:?}. Each of these is a \
          runtime 42501 waiting for the first request that touches it."
     );
+}
+
+// ===========================================================================
+// Boot. The knot the split had to untie.
+// ===========================================================================
+
+/// A pool connected to the SAME `#[sqlx::test]` database as the runtime role.
+/// `ensure_pg_migrations` takes a `&PgPool`, so the probe has to be one.
+async fn app_role_pool(pool: &PgPool) -> PgPool {
+    sqlx::raw_sql(&format!(
+        "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
+    ))
+    .execute(pool)
+    .await
+    .expect("set a known password on the runtime role for this probe");
+
+    let options: PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(APP_ROLE)
+        .password(APP_PROBE_PASSWORD);
+
+    let probe = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("runtime-role pool on the test database");
+
+    let can_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")
+            .fetch_one(&probe)
+            .await
+            .expect("schema privilege probe");
+    assert!(
+        !can_create,
+        "premise: the runtime role has CREATE on schema public, so it would \
+         take the OWNER branch and this test would measure nothing"
+    );
+
+    probe
+}
+
+/// THE KNOT.
+///
+/// `main.rs` ran `sqlx::migrate!` on every boot, on the same pool it then
+/// served with — one connection doing both DDL and DML. A migration role needs
+/// `CREATE ON SCHEMA public` and table ownership (measured: 018/021/023 fail
+/// without CREATE, 022 fails with `must be owner of table
+/// token_vault_entries`). The runtime role must have neither.
+///
+/// It is not enough for the runtime role to have "nothing to do": measured on
+/// `postgres:16`, `CREATE TABLE IF NOT EXISTS _sqlx_migrations` on an
+/// ALREADY-EXISTING table is still refused with `permission denied for schema
+/// public` — Postgres checks the schema privilege before the existence check.
+/// So `MIGRATOR.run` cannot even no-op under the runtime role, and the API
+/// cannot simply be pointed at the app URL and left otherwise unchanged.
+///
+/// Boot must therefore notice which role it holds. This test is that
+/// behaviour: a fully-migrated schema, a runtime connection, and a boot that
+/// succeeds without attempting any DDL.
+#[sqlx::test]
+async fn boot_as_the_runtime_role_succeeds_without_attempting_ddl(pool: PgPool) {
+    let probe = app_role_pool(&pool).await;
+
+    ensure_pg_migrations(&probe)
+        .await
+        .expect("boot as the runtime role must succeed against a migrated schema");
+
+    probe.close().await;
+}
+
+/// The other half: skipping migrations must never mean "not noticing they were
+/// skipped". If the migration step did not run — the operator forgot the
+/// one-shot, or it failed and was not looked at — the serving process must
+/// refuse to start rather than serve requests against a schema it was not
+/// compiled for.
+///
+/// The assertion is on the CONTENT of the error, not merely that there is one.
+/// Before this behaviour existed the call also returned `Err`, but with
+/// `permission denied for schema public` — an error that tells an operator
+/// nothing about what is actually wrong. A bare `expect_err` here would have
+/// been a vacuous pass.
+#[sqlx::test]
+async fn boot_as_the_runtime_role_refuses_a_schema_that_is_behind(pool: PgPool) {
+    let head = MIGRATOR
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("the embedded migration set is not empty");
+
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+        .bind(head)
+        .execute(&pool)
+        .await
+        .expect("simulate a migration step that never ran to completion");
+
+    let probe = app_role_pool(&pool).await;
+
+    let err = ensure_pg_migrations(&probe)
+        .await
+        .expect_err("a runtime role must not serve a schema that is behind")
+        .to_string();
+
+    assert!(
+        err.contains(&head.to_string()),
+        "the refusal must name the missing migration so an operator can act \
+         on it. Got: {err}"
+    );
+
+    probe.close().await;
+}
+
+/// POSITIVE CONTROL, over the awkward path `ensure_pg_migrations` was written
+/// for: a database whose tables exist but whose `_sqlx_migrations` does not,
+/// because someone applied the schema by hand with `psql` and then redeployed.
+///
+/// This is also the path an EXISTING deployment can land on while adopting the
+/// role split, so it is worth pinning as behaviour rather than as prose. The
+/// owner branch must still perform DDL here — `CREATE TABLE _sqlx_migrations`
+/// plus a row per embedded migration. Without this control,
+/// `boot_as_the_runtime_role_succeeds_without_attempting_ddl` could be
+/// satisfied by an `ensure_pg_migrations` that had quietly become a no-op for
+/// everyone.
+#[sqlx::test]
+async fn boot_as_the_owner_bootstraps_tracking_when_the_schema_predates_sqlx(pool: PgPool) {
+    sqlx::raw_sql("DROP TABLE _sqlx_migrations")
+        .execute(&pool)
+        .await
+        .expect("simulate a schema applied by hand, with no sqlx tracking");
+
+    let tracked_before: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("existence probe");
+    assert!(
+        !tracked_before,
+        "premise: the tracking table must start absent"
+    );
+
+    ensure_pg_migrations(&pool)
+        .await
+        .expect("boot as the owner must bootstrap the tracking table");
+
+    let tracked: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
+        .fetch_one(&pool)
+        .await
+        .expect("tracking probe");
+
+    assert_eq!(
+        tracked,
+        MIGRATOR.iter().count() as i64,
+        "the owner branch did not bootstrap every embedded migration. \
+         Migrations are no longer being applied on boot for ANYONE, which the \
+         runtime-role test above cannot distinguish from working correctly."
+    );
+}
+
+/// The same database, the other role. An existing deployment that has just
+/// been pointed at the runtime URL, before its migration step has ever run,
+/// must be told so — not handed `permission denied for schema public`, and
+/// certainly not allowed to serve.
+#[sqlx::test]
+async fn boot_as_the_runtime_role_refuses_a_schema_with_no_tracking_table(pool: PgPool) {
+    sqlx::raw_sql("DROP TABLE _sqlx_migrations")
+        .execute(&pool)
+        .await
+        .expect("simulate a schema applied by hand, with no sqlx tracking");
+
+    let probe = app_role_pool(&pool).await;
+
+    let err = ensure_pg_migrations(&probe)
+        .await
+        .expect_err("a runtime role cannot bootstrap tracking — it has no DDL")
+        .to_string();
+
+    assert!(
+        err.contains("_sqlx_migrations"),
+        "the refusal must name what is missing so an operator knows to run the \
+         migration step as the owner role. Got: {err}"
+    );
+
+    probe.close().await;
 }
