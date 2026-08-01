@@ -212,6 +212,9 @@ static-checks:
     # MR7 I1: no runbook may route an upgrade through `init-env.sh --force`,
     # which rotates the AES key for stored provider credentials.
     - bash scripts/ci/check-upgrade-path-is-nondestructive.sh
+    # MR7 C4: all four "the runtime role is powerless" assertions must ask
+    # about role membership, not just role attributes.
+    - bash scripts/ci/check-powerless-assertions-agree.sh
     # Every mart consumed by the dashboard is declared as a dbt exposure.
     - node scripts/ci/check-mart-exposures.mjs
     - |

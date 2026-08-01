@@ -154,6 +154,29 @@ if [ "$privileged" != "f" ]; then
   exit 1
 fi
 
+# ROLE MEMBERSHIP. MEASURED: granting ${APP_ROLE} membership of a role that
+# holds CREATE ON SCHEMA public — or BYPASSRLS — leaves BOTH the attribute
+# check above and the has_schema_privilege check below answering harmless,
+# because the role is NOINHERIT and does not pick the privilege up
+# automatically. NOINHERIT only means "not automatic": SET ROLE still reaches
+# them, over an ordinary connection, with no password. Without this block the
+# script printed its all-clear over a role that was one statement from
+# BYPASSRLS.
+memberships="$(psql "$ADMIN_DATABASE_URL" -tAc \
+  "SELECT COALESCE(string_agg(g.rolname, ', ' ORDER BY g.rolname), '')
+     FROM pg_auth_members m
+     JOIN pg_roles mem ON mem.oid = m.member
+     JOIN pg_roles g   ON g.oid   = m.roleid
+    WHERE mem.rolname='${APP_ROLE}'")"
+if [ -n "$memberships" ]; then
+  echo "FAIL: ${APP_ROLE} is a member of: ${memberships}." >&2
+  echo "      NOINHERIT does not close this — SET ROLE reaches those" >&2
+  echo "      privileges from an ordinary connection, so whatever they hold," >&2
+  echo "      the runtime role effectively holds. Revoke it:" >&2
+  echo "        REVOKE <role> FROM ${APP_ROLE};" >&2
+  exit 1
+fi
+
 can_create="$(psql "$ADMIN_DATABASE_URL" -tAc \
   "SELECT has_schema_privilege('${APP_ROLE}','public','CREATE')")"
 if [ "$can_create" != "f" ]; then
@@ -172,4 +195,4 @@ if [ "$owns" != "0" ]; then
   exit 1
 fi
 
-echo "OK: ${APP_ROLE} exists, NOSUPERUSER + NOBYPASSRLS, no CREATE on public, owns nothing."
+echo "OK: ${APP_ROLE} exists, NOSUPERUSER + NOBYPASSRLS, no role memberships, no CREATE on public, owns nothing."

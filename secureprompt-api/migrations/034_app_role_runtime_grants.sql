@@ -204,9 +204,10 @@ END $$;
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-    privileged BOOLEAN;
-    can_create BOOLEAN;
-    grantees   TEXT;
+    privileged  BOOLEAN;
+    can_create  BOOLEAN;
+    grantees    TEXT;
+    memberships TEXT;
 BEGIN
     SELECT rolsuper OR rolbypassrls
       INTO privileged
@@ -220,6 +221,38 @@ BEGIN
             'Refusing to complete the migration.';
     END IF;
 
+    -- ROLE MEMBERSHIP. Asked before the CREATE check, and asked at all,
+    -- because a role can be powerless on paper and not in practice: granting
+    -- secureprompt_app membership of a role that holds CREATE ON SCHEMA public
+    -- — or BYPASSRLS — leaves BOTH attribute checks above and the
+    -- has_schema_privilege check below answering harmless, because this role is
+    -- NOINHERIT and does not pick the privilege up automatically. MEASURED.
+    --
+    -- NOINHERIT only means the privileges are not AUTOMATIC. `SET ROLE` reaches
+    -- them over an ordinary connection, with no password. So a BYPASSRLS role
+    -- secureprompt_app is a member of is BYPASSRLS, one statement away, and
+    -- every RLS policy in this schema is inert at runtime with nothing
+    -- reporting it.
+    --
+    -- This is the assertion that runs on the paths --migrate-only does not
+    -- cover: `sqlx migrate run`, and any database already at head where this
+    -- file is no longer pending. It has to be complete on its own.
+    SELECT string_agg(grantee.rolname, ', ' ORDER BY grantee.rolname)
+      INTO memberships
+      FROM pg_auth_members m
+      JOIN pg_roles member  ON member.oid  = m.member
+      JOIN pg_roles grantee ON grantee.oid = m.roleid
+     WHERE member.rolname = 'secureprompt_app';
+
+    IF memberships IS NOT NULL THEN
+        RAISE EXCEPTION
+            'secureprompt_app is a member of: %. NOINHERIT does not close this '
+            '— SET ROLE reaches those privileges from an ordinary connection, '
+            'so whatever they hold, the runtime role effectively holds. '
+            'Revoke it: REVOKE <role> FROM secureprompt_app; Refusing to '
+            'complete the migration.', memberships;
+    END IF;
+
     SELECT has_schema_privilege('secureprompt_app', 'public', 'CREATE')
       INTO can_create;
 
@@ -229,7 +262,8 @@ BEGIN
         -- ONE cause it provably cannot be: secureprompt_app is NOINHERIT, and
         -- a NOINHERIT membership makes has_schema_privilege answer FALSE
         -- (measured). That sent the operator to pg_auth_members, which is
-        -- empty, while the real grantee sat in pg_namespace.nspacl.
+        -- empty, while the real grantee sat in pg_namespace.nspacl. Membership
+        -- has in any case already been ruled out above.
         SELECT string_agg(DISTINCT
                    CASE WHEN a.grantee = 0 THEN 'PUBLIC'
                         ELSE pg_get_userbyid(a.grantee) END, ', ')

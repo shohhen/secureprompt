@@ -56,4 +56,23 @@ if [ "$privileged" != "f" ]; then
   exit 1
 fi
 
-echo "OK: ${RUNNER_ROLE} exists, NOSUPERUSER + NOBYPASSRLS + CREATEDB."
+# ROLE MEMBERSHIP. Three other files describe themselves as "the same shape as
+# scripts/ci/create-nonsuperuser-role.sh", and until MR7 none of them — this
+# one included — asked this question. MEASURED: a NOINHERIT role that is a
+# MEMBER of a BYPASSRLS role reads NOSUPERUSER/NOBYPASSRLS in pg_roles and
+# still reaches BYPASSRLS with one SET ROLE. For a gate whose entire purpose is
+# to run the suite as a role RLS applies to, that is the failure that matters.
+memberships="$(psql "$ADMIN_DATABASE_URL" -tAc \
+  "SELECT COALESCE(string_agg(g.rolname, ', ' ORDER BY g.rolname), '')
+     FROM pg_auth_members m
+     JOIN pg_roles mem ON mem.oid = m.member
+     JOIN pg_roles g   ON g.oid   = m.roleid
+    WHERE mem.rolname='${RUNNER_ROLE}'")"
+if [ -n "$memberships" ]; then
+  echo "FAIL: ${RUNNER_ROLE} is a member of: ${memberships}." >&2
+  echo "      SET ROLE reaches whatever those hold, NOINHERIT or not, so this" >&2
+  echo "      job could be exercising no RLS at all. Refusing to continue." >&2
+  exit 1
+fi
+
+echo "OK: ${RUNNER_ROLE} exists, NOSUPERUSER + NOBYPASSRLS + CREATEDB, no role memberships."

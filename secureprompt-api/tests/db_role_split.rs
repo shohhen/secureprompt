@@ -289,12 +289,32 @@ async fn the_runtime_role_cannot_create_objects_in_the_public_schema(pool: PgPoo
     );
 }
 
-/// The mandated powerless-assertion, in the same shape as
-/// `scripts/ci/create-nonsuperuser-role.sh`: without it a future base image or
-/// a stray GRANT could hand the runtime role superuser and the entire suite
-/// would keep passing while enforcing nothing.
+/// The mandated powerless-assertion.
+///
+/// PROVED IN REVIEW: this test used to read five `pg_roles` attribute columns
+/// and nothing else, so it PASSED with the live `secureprompt_app` granted
+/// membership of a BYPASSRLS role — the exact state its own doc-comment
+/// promised it would catch ("a stray GRANT could hand the runtime role
+/// superuser and the entire suite would keep passing while enforcing
+/// nothing"). The membership check had been added to the production assertion
+/// and never to the test named for the guarantee.
+///
+/// So it now calls the PRODUCTION assertion rather than re-implementing a
+/// weaker subset of it: whatever a deployment refuses to start on, this
+/// refuses to pass on. The attribute checks below are kept because they are
+/// STRICTER than production's — CREATEDB, CREATEROLE and LOGIN are not things
+/// the migration step refuses on, but a runtime role with CREATEROLE can grant
+/// itself membership of a privileged role and escape the split entirely.
 #[sqlx::test]
 async fn the_runtime_role_is_genuinely_powerless(pool: PgPool) {
+    secureprompt_api::db::migrations::assert_runtime_role_is_powerless(&pool)
+        .await
+        .expect(
+            "the runtime role is not powerless by the same standard the \
+             migration step applies. A deployment would refuse to start; this \
+             suite must not pass.",
+        );
+
     let row = sqlx::query(
         "SELECT rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolcanlogin
            FROM pg_roles WHERE rolname = $1",
@@ -719,8 +739,6 @@ async fn migration_034_repairs_a_public_create_grant_instead_of_failing(pool: Pg
 /// invisible to them.
 #[sqlx::test]
 async fn migration_034_refuses_a_runtime_role_that_can_reach_bypassrls(pool: PgPool) {
-    use sqlx::Acquire as _;
-
     let mut tx = pool.begin().await.expect("probe transaction");
 
     sqlx::raw_sql(
@@ -924,6 +942,72 @@ async fn concurrent_migration_steps_all_succeed(pool: PgPool) {
          them is an initContainer exiting non-zero on a rollout that was \
          supposed to be idempotent. Failures: {failures:#?}",
         failures.len()
+    );
+}
+
+/// PROVED IN REVIEW: nothing reached the powerless assertion THROUGH
+/// `run_migration_step`. A full reference sweep found three call sites — one
+/// that fails earlier on the CREATE check, one that passes with or without the
+/// assertion, and one calling `assert_role_is_powerless` directly — so the line
+/// could be deleted from the migration step with all thirteen tests green. The
+/// deployment gate was pinned by nothing.
+///
+/// It could not be tested through `run_migration_step` because that function
+/// hard-coded `RUNTIME_ROLE`, which is cluster-global: a test that made
+/// `secureprompt_app` a member of a BYPASSRLS role would break every other test
+/// in this file. `run_migration_step_for_role` takes the role as a parameter,
+/// so the assertion is reachable against a throwaway.
+///
+/// MUTATION-PROVED: deleting `assert_role_is_powerless_on` from
+/// `locked_migration_step` turns THIS test red and leaves the other seventeen
+/// green — which is exactly the review's finding, now the other way round.
+#[sqlx::test]
+async fn the_migration_step_refuses_a_runtime_role_that_can_reach_bypassrls(pool: PgPool) {
+    sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             CREATE ROLE sp_step_probe LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                 NOINHERIT NOBYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         DO $$
+         BEGIN
+             CREATE ROLE sp_step_grantor NOLOGIN BYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         GRANT sp_step_grantor TO sp_step_probe;",
+    )
+    .execute(&pool)
+    .await
+    .expect("probe roles");
+
+    // PREMISE: the step is connected as the OWNER, so it gets past the
+    // authority check and actually runs. Otherwise it would refuse for an
+    // unrelated reason and prove nothing.
+    let outcome =
+        secureprompt_api::db::migrations::run_migration_step_for_role(&pool, "sp_step_probe", None)
+            .await;
+
+    sqlx::raw_sql(
+        "REVOKE sp_step_grantor FROM sp_step_probe;
+         DROP ROLE IF EXISTS sp_step_grantor;
+         DROP ROLE IF EXISTS sp_step_probe;",
+    )
+    .execute(&pool)
+    .await
+    .ok();
+
+    let err = outcome
+        .expect_err(
+            "the migration step completed while its runtime role was one SET \
+             ROLE from BYPASSRLS. --migrate-only would exit 0 and the \
+             deployment would serve with every RLS policy inert.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("sp_step_grantor"),
+        "the refusal must name the reachable role. Got: {err}"
     );
 }
 
