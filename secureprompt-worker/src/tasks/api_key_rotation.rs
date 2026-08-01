@@ -35,6 +35,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::tasks::workspace_enumeration::enumerate_workspaces;
+
 /// The sweep itself, run once per workspace with that workspace's scope armed.
 ///
 /// The `workspace_id = $1` is NOT redundant with the policy and is not there
@@ -69,6 +71,15 @@ const SCOPE_NOT_ARMED: &str =
 pub struct Outcome {
     /// Rows moved to `status = 'revoked'`.
     pub keys_revoked: u64,
+    /// Workspaces the enumeration returned — the CENSUS, and the denominator
+    /// [`Outcome::all_ok`] measures `workspaces_swept` against.
+    ///
+    /// MR6 F2: without it, `all_ok()` was `failures == 0` and therefore
+    /// VACUOUSLY TRUE over an empty enumeration. A policed `workspaces` makes
+    /// the bare-pool `SELECT` answer `Ok(vec![])`, the loop runs zero times,
+    /// nothing fails because nothing ran, and the cron records success on a
+    /// night when every grace-expired key stayed live.
+    pub enumerated: usize,
     /// Workspaces the sweep actually visited.
     pub workspaces_swept: usize,
     /// Per-workspace sweeps that returned an error. Non-zero makes
@@ -79,9 +90,23 @@ pub struct Outcome {
 
 impl Outcome {
     /// Whether the job should record itself as successful.
+    ///
+    /// Both terms are load-bearing and neither subsumes the other.
+    /// `failures == 0` catches a workspace that errored; `swept ==
+    /// enumerated` catches a workspace that was skipped without erroring —
+    /// which is the only shape an RLS failure takes, since a filtered read
+    /// returns rows rather than an error.
+    ///
+    /// `enumerated == 0` is deliberately NOT a failure on its own: a genuinely
+    /// empty deployment must not page anyone nightly. The blind case is caught
+    /// upstream instead, by
+    /// [`crate::tasks::workspace_enumeration::enumerate_workspaces`]'s
+    /// `row_security_active` precondition, which turns "I could not see" into
+    /// an error and so into `failures = 1` — a positive statement rather than
+    /// an inference from a zero.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.failures == 0
+        self.failures == 0 && self.workspaces_swept == self.enumerated
     }
 }
 
@@ -125,13 +150,19 @@ impl Outcome {
 /// FAILED. The silent-success path this replaces is the whole defect.
 pub async fn run(pg: &PgPool) -> Outcome {
     // `workspaces` is not under FORCE ROW LEVEL SECURITY (asserted as a
-    // premise in this module's tests), so this enumeration needs no scope. If
-    // a future migration arms it, this read becomes a silent empty set and the
-    // tests here fail on `workspaces_swept`, which is why that field exists.
-    let workspaces = match sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces")
-        .fetch_all(pg)
-        .await
-    {
+    // premise in this module's tests), so this enumeration needs no scope.
+    //
+    // MR6 F2 — that premise is now CHECKED rather than commented. This read
+    // used to be a bare `SELECT id FROM workspaces`, under a comment claiming
+    // that if a future migration armed the table "the tests here fail on
+    // `workspaces_swept`". They did not: there was no such test, and
+    // `workspaces_swept` was read by no production code — not by `all_ok()`,
+    // not by `main.rs`, only by a `tracing::info!`. An armed `workspaces`
+    // makes this answer `Ok(vec![])` with no error at all, so the check has to
+    // be a positive one. `enumerate_workspaces` is shared with
+    // `tasks::retention_purge`, which got this precondition in the MR that
+    // left this function without it.
+    let workspaces = match enumerate_workspaces(pg).await {
         Ok(ids) => ids,
         Err(e) => {
             tracing::error!(error = %e, "rotation cleanup could not enumerate workspaces");
@@ -142,7 +173,10 @@ pub async fn run(pg: &PgPool) -> Outcome {
         }
     };
 
-    let mut outcome = Outcome::default();
+    let mut outcome = Outcome {
+        enumerated: workspaces.len(),
+        ..Outcome::default()
+    };
     for workspace_id in workspaces {
         match sweep_one(pg, workspace_id).await {
             Ok(revoked) => {

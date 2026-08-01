@@ -93,6 +93,11 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
+// MR6 F2 — the enumeration and its `row_security_active` precondition used to
+// live here as private items. `tasks::api_key_rotation` had a second, weaker
+// copy, and that divergence IS the defect; both now call one function.
+use crate::tasks::workspace_enumeration::enumerate_workspaces;
+
 /// Scope name for the Postgres token vault.
 pub const SCOPE_TOKEN_VAULT: &str = "token_vault_entries";
 /// Scope name for `ClickHouse` captured request content.
@@ -527,18 +532,6 @@ struct CaptureStats {
     newest: u32,
 }
 
-/// The refusal recorded when the sweep's ONE bare-pool read is itself policed.
-///
-/// The enumeration below is sound only because `workspaces` is not under row
-/// level security. If a migration ever arms it, the enumeration stops being a
-/// list of every tenant and becomes a silent empty set — the same shape as the
-/// defect this whole function was rewritten to remove, one level up. So the
-/// precondition is CHECKED rather than commented, and its failure is recorded.
-const WORKSPACES_ARE_POLICED: &str =
-    "row security is active on `workspaces` for this connection, so enumerating \
-     it would return a filtered list and any sweep built on it would silently \
-     skip every workspace it cannot see";
-
 /// The refusal recorded when one workspace's settings transaction did not take
 /// the scope. Same shape and the same reason as [`SCOPE_NOT_ARMED`] below and
 /// `tasks::api_key_rotation`'s constant of that name.
@@ -624,26 +617,6 @@ async fn begin_armed<'p>(
         return Err(sqlx::Error::Protocol(not_armed.to_owned()));
     }
     Ok(tx)
-}
-
-/// Enumerate every tenant, refusing to do so blind.
-///
-/// `workspaces` carries no `workspace_id` and no policy, which is what lets the
-/// one cross-tenant read this job needs stay on a bare pool. MEASURED both
-/// ways: `SELECT row_security_active('public.workspaces')` answers `false` for
-/// the runner role on the current schema, and `true` in
-/// `a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly`, which arms
-/// the table and requires the run to fail.
-async fn enumerate_workspaces(pg: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
-    let policed: bool = sqlx::query_scalar("SELECT row_security_active('public.workspaces')")
-        .fetch_one(pg)
-        .await?;
-    if policed {
-        return Err(sqlx::Error::Protocol(WORKSPACES_ARE_POLICED.to_owned()));
-    }
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces")
-        .fetch_all(pg)
-        .await
 }
 
 /// One workspace's CURRENT retention, read inside a transaction armed to that

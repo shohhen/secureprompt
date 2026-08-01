@@ -177,6 +177,11 @@ async fn main() -> anyhow::Result<()> {
                 let outcome = tasks::api_key_rotation::run(&pool).await;
                 tracing::info!(
                     keys_revoked = outcome.keys_revoked,
+                    // MR6 F2 — `enumerated` beside `workspaces_swept`, because
+                    // the pair is the finding. `swept` alone cannot distinguish
+                    // "nothing to do" from "could not see anything", and it is
+                    // their EQUALITY that `all_ok()` now requires.
+                    workspaces_enumerated = outcome.enumerated,
                     workspaces_swept = outcome.workspaces_swept,
                     failures = outcome.failures,
                     "rotation cleanup complete"
