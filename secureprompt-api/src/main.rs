@@ -57,6 +57,9 @@ async fn migrate_only() -> anyhow::Result<()> {
     let app_password = std::env::var("SECUREPROMPT_APP_DB_PASSWORD")
         .ok()
         .filter(|value| !value.is_empty());
+    if let Some(value) = app_password.as_deref() {
+        reject_placeholder_app_password(value).map_err(|msg| anyhow::anyhow!(msg))?;
+    }
     if app_password.is_none() {
         tracing::info!(
             "SECUREPROMPT_APP_DB_PASSWORD unset — leaving the runtime role's \
@@ -71,10 +74,69 @@ async fn migrate_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the binary was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Apply the schema as the owner role and exit.
+    MigrateOnly,
+    /// Serve HTTP.
+    Serve,
+}
+
+/// Parse argv, REFUSING anything unrecognised.
+///
+/// The refusal is the point. `--migrate-only` is a new mode, and the 0.1.x
+/// image tags are mutable, so a node-cached PRE-SPLIT image can be handed
+/// `--migrate-only` by an initContainer. That binary had no argument parsing at
+/// all: it ignored the flag and started the full API from a container given
+/// only DATABASE_URL. Silently doing the wrong thing is the failure mode this
+/// whole change exists to remove, so a mis-invocation must be loud.
+fn parse_mode<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, String> {
+    let mut mode = Mode::Serve;
+    for arg in args.into_iter().skip(1) {
+        match arg.as_str() {
+            "--migrate-only" => mode = Mode::MigrateOnly,
+            other => {
+                return Err(format!(
+                    "unrecognised argument `{other}`. secureprompt-api takes \
+                     either no arguments (serve HTTP) or `--migrate-only` \
+                     (apply the schema as the owner role and exit). Refusing to \
+                     guess: an image too old to know `--migrate-only` would \
+                     otherwise start the API from a migration container."
+                ))
+            }
+        }
+    }
+    Ok(mode)
+}
+
+/// The placeholder `.env.example` ships, rejected the way the JWT secret is.
+///
+/// MR7 I4: `SECUREPROMPT_APP_DB_PASSWORD=CHANGEME` shipped with neither a
+/// hygiene-check entry nor a boot gate, and docker-compose builds BOTH the
+/// password this step sets and the api/worker `DATABASE_URL` from that one
+/// variable — so they agreed, and `cp .env.example .env` produced a stack that
+/// came up green with the literal string CHANGEME as its database credential.
+/// `scripts/init-env.sh` states the convention this repo relies on:
+/// ".env.example keeps values the boot gate REJECTS." There was no gate.
+fn reject_placeholder_app_password(value: &str) -> Result<(), String> {
+    if value.trim().eq_ignore_ascii_case("CHANGEME") {
+        return Err(
+            "SECUREPROMPT_APP_DB_PASSWORD is still the .env.example placeholder \
+             `CHANGEME`. That string would become the runtime role's actual \
+             database password. Generate one: `openssl rand -hex 32`, or run \
+             `./scripts/init-env.sh --fill-missing`."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|arg| arg == "--migrate-only") {
-        return migrate_only().await;
+    match parse_mode(std::env::args()).map_err(|msg| anyhow::anyhow!(msg))? {
+        Mode::MigrateOnly => return migrate_only().await,
+        Mode::Serve => {}
     }
 
     let config = AppConfig {
@@ -392,4 +454,65 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("secureprompt-api".to_string())
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_arguments_serves() {
+        assert_eq!(parse_mode(argv(&[])), Ok(Mode::Serve));
+    }
+
+    #[test]
+    fn the_migrate_flag_selects_the_migration_step() {
+        assert_eq!(parse_mode(argv(&["--migrate-only"])), Ok(Mode::MigrateOnly));
+    }
+
+    /// MR7 I2. The old `main` did `args().any(|a| a == "--migrate-only")`, so a
+    /// typo — or any other argument — silently started the HTTP server. In an
+    /// initContainer that is a pod which never becomes ready, with no
+    /// explanation anywhere.
+    #[test]
+    fn an_unrecognised_argument_is_refused_by_name() {
+        let err = parse_mode(argv(&["--migrate-onlyy"])).expect_err(
+            "a mis-typed flag must not silently fall through to serving HTTP",
+        );
+        assert!(err.contains("--migrate-onlyy"), "got: {err}");
+        assert!(err.contains("--migrate-only"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unrecognised_argument_after_a_valid_one_is_still_refused() {
+        assert!(parse_mode(argv(&["--migrate-only", "--serve"])).is_err());
+    }
+
+    /// MR7 I4.
+    #[test]
+    fn the_env_example_placeholder_is_not_a_database_password() {
+        for placeholder in ["CHANGEME", "changeme", "  CHANGEME  "] {
+            let err = reject_placeholder_app_password(placeholder).expect_err(
+                "the placeholder .env.example ships must never become the \
+                 runtime role's real password",
+            );
+            assert!(err.contains("CHANGEME"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_real_password_is_accepted() {
+        assert_eq!(
+            reject_placeholder_app_password(
+                "9f2c1a4e8b7d6053f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708"
+            ),
+            Ok(())
+        );
+    }
 }

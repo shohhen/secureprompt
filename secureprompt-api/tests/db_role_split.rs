@@ -476,6 +476,46 @@ async fn boot_as_the_runtime_role_refuses_a_schema_that_is_behind(pool: PgPool) 
     probe.close().await;
 }
 
+/// PROVED IN REVIEW (I3): the boot branch is chosen by
+/// `has_schema_privilege(current_user,'public','CREATE')`, so a runtime role
+/// that LATER acquires CREATE silently flips to the OWNER branch. On a database
+/// already at head `MIGRATOR.run` has nothing to do, so it succeeds — and the
+/// API serves as a role that can now create and own tables, with nothing
+/// reporting it. `FORCE ROW LEVEL SECURITY` filters an owner rather than
+/// exempting it, so that is a second, undesigned access path.
+///
+/// A `PUBLIC` grant is the reachable way in, and not an exotic one: it is the
+/// default on any database created before PostgreSQL 15 (see
+/// `migration_034_repairs_a_public_create_grant_instead_of_failing`).
+#[sqlx::test]
+async fn boot_as_the_runtime_role_refuses_when_a_public_grant_hands_it_create(pool: PgPool) {
+    // Built BEFORE the grant: `app_role_pool` asserts the role has no CREATE,
+    // which is the premise this test then breaks on purpose.
+    let probe = app_role_pool(&pool).await;
+
+    sqlx::raw_sql("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        .execute(&pool)
+        .await
+        .expect("the pre-PG15 default, granted here after boot detection was set up");
+
+    let err = ensure_pg_migrations(&probe)
+        .await
+        .expect_err(
+            "the runtime role acquired CREATE and boot took the OWNER branch \
+             without a word. The process would serve as a role that can create \
+             and own tables.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("REVOKE CREATE ON SCHEMA public FROM PUBLIC"),
+        "the refusal must give the operator the statement that repairs it. \
+         Got: {err}"
+    );
+
+    probe.close().await;
+}
+
 /// POSITIVE CONTROL, over the awkward path `ensure_pg_migrations` was written
 /// for: a database whose tables exist but whose `_sqlx_migrations` does not,
 /// because someone applied the schema by hand with `psql` and then redeployed.

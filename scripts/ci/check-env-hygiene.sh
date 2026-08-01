@@ -11,6 +11,13 @@ REQUIRED=(
     "SECUREPROMPT_JWT_SECRET"
     "SECUREPROMPT_PROVIDER_KEY"
     "NEXTAUTH_SECRET"
+    # WS1-P0 role split. Added late (MR7 I4): it shipped in .env.example as
+    # CHANGEME with neither an entry here nor a boot gate, so `cp .env.example
+    # .env` produced a working stack whose database credential was the literal
+    # string CHANGEME — docker-compose builds both db-migrate's
+    # SECUREPROMPT_APP_DB_PASSWORD and the api/worker DATABASE_URL from it, so
+    # they agreed and everything came up green.
+    "SECUREPROMPT_APP_DB_PASSWORD"
 )
 
 FAIL=0
