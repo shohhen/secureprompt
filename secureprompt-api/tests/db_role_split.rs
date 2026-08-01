@@ -604,6 +604,83 @@ async fn boot_as_the_runtime_role_refuses_a_schema_with_no_tracking_table(pool: 
 }
 
 // ===========================================================================
+// Migration 034 itself, re-run against databases it was not written on.
+// ===========================================================================
+
+/// The SQL text of one embedded migration.
+///
+/// Running the migration's own bytes is the only way to test it: by the time
+/// `#[sqlx::test]` hands over a pool, 034 is already applied and will never be
+/// pending again. 034's header commits to being idempotent — "safe on a fresh
+/// database and on one that has been running since 001" — so re-running it is
+/// also exactly what the runbook tells an operator to do when grants drift.
+fn migration_sql(version: i64) -> String {
+    MIGRATOR
+        .iter()
+        .find(|m| m.version == version)
+        .unwrap_or_else(|| panic!("migration {version} is not in the embedded set"))
+        .sql
+        .to_string()
+}
+
+/// PROVED IN REVIEW: 034 took the whole deployment down on any database where
+/// `CREATE ON SCHEMA public` is granted to `PUBLIC`.
+///
+/// `REVOKE CREATE ON SCHEMA public FROM secureprompt_app` does **nothing**
+/// against a grant held by `PUBLIC`. Section 5 then sees
+/// `has_schema_privilege = true` and raises, so `--migrate-only` exits
+/// non-zero, the compose `db-migrate` service never reaches
+/// `service_completed_successfully`, and neither `api` nor `worker` starts.
+///
+/// `PUBLIC` holding `CREATE` on `public` is the default for every database
+/// created before PostgreSQL 15, survives `pg_upgrade` (which preserves schema
+/// ACLs — only a NEWLY initdb'd PG15+ cluster drops it), and is what an
+/// operator gets from the very common `GRANT ALL ON SCHEMA public TO PUBLIC`.
+/// A full outage on upgrade, on a database that was working a minute earlier.
+#[sqlx::test]
+async fn migration_034_repairs_a_public_create_grant_instead_of_failing(pool: PgPool) {
+    sqlx::raw_sql("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        .execute(&pool)
+        .await
+        .expect("the pre-PG15 default, and a common operator incantation");
+
+    let can_create_before: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("schema privilege probe");
+    assert!(
+        can_create_before,
+        "premise: the PUBLIC grant must reach {APP_ROLE}, or this test measures \
+         nothing"
+    );
+
+    sqlx::raw_sql(&migration_sql(34))
+        .execute(&pool)
+        .await
+        .expect(
+            "034 must survive a PUBLIC grant. Failing here is a total outage: \
+             --migrate-only exits non-zero, db-migrate never completes, and \
+             nothing starts.",
+        );
+
+    let can_create_after: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("schema privilege probe");
+    assert!(
+        !can_create_after,
+        "034 reported success while {APP_ROLE} can still create — and therefore \
+         own — tables in schema public. An owner is filtered by FORCE ROW LEVEL \
+         SECURITY rather than exempt from it, so this is a second, undesigned \
+         access path that the migration claims to have closed."
+    );
+}
+
+// ===========================================================================
 // The migration step itself.
 // ===========================================================================
 
