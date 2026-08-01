@@ -21,6 +21,14 @@ COPY sp-agent/Cargo.toml sp-agent/
 RUN mkdir -p secureprompt-common/src && echo "pub fn _stub() {}" > secureprompt-common/src/lib.rs \
  && mkdir -p secureprompt-api/src && echo "pub fn _stub() {}" > secureprompt-api/src/lib.rs \
  && echo "fn main() {}" > secureprompt-api/src/main.rs \
+ # secureprompt-api/Cargo.toml declares `[[bench]] name = "detection_floor"`.
+ # Cargo parses the manifest — and so fails on a missing bench target — before
+ # it looks at what is being built, so the dependency-caching layer needs a stub
+ # for it too. Without this the image does not build at all:
+ #   error: failed to parse manifest at `/workspace/secureprompt-api/Cargo.toml`
+ #   can't find `detection_floor` bench at `benches/detection_floor.rs`
+ && mkdir -p secureprompt-api/benches \
+ && echo "fn main() {}" > secureprompt-api/benches/detection_floor.rs \
  && mkdir -p secureprompt-worker/src && echo "fn main() {}" > secureprompt-worker/src/main.rs \
  && mkdir -p secureprompt-mcp/src && echo "fn main() {}" > secureprompt-mcp/src/main.rs \
  && mkdir -p sp-agent/src && echo "fn main() {}" > sp-agent/src/main.rs
