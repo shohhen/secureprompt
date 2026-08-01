@@ -490,35 +490,79 @@ async fn the_audit_row_counts_the_refresh_rows_it_killed(pool: PgPool) {
 
 /// A refusal is only evidence if the same call, changed in exactly one
 /// dimension, succeeds.
+///
+/// # Why every call below targets the ACTOR THEMSELVES
+///
+/// The earlier version of this test pointed both refusals at `ws.owner` and
+/// its control at `ws.viewer`, and so could not be killed by any single-line
+/// production change. Three independent rules each answer 403 to
+/// viewer → owner: `require_role(&ctx, UserRole::Admin)`, the `ActorRoleTooLow`
+/// floor, and `TargetOutranksActor`. Delete the first TWO — the entire actor
+/// role floor this test is named for — and `TargetOutranksActor` still returns
+/// 403 and the test stays green. Its own docstring stated the standard it
+/// failed: the control changed two dimensions at once, the actor's role AND
+/// the target.
+///
+/// Self-targeting isolates the floor, because `may_revoke`'s second rule is
+/// `privilege_level(target) > privilege_level(actor)` and nobody outranks
+/// themselves. So with the floor removed the answer is `Allowed`, not a
+/// second 403 from a different rule.
+///
+/// ONE DIMENSION, literally: all three calls are made by the same user
+/// (`ws.viewer`) against the same target (`ws.viewer`) on the same router.
+/// Only the token's `role` claim changes — viewer, developer, admin. There is
+/// nothing else left that could explain the difference in outcome.
+///
+/// Self-revocation succeeding is not a loophole introduced to make the test
+/// work: `may_revoke`'s doc records it as a deliberate rule (an admin who
+/// thinks their own laptop is compromised should not have to ask someone
+/// else), and `may_revoke_matrix` pins it as a pure function.
 #[sqlx::test]
 async fn viewer_is_refused_where_admin_succeeds(pool: PgPool) {
     let ws = seed_workspace(&pool).await;
     let app = build_app(pool.clone());
-    let target = ws.owner;
+    // The actor is also the target, throughout. See the doc above.
+    let actor = ws.viewer;
 
-    let viewer_token = make_jwt(ws.id, ws.viewer, "viewer");
-    let refused = revoke(&app, &viewer_token, target).await;
+    let viewer_token = make_jwt(ws.id, actor, "viewer");
+    let refused = revoke(&app, &viewer_token, actor).await;
     assert_eq!(
         refused.status(),
         StatusCode::FORBIDDEN,
-        "a viewer must not be able to revoke anyone"
+        "a viewer must not be able to revoke anyone, including themselves — \
+         `POST /v1/auth/logout` is the route that needs no privilege"
     );
 
-    let developer_token = make_jwt(ws.id, ws.viewer, "developer");
+    let developer_token = make_jwt(ws.id, actor, "developer");
     assert_eq!(
-        revoke(&app, &developer_token, target).await.status(),
+        revoke(&app, &developer_token, actor).await.status(),
         StatusCode::FORBIDDEN,
         "a developer must not be able to revoke anyone either"
     );
 
-    // POSITIVE CONTROL: the identical call as an owner succeeds, so the two
-    // 403s above are the role gate and not a broken route.
-    let owner_token = make_jwt(ws.id, ws.owner, "owner");
-    let allowed = revoke(&app, &owner_token, ws.viewer).await;
+    // POSITIVE CONTROL. Same actor, same target, same router; the ONLY
+    // difference from the two refusals above is the `role` claim. If this is
+    // not 200 the two 403s prove nothing, because a route that refuses
+    // everybody refuses viewers too.
+    let admin_token = make_jwt(ws.id, actor, "admin");
+    let allowed = revoke(&app, &admin_token, actor).await;
     assert_eq!(
         allowed.status(),
         StatusCode::OK,
-        "control: an owner performing the same call must succeed"
+        "control: the identical call with an `admin` role claim must succeed"
+    );
+
+    // A SECOND refusal, from a DIFFERENT rule, so the two are not conflated.
+    // An admin aiming at the owner is refused by `TargetOutranksActor`, not by
+    // the actor floor — which is why the calls above cannot be pointed at the
+    // owner if they are to measure the floor.
+    let admin_at_owner = make_jwt(ws.id, ws.admin, "admin");
+    assert_eq!(
+        revoke(&app, &admin_at_owner, ws.owner).await.status(),
+        StatusCode::FORBIDDEN,
+        "an admin must not revoke the owner — a different rule from the floor \
+         above, and `an_admin_cannot_revoke_an_owner_but_an_owner_can_revoke_\
+         an_admin` is where it is measured in both directions"
     );
 
     // And unauthenticated is 401, not 403 — a different layer.
@@ -527,7 +571,7 @@ async fn viewer_is_refused_where_admin_succeeds(pool: PgPool) {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/v1/users/{target}/sessions"))
+                .uri(format!("/v1/users/{actor}/sessions"))
                 .body(Body::empty())
                 .expect("request"),
         )
