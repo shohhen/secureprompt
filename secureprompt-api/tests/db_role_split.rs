@@ -482,6 +482,100 @@ async fn boot_as_the_owner_bootstraps_tracking_when_the_schema_predates_sqlx(poo
     );
 }
 
+/// Number of `pg_default_acl` rows in schema `public` naming the runtime role.
+/// This is 034's fingerprint: nothing else in the migration set issues
+/// `ALTER DEFAULT PRIVILEGES`, and `pg_default_acl` was MEASURED empty at the
+/// parent commit. Two rows (tables, sequences) means 034 executed; zero means
+/// it did not, whatever `_sqlx_migrations` claims.
+async fn runtime_role_default_acls(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_default_acl d
+           JOIN pg_namespace n ON n.oid = d.defaclnamespace
+          WHERE n.nspname = 'public'
+            AND array_to_string(d.defaclacl, ',') LIKE '%' || $1 || '=%'",
+    )
+    .bind(APP_ROLE)
+    .fetch_one(pool)
+    .await
+    .expect("default-privilege probe")
+}
+
+/// THE UPGRADE PATH FOR EVERY EXISTING DEPLOYMENT.
+///
+/// The bootstrap branch of `apply_as_owner` exists for a database whose schema
+/// was applied by hand with `psql` and which therefore has no
+/// `_sqlx_migrations`. It marked EVERY embedded migration applied and then ran
+/// `MIGRATOR.run`, which consequently found nothing pending — so on a database
+/// whose hand-applied schema predates 034, the one migration that grants the
+/// runtime role anything was recorded as applied WITHOUT EVER RUNNING.
+///
+/// MEASURED on `postgres:16` against a database at 001–033 (scratch DB
+/// `mr7_pre034`): `pg_default_acl = 0`,
+/// `has_table_privilege(secureprompt_app,'_sqlx_migrations','SELECT') = f`,
+/// and `--migrate-only` **exits 0**. The API then dies on the bare `42501`
+/// this whole change exists to replace — and the obvious operator reaction,
+/// pointing DATABASE_URL back at the owner, lands the deployment in exactly
+/// the superuser-serving state the split exists to leave.
+///
+/// So the assertion is not "the tracking table has 34 rows" (that is what the
+/// defect produced); it is that the migration's EFFECTS are present, and that
+/// the runtime role can then actually boot.
+#[sqlx::test]
+async fn the_tracking_bootstrap_does_not_claim_a_migration_it_never_ran(pool: PgPool) {
+    // Rewind this database to the state a pre-034 hand-applied schema is in:
+    // tables present, 034's grants and default privileges absent, no sqlx
+    // tracking table.
+    sqlx::raw_sql(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public
+             REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM secureprompt_app;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA public
+             REVOKE USAGE, SELECT ON SEQUENCES FROM secureprompt_app;
+         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM secureprompt_app;
+         DROP TABLE _sqlx_migrations;",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate a schema hand-applied before 034 existed");
+
+    assert_eq!(
+        runtime_role_default_acls(&pool).await,
+        0,
+        "premise: 034's effects must start absent, or this test measures nothing"
+    );
+
+    ensure_pg_migrations(&pool)
+        .await
+        .expect("boot as the owner must bring a pre-034 database up to head");
+
+    assert!(
+        runtime_role_default_acls(&pool).await > 0,
+        "the bootstrap recorded 034 as applied without running it: \
+         pg_default_acl is still empty. Every table a later migration creates \
+         will be unreachable by {APP_ROLE}, and the migration step reports \
+         success while having prepared nothing."
+    );
+
+    let tracking_readable: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1, '_sqlx_migrations', 'SELECT')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("tracking-table privilege probe");
+    assert!(
+        tracking_readable,
+        "{APP_ROLE} cannot SELECT from _sqlx_migrations, which is the FIRST \
+         thing the runtime branch of boot reads. The migration step exited 0 \
+         and the API cannot start."
+    );
+
+    // The end of the story, not a proxy for it: the serving role boots.
+    let probe = app_role_pool(&pool).await;
+    ensure_pg_migrations(&probe)
+        .await
+        .expect("the runtime role must be able to boot after the migration step reported success");
+    probe.close().await;
+}
+
 /// The same database, the other role. An existing deployment that has just
 /// been pointed at the runtime URL, before its migration step has ever run,
 /// must be told so — not handed `permission denied for schema public`, and
