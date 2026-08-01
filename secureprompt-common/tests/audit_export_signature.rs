@@ -304,6 +304,11 @@ fn a_row_removed_from_a_control_plane_page_fails_verification() {
 
 /// A WHOLE page dropped. This is the case a per-page signature cannot catch:
 /// the remaining pages are untouched and would each verify individually.
+///
+/// The signed `total_pages` is what catches it — `PageCountMismatch`, not the
+/// chain. Named here because the module header of `audit_export.rs` cites this
+/// test, and a reader who takes it as chain evidence will draw the wrong
+/// conclusion from a green run.
 #[test]
 fn a_whole_page_removed_fails_verification() {
     let mut e = export(ExportFormat::Jsonl, &key_a());
@@ -495,9 +500,15 @@ fn each_section_carries_its_own_per_source_retention() {
     }
 }
 
-/// Pages reordered. The chain is over digests IN ORDER, so a swap breaks it
-/// even though the multiset of pages is unchanged — the case a plain
-/// "set of per-page digests" manifest would miss.
+/// Pages reordered — the case a plain "set of per-page digests" manifest would
+/// miss, because the multiset of pages is unchanged.
+///
+/// What catches it is that the page list is POSITIONAL: `pages[i]` describes
+/// the (i+1)th file, so a swap makes both pages fail their own digest. This
+/// doc used to credit the chain, and that was wrong: make `chain_step` ignore
+/// its `prev` argument, destroying the chain's ordering entirely, and this
+/// test stays GREEN. The assertion below is `PageDigestMismatch` and always
+/// was.
 #[test]
 fn pages_reordered_fail_verification() {
     let mut e = export(ExportFormat::Jsonl, &key_a());
@@ -508,10 +519,15 @@ fn pages_reordered_fail_verification() {
     );
 }
 
-/// A page lifted from a DIFFERENT export of the same shape. The chain is
-/// seeded from this export's own header (id, workspace, window, format, page
-/// size), so a foreign page cannot be spliced in even if its digest happened
-/// to be chosen to fit.
+/// A page lifted from a DIFFERENT export of the same shape.
+///
+/// Caught by the positional digest list: the foreign page's SHA-256 is not the
+/// one `pages[1]` publishes, so it fails at page 2. NOT by the genesis seed —
+/// this doc used to say the seed was what stopped it, and destroying the chain
+/// leaves this test green. The seed's real contribution is that `chain_root`
+/// differs between two exports whose PAGES are byte-identical, which is a
+/// different property and is pinned by
+/// `a_chain_genesis_the_header_does_not_imply_fails_verification`.
 #[test]
 fn a_page_from_another_export_cannot_be_spliced_in() {
     let e = export(ExportFormat::Jsonl, &key_a());
