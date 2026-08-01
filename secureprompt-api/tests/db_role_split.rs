@@ -700,6 +700,73 @@ async fn migration_034_repairs_a_public_create_grant_instead_of_failing(pool: Pg
     );
 }
 
+/// PROVED IN REVIEW: 034's own closing assertion — the ONLY one that runs on
+/// the two supported paths where `--migrate-only` is not what applied the
+/// schema (`sqlx migrate run`, and any database already at head where 034 is
+/// no longer pending) — passed while `secureprompt_app` was a member of a
+/// BYPASSRLS role. `migrations.rs` claimed the Rust assertion was "in the same
+/// shape as ... the closing block of 034"; only the Rust one asked
+/// `pg_auth_members`.
+///
+/// NOINHERIT is what makes this invisible to the attribute checks: it means
+/// the privileges are not AUTOMATIC, not that they are unreachable. `SET ROLE`
+/// reaches them over an ordinary connection with no password, so a BYPASSRLS
+/// role the runtime role is a member of is BYPASSRLS, one statement away.
+///
+/// The whole probe runs inside a transaction that is ROLLED BACK: `pg_authid`
+/// and `pg_auth_members` are cluster-global, and every other test in this file
+/// depends on `secureprompt_app`'s real state. Uncommitted catalog rows are
+/// invisible to them.
+#[sqlx::test]
+async fn migration_034_refuses_a_runtime_role_that_can_reach_bypassrls(pool: PgPool) {
+    use sqlx::Acquire as _;
+
+    let mut tx = pool.begin().await.expect("probe transaction");
+
+    sqlx::raw_sql(
+        "CREATE ROLE sp_034_bypass_probe NOLOGIN BYPASSRLS;
+         GRANT sp_034_bypass_probe TO secureprompt_app;",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("grant the runtime role membership of a BYPASSRLS role");
+
+    // PREMISE: every attribute-based check still calls the role harmless, so
+    // only a membership check can catch this.
+    let looks_harmless: bool = sqlx::query_scalar(
+        "SELECT NOT (rolsuper OR rolbypassrls)
+            AND NOT has_schema_privilege($1, 'public', 'CREATE')
+           FROM pg_roles WHERE rolname = $1",
+    )
+    .bind(APP_ROLE)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("attribute probe");
+    assert!(
+        looks_harmless,
+        "premise: the attribute checks must NOT already flag {APP_ROLE}, or \
+         this test is not measuring the membership hole"
+    );
+
+    let outcome = sqlx::raw_sql(&migration_sql(34)).execute(&mut *tx).await;
+
+    tx.rollback().await.expect("undo the cluster-global grant");
+
+    let err = outcome
+        .expect_err(
+            "034 reported success while secureprompt_app was one SET ROLE from \
+             BYPASSRLS. This is the only powerless-assertion that runs on a \
+             `sqlx migrate run` deployment or on a database already at head.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("sp_034_bypass_probe"),
+        "the refusal must name the role that is reachable, or an operator \
+         cannot find it. Got: {err}"
+    );
+}
+
 // ===========================================================================
 // The migration step itself.
 // ===========================================================================
