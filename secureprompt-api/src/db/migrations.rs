@@ -81,7 +81,8 @@ pub async fn schema_authority(pool: &PgPool) -> anyhow::Result<SchemaAuthority> 
 ///    manually via `psql`, then redeployed): the tables are already there, but
 ///    `_sqlx_migrations` is missing, so a naive `MIGRATOR.run` would try to
 ///    recreate `workspaces` and fail. We detect this and bootstrap the tracking
-///    table by marking every embedded migration as already applied.
+///    table — but only for migrations whose effects we do not have a cheaper
+///    way of checking. See `BOOTSTRAP_WITNESSES`.
 pub async fn ensure_pg_migrations(pool: &PgPool) -> anyhow::Result<()> {
     match schema_authority(pool).await? {
         SchemaAuthority::Owner => apply_as_owner(pool).await,
@@ -147,7 +148,50 @@ async fn verify_schema_at_head(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `Owner` branch. Byte-identical to what boot has always done.
+/// Migrations the tracking-table bootstrap is NOT allowed to take on faith,
+/// paired with a query that answers "did this migration's effect actually
+/// land?".
+///
+/// # Why this list exists
+///
+/// The bootstrap runs on a database whose `_sqlx_migrations` is missing because
+/// the schema was applied by hand with `psql`. It cannot know WHICH migrations
+/// that hand-application covered; the presence of `workspaces` only proves 001.
+/// Marking the whole set applied is therefore a guess, and MEASURED on
+/// `postgres:16` it is a guess that breaks the deployment: on a database
+/// hand-applied at 001–033, marking 034 applied means the one migration that
+/// grants the runtime role anything never runs. `pg_default_acl` stays empty,
+/// `secureprompt_app` cannot even `SELECT` from `_sqlx_migrations`, and
+/// `--migrate-only` exits **0** on a database it did not prepare. The API then
+/// dies at boot on the bare `permission denied` this module exists to replace.
+///
+/// A migration listed here is left OUT of the blanket insert when its witness
+/// answers false, so `MIGRATOR.run` applies it immediately afterwards. That is
+/// only safe for a migration that is idempotent by construction — which is why
+/// this is an explicit, reviewed list and not a heuristic over the whole set.
+///
+/// 034 qualifies: it issues `GRANT`, `ALTER DEFAULT PRIVILEGES` and `REVOKE`,
+/// creates no object, moves no data, and its header commits to being re-runnable
+/// as the documented repair for drifted grants. Its witness is `pg_default_acl`,
+/// which is 034's fingerprint — nothing else in the set issues
+/// `ALTER DEFAULT PRIVILEGES`, and the catalog was MEASURED empty at the commit
+/// before it.
+///
+/// The residual gap is deliberate and named: a database hand-applied at, say,
+/// 020 still has 021–033 marked applied without running. Those migrations
+/// create tables, so re-running them is not safe, and no witness can make it
+/// so — the bootstrap warns instead.
+const BOOTSTRAP_WITNESSES: &[(i64, &str)] = &[(
+    34,
+    "SELECT EXISTS (
+         SELECT 1
+           FROM pg_default_acl d
+           JOIN pg_namespace n ON n.oid = d.defaclnamespace
+          WHERE n.nspname = 'public'
+            AND array_to_string(d.defaclacl, ',') LIKE '%secureprompt_app=%')",
+)];
+
+/// The `Owner` branch.
 async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
     let workspaces_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public.workspaces') IS NOT NULL")
@@ -174,7 +218,30 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
         )
         .execute(pool)
         .await?;
+
+        // Ask, for every migration we have a witness for, whether it really ran.
+        // Anything that answers "no" is left out of the insert below so that
+        // `MIGRATOR.run` applies it for real.
+        let mut unwitnessed: Vec<i64> = Vec::new();
+        for (version, witness) in BOOTSTRAP_WITNESSES {
+            let effect_present: bool = sqlx::query_scalar(witness).fetch_one(pool).await?;
+            if !effect_present {
+                unwitnessed.push(*version);
+            }
+        }
+        if !unwitnessed.is_empty() {
+            tracing::warn!(
+                versions = ?unwitnessed,
+                "these migrations have left no trace in this database, so the \
+                 bootstrap will NOT record them as applied — they are about to \
+                 be run for real"
+            );
+        }
+
         for m in MIGRATOR.iter() {
+            if unwitnessed.contains(&m.version) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES ($1, $2, TRUE, $3, 0) ON CONFLICT (version) DO NOTHING",
@@ -185,6 +252,14 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
         }
+
+        tracing::warn!(
+            "the schema this database already carried is being taken on trust \
+             for every migration not listed above. If it was hand-applied part \
+             way through the set, the migrations after that point are now \
+             recorded as applied without having run — verify against \
+             secureprompt-api/migrations/ before serving."
+        );
     }
 
     MIGRATOR.run(pool).await?;
