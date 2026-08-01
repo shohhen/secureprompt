@@ -955,7 +955,10 @@ mod local_card_class_filter_tests {
             classes(LOCAL_PAN),
             vec!["UZCARD".to_owned()],
             "the generic CREDIT_CARD detection is suppressed on this span; \
-             that suppression is the premise of this module"
+             that suppression is the premise of this module. If this now \
+             reports [\"CREDIT_CARD\", \"UZCARD\"] the suppression pass was \
+             reverted — the class alias in policy/engine.rs is then redundant \
+             but harmless, and this premise is what should be updated"
         );
         assert_eq!(
             classes(FOREIGN_PAN),
@@ -1050,5 +1053,114 @@ mod local_card_class_filter_tests {
         let detections = pipeline_detections(LOCAL_PAN);
         let input = eval_input(LOCAL_PAN, &detections);
         assert!(rule_matches(&rule, &input), "{detections:?}");
+    }
+
+    /// Pins the SECOND half of the fix: the alias in `matching_detections`,
+    /// not just in `rule_matches`.
+    ///
+    /// Driven through `evaluate`, because the two halves are only
+    /// distinguishable there. With the alias in `rule_matches` alone the rule
+    /// fires and then selects NOTHING (no detection's class is literally
+    /// `CREDIT_CARD`), which falls through `matching_detections`' "empty
+    /// filter → return everything" escape and redacts the whole prompt. The
+    /// card would be protected by accident, and every other entity in the
+    /// request over-redacted — a narrow rule silently behaving like a total
+    /// one. So the assertion is a PAIR: the card is redacted AND the email,
+    /// which this rule says nothing about, is not.
+    ///
+    /// `fail_closed` is false on purpose. With it on, the `redact` arm
+    /// bypasses `matching_detections` entirely and this test would pass
+    /// without the alias.
+    #[sqlx::test]
+    async fn a_credit_card_rule_redacts_the_local_card_and_leaves_the_rest(pool: sqlx::PgPool) {
+        use crate::db::{PolicyRepository, WorkspaceRepository};
+        use crate::policy::engine::evaluate;
+        use secureprompt_common::types::TokenVault;
+        use std::collections::HashMap;
+
+        const PROMPT: &str = "Ali Aliev, ali@example.com, karta 8600123456789012";
+
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Card Rule Co",
+                &format!("card-rule-{}@example.com", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        // Replace the seeded default rule (which names UZCARD explicitly and
+        // so cannot show this) with the narrow, reachable shape: a rule that
+        // names the GENERIC card class only.
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(&pool)
+            .await
+            .expect("clear the seeded rule");
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, 'Redact cards', 100, $3, 'redact', '{}'::jsonb,
+                     true, false, NOW(), NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace.id)
+        .bind(serde_json::json!([
+            { "field": "detection_class", "op": "in", "value": ["CREDIT_CARD"] }
+        ]))
+        .execute(&pool)
+        .await
+        .expect("insert the CREDIT_CARD-only rule");
+
+        let detections = pipeline_detections(PROMPT);
+        let found: Vec<&str> = detections.iter().map(|d| d.class.as_str()).collect();
+        assert!(
+            found.contains(&"UZCARD") && found.contains(&"EMAIL_ADDRESS"),
+            "premise: the prompt must carry both a local card and an entity \
+             the rule says nothing about, got {found:?}"
+        );
+
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace.id),
+                provider_name: "none",
+                model: "none",
+                content: PROMPT,
+                detections: &detections,
+                fail_closed: false,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "premise: exactly one rule, or the redact_when_no_rules net would \
+             mask what is under test"
+        );
+        assert_eq!(
+            outcome.result.final_action, "redact",
+            "the CREDIT_CARD rule did not fire on a local PAN at all"
+        );
+        assert!(
+            !outcome.content.contains("8600123456789012"),
+            "the card the rule names was forwarded in the clear: {:?}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("ali@example.com"),
+            "the rule names CREDIT_CARD and nothing else, but the whole prompt \
+             was redacted — `matching_detections` selected nothing and fell \
+             through its empty-filter escape: {:?}",
+            outcome.content
+        );
     }
 }

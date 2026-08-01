@@ -265,6 +265,59 @@ pub(crate) fn rule_matches(rule: &PolicyRuleRow, input: &PolicyEvaluationInput<'
         })
 }
 
+/// Detection classes that are a SPECIFIC answer to a question a broader class
+/// already asks, paired with that broader class.
+///
+/// Read as `(specific, generic)`: a rule whose `detection_class` filter names
+/// the GENERIC class also matches a detection carrying the SPECIFIC one. Never
+/// the reverse — a rule naming `UZCARD` says nothing about a Visa.
+///
+/// # Why this exists (MR5 C2)
+///
+/// `Matcher::LocalCard("8600")` and `Matcher::CreditCard` both take an
+/// unseparated local PAN on the identical span, so the detection set used to
+/// carry `["UZCARD", "CREDIT_CARD"]` for one card. WS1 FU6's
+/// `drop_generic_card_double_counts` suppresses the generic duplicate — right
+/// for the leak report, which dedups `per_class` on `(class, value)` and was
+/// counting one card twice, but it also removed the class a policy rule may be
+/// keyed on. `rule_matches` and `matching_detections` run BEFORE
+/// `apply_redaction`, so for any workspace whose enabled rules name
+/// `CREDIT_CARD` and not `UZCARD`/`HUMO` an unseparated local PAN stopped
+/// matching: a `deny` rule was bypassed and, with `redact_when_no_rules` off,
+/// the card was forwarded in the clear.
+///
+/// Reachable configurations: the 15-entry class list migration 017's back-fill
+/// leaves behind wherever it did not take, and any rule an admin narrowed in
+/// the policy UI. `DEFAULT_POLICY_CLASSES` names all three, so freshly seeded
+/// workspaces were never exposed — which is why this survived review.
+///
+/// # Why the alias lives here and not back in the registry
+///
+/// Restoring the second detection would fix policy matching and re-break the
+/// auditor-facing count. The two layers want different things from the same
+/// span: the registry wants ONE answer, the most specific one; policy wants to
+/// know which questions that answer is responsive to. That is a policy-layer
+/// relation, so it is expressed as one.
+///
+/// # Direction of safety
+///
+/// This WIDENS what a rule matches, which for `deny`/`redact` is protective
+/// and for `allow` is permissive. That is not a new judgement call: before the
+/// suppression, both classes were present, so an `allow` rule naming
+/// `CREDIT_CARD` fired on a local PAN too. The alias restores the pre-FU6
+/// semantics exactly, in both directions, without restoring the double count.
+const GENERIC_CLASS_FOR: &[(&str, &str)] = &[("UZCARD", "CREDIT_CARD"), ("HUMO", "CREDIT_CARD")];
+
+/// Whether a rule's `detection_class` filter entry is satisfied by a
+/// detection's class — exact match, or the generic-covers-specific relation
+/// in [`GENERIC_CLASS_FOR`].
+fn class_filter_matches(filter: &str, detection_class: &str) -> bool {
+    filter == detection_class
+        || GENERIC_CLASS_FOR
+            .iter()
+            .any(|(specific, generic)| *specific == detection_class && *generic == filter)
+}
+
 /// Conditions whose field names a property of an individual detection
 /// (as opposed to the request as a whole).
 fn is_detection_scoped(condition: &Value) -> bool {
@@ -289,12 +342,14 @@ fn matches_detection_condition(condition: &Value, detection: &Detection) -> bool
     };
 
     match (field, operator) {
-        ("detection_class", "eq") => value.as_str() == Some(detection.class.as_str()),
+        ("detection_class", "eq") => value
+            .as_str()
+            .is_some_and(|filter| class_filter_matches(filter, &detection.class)),
         ("detection_class", "in") => value.as_array().is_some_and(|values| {
             values
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|candidate| candidate == detection.class)
+                .any(|candidate| class_filter_matches(candidate, &detection.class))
         }),
         ("confidence_gte", "gte") => value
             .as_f64()
@@ -444,8 +499,18 @@ fn matching_detections(rule: &PolicyRuleRow, detections: &[Detection]) -> Vec<De
     let filtered: Vec<_> = detections
         .iter()
         .filter(|detection| {
+            // `class_filter_matches` rather than `==` for the same reason
+            // `matches_detection_condition` uses it: a filter naming
+            // `CREDIT_CARD` covers the local card classes the registry emits
+            // in its place. Without it a `redact` rule that now MATCHES via
+            // `rule_matches` would select nothing here, fall through the
+            // "empty filter → return everything" escape below, and redact the
+            // whole request — protecting the card by accident while
+            // over-redacting everything beside it.
             (class_filters.is_empty()
-                || class_filters.iter().any(|class| class == &detection.class))
+                || class_filters
+                    .iter()
+                    .any(|class| class_filter_matches(class, &detection.class)))
                 && confidence_gte
                     .is_none_or(|threshold| f64::from(detection.confidence) >= threshold)
                 && confidence_lte
