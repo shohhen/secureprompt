@@ -52,6 +52,23 @@
 --
 -- IDEMPOTENT. Safe on a fresh database and on one that has been running since
 -- 001. It transfers no ownership and moves no data.
+--
+-- IF YOU ALREADY RAN AN EARLIER VERSION OF THIS FILE (unmerged branch only)
+-- ------------------------------------------------------------------------
+-- MR7 review changed this file: sections 4b and 5 were wrong in ways that took
+-- a deployment down (a PUBLIC grant made section 5 raise) or falsely reassured
+-- one (section 5 passed while the runtime role was a member of a BYPASSRLS
+-- role). The fix had to be HERE and not in a later migration, because a fresh
+-- install fails AT 034 — it never reaches 035.
+--
+-- That changes the checksum, so a database that applied the old bytes reports
+--     migration 34 was previously applied but has been modified
+-- Because this file is idempotent, the repair is to forget the old row and let
+-- it re-run:
+--     DELETE FROM _sqlx_migrations WHERE version = 34;
+--     secureprompt-api --migrate-only     # with the OWNER DATABASE_URL
+-- This applies only to databases used while this branch was in review; 034 has
+-- never been released.
 
 -- ---------------------------------------------------------------------------
 -- 1. The role must exist, and must be powerless.
