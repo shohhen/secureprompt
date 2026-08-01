@@ -39,10 +39,35 @@ const APP_ROLE: &str = "secureprompt_app";
 /// Password used only to open a probe connection from this suite. Migration 001
 /// creates the role with a placeholder password; deployments set a real one out
 /// of band (`scripts/db/setup-app-role.sh`, or `secureprompt-api --migrate-only`
-/// with `SECUREPROMPT_APP_DB_PASSWORD`). Setting it here is idempotent and
-/// concurrency-safe — roles are cluster-global while `#[sqlx::test]` databases
-/// are per-test, so several tests race to write the same value.
+/// with `SECUREPROMPT_APP_DB_PASSWORD`). It is written once per test binary —
+/// see `APP_PASSWORD_SET` for why writing it per-test is not safe.
 const APP_PROBE_PASSWORD: &str = "app_probe_password";
+
+/// `ALTER ROLE` rewrites one row of the cluster-global `pg_authid`. Several
+/// tests in this file need the runtime role to have a known password, they run
+/// concurrently, and they were each issuing that write — which fails
+/// intermittently with `XX000 tuple concurrently updated`. MEASURED: one
+/// failure in two consecutive full-suite runs.
+///
+/// `#[sqlx::test]` gives every test its own DATABASE but the same PROCESS, and
+/// advisory locks are scoped to a database, so they cannot serialise this.
+/// A process-wide `OnceCell` can: the password is a constant, so writing it
+/// once per test binary is exactly equivalent to writing it before each test,
+/// minus the race.
+static APP_PASSWORD_SET: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+async fn ensure_app_role_password(pool: &PgPool) {
+    APP_PASSWORD_SET
+        .get_or_init(|| async {
+            sqlx::raw_sql(&format!(
+                "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
+            ))
+            .execute(pool)
+            .await
+            .expect("set a known password on the runtime role for this probe");
+        })
+        .await;
+}
 
 /// Open a connection to the SAME `#[sqlx::test]` database as the runtime role,
 /// and assert ON THE WIRE that it really is powerless.
@@ -53,12 +78,7 @@ const APP_PROBE_PASSWORD: &str = "app_probe_password";
 /// rather than pass for the wrong reason — but only because these three lines
 /// are here to notice.
 async fn app_role_connection(pool: &PgPool) -> PgConnection {
-    sqlx::raw_sql(&format!(
-        "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
-    ))
-    .execute(pool)
-    .await
-    .expect("set a known password on the runtime role for this probe");
+    ensure_app_role_password(pool).await;
 
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
@@ -288,12 +308,7 @@ async fn every_table_in_the_schema_is_reachable_by_the_runtime_role(pool: PgPool
 /// A pool connected to the SAME `#[sqlx::test]` database as the runtime role.
 /// `ensure_pg_migrations` takes a `&PgPool`, so the probe has to be one.
 async fn app_role_pool(pool: &PgPool) -> PgPool {
-    sqlx::raw_sql(&format!(
-        "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
-    ))
-    .execute(pool)
-    .await
-    .expect("set a known password on the runtime role for this probe");
+    ensure_app_role_password(pool).await;
 
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
@@ -556,4 +571,80 @@ async fn the_migration_step_succeeds_as_the_owner(pool: PgPool) {
     secureprompt_api::db::migrations::run_migration_step(&pool, None)
         .await
         .expect("the migration step must succeed as the owner role");
+}
+
+/// A role can be powerless on paper and not in practice.
+///
+/// MEASURED while exercising `scripts/db/setup-app-role.sh`: granting
+/// `secureprompt_app` membership of a role that holds `CREATE ON SCHEMA
+/// public` leaves `has_schema_privilege('secureprompt_app','public','CREATE')`
+/// answering **false**, because the runtime role is NOINHERIT and so does not
+/// pick the privilege up automatically. The catalog says powerless.
+///
+/// But NOINHERIT only means the privileges are not AUTOMATIC. `SET ROLE` still
+/// reaches them, from an ordinary connection, with no password. So membership
+/// is an escape hatch out of the split that neither `rolsuper`, `rolbypassrls`
+/// nor `has_schema_privilege` reports — and BYPASSRLS held by a role the
+/// runtime role can `SET ROLE` to is BYPASSRLS.
+///
+/// The assertion has to look at membership itself.
+#[sqlx::test]
+async fn a_role_that_can_reach_privileges_through_membership_is_not_powerless(pool: PgPool) {
+    sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             CREATE ROLE sp_member_probe LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                 NOINHERIT NOBYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         DO $$
+         BEGIN
+             CREATE ROLE sp_grantor_probe NOLOGIN BYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         GRANT sp_grantor_probe TO sp_member_probe;",
+    )
+    .execute(&pool)
+    .await
+    .expect("probe roles");
+
+    // PREMISE: every attribute-based check says this role is harmless.
+    let looks_harmless: bool = sqlx::query_scalar(
+        "SELECT NOT (rolsuper OR rolbypassrls)
+            AND NOT has_schema_privilege('sp_member_probe', 'public', 'CREATE')
+           FROM pg_roles WHERE rolname = 'sp_member_probe'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("attribute probe");
+    assert!(
+        looks_harmless,
+        "premise: the attribute checks must NOT already flag this role, or the \
+         test is not measuring the membership hole"
+    );
+
+    let result =
+        secureprompt_api::db::migrations::assert_role_is_powerless(&pool, "sp_member_probe").await;
+
+    sqlx::raw_sql(
+        "REVOKE sp_grantor_probe FROM sp_member_probe;
+         DROP ROLE IF EXISTS sp_grantor_probe;
+         DROP ROLE IF EXISTS sp_member_probe;",
+    )
+    .execute(&pool)
+    .await
+    .ok();
+
+    let err = result
+        .expect_err(
+            "a role that can SET ROLE to a BYPASSRLS role is not powerless, \
+             however its own attributes read",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("sp_grantor_probe"),
+        "the refusal must name the role that is reachable, or an operator \
+         cannot find it. Got: {err}"
+    );
 }

@@ -268,29 +268,85 @@ pub async fn run_migration_step(pool: &PgPool, app_password: Option<&str>) -> an
 /// BYPASSRLS after 034 was applied would otherwise go unnoticed forever, and a
 /// deployment that enforces no tenancy at all reports nothing by itself.
 pub async fn assert_runtime_role_is_powerless(pool: &PgPool) -> anyhow::Result<()> {
+    assert_role_is_powerless(pool, RUNTIME_ROLE).await
+}
+
+/// Three questions, because two of them are not enough.
+///
+/// 1. `rolsuper OR rolbypassrls` — the obvious one. Either exempts the role
+///    from row-level security outright.
+/// 2. `has_schema_privilege(..., 'CREATE')` — a role that can create can own,
+///    and `FORCE ROW LEVEL SECURITY` filters an owner rather than exempting it,
+///    so ownership is a second undesigned access path.
+/// 3. **Role membership.** MEASURED while exercising
+///    `scripts/db/setup-app-role.sh`: granting `secureprompt_app` membership of
+///    a role holding `CREATE ON SCHEMA public` leaves question 2 answering
+///    **false**, because the runtime role is NOINHERIT and does not pick the
+///    privilege up automatically. Both attribute checks call it powerless.
+///
+///    NOINHERIT only means the privileges are not AUTOMATIC. `SET ROLE` still
+///    reaches them, over an ordinary connection, with no password — so a
+///    BYPASSRLS role the runtime role is a member of is BYPASSRLS, one
+///    statement away. Membership is the escape hatch neither attribute
+///    reports, so it is asked about directly.
+pub async fn assert_role_is_powerless(pool: &PgPool, role: &str) -> anyhow::Result<()> {
     let privileged: Option<bool> =
         sqlx::query_scalar("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = $1")
-            .bind(RUNTIME_ROLE)
+            .bind(role)
             .fetch_optional(pool)
             .await?;
 
     match privileged {
         None => anyhow::bail!(
-            "role `{RUNTIME_ROLE}` does not exist after the migrations ran. \
-             The application has nothing to connect as."
+            "role `{role}` does not exist after the migrations ran. The \
+             application has nothing to connect as."
         ),
         Some(true) => anyhow::bail!(
-            "role `{RUNTIME_ROLE}` has SUPERUSER or BYPASSRLS. Every row-level \
-             security policy in this schema would be inert at runtime, and \
-             nothing else would report it. Refusing to complete the migration \
-             step."
+            "role `{role}` has SUPERUSER or BYPASSRLS. Every row-level security \
+             policy in this schema would be inert at runtime, and nothing else \
+             would report it. Refusing to complete the migration step."
         ),
-        Some(false) => {
-            tracing::info!(
-                role = RUNTIME_ROLE,
-                "runtime role verified NOSUPERUSER and NOBYPASSRLS"
-            );
-            Ok(())
-        }
+        Some(false) => {}
     }
+
+    let can_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(role)
+            .fetch_one(pool)
+            .await?;
+    if can_create {
+        anyhow::bail!(
+            "role `{role}` has CREATE on schema public. It can create — and \
+             therefore own — a table, and an owner is filtered by FORCE ROW \
+             LEVEL SECURITY rather than exempt from it."
+        );
+    }
+
+    let memberships: Vec<String> = sqlx::query_scalar(
+        "SELECT grantee.rolname::text
+           FROM pg_auth_members m
+           JOIN pg_roles member  ON member.oid = m.member
+           JOIN pg_roles grantee ON grantee.oid = m.roleid
+          WHERE member.rolname = $1
+          ORDER BY grantee.rolname",
+    )
+    .bind(role)
+    .fetch_all(pool)
+    .await?;
+
+    if !memberships.is_empty() {
+        anyhow::bail!(
+            "role `{role}` is a member of: {}. NOINHERIT does not close this — \
+             `SET ROLE` reaches those privileges from an ordinary connection, so \
+             whatever they hold, the runtime role effectively holds. Revoke the \
+             membership.",
+            memberships.join(", ")
+        );
+    }
+
+    tracing::info!(
+        role,
+        "runtime role verified NOSUPERUSER, NOBYPASSRLS, no CREATE on public, no role memberships"
+    );
+    Ok(())
 }
