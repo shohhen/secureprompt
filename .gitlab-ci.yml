@@ -209,6 +209,9 @@ static-checks:
     - bash scripts/ci/check-no-dangerous-html.sh
     # AUTH-07: .env.example carries CHANGEME sentinels, never a real secret.
     - bash scripts/ci/check-env-hygiene.sh
+    # MR7 I1: no runbook may route an upgrade through `init-env.sh --force`,
+    # which rotates the AES key for stored provider credentials.
+    - bash scripts/ci/check-upgrade-path-is-nondestructive.sh
     # Every mart consumed by the dashboard is declared as a dbt exposure.
     - node scripts/ci/check-mart-exposures.mjs
     - |

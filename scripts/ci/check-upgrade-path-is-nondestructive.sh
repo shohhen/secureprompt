@@ -80,8 +80,11 @@ fi
 # ---------------------------------------------------------------------------
 # 2. No document sends an operator through the destructive path.
 # ---------------------------------------------------------------------------
+# Anchored at the start of the line, so this catches a COMMAND an operator is
+# meant to paste (in a fenced block, with or without a `$ ` prompt) and not
+# prose that names `--force` in order to warn about it.
 offenders="$(git ls-files -z 'docs/**/*.md' 'README.md' \
-    | xargs -0 grep -nH -E 'init-env\.sh[^\n]*--force' || true)"
+    | xargs -0 grep -nH -E '^[[:space:]]*(\$[[:space:]]+)?\.?/?(scripts/)?init-env\.sh[^`]*--force' || true)"
 if [ -n "$offenders" ]; then
     fail "documentation tells an operator to run init-env.sh --force:"
     echo "$offenders" | sed 's/^/       /' >&2
