@@ -534,6 +534,229 @@ fn a_page_from_another_export_cannot_be_spliced_in() {
     );
 }
 
+// ── The chain itself ──────────────────────────────────────────────────────
+//
+// MEASURED, and the reason this section exists: with `verify_export`'s genesis
+// check, chain-link check, chain-root check and total-rows check ALL FOUR
+// deleted, the suite above was 22 unit + 16 integration tests green. Four
+// checks of a published verification recipe, and nothing in the repository
+// observed their removal.
+//
+// So be exact about what the chain does and does not do here, because the
+// tests above were credited with more than they measure:
+//
+//   * A page tampered, reordered, or lifted from another export is caught by
+//     the POSITIONAL per-page digest list (`PageDigestMismatch`), not by the
+//     chain. A whole page dropped is caught by the signed `total_pages`
+//     (`PageCountMismatch`), not by the chain. Destroying `chain_step` — making
+//     it ignore its `prev` argument entirely — leaves every one of those tests
+//     green.
+//   * What the chain adds is a SINGLE value, `chain_root`, that commits to the
+//     whole ordered digest list and is seeded from this export's own header, so
+//     one 32-byte string identifies this export and no other — including
+//     another export with byte-identical pages. That is the value an auditor
+//     can pin, quote in a report and compare a year later without holding N
+//     digests, and it is what `docs/audit-export-format.md`'s recipe has them
+//     recompute from the manifest text with nothing but SHA-256.
+//
+// The four tests below are what make that recipe's steps 6, 7 and 8 executable
+// rather than published. Each corrupts exactly ONE field of a re-signed
+// manifest — the attacker who holds the signing key, since a signature over a
+// re-signed document is valid by construction — and each is caught by exactly
+// one check: delete that check and this test, alone, goes red.
+
+/// The re-signing machinery applied to an UNALTERED manifest must still
+/// verify.
+///
+/// Every test in this section mutates one field and re-signs. Without this
+/// control a rejection below could be the re-signature rather than the
+/// mutation, and all four would be measuring `resign` instead of the verifier.
+fn resigning_alone_changes_nothing(e: &Export) {
+    let (json, signature) = resign(
+        &serde_json::from_str::<serde_json::Value>(&e.manifest_json).expect("json"),
+        &key_a(),
+    );
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs).is_ok(),
+        "positive control: a re-signed but unaltered export must still verify"
+    );
+}
+
+/// One hex digit of `value` changed.
+///
+/// The string stays well-formed 64-character hex, so only its VALUE is wrong.
+/// Truncating it or putting a non-hex character in would be refused by the
+/// parse (`ManifestMalformed`) and would pin nothing about the check under
+/// test.
+fn flip_one_hex_digit(value: &str) -> String {
+    let mut out: Vec<char> = value.chars().collect();
+    let last = out.len() - 1;
+    out[last] = if out[last] == '0' { '1' } else { '0' };
+    out.into_iter().collect()
+}
+
+/// **Step 6 of the published recipe.** `chain_genesis` no longer matches the
+/// header it is derived from.
+///
+/// Nothing else in the manifest is touched: `verify_export` recomputes the seed
+/// from the header and chains from THAT, so every page digest, every chain link
+/// and the root still agree with each other. The published `chain_genesis`
+/// string is the only thing wrong, and the genesis comparison is the only check
+/// that looks at it.
+///
+/// This matters precisely because an auditor following the recipe recomputes
+/// the seed and compares it to this field. A product that accepted a manifest
+/// whose own `chain_genesis` it disagreed with would hand out artifacts that
+/// fail the documented procedure while passing the vendor's verifier — which is
+/// the failure `the_chain_is_recomputable_from_the_manifest_text_alone` was
+/// written for, one field along.
+#[test]
+fn a_chain_genesis_the_header_does_not_imply_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    resigning_alone_changes_nothing(&e);
+
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    let genuine = manifest["chain_genesis"]
+        .as_str()
+        .expect("chain_genesis")
+        .to_owned();
+    let corrupted = flip_one_hex_digit(&genuine);
+    assert_ne!(
+        corrupted, genuine,
+        "premise: the mutation must change bytes"
+    );
+    assert_eq!(
+        corrupted.len(),
+        genuine.len(),
+        "premise: the field must stay a well-formed digest, or the parse \
+         catches this instead of the genesis check"
+    );
+    manifest["chain_genesis"] = serde_json::json!(corrupted);
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::GenesisMismatch),
+        "a manifest whose chain seed is not the one its own header implies \
+         must be refused; delete the genesis check in `verify_export` and this \
+         export verifies clean"
+    );
+}
+
+/// **Step 7 of the published recipe.** One link of the chain edited.
+///
+/// The page bytes and every `sha256` are untouched, so the positional digest
+/// loop passes; `chain_root` is untouched, so the root still matches the chain
+/// recomputed from the digests. Only `pages[1].chain` is wrong, and the
+/// per-link comparison is the only check that reads it — which is also what
+/// makes the error LOCAL: it names page 2 rather than saying "something is
+/// wrong somewhere".
+#[test]
+fn a_broken_chain_link_fails_verification_and_names_the_page() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    resigning_alone_changes_nothing(&e);
+
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    assert_eq!(
+        manifest["pages"][1]["page"].as_u64(),
+        Some(2),
+        "premise: pages[1] is page 2, so the error below names the right file"
+    );
+    let genuine = manifest["pages"][1]["chain"]
+        .as_str()
+        .expect("chain")
+        .to_owned();
+    manifest["pages"][1]["chain"] = serde_json::json!(flip_one_hex_digit(&genuine));
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::ChainBroken { page: 2 }),
+        "a chain link that does not follow from the previous one must be \
+         refused, and must name the page; delete the per-link check and this \
+         export verifies clean"
+    );
+}
+
+/// **Step 8 of the published recipe.** The published root does not match the
+/// chain the manifest's own links build.
+///
+/// Every link is internally consistent, so the loop above passes. `chain_root`
+/// is the one value an auditor is told to pin and quote, and this is the check
+/// that makes the published one binding rather than decorative.
+#[test]
+fn a_chain_root_that_the_links_do_not_build_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    resigning_alone_changes_nothing(&e);
+
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    let genuine = manifest["chain_root"]
+        .as_str()
+        .expect("chain_root")
+        .to_owned();
+    let last_link = manifest["pages"]
+        .as_array()
+        .expect("pages")
+        .last()
+        .expect("at least one page")["chain"]
+        .as_str()
+        .expect("chain")
+        .to_owned();
+    assert_eq!(
+        genuine, last_link,
+        "premise: the genuine root IS the last link, so the mutation below \
+         separates them rather than restating one of them"
+    );
+    manifest["chain_root"] = serde_json::json!(flip_one_hex_digit(&genuine));
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::ChainRootMismatch),
+        "a published root that the manifest's own links do not build must be \
+         refused; delete the root check and this export verifies clean"
+    );
+}
+
+/// `total_rows` edited to a figure the pages do not sum to.
+///
+/// The fourth unpinned check, and the one with a consequence outside
+/// cryptography: `total_rows` is the number a compliance report quotes ("this
+/// export covers 4,812 requests"). The per-SECTION row sums are already pinned
+/// by `a_section_row_count_that_its_pages_do_not_sum_to_fails_verification`;
+/// this is the export-wide total, which that test cannot see because it moves
+/// the same row between the two sections and leaves the total intact.
+#[test]
+fn a_total_row_count_the_pages_do_not_sum_to_fails_verification() {
+    let e = export(ExportFormat::Jsonl, &key_a());
+    resigning_alone_changes_nothing(&e);
+
+    let mut manifest: serde_json::Value = serde_json::from_str(&e.manifest_json).expect("json");
+    let genuine = manifest["total_rows"].as_u64().expect("total_rows");
+    assert_eq!(
+        genuine, 6,
+        "premise: the fixture is two data pages of two rows and two \
+         control pages of one"
+    );
+    manifest["total_rows"] = serde_json::json!(genuine - 1);
+
+    let (json, signature) = resign(&manifest, &key_a());
+    let refs: Vec<&[u8]> = e.pages.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        verify_export(&json, &signature, &e.public_key_b64, &refs),
+        Err(VerifyError::RowCountMismatch {
+            declared: 5,
+            summed: 6
+        }),
+        "an export whose declared total does not match its pages must be \
+         refused; delete the total-rows check and this export verifies clean"
+    );
+}
+
 // ── The manifest itself ───────────────────────────────────────────────────
 
 /// Editing the manifest to match a tampered export breaks the SIGNATURE. This
