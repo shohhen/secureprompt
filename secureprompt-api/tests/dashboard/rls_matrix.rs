@@ -710,6 +710,108 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// MR1 review I6(c) — what the two deleted matrix rows should have been.
+///
+/// The matrix carried `/v1/providers?workspace_id={B}` and
+/// `/v1/policy-rules?workspace_id={B}` as `Expect::ForbiddenOrEmpty`, whose
+/// doc says "the guard should reject before any query runs". Neither handler
+/// has such a guard, or could: `list_providers` (`providers.rs`) and
+/// `list_rules` (`policy_rules.rs`) are `(State, Extension<JwtAuthContext>)`,
+/// so axum parses no query string and there is nothing to compare. No
+/// production line's deletion reddened those rows. They are gone.
+///
+/// The property these endpoints really have is worth pinning and was not
+/// pinned anywhere: the workspace comes from the JWT only, so supplying
+/// `workspace_id={B}` must change nothing — the caller still gets their own
+/// rows, and never B's. That is the same guarantee the deleted rows were
+/// gesturing at, expressed so a production line can falsify it.
+///
+/// Three defences against a vacuous pass:
+///
+/// 1. **Premise / positive control** — A's own provider and rule MUST appear.
+///    An empty or errored response fails here rather than passing the
+///    tenancy assertion by returning nothing.
+/// 2. **B is really seeded** — B's rows go in under B's own armed scope, so
+///    "B is absent" cannot be true merely because B has nothing.
+/// 3. **Both spellings** — with and without the parameter. If a future change
+///    starts honouring `workspace_id`, the parameterised call returns B's
+///    rows and the tenancy assertion catches it.
+///
+/// Falsifier (verified): delete `WHERE workspace_id = $1` from
+/// `provider_repo::list_providers` or `policy_repo::list_rules` — the two
+/// queries whose comments say "this WHERE, not `begin_scoped`, is the real
+/// isolation boundary. Do not remove." Both reddened.
+#[sqlx::test]
+async fn providers_and_policy_rules_ignore_a_workspace_id_parameter(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    let provider_a = format!("provider-own-{run}");
+    let provider_b = format!("provider-other-{run}");
+    let rule_a = format!("rule-own-{run}");
+    let rule_b = format!("rule-other-{run}");
+
+    // Written from inside each workspace's own armed scope, the way
+    // `seed_two_workspaces` writes `api_keys`: one scope names exactly one
+    // tenant, so the two tenants cannot share a transaction.
+    for (workspace_id, provider, rule) in [
+        (seeded.workspace_a, &provider_a, &rule_a),
+        (seeded.workspace_b, &provider_b, &rule_b),
+    ] {
+        let mut tx = fixtures::scoped(&pool, workspace_id).await;
+        sqlx::query(
+            "INSERT INTO providers (id, workspace_id, name, provider_type)
+             VALUES ($1, $2, $3, 'openai')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id)
+        .bind(provider)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO policy_rules (id, workspace_id, name, action)
+             VALUES ($1, $2, $3, 'redact')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id)
+        .bind(rule)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, seeded.workspace_a, seeded.admin_a, "admin");
+    let (_state, router) = build_app(pool);
+
+    for (endpoint, own, other) in [
+        ("/v1/providers", &provider_a, &provider_b),
+        ("/v1/policy-rules", &rule_a, &rule_b),
+    ] {
+        for path in [
+            endpoint.to_owned(),
+            format!("{endpoint}?workspace_id={}", seeded.workspace_b),
+        ] {
+            let (status, body) = send_raw(&router, "GET", &path, None, &token_a).await;
+            assert_eq!(status, StatusCode::OK, "{path} failed: {body}");
+
+            let rendered = body.to_string();
+            assert!(
+                rendered.contains(own.as_str()),
+                "positive control: workspace A's own row '{own}' is missing \
+                 from {path}, so the absence of B's row proves nothing: {body}"
+            );
+            assert!(
+                !rendered.contains(other.as_str()),
+                "workspace B's row '{other}' reached workspace A via {path}: {body}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// WS1-2 follow-up — tenancy on the MART ITSELF, not on the raw fallback.
 ///
 /// `cross_tenant_matrix` above can only ever exercise the raw `request_events`
