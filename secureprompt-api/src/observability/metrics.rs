@@ -165,7 +165,6 @@ pub struct MetricsRegistry {
     budget_redis_failure_total: AtomicU64,
 
     // ── Plan 05-03 — dashboard analytics metrics ──────────────────────────
-
     /// `secureprompt_dashboard_request_duration_seconds{endpoint,outcome}` —
     /// real bucketed histogram (KPI-2 monitoring, Task 1), one series per
     /// `(endpoint, outcome)` pair.
@@ -180,7 +179,6 @@ pub struct MetricsRegistry {
     dashboard_client_errors: Mutex<Vec<(String, u64)>>,
 
     // ── KPI-2 monitoring, Task 2 ───────────────────────────────────────────
-
     /// `secureprompt_request_duration_seconds{model}` — real bucketed
     /// histogram, one series per resolved provider `model` (fallback
     /// `"unknown"` when no provider was resolved, e.g. a policy-denied
@@ -193,11 +191,21 @@ pub struct MetricsRegistry {
 
     // ── WS2-3 ─ ML sidecar coverage loss ────────────────────────────────
     /// Counter `secureprompt_sidecar_unavailable_total{reason,action}`.
-    /// `reason` is a bounded `SidecarOutage` label
-    /// (`unconfigured`/`disabled`/`circuit_open`/`all_calls_failed`) and
-    /// `action` is the workspace policy that was applied
-    /// (`block`/`degrade_with_alert`). This is the alert signal for a
-    /// gateway running with no ML detection coverage.
+    /// `reason` is a bounded
+    /// [`crate::ml_sidecar::types::CoverageLoss::as_str`] label — the four
+    /// `SidecarOutage` spellings `unconfigured`/`disabled`/`circuit_open`/
+    /// `all_calls_failed` PLUS `partial_coverage` — and `action` is the
+    /// workspace policy that was applied (`block`/`degrade_with_alert`).
+    /// This is the alert signal for a gateway running with no ML detection
+    /// coverage.
+    ///
+    /// MR1 review M1: this used to say `reason` was a `SidecarOutage` label
+    /// and enumerate only the four. Both call sites pass `CoverageLoss`, so
+    /// `partial_coverage` — a document that tiled into chunks and lost one —
+    /// was an undocumented fifth value. Still bounded, so there was never a
+    /// cardinality risk; the label domain a dashboard or alert rule is
+    /// written against was simply wrong. Pinned by
+    /// `sidecar_unavailable_reason_label_domain` below.
     sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
 
     // ── WS4-4 ─ license gate ────────────────────────────────────────────
@@ -547,8 +555,10 @@ impl MetricsRegistry {
 
     /// WS2-3 — record one request for which the ML sidecar produced no
     /// detection coverage. Both labels are bounded: `reason` is
-    /// [`crate::ml_sidecar::types::SidecarOutage::as_str`], `action` is the
-    /// workspace's `sidecar_unavailable` policy. Never a workspace id.
+    /// [`crate::ml_sidecar::types::CoverageLoss::as_str`] — NOT
+    /// `SidecarOutage::as_str`, which is only four of its five values; the
+    /// fifth is `partial_coverage` — and `action` is the workspace's
+    /// `sidecar_unavailable` policy. Never a workspace id.
     ///
     /// # Panics
     /// Panics if the internal `Mutex` is poisoned.
@@ -597,7 +607,10 @@ impl MetricsRegistry {
             .license_gate_engaged
             .lock()
             .expect("license_gate_engaged mutex");
-        if let Some(row) = guard.iter_mut().find(|(r, a, _)| r == reason && a == action) {
+        if let Some(row) = guard
+            .iter_mut()
+            .find(|(r, a, _)| r == reason && a == action)
+        {
             row.2 += 1;
         } else {
             guard.push((reason.to_owned(), action.to_owned(), 1));
@@ -631,8 +644,14 @@ impl MetricsRegistry {
     /// # Panics
     /// Panics if the internal `Mutex` is poisoned.
     pub fn record_auth_gate_engaged(&self, reason: &str, action: &str) {
-        let mut guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
-        if let Some(row) = guard.iter_mut().find(|(r, a, _)| r == reason && a == action) {
+        let mut guard = self
+            .auth_gate_engaged
+            .lock()
+            .expect("auth_gate_engaged mutex");
+        if let Some(row) = guard
+            .iter_mut()
+            .find(|(r, a, _)| r == reason && a == action)
+        {
             row.2 += 1;
         } else {
             guard.push((reason.to_owned(), action.to_owned(), 1));
@@ -647,7 +666,10 @@ impl MetricsRegistry {
     /// Panics if the internal `Mutex` is poisoned.
     #[must_use]
     pub fn auth_gate_engaged_count(&self, reason: &str, action: &str) -> u64 {
-        let guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
+        let guard = self
+            .auth_gate_engaged
+            .lock()
+            .expect("auth_gate_engaged mutex");
         guard
             .iter()
             .find(|(r, a, _)| r == reason && a == action)
@@ -702,7 +724,8 @@ impl MetricsRegistry {
             self.analytics_dropped_total.load(Ordering::Relaxed),
             self.analytics_consumed_total.load(Ordering::Relaxed),
             self.analytics_failures_total.load(Ordering::Relaxed),
-            self.clickhouse_insert_failures_total.load(Ordering::Relaxed),
+            self.clickhouse_insert_failures_total
+                .load(Ordering::Relaxed),
             self.clickhouse_insert_retries_total.load(Ordering::Relaxed),
         );
 
@@ -726,9 +749,7 @@ impl MetricsRegistry {
                 .lock()
                 .expect("dashboard_request_duration mutex");
             if !guard.is_empty() {
-                out.push_str(
-                    "# TYPE secureprompt_dashboard_request_duration_seconds histogram\n",
-                );
+                out.push_str("# TYPE secureprompt_dashboard_request_duration_seconds histogram\n");
                 for (endpoint, outcome, hist) in guard.iter() {
                     let labels = format!("endpoint=\"{endpoint}\",outcome=\"{outcome}\"");
                     hist.render_into(
@@ -785,9 +806,7 @@ impl MetricsRegistry {
                 .lock()
                 .expect("dashboard_client_errors mutex");
             if !guard.is_empty() {
-                out.push_str(
-                    "# TYPE secureprompt_dashboard_client_errors_total counter\n",
-                );
+                out.push_str("# TYPE secureprompt_dashboard_client_errors_total counter\n");
                 for (component, value) in guard.iter() {
                     let _ = writeln!(
                         out,
@@ -872,7 +891,10 @@ impl MetricsRegistry {
 
         // FU3 — JWT auth gate under a session-store outage.
         {
-            let guard = self.auth_gate_engaged.lock().expect("auth_gate_engaged mutex");
+            let guard = self
+                .auth_gate_engaged
+                .lock()
+                .expect("auth_gate_engaged mutex");
             if !guard.is_empty() {
                 out.push_str("# TYPE secureprompt_auth_gate_engaged_total counter\n");
                 for (reason, action, value) in guard.iter() {
@@ -891,6 +913,84 @@ impl MetricsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MR1 review M1 — the `reason` label domain of
+    /// `secureprompt_sidecar_unavailable_total`, pinned against the type the
+    /// call sites actually pass.
+    ///
+    /// The finding was that the doc named `SidecarOutage::as_str` while both
+    /// call sites (`pipeline::service::alert_sidecar_unavailable` and
+    /// `http::sidecar_coverage::alert`) pass `CoverageLoss::as_str`, which
+    /// emits a fifth value, `partial_coverage`. A corrected comment with
+    /// nothing holding it true is how the first one got written, so:
+    ///
+    /// * the `match` is a COMPILE-TIME exhaustiveness guard — add a
+    ///   `CoverageLoss` or `SidecarOutage` variant and this stops compiling
+    ///   until the documented domain is extended. Written out by hand on
+    ///   purpose; deriving it from a production slice would mean the test can
+    ///   never notice a case production forgot (same argument as
+    ///   `pipeline::tests::assert_outage_list_is_exhaustive`).
+    /// * the render assertion is the RUNTIME half: it drives the real
+    ///   `record_sidecar_unavailable` + `render_prometheus` path, so a change
+    ///   that stops a value reaching the series reddens it.
+    ///
+    /// FALSIFIER, in the direction that matters: drop `Self::Partial` from
+    /// `CoverageLoss::as_str`'s match (or make it return an outage spelling)
+    /// and the `partial_coverage` line disappears from the render.
+    #[test]
+    fn sidecar_unavailable_reason_label_domain() {
+        use crate::ml_sidecar::types::{CoverageLoss, SidecarOutage};
+
+        // Compile-time: every variant must be named here.
+        fn domain_of(loss: CoverageLoss) -> &'static str {
+            match loss {
+                CoverageLoss::Outage(SidecarOutage::Unconfigured) => "unconfigured",
+                CoverageLoss::Outage(SidecarOutage::Disabled) => "disabled",
+                CoverageLoss::Outage(SidecarOutage::CircuitOpen) => "circuit_open",
+                CoverageLoss::Outage(SidecarOutage::AllCallsFailed) => "all_calls_failed",
+                CoverageLoss::Partial => "partial_coverage",
+            }
+        }
+
+        let all = [
+            CoverageLoss::Outage(SidecarOutage::Unconfigured),
+            CoverageLoss::Outage(SidecarOutage::Disabled),
+            CoverageLoss::Outage(SidecarOutage::CircuitOpen),
+            CoverageLoss::Outage(SidecarOutage::AllCallsFailed),
+            CoverageLoss::Partial,
+        ];
+
+        let metrics = MetricsRegistry::default();
+        for loss in all {
+            assert_eq!(
+                loss.as_str(),
+                domain_of(loss),
+                "CoverageLoss::as_str drifted from the documented label domain"
+            );
+            metrics.record_sidecar_unavailable(loss.as_str(), "block");
+        }
+
+        let rendered = metrics.render_prometheus();
+        for loss in all {
+            let expected = format!(
+                "secureprompt_sidecar_unavailable_total{{reason=\"{}\",action=\"block\"}} 1",
+                loss.as_str()
+            );
+            assert!(
+                rendered.contains(&expected),
+                "reason={:?} never reached the series; the metric's documented \
+                 label domain is wrong again. Looked for {expected:?} in:\n{rendered}",
+                loss.as_str()
+            );
+        }
+
+        // The value M1 was about, named literally so a reader of the failure
+        // sees the finding rather than a generic missing-label message.
+        assert!(
+            rendered.contains("reason=\"partial_coverage\""),
+            "partial_coverage is the fifth reason value the doc used to omit"
+        );
+    }
 
     /// Step 1 (KPI-2 histogram conversion) — failing unit test written before
     /// `Histogram` exists. Observing `[0.02, 0.2, 2.0]` on a single
@@ -924,7 +1024,10 @@ mod tests {
             "expected cumulative count 3 at le=+Inf; got:\n{out}"
         );
         assert!(out.contains("x_count 3"), "expected x_count 3; got:\n{out}");
-        assert!(out.contains("x_sum 2.22"), "expected x_sum 2.22; got:\n{out}");
+        assert!(
+            out.contains("x_sum 2.22"),
+            "expected x_sum 2.22; got:\n{out}"
+        );
 
         // Buckets must be cumulative and monotonic non-decreasing.
         let mut last = 0u64;
