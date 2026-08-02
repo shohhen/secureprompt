@@ -104,6 +104,11 @@ async fn ensure_low_privilege_role(pool: &PgPool) {
     .expect("grants on the test database");
 }
 
+/// The low-privilege pool's ceiling, named because
+/// `the_creating_scope_does_not_outlive_the_transaction` acquires exactly this
+/// many connections at once to make its probe exhaustive rather than lucky.
+const LOW_POOL_MAX_CONNECTIONS: u32 = 4;
+
 /// A POOL onto the same `#[sqlx::test]` database as `RLS_ROLE`, with the
 /// role's powerlessness asserted ON THE WIRE.
 ///
@@ -120,7 +125,7 @@ async fn low_privilege_pool(pool: &PgPool) -> PgPool {
         .password(RLS_PASSWORD);
 
     let low = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(LOW_POOL_MAX_CONNECTIONS)
         .min_connections(2)
         .connect_with(options)
         .await
@@ -240,13 +245,54 @@ async fn the_creating_scope_does_not_outlive_the_transaction(pool: PgPool) {
         "premise: the seeded rule must exist"
     );
 
-    // Every connection in the pool, unarmed, must fail to reach the row.
-    // `min_connections(2)` plus this loop makes it very unlikely we only ever
-    // probe a connection the creating transaction never touched.
-    for probe in 0..8 {
+    // MR5 M-3: this used to be eight `fetch_one(&low)` probes and a comment
+    // saying `min_connections(2)` "makes it very unlikely we only ever probe a
+    // connection the creating transaction never touched". Unlikely is not a
+    // control. A regression to a session-level `set_config(..., false)` had a
+    // real chance of passing, and a test that can pass by luck against the
+    // defect it names is the shape this suite exists to refuse.
+    //
+    // Deterministic instead: hold EVERY connection the pool can hand out, at
+    // the same time, and probe each one. The connection the creating
+    // transaction borrowed was returned to this pool and cannot have escaped
+    // it, so it is necessarily among them.
+    let mut held = Vec::new();
+    for slot in 0..LOW_POOL_MAX_CONNECTIONS {
+        held.push(
+            low.acquire()
+                .await
+                .unwrap_or_else(|e| panic!("holding pool connection {slot}: {e}")),
+        );
+    }
+
+    // PREMISE, and the one the old loop could not make: at least one held
+    // connection must show that it SERVED the creating transaction. Postgres
+    // resets a committed `SET LOCAL` custom GUC to the EMPTY STRING rather than
+    // unsetting it, so `Some("")` is the fingerprint of a connection that has
+    // run a scoped transaction. Without this, every probe below could be
+    // reading connections the transaction never touched and the whole test
+    // would be about nothing.
+    let mut states: Vec<Option<String>> = Vec::new();
+    for conn in &mut held {
+        states.push(
+            sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
+                .fetch_one(&mut **conn)
+                .await
+                .expect("GUC fingerprint probe"),
+        );
+    }
+    assert!(
+        states.iter().any(|s| s.as_deref() == Some("")),
+        "premise: none of the {} held connections had ever served a scoped \
+         transaction (states {states:?}), so the leak probes below would be \
+         reading connections `create_with_owner` never borrowed",
+        held.len()
+    );
+
+    for (probe, conn) in held.iter_mut().enumerate() {
         let leaked: Option<String> =
             sqlx::query_scalar("SELECT current_setting('app.current_workspace_id', true)")
-                .fetch_one(&low)
+                .fetch_one(&mut **conn)
                 .await
                 .expect("GUC probe");
         assert_ne!(
@@ -271,10 +317,12 @@ async fn the_creating_scope_does_not_outlive_the_transaction(pool: PgPool) {
         // That is the LOUD half of the failure mode `db::scope`'s header
         // describes, and it is why both branches are accepted here — what must
         // never happen is the third possibility, the row coming back.
+        // On the SAME held connection — going back to `&low` here would
+        // deadlock, since this loop owns every connection the pool has.
         let unscoped: Result<Vec<String>, sqlx::Error> =
             sqlx::query_scalar("SELECT name FROM policy_rules WHERE workspace_id = $1")
                 .bind(ws.id)
-                .fetch_all(&low)
+                .fetch_all(&mut **conn)
                 .await;
 
         match unscoped {
