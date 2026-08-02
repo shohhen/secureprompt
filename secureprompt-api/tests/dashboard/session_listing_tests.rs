@@ -1559,10 +1559,11 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
         row.0, None,
         "a value that is not an IP address must be dropped, not stored"
     );
-    // The assertions below are `is_none_or`, so a `None` satisfies them without
-    // exercising anything. This is what makes them non-vacuous: the hostile UA
-    // NAMES a browser and a platform, so the reducer must have produced a
-    // value, and the two claims are about that value.
+    // The two claims below are about a VALUE, not about an `Option`. The
+    // pre-F9 form was `assert!(row.1.as_deref().is_none_or(|d| …))` twice, and
+    // a `None` satisfied both without exercising the reducer at all; the
+    // `expect` is what removes that escape, and the hostile UA naming a browser
+    // and a platform is what makes the `expect` reachable.
     let descriptor = row.1.as_deref().expect(
         "a recognisable hostile UA must still yield a descriptor, or \
                  the two assertions below prove nothing",
@@ -1576,9 +1577,10 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
         "no part of the raw User-Agent may be stored verbatim, got {descriptor:?}"
     );
 
-    // CONTROL THAT MUST DIFFER: a well-formed device IS recorded, so the two
-    // `None`s above are the validators and not a write path that stores
-    // nothing at all.
+    // CONTROL THAT MUST DIFFER: a well-formed device IS recorded, so the
+    // dropped IP above is the validator refusing a non-address and not a write
+    // path that stores nothing at all — and the descriptor assertions are the
+    // reducer bounding a real value, not an empty column.
     let second = seed_workspace(&pool).await;
     sign_in(&app, &second.viewer_email, "203.0.113.7", CHROME_MAC).await;
     let good: (Option<String>, Option<String>) = {
