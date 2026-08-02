@@ -437,18 +437,27 @@ async fn fresh_workspace_stores_no_raw_content_in_clickhouse(pool: PgPool) -> sq
          (raw_prompt, raw_response, restored_response), got isNull triple: {nulls}"
     );
 
-    // And the synthetic PII must not be anywhere in the row.
+    // And the synthetic PII must not be anywhere in the row — the WHOLE row.
+    //
+    // This searched `raw_prompt`/`raw_response`/`restored_response`, the three
+    // columns the assertion directly above has already established are NULL.
+    // `position(coalesce(NULL, ''), x) > 0` is false for every NULL column, so
+    // it could not fail without that assertion failing first: it read as
+    // coverage and was arithmetic. `formatRow('CSV', *)` serialises the entire
+    // row, which is what is NOT implied — `provider`, `model`, `api_key_name`,
+    // `ip_address`, and any content column a future migration adds. That last
+    // case has history on this exact table: migrations 004 and 005 are how
+    // raw_prompt / raw_response / restored_response got here.
     let leaked = ch_query(&format!(
-        "SELECT count() FROM request_events WHERE user_agent = '{marker}' AND (\
-            position(coalesce(raw_prompt, ''), '{SYNTHETIC_NAME}') > 0 OR \
-            position(coalesce(raw_response, ''), '{SYNTHETIC_NAME}') > 0 OR \
-            position(coalesce(restored_response, ''), '{SYNTHETIC_NAME}') > 0)"
+        "SELECT count() FROM request_events WHERE user_agent = '{marker}' \
+         AND position(formatRow('CSV', *), '{SYNTHETIC_NAME}') > 0"
     ))
     .await;
     assert_eq!(
         leaked, "0",
         "the synthetic PII leaked into request_events on a workspace that \
-         never opted in"
+         never opted in — somewhere in the row, not necessarily in a column \
+         this test names"
     );
 
     // ...and nothing went to the opt-in store either. This assertion is not
@@ -572,15 +581,19 @@ async fn fail_closed_request_stores_no_prompt_body_in_clickhouse(pool: PgPool) -
          body to request_events (plaintext, fixed 90-day TTL, no opt-in) \
          creates a disclosure that would not otherwise exist"
     );
+    // Same correction as the fresh-install test: searching `redacted_prompt`
+    // alone was implied by `PROMPT_PROBE == "1|"` above, which has already
+    // asserted that column is NULL. The whole serialised row is the part that
+    // is not implied.
     let leaked = ch_query(&format!(
         "SELECT count() FROM request_events WHERE user_agent = '{blocked_marker}' \
-         AND position(coalesce(redacted_prompt, ''), '{SYNTHETIC_NAME}') > 0"
+         AND position(formatRow('CSV', *), '{SYNTHETIC_NAME}') > 0"
     ))
     .await;
     assert_eq!(
         leaked, "0",
-        "the synthetic PII reached request_events.redacted_prompt on a \
-         request the gateway refused to forward BECAUSE it could not redact it"
+        "the synthetic PII reached request_events on a request the gateway \
+         refused to forward BECAUSE it could not redact it"
     );
 
     Ok(())
@@ -909,8 +922,17 @@ async fn await_capture(expr: &str, marker: &str) -> String {
 // ── WS3-1: every one of the seven write sites is gated ────────────────────
 
 /// The seven original assignments live on four distinct code paths. This
-/// drives ALL FOUR on a workspace that never opted in and asserts none of
-/// them produced a capture row.
+/// drives THREE of them on a workspace that never opted in and asserts none
+/// of them produced a capture row: policy deny (site 2/7), fail-closed
+/// (site 1/7) and the streaming finalizer (sites 6/7 and 7/7).
+///
+/// It said "This drives ALL FOUR". It does not, and never did — the loop
+/// below enumerates three labels. The fourth path, buffered execute (sites
+/// 3/7, 4/7, 5/7), is covered by
+/// `fresh_workspace_stores_no_raw_content_in_clickhouse`, which sends an
+/// ordinary non-streaming request through a healthy sidecar. So this is a
+/// false coverage claim rather than a hole — but a deletion check reading
+/// this doc would have believed one test guarded four paths.
 ///
 /// PREMISE for every path: an audit row for that request exists in
 /// `request_events`. That is what makes "zero capture rows" mean "the gate
@@ -969,7 +991,8 @@ async fn no_write_site_captures_raw_content_by_default(pool: PgPool) -> sqlx::Re
         "premise: the fail-closed path must actually be taken"
     );
 
-    // A second workspace with no deny rule, for the success paths.
+    // A second workspace with no deny rule, for the streaming path below.
+    // (Said "the success paths", plural; only the streaming request uses it.)
     let clean_ws = Uuid::new_v4();
     support::seed_workspace(&pool, clean_ws, "sp_ws3_1_clean").await?;
     support::seed_provider_and_model(
