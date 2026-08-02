@@ -104,6 +104,16 @@ macro_rules! admin_audit_vocabulary {
         ///      `audit_export::CONTROL_COVERAGE`, the prose copied into every
         ///      signed manifest, so the auditor's document cannot fall behind
         ///      the code.
+        ///   4. MR5 I-4 —
+        ///      `every_audited_action_writes_the_detail_keys_the_auditors_document_promises`
+        ///      (`tests/admin_audit.rs`) performs one of every action through
+        ///      the API and requires each row's `detail` keys to EQUAL the list
+        ///      `docs/audit-export-format.md` §3.2 gives it. So a new action
+        ///      needs a §3.2 row AND a driver in that test's
+        ///      `drive_every_audited_action`; without the driver the test fails
+        ///      on its own coverage assertion, which is deliberate — an action
+        ///      nobody performs is an action whose documented keys are checked
+        ///      by nothing, which is the defect I-4 named.
         ///
         /// The export itself needs no entry at all: it selects every row of
         /// `admin_audit` without an `action` predicate and passes the value
