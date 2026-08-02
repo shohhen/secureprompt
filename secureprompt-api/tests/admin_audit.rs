@@ -1297,6 +1297,474 @@ async fn the_action_vocabulary_is_pinned_in_three_places(pool: PgPool) {
     );
 }
 
+// ── MR5 I-4 — §3.2's per-action `detail` key lists ────────────────────────
+
+/// `docs/audit-export-format.md`, the auditor's document.
+///
+/// `CARGO_MANIFEST_DIR` is `secureprompt-api/`, so the document is one level
+/// up. Read at runtime rather than `include_str!`d on purpose: the point is to
+/// compare what the document SAYS against what the product DOES, and a
+/// compile-time copy would still be checked, just less obviously.
+fn audit_export_doc() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate directory has a workspace root above it")
+        .join("docs/audit-export-format.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The top-level `detail` keys one §3.2 table cell claims, and nothing else.
+///
+/// The cell is prose with backticks in it, and only some of those backticks are
+/// keys. Two rules separate them, and both are needed:
+///
+///   * **Drop parenthesised spans.** `` `changed` (may carry `name`,
+///     `priority`) `` documents ONE key whose VALUE may carry those names;
+///     `` `method` (`password` or `oidc`) `` documents one key and two of its
+///     values. A parser that took every backtick would read four keys and two
+///     keys respectively, and would be wrong about both.
+///   * **Cut at the first `;`.** `license.activated`'s cell ends
+///     "…; the vendor `lic_id` is in `target_label`", which is a sentence about
+///     a DIFFERENT column, not two more `detail` keys.
+///
+/// An em-dash cell (`api_key.revoked`, `two_factor.enabled`) contains no
+/// backticks and yields the empty set, which is the claim being made.
+fn documented_detail_keys_in(cell: &str) -> BTreeSet<String> {
+    let mut outside = String::new();
+    let mut depth = 0usize;
+    for ch in cell.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => outside.push(ch),
+            _ => {}
+        }
+    }
+    let head = outside.split(';').next().unwrap_or_default().to_owned();
+
+    let mut keys = BTreeSet::new();
+    let mut rest = head.as_str();
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        keys.insert(after[..close].to_owned());
+        rest = &after[close + 1..];
+    }
+    keys
+}
+
+/// §3.2's `detail` key tables, restricted to the `admin_audit` vocabulary.
+///
+/// §3.2 carries two tables under the same header: one for the three event types
+/// the exporter builds itself (`raw_capture.changed`, `retention.purge`,
+/// `session.revoked`) and one for every `admin_audit` action. The worker's doc
+/// gate already checks the first three end to end, because it renders them.
+/// This selects the second table by keeping only rows whose event type is in
+/// [`AdminAuditAction::ALL`] — which also means an unrelated two-column table
+/// elsewhere in the document cannot contribute a row.
+fn documented_admin_audit_detail_keys(doc: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let vocabulary: BTreeSet<&str> = AdminAuditAction::ALL.iter().map(|a| a.as_str()).collect();
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in doc.lines() {
+        let line = line.trim();
+        if !line.starts_with("| `") || !line.ends_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = line
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if cells.len() != 2 {
+            continue;
+        }
+        let event = cells[0].trim_matches('`');
+        if !vocabulary.contains(event) {
+            continue;
+        }
+        let previous = out.insert(event.to_owned(), documented_detail_keys_in(cells[1]));
+        assert!(
+            previous.is_none(),
+            "§3.2 gives `{event}` more than one `detail` row; an auditor \
+             reading the second cannot tell it is not the first"
+        );
+    }
+    out
+}
+
+/// **MR5 I-4 — §3.2's per-action `detail` key lists, driven through the API.**
+///
+/// Commit `78e6e8b` is titled "one `detail` row per audited action, and CORRECT
+/// KEYS". The gate that landed with it checks the first half only. The worker's
+/// `the_documented_detail_tables_cover_every_audited_action` compares event-type
+/// NAMES against the database's CHECK constraint — coverage, not content — and
+/// `the_documented_detail_keys_match_a_real_export` compares KEYS for exactly
+/// the three event types the exporter builds itself. Every per-action key list
+/// for an `admin_audit` event — `conditions_present`, `credential_present`,
+/// `grace_secs`, `role_granted`, `reenrollment`, `source_before`/`after`, … —
+/// was checked by nothing at all. They happened to be right; that is the
+/// "guarantee pinned by nothing" shape rather than a defect, and this is the
+/// pin.
+///
+/// # Why this test lives here and not in the doc gate
+///
+/// `admin_audit.detail` is built by the API, one JSON object per write site
+/// across seven files, and the worker cannot reach those write sites. The doc
+/// gate seeds `admin_audit` rows itself, so any key assertion it made would be
+/// about its own seeder — produced and checked by the same code, which is the
+/// exact shape this body of work exists to remove. The only honest way to check
+/// the claim is to perform each administrative action for real and read back
+/// what the product stored, which needs an HTTP harness. That is this file.
+///
+/// # What makes it non-vacuous
+///
+/// Three things, and the third is the one that matters:
+///
+///   1. The parse is compared against [`AdminAuditAction::ALL`] before anything
+///      is driven, so a document that names nothing cannot agree with a product
+///      that writes nothing.
+///   2. Every row's key set is compared for EQUALITY, not containment — a key
+///      the document does not mention fails just as loudly as a missing one.
+///      That direction is the one that matters for a signed artifact: an
+///      undocumented key in `detail` is a value the auditor has nothing to
+///      interpret with.
+///   3. The set of actions actually observed must equal the whole vocabulary.
+///      A test that quietly stopped driving half the actions would still be
+///      green under (1) and (2); this is what stops it becoming one.
+///
+/// Falsified by mutation — see the commit message.
+#[sqlx::test]
+async fn every_audited_action_writes_the_detail_keys_the_auditors_document_promises(pool: PgPool) {
+    set_provider_key();
+    set_kms_key();
+    let doc = audit_export_doc();
+    let documented = documented_admin_audit_detail_keys(&doc);
+    let vocabulary: BTreeSet<String> = AdminAuditAction::ALL
+        .iter()
+        .map(|a| a.as_str().to_owned())
+        .collect();
+
+    // PREMISE. Without this an empty parse and an undriven product agree.
+    assert_eq!(
+        documented.keys().cloned().collect::<BTreeSet<String>>(),
+        vocabulary,
+        "§3.2's `detail` table and `AdminAuditAction::ALL` name different \
+         actions, so the comparison below would be about a document that does \
+         not describe this product"
+    );
+
+    let ws = seed_workspace(&pool).await;
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let app = build_app_with_license_key(pool.clone(), &signing_key);
+    let admin = make_jwt(ws.id, ws.admin, "admin");
+    let viewer = make_jwt(ws.id, ws.viewer, "viewer");
+    assert_no_audit_yet(&pool, ws.id).await;
+
+    drive_every_audited_action(&pool, &app, &ws, &admin, &viewer, &signing_key).await;
+
+    let rows = audit_rows(&pool, ws.id).await;
+    let mut observed: BTreeSet<String> = BTreeSet::new();
+    for row in &rows {
+        let claimed = documented
+            .get(&row.action)
+            .unwrap_or_else(|| panic!("§3.2 must give `{}` a `detail` row", row.action));
+        let actual: BTreeSet<String> = row
+            .detail
+            .as_object()
+            .unwrap_or_else(|| panic!("`{}`'s detail must be a JSON object", row.action))
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            &actual, claimed,
+            "`{}`: §3.2 promises the auditor these `detail` keys and the \
+             product wrote different ones. This string is copied into every \
+             signed compliance manifest, so a key the document does not \
+             mention is a value nobody can interpret, and a key it mentions \
+             that is absent is a claim the artifact does not support.",
+            row.action
+        );
+        observed.insert(row.action.clone());
+    }
+
+    // (3) — the anti-vacuity guard. An action added to the vocabulary and not
+    // driven here would leave its documented keys unchecked, which is the
+    // defect this test closes.
+    assert_eq!(
+        observed,
+        vocabulary,
+        "these audited actions were never performed by this test, so their \
+         documented `detail` keys are still checked by nothing: {:?}",
+        vocabulary.difference(&observed).collect::<Vec<_>>()
+    );
+}
+
+/// Perform one of every audited administrative action against `ws`.
+///
+/// Deliberately assertion-light — the caller makes the claim. What IS asserted
+/// here is every status code, because an action that silently 4xx'd would write
+/// no row and the caller's coverage check would then blame the vocabulary
+/// rather than the driver.
+async fn drive_every_audited_action(
+    pool: &PgPool,
+    app: &axum::Router,
+    ws: &Workspace,
+    admin: &str,
+    viewer: &str,
+    signing_key: &SigningKey,
+) {
+    // ── API keys. Two keys, because a rotated key is in `rotating` status and
+    // revoking it would exercise a different branch from revoking a live one.
+    let (status, rotate) = send(
+        app,
+        "POST",
+        "/v1/keys",
+        admin,
+        Some(json!({"name": "i4-rotate"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create key: {rotate}");
+    let rotate_id = rotate["id"].as_str().expect("id").to_owned();
+    let (status, revoke) = send(
+        app,
+        "POST",
+        "/v1/keys",
+        admin,
+        Some(json!({"name": "i4-revoke"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create key: {revoke}");
+    let revoke_id = revoke["id"].as_str().expect("id").to_owned();
+    let (status, body) = send(
+        app,
+        "POST",
+        &format!("/v1/keys/{rotate_id}/rotate"),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rotate key: {body}");
+    let (status, body) = send(app, "DELETE", &format!("/v1/keys/{revoke_id}"), admin, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke key: {body}");
+
+    // ── Providers.
+    let (status, provider) = send(
+        app,
+        "POST",
+        "/v1/providers",
+        admin,
+        Some(json!({
+            "name": "i4-before",
+            "provider_type": "openai",
+            "credential": "sk-i4-not-a-real-credential"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create provider: {provider}");
+    let provider_id = provider["id"].as_str().expect("id").to_owned();
+    let (status, body) = send(
+        app,
+        "PUT",
+        &format!("/v1/providers/{provider_id}"),
+        admin,
+        Some(json!({"name": "i4-after", "credential": "sk-i4-rotated-not-real"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update provider: {body}");
+    let (status, body) = send(
+        app,
+        "DELETE",
+        &format!("/v1/providers/{provider_id}"),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete provider: {body}");
+
+    // ── Policy rules. All five actions move through one rule's lifecycle.
+    let (status, rule) = send(
+        app,
+        "POST",
+        "/v1/policy-rules",
+        admin,
+        Some(json!({
+            "name": "i4-rule",
+            "priority": 10,
+            "action": "redact",
+            "enabled": true,
+            "dry_run": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create rule: {rule}");
+    let rule_id = rule["id"].as_str().expect("id").to_owned();
+    let (status, body) = send(
+        app,
+        "PUT",
+        &format!("/v1/policy-rules/{rule_id}"),
+        admin,
+        Some(json!({
+            "name": "i4-rule",
+            "priority": 20,
+            "action": "deny",
+            "enabled": true,
+            "dry_run": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update rule: {body}");
+    let (status, body) = send(
+        app,
+        "PATCH",
+        &format!("/v1/policy-rules/{rule_id}/enabled"),
+        admin,
+        Some(json!({"value": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "toggle enabled: {body}");
+    let (status, body) = send(
+        app,
+        "PATCH",
+        &format!("/v1/policy-rules/{rule_id}/dry-run"),
+        admin,
+        Some(json!({"value": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "toggle dry-run: {body}");
+    let (status, body) = send(
+        app,
+        "DELETE",
+        &format!("/v1/policy-rules/{rule_id}"),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete rule: {body}");
+
+    // ── Users.
+    let (status, body) = send(
+        app,
+        "POST",
+        "/v1/users",
+        admin,
+        Some(json!({
+            "email": format!("i4-{}@example.invalid", Uuid::new_v4().simple()),
+            "password": "correct-horse-battery-staple",
+            "role": "viewer"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create user: {body}");
+
+    // ── Budget. `budget.updated` is written only when a field actually moves,
+    // so the values below must differ from the defaults.
+    let (status, body) = send(
+        app,
+        "PUT",
+        &format!("/v1/workspaces/{}/budgets", ws.id),
+        admin,
+        Some(json!({
+            "daily_token_limit": 123_456,
+            "monthly_token_limit": 7_890_123,
+            "behavior": "block"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put budget: {body}");
+
+    // ── Secure mode and the sidecar policy. One PUT, two audited actions —
+    // and BOTH are conditional on the value actually moving, so both must be
+    // driven away from the deployment default. `sidecar_unavailable` defaults
+    // to `block` (`SidecarUnavailablePolicy::Block`, and `test_config`'s
+    // `sidecar_unavailable_default`), so submitting `block` writes no row at
+    // all. The first draft of this test did exactly that and the caller's
+    // coverage assertion is what caught it.
+    let (status, body) = send(
+        app,
+        "PUT",
+        "/v1/secure-mode",
+        admin,
+        Some(json!({
+            "enabled": true,
+            "level": "strict",
+            "block_on_pii_detection": true,
+            "sidecar_unavailable": "degrade_with_alert"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put secure mode: {body}");
+
+    // ── License, activated then cleared.
+    let (token, _lic_id) = make_license_token(signing_key, "I-4 Doc Gate Co");
+    let (status, body) = send(
+        app,
+        "PUT",
+        "/v1/license",
+        admin,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "activate license: {body}");
+    let (status, body) = send(app, "DELETE", "/v1/license", admin, None).await;
+    assert_eq!(status, StatusCode::OK, "clear license: {body}");
+
+    // ── The four self-service auth events, in the one order that reaches all
+    // of them: enrol and confirm on the VIEWER (who is not forced into 2FA),
+    // then log in — which is now challenged rather than completed — clear the
+    // challenge, and finally disable.
+    let (status, enrolled) = send(app, "POST", "/v1/auth/2fa/enroll", viewer, None).await;
+    assert_eq!(status, StatusCode::OK, "enroll 2fa: {enrolled}");
+    let secret_b32 = enrolled["secret_b32"].as_str().expect("secret").to_owned();
+    let backup_codes: Vec<String> = enrolled["backup_codes"]
+        .as_array()
+        .expect("backup codes")
+        .iter()
+        .map(|code| code.as_str().expect("code").to_owned())
+        .collect();
+
+    let code = fresh_totp_code(pool, ws.viewer, &secret_b32).await;
+    let (status, body) = send(
+        app,
+        "POST",
+        "/v1/auth/2fa/verify",
+        viewer,
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "verify 2fa: {body}");
+
+    let (status, body) = login(app, &ws.viewer_email, SEED_PASSWORD).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "an enrolled account's login must stop at the challenge, or \
+         `auth.second_factor_verified` is unreachable: {body}"
+    );
+    let challenge_token = body["challenge_token"].as_str().expect("token").to_owned();
+    let code = fresh_totp_code(pool, ws.viewer, &secret_b32).await;
+    let (status, body) = send(
+        app,
+        "POST",
+        "/v1/auth/2fa/challenge",
+        &challenge_token,
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "clear challenge: {body}");
+
+    // Disabling with a BACKUP CODE rather than a TOTP code, so `verified_with`
+    // is written from the branch that is not the default.
+    let (status, body) = send(
+        app,
+        "POST",
+        "/v1/auth/2fa/disable",
+        viewer,
+        Some(json!({"code": backup_codes[0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "disable 2fa: {body}");
+}
+
 // ── RLS, proved from a role that cannot bypass it ─────────────────────────
 
 const RLS_ROLE: &str = "secureprompt_runner";
