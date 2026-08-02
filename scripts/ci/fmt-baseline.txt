@@ -22,7 +22,6 @@ secureprompt-api/src/http/routes/dashboard/budgets.rs
 secureprompt-api/src/http/routes/dashboard/keys.rs
 secureprompt-api/src/http/routes/dashboard/me.rs
 secureprompt-api/src/http/routes/dashboard/policy_rules.rs
-secureprompt-api/src/http/routes/dashboard/providers.rs
 secureprompt-api/src/http/routes/dashboard/requests.rs
 secureprompt-api/src/http/routes/dashboard/secure_mode.rs
 secureprompt-api/src/http/routes/internal.rs

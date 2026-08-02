@@ -132,10 +132,19 @@ pub fn routes() -> Router<AppState> {
         .route("/test-connection", post(test_connection_unsaved))
         .route("/{id}", put(update_provider).delete(delete_provider))
         .route("/{id}/test-connection", post(test_connection_stored))
-        .route("/{id}/models", get(list_provider_models).post(add_provider_model))
+        .route(
+            "/{id}/models",
+            get(list_provider_models).post(add_provider_model),
+        )
         .route("/{id}/models/sync", post(sync_provider_models))
-        .route("/{id}/models/bulk-delete", post(bulk_delete_provider_models))
-        .route("/{id}/models/{name}", axum::routing::delete(delete_provider_model))
+        .route(
+            "/{id}/models/bulk-delete",
+            post(bulk_delete_provider_models),
+        )
+        .route(
+            "/{id}/models/{name}",
+            axum::routing::delete(delete_provider_model),
+        )
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -163,7 +172,10 @@ async fn list_providers(
             .await
             .map_err(api_error_response)?
             .into_iter()
-            .map(|m| ModelSummary { id: m.id, name: m.name })
+            .map(|m| ModelSummary {
+                id: m.id,
+                name: m.name,
+            })
             .collect();
         items.push(ProviderResponse {
             id: r.id,
@@ -236,7 +248,10 @@ async fn create_provider(
         .await
         .map_err(api_error_response)?
         .into_iter()
-        .map(|m| ModelSummary { id: m.id, name: m.name })
+        .map(|m| ModelSummary {
+            id: m.id,
+            name: m.name,
+        })
         .collect();
 
     Ok((
@@ -315,7 +330,10 @@ async fn update_provider(
         .await
         .map_err(api_error_response)?
         .into_iter()
-        .map(|m| ModelSummary { id: m.id, name: m.name })
+        .map(|m| ModelSummary {
+            id: m.id,
+            name: m.name,
+        })
         .collect();
     Ok(Json(ProviderResponse {
         id: record.id,
@@ -356,6 +374,20 @@ async fn delete_provider(
 /// Any role; the dashboard renders this list when the user opens the provider's
 /// model panel and the LibreChat discovery client also reads it via the
 /// nested `models` field on `GET /v1/providers`.
+///
+/// # Tenancy lives in the callee, not here (MR6 F7)
+///
+/// This handler passes the path `provider_id` straight through and performs no
+/// ownership check of its own. What closes the cross-tenant leak is
+/// `ProviderRepository::list_models_for_provider`'s join predicate on BOTH
+/// tables — `rls_missing_predicate.rs` and `tenancy_predicate_guard.rs` pin it,
+/// and deleting either half reddens them.
+///
+/// The visible consequence, stated so nobody reads this route as checking
+/// ownership: naming another tenant's provider returns `200 []`, not `404`.
+/// That is not a leak and not an existence oracle — a provider id that exists
+/// nowhere returns `[]` too, so the two are indistinguishable — but it is also
+/// not a check.
 async fn list_provider_models(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
@@ -368,7 +400,10 @@ async fn list_provider_models(
         .map_err(api_error_response)?;
     let items = rows
         .into_iter()
-        .map(|m| ModelSummary { id: m.id, name: m.name })
+        .map(|m| ModelSummary {
+            id: m.id,
+            name: m.name,
+        })
         .collect();
     Ok(Json(items))
 }
@@ -400,7 +435,10 @@ async fn add_provider_model(
         .map_err(api_error_response)?;
     Ok((
         StatusCode::CREATED,
-        Json(ModelSummary { id: row.id, name: row.name }),
+        Json(ModelSummary {
+            id: row.id,
+            name: row.name,
+        }),
     ))
 }
 
@@ -463,7 +501,10 @@ async fn test_connection_unsaved(
         .config
         .as_ref()
         .map(crate::providers::vertex::VertexConfig::from_value)
-        .unwrap_or(crate::providers::vertex::VertexConfig { region: None, project: None });
+        .unwrap_or(crate::providers::vertex::VertexConfig {
+            region: None,
+            project: None,
+        });
     let result = crate::providers::credential_test::test_connection(
         &body.provider_type,
         &body.credential,
@@ -686,10 +727,7 @@ async fn encrypt_credential(
 /// # Errors
 /// Returns `ApiError::Internal` when the ciphertext is invalid base64 or decryption fails.
 #[allow(dead_code)]
-pub async fn decrypt_stored_credential(
-    stored: &str,
-    state: &AppState,
-) -> Result<String, ApiError> {
+pub async fn decrypt_stored_credential(stored: &str, state: &AppState) -> Result<String, ApiError> {
     let raw = URL_SAFE_NO_PAD
         .decode(stored)
         .map_err(|e| ApiError::Internal(format!("credential decode failed: {e}")))?;
