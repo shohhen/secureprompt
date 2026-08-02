@@ -48,23 +48,66 @@ QUARANTINE_FILE="scripts/ci/quarantine.tsv"
 TEST_THREADS="${TEST_THREADS:-4}"
 
 # --------------------------------------------------------------------------
-# Suite discovery. Deliberately derived from the filesystem rather than a
-# hand-maintained list: a newly added tests/*.rs is gated automatically, so
-# nobody can add a test file that quietly never runs.
+# Suite discovery. Derived from the workspace members and then from each
+# package's filesystem layout, so a new crate, a new tests/*.rs and a new
+# #[cfg(test)] module in a binary are all gated without editing this script.
+#
+# This block used to hard-code the packages in two lists — tests/*.rs globbed
+# for `secureprompt-common` and `secureprompt-api`, `--bins` only for the
+# other three — under a comment claiming "a newly added tests/*.rs is gated
+# automatically, so nobody can add a test file that quietly never runs". That
+# was false in both directions, and one direction was LIVE, not latent:
+# `secureprompt-api` has a `[[bin]]` as well as a `[lib]`, only `--lib` was
+# ever selected, and the six #[cfg(test)] tests in secureprompt-api/src/main.rs
+# had never run in this gate. A tests/ directory added to the worker, the MCP
+# server or sp-agent would likewise never have been globbed. The quarantine
+# cross-check cannot see either case: it reconciles cargo's `N ignored`, which
+# stays 0 for a binary that was never built.
+#
+# WHAT IS STILL NOT DISCOVERED, stated rather than implied: a target declared
+# in a package's Cargo.toml at a NON-DEFAULT path (`[[test]] path = ...`, a
+# `[lib]`/`[[bin]]` outside src/). No package does that today — the two
+# explicit declarations in secureprompt-api/Cargo.toml both point at the
+# default paths — and `cargo metadata` would be the fix if one ever did.
 # --------------------------------------------------------------------------
 SUITES=()
-for pkg in secureprompt-common secureprompt-api; do
-  SUITES+=("-p ${pkg} --lib")
+# Workspace members, read from the root manifest rather than repeated here.
+WORKSPACE_PKGS=$(
+  awk '
+    /^\[workspace\]/            { in_ws = 1; next }
+    in_ws && /^\[/              { in_ws = 0 }
+    in_ws && /^members[[:space:]]*=/ { in_members = 1 }
+    in_members {
+      if (match($0, /"[^"]+"/)) { print substr($0, RSTART + 1, RLENGTH - 2) }
+      if (/\]/) { in_members = 0 }
+    }
+  ' Cargo.toml
+)
+if [ -z "$WORKSPACE_PKGS" ]; then
+  echo "FAIL: no workspace members parsed out of Cargo.toml. The gate refuses" >&2
+  echo "      to run against an empty package list — that would report OK" >&2
+  echo "      while executing nothing." >&2
+  exit 2
+fi
+for pkg in $WORKSPACE_PKGS; do
+  if [ ! -d "$pkg" ]; then
+    echo "FAIL: workspace member '${pkg}' has no directory at the repo root." >&2
+    exit 2
+  fi
+  # Unit tests: one selector per target KIND the package actually has. A
+  # crate with both (secureprompt-api) needs both, or half its #[cfg(test)]
+  # modules are invisible.
+  [ -f "${pkg}/src/lib.rs" ] && SUITES+=("-p ${pkg} --lib")
+  if [ -f "${pkg}/src/main.rs" ] || [ -d "${pkg}/src/bin" ]; then
+    SUITES+=("-p ${pkg} --bins")
+  fi
+  # Integration tests: every tests/*.rs, for every package.
   if [ -d "${pkg}/tests" ]; then
     for f in "${pkg}"/tests/*.rs; do
       [ -e "$f" ] || continue
       SUITES+=("-p ${pkg} --test $(basename "$f" .rs)")
     done
   fi
-done
-# Binary-only crates: their tests live in src/ behind #[cfg(test)].
-for pkg in secureprompt-worker secureprompt-mcp sp-agent; do
-  SUITES+=("-p ${pkg} --bins")
 done
 
 # --------------------------------------------------------------------------
