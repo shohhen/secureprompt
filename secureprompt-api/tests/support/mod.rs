@@ -6,8 +6,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use secureprompt_api::{
-    app_state::AppState, db::api_key_repo::hash_api_key, http::build_router,
-    ml_sidecar::MlSidecarClient,
+    app_state::AppState, db::api_key_repo::hash_api_key, db::scope::begin_scoped,
+    http::build_router, ml_sidecar::MlSidecarClient,
 };
 use secureprompt_common::config::{
     AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig, RedisConfig,
@@ -99,7 +99,41 @@ pub fn router_with_default(
     ))
 }
 
+/// MR1 review M4 — arm the tenancy scope the way production does, not the way
+/// that only looks like it.
+///
+/// The seeds below used to run
+/// `SELECT set_config('app.current_workspace_id', $1, false)` via
+/// `.execute(pool)`. Two things were wrong with that, and both were invisible:
+///
+///  1. `.execute(pool)` takes its own checkout from the pool. The INSERTs that
+///     followed took a DIFFERENT one, so the setting was never in scope for
+///     the statements it was written for.
+///  2. `false` is `is_local = false`, i.e. session-scoped. Even on one
+///     connection that leaks the workspace id onto whatever the pool hands out
+///     next — the precise thing `db::scope::begin_scoped`'s `true` avoids.
+///
+/// It was inert either way, because `#[sqlx::test]` connects as the role
+/// `DATABASE_URL` names and for the compose stack that is a superuser, which
+/// bypasses RLS including FORCE. So it changed no result — it only told the
+/// next reader "this seed is RLS-aware" when it was not. The day these suites
+/// run as `secureprompt_app` (the DB role split makes that a supported
+/// configuration) the INSERTs below would start being rejected, and
+/// `seed_workspace` did not even have the inert version despite `api_keys`
+/// being armed and FORCEd since 001.
+///
+/// These now go through the production helper, `db::scope::begin_scoped`,
+/// which sets the GUC transaction-locally AND READS IT BACK — so an unarmed
+/// transaction fails loudly rather than seeding nothing.
+fn scope_err(e: secureprompt_common::errors::ApiError) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("scoped seed transaction failed: {e}"))
+}
+
 pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) -> sqlx::Result<()> {
+    // `workspaces` itself is NOT RLS-armed (no `workspace_id` column to key a
+    // policy off), and the scope below names the row this INSERT creates, so
+    // it has to land first — the same ordering constraint
+    // `WorkspaceRepository::create_with_owner` documents.
     sqlx::query(
         "INSERT INTO workspaces (id, name, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())",
@@ -109,6 +143,9 @@ pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) ->
     .execute(pool)
     .await?;
 
+    // `api_keys` IS armed and FORCEd (001_init). This seed had no scoping at
+    // all before.
+    let mut tx = begin_scoped(pool, workspace_id).await.map_err(scope_err)?;
     sqlx::query(
         "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at)
          VALUES ($1, $2, $3, $4, NOW())",
@@ -117,8 +154,9 @@ pub async fn seed_workspace(pool: &PgPool, workspace_id: Uuid, api_key: &str) ->
     .bind(workspace_id)
     .bind("default")
     .bind(hash_api_key(api_key))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -132,10 +170,10 @@ pub async fn seed_provider_and_model(
     credential: Option<&str>,
     public_model: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
-        .bind(workspace_id.to_string())
-        .execute(pool)
-        .await?;
+    // `providers` and `models` are both armed and FORCEd. One scoped
+    // transaction covers both INSERTs — see `scope_err` above for what was
+    // here before and why it did nothing.
+    let mut tx = begin_scoped(pool, workspace_id).await.map_err(scope_err)?;
 
     sqlx::query(
         "INSERT INTO providers (id, workspace_id, name, provider_type, encrypted_credential, created_at, updated_at)
@@ -146,7 +184,7 @@ pub async fn seed_provider_and_model(
     .bind(provider_name)
     .bind(provider_type)
     .bind(credential)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query(
@@ -157,8 +195,10 @@ pub async fn seed_provider_and_model(
     .bind(workspace_id)
     .bind(provider_id)
     .bind(public_model)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(())
 }
@@ -174,10 +214,8 @@ pub async fn seed_policy_rule(
     action_params: Value,
     dry_run: bool,
 ) -> sqlx::Result<()> {
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, false)")
-        .bind(workspace_id.to_string())
-        .execute(pool)
-        .await?;
+    // `policy_rules` is armed and FORCEd since 001_init.
+    let mut tx = begin_scoped(pool, workspace_id).await.map_err(scope_err)?;
 
     sqlx::query(
         "INSERT INTO policy_rules
@@ -193,8 +231,10 @@ pub async fn seed_policy_rule(
     .bind(action)
     .bind(action_params)
     .bind(dry_run)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(())
 }
