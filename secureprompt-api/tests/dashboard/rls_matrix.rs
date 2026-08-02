@@ -168,6 +168,56 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
     );
 }
 
+/// Seed one `policy_events` row for `workspace_id` carrying `canary` as the
+/// rule NAME.
+///
+/// MR1 review I7: two of the four `NoCanary` cases —
+/// `/v1/analytics/policy-violations` and `/v1/analytics/latency-pctiles` —
+/// asserted the absence of a canary the endpoint could not have returned.
+/// The only canary was a `request_events` row, and `query_policy_violations`
+/// reads `mart_policy_violations` and falls back to `policy_events`; neither
+/// touches `request_events` and both were empty. `body.contains(canary)` was
+/// therefore false unconditionally, and removing `WHERE workspace_id = ?` from
+/// `dashboard_reader.rs` left both cases green.
+///
+/// `rule_name` is the carrier because `PolicyViolationsRow` serialises it, so
+/// a row belonging to another tenant is visible in the response body — which
+/// is the only thing the matrix's classifier can see.
+async fn seed_policy_event(workspace_id: Uuid, canary: &str) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.policy_events \
+             (request_id, workspace_id, rule_id, rule_name, action, dry_run, created_at) \
+             VALUES ('{rid}', '{ws}', '{rule}', '{canary}', 'redact', false, now())",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            rule = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding policy_events",
+    )
+    .await;
+}
+
+/// Seed one `latency_samples` row for `workspace_id` carrying `canary` as the
+/// MODEL name — the `latency-pctiles` half of I7, same reasoning as
+/// `seed_policy_event`. `LatencyPctilesRow` serialises `model`, and
+/// `query_latency_pctiles` falls back to `latency_samples`.
+async fn seed_latency_sample(workspace_id: Uuid, canary: &str) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.latency_samples \
+             (request_id, workspace_id, model, latency_ms, created_at) \
+             VALUES ('{rid}', '{ws}', '{canary}', 120, now())",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding latency_samples",
+    )
+    .await;
+}
+
 /// POST a statement to the test `ClickHouse`, failing loudly with the server's
 /// own error text. Same "never skip" stance as `seed_canary`: an unreachable or
 /// erroring datastore must fail the run, not silently weaken it.
@@ -363,18 +413,21 @@ fn matrix_cases() -> Vec<Case> {
             body_fn: None,
             expect: Expect::ForbiddenOrEmpty,
         },
-        Case {
-            method: "GET",
-            path_template: "/v1/providers?workspace_id={B}",
-            body_fn: None,
-            expect: Expect::ForbiddenOrEmpty,
-        },
-        Case {
-            method: "GET",
-            path_template: "/v1/policy-rules?workspace_id={B}",
-            body_fn: None,
-            expect: Expect::ForbiddenOrEmpty,
-        },
+        // `/v1/providers?workspace_id={B}` and `/v1/policy-rules?workspace_id={B}`
+        // used to sit here and were REMOVED by MR1 review I6. Neither handler
+        // takes a `workspace_id` query parameter — `list_providers` and
+        // `list_rules` are `(State, Extension<JwtAuthContext>)` and axum
+        // discards the query string — so there was no production line whose
+        // deletion could redden them, which directly contradicts
+        // `Expect::ForbiddenOrEmpty`'s doc ("the guard should reject before
+        // any query runs"). They were fixtures named for a code path that
+        // does not exist.
+        //
+        // The property those endpoints DO have — a supplied `workspace_id`
+        // must not change the answer, and must never surface another tenant's
+        // rows — is real and was untested. It is now
+        // `providers_and_policy_rules_ignore_a_workspace_id_parameter` below,
+        // where it can be falsified by a production line.
         Case {
             method: "GET",
             path_template: "/v1/workspaces/{B}/budgets",
@@ -391,6 +444,11 @@ fn matrix_cases() -> Vec<Case> {
 
     // ---- Omitted workspace_id: the guard never fires -----------------------
     // These are the cases that catch a query missing its tenancy predicate.
+    // All four of them, since MR1 review I7: the canary is now seeded into
+    // `policy_events` and `latency_samples` as well as `request_events`, so
+    // `policy-violations` and `latency-pctiles` can finally see the row whose
+    // absence they assert. Before that, this comment was true only of
+    // `usage-daily` and `cost-by-model`.
     for path in [
         "/v1/analytics/usage-daily",
         "/v1/analytics/cost-by-model",
@@ -560,8 +618,36 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
 
     // Give workspace B something worth stealing, tagged uniquely per run so a
     // sighting can never be coincidental.
+    //
+    // THREE tables, not one (MR1 review I7). The canary used to be a
+    // `request_events` row only, and `policy-violations` / `latency-pctiles`
+    // read `policy_events` / `latency_samples` — so their `NoCanary` cases
+    // asserted the absence of something the endpoint structurally could not
+    // return, and stayed green with `WHERE workspace_id = ?` deleted from
+    // `dashboard_reader.rs`.
     let canary = format!("rls-canary-{}", Uuid::new_v4().simple());
     seed_canary(seeded.workspace_b, &canary).await;
+    seed_policy_event(seeded.workspace_b, &canary).await;
+    seed_latency_sample(seeded.workspace_b, &canary).await;
+
+    // And give workspace A — the CALLER — its own rows in the same three
+    // tables (MR1 review I6).
+    //
+    // Only B was seeded before, so for every endpoint that already scopes by
+    // `ctx.workspace_id` the `ForbiddenOrEmpty` verdict was reachable two
+    // ways: 403 from the IDOR guard, or `200 []` because the caller's own
+    // workspace was empty. Deleting all four guards at
+    // `analytics.rs:80-88,…` and the one at `requests.rs:238-244` left the
+    // matrix green — measured. With A seeded, guard deletion returns A's own
+    // rows for a request that named B, `rows_of` sees a non-empty array, and
+    // the verdict is `Leak`.
+    //
+    // A's marker is deliberately NOT the canary: a canary sighting is a leak
+    // by definition in `classify`, and A seeing its own data is correct.
+    let own = format!("rls-own-{}", Uuid::new_v4().simple());
+    seed_canary(seeded.workspace_a, &own).await;
+    seed_policy_event(seeded.workspace_a, &own).await;
+    seed_latency_sample(seeded.workspace_a, &own).await;
 
     // Build Redis pool (needed by AppState even if not seeding budget data).
     let _redis_pool = RedisConfig::from_url(redis_url())
