@@ -1093,8 +1093,15 @@ mod tests {
         assert!(validate_window(from, exactly_max).is_ok());
     }
 
-    /// Every read in this module must carry the tenancy predicate. The
-    /// constant is the mechanism; this pins that it is what it claims to be.
+    /// [`SCOPE`] is what it claims to be — the SHAPE of the constant.
+    ///
+    /// Scope note, because the name overstates on its own: this asserts the
+    /// constant, not its use. It cannot see a new query added to this module
+    /// that reads an analytics table without interpolating `{SCOPE}`, which is
+    /// the way the tenancy guarantee would actually be lost.
+    /// [`every_analytics_read_in_this_module_carries_the_scope`] covers that
+    /// half, and the two together are what the module's tenancy claim rests
+    /// on.
     #[test]
     fn the_shared_scope_binds_the_workspace() {
         assert!(
@@ -1113,6 +1120,94 @@ mod tests {
             "both instants must go through toDateTime: a chrono datetime bound \
              directly serialises as RFC 3339 and ClickHouse rejects it with \
              TYPE_MISMATCH, which surfaced as a 500 on every report: {SCOPE}"
+        );
+    }
+
+    /// Every read of an analytics table in this module interpolates
+    /// [`SCOPE`].
+    ///
+    /// The sibling test above pins the constant. A constant nobody
+    /// interpolates protects nothing: `SCOPE.starts_with("workspace_id = ?")`
+    /// stays true forever while a newly added
+    /// `SELECT … FROM request_events WHERE api_key_id = ?` reads every
+    /// workspace's rows. Reviewer discipline was the only thing standing
+    /// between this module and that query, and this is the rule stated over
+    /// the source instead.
+    ///
+    /// PREMISE: the scrape must find reads at all, or an empty set passes.
+    /// CONTROLS: the classifier is run over both spellings — a read with the
+    /// interpolation and the same read without it.
+    #[test]
+    fn every_analytics_read_in_this_module_carries_the_scope() {
+        const WHOLE_FILE: &str = include_str!("leak_report.rs");
+        /// Tables that hold per-workspace analytics rows. A read of one of
+        /// these without the tenancy predicate crosses a tenant boundary.
+        const TENANT_TABLES: [&str; 2] = ["detection_class_counts", "request_events"];
+
+        /// `true` when `window` reads a tenant table without `{SCOPE}`.
+        /// `window` is the FROM line plus the line after it, because the
+        /// predicate is sometimes wrapped onto the continuation line.
+        fn is_unscoped_read(window: &str) -> bool {
+            TENANT_TABLES
+                .iter()
+                .any(|t| window.contains(&format!("FROM {t}")))
+                && !window.contains("{SCOPE}")
+        }
+
+        assert!(
+            is_unscoped_read("\"SELECT count() FROM request_events WHERE api_key_id = ?\""),
+            "control: a read that binds something OTHER than the workspace \
+             must be flagged, or this test cannot see the defect it exists for"
+        );
+        assert!(
+            !is_unscoped_read(
+                "\"SELECT count() FROM request_events WHERE {SCOPE} AND api_key_id = ?\""
+            ),
+            "control: the scoped spelling of the same read must not be flagged"
+        );
+
+        // The HANDLER half only. This test's own body quotes both spellings,
+        // so scanning itself would fail permanently on its own controls.
+        let handler_half = WHOLE_FILE
+            .split_once("\n#[cfg(test)]\n")
+            .expect("premise: this module must end in a #[cfg(test)] block")
+            .0;
+        assert!(
+            handler_half.len() > WHOLE_FILE.len() / 2,
+            "premise failed: the split kept only {} of {} bytes — the marker \
+             moved and this test is scanning almost nothing",
+            handler_half.len(),
+            WHOLE_FILE.len()
+        );
+
+        let lines: Vec<&str> = handler_half.lines().collect();
+        let mut reads = 0_usize;
+        let mut unscoped: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !TENANT_TABLES
+                .iter()
+                .any(|t| line.contains(&format!("FROM {t}")))
+            {
+                continue;
+            }
+            reads += 1;
+            let window = format!("{line}\n{}", lines.get(i + 1).unwrap_or(&""));
+            if is_unscoped_read(&window) {
+                unscoped.push(format!("line {}: {}", i + 1, line.trim()));
+            }
+        }
+
+        assert!(
+            reads >= 5,
+            "premise failed: only {reads} analytics read(s) found in the \
+             handler half. This module has seven; the scrape has stopped \
+             matching and would pass over an empty set"
+        );
+        assert!(
+            unscoped.is_empty(),
+            "these reads of a per-workspace analytics table do not interpolate \
+             SCOPE, so they are not bound to the caller's workspace:\n  {}",
+            unscoped.join("\n  ")
         );
     }
 
