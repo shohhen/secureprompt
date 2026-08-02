@@ -45,6 +45,29 @@
 //! runtime read-back rather than replacing it.
 //! `the_detector_actually_detects` is the positive control that keeps the
 //! scanner itself honest.
+//!
+//! Two limits were STATED here and were wrong in the same direction, so they
+//! are named individually now rather than left inside "the scan is textual":
+//!
+//!   * MR6 F4 — the executor filter was `contains("tx") || contains("conn")`,
+//!     which skipped `&ctx.pool` and `&self.conn_pool`. Closed;
+//!     `executor_is_scoped` tests the trailing identifier and
+//!     `the_executor_filter_skips_transactions_and_not_pools_that_merely_spell_them`
+//!     pins both directions.
+//!   * MR5 I-3 — everything after a file's FIRST `#[cfg(test)]` was discarded,
+//!     whether or not it introduced a module; three files lost application
+//!     source that way, one of them 967 lines. Closed; `strip_test_modules`
+//!     removes modules only, and `only_test_modules_are_removed_from_the_scan`
+//!     pins it.
+//!
+//! ONE limit of that family is still OPEN and is not claimed closed: the
+//! executor regex is applied PER LINE, so `.fetch_all(\n    &self.pool,\n)`
+//! split across lines is invisible. Measured at the tip: the only multi-line
+//! `.execute(` calls in application source are `openai.rs:278` and `:379`,
+//! which are `PipelineService::execute` and not sqlx, so there is no live false
+//! negative — but rustfmt will produce that shape as soon as an executor
+//! expression grows past the line budget, and closing it needs a parse rather
+//! than a wider regex.
 
 use regex::Regex;
 use sqlx::PgPool;
@@ -240,6 +263,103 @@ fn rs_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Is this executor expression an already-scoped unit — a transaction, or a
+/// connection whose scope its caller owns?
+///
+/// MR6 F4: this used to be `executor.contains("tx") || executor.contains("conn")`,
+/// which skips any expression containing those two letter-runs ANYWHERE.
+/// `&ctx.pool`, `&self.conn_pool` and `&context.db` are bare pools that the
+/// substring test waves through, and a guard that cannot see a whole naming
+/// convention is one rename away from being blind.
+///
+/// A plain `\btx\b` is not the fix either, and this is why it is written out
+/// rather than left to a regex: `&mut *probe_tx` (`refresh_token_repo.rs:203`
+/// and `:386`, both real transactions) has no word boundary before `tx`, so a
+/// word-boundary rule turns two correct call sites into false positives and the
+/// allowlist grows to accommodate the scanner. MEASURED: substring → 1 hit,
+/// `\btx\b` → 3 hits, this rule → the same 1 hit, which is the documented
+/// generic-parameter false positive in `retention_purge.rs`.
+///
+/// So the test is on the TRAILING IDENTIFIER, with `_` treated as the word
+/// separator Rust uses: exactly `tx`/`conn`, or a suffix `_tx`/`_conn`.
+fn executor_is_scoped(executor: &str) -> bool {
+    let ident: String = executor
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    ident == "tx" || ident == "conn" || ident.ends_with("_tx") || ident.ends_with("_conn")
+}
+
+/// Remove `#[cfg(test)]`-gated MODULES, and nothing else.
+///
+/// MR5 I-3: this used to be `source.find("\n#[cfg(test)]")` and a truncation to
+/// that point, which drops everything after the FIRST such marker whether or
+/// not it introduces a module. MEASURED at the tip, that silently removed
+/// application source from the scan in three files —
+/// `worker/tasks/audit_export.rs` cut at line 108 of 1075 (the marker sits on a
+/// `pub const`), `db/license_repo.rs` at 110 of 155 (on a `pub async fn`), and
+/// `dashboard/secure_mode.rs` at 148 of 703 (on a real but NON-FINAL test
+/// module, with every handler in the file below it). The guard's header
+/// promises it is exact in both directions; ~2,000 lines of application source
+/// were outside it.
+///
+/// It happened to miss no violation — verified by running the scan with and
+/// without the cut: the only difference is `db/workspace_repo.rs:408`, which is
+/// genuinely inside its own `mod tests`. That is luck, not a property.
+///
+/// Column-0 `}` ends a top-level item in rustfmt-formatted source, and every
+/// scanned crate is under the fmt gate, so brace COUNTING is not needed — which
+/// matters, because a SQL literal containing an unbalanced brace would defeat
+/// counting and this repository writes `{{placeholder}}` strings.
+///
+/// Removed lines are BLANKED rather than deleted. `scan` reports `file:line`
+/// and an engineer opens that line; dropping lines would shift every number
+/// after a stripped module and point them at the wrong statement.
+fn strip_test_modules(source: &str) -> String {
+    let mut lines: Vec<&str> = source.lines().collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        if lines[idx] != "#[cfg(test)]" {
+            idx += 1;
+            continue;
+        }
+        let mut next = idx + 1;
+        while next < lines.len() && lines[next].trim().is_empty() {
+            next += 1;
+        }
+        let introduces_module = next < lines.len()
+            && lines[next]
+                .strip_prefix("pub(crate) ")
+                .or_else(|| lines[next].strip_prefix("pub "))
+                .unwrap_or(lines[next])
+                .starts_with("mod ");
+        if !introduces_module {
+            idx += 1;
+            continue;
+        }
+        // `#[cfg(test)] mod tests;` is a file-level declaration and owns only
+        // its own two lines; anything else owns up to its column-0 `}`.
+        let end = if lines[next].trim_end().ends_with(';') {
+            next
+        } else {
+            let mut close = next + 1;
+            while close < lines.len() && lines[close] != "}" {
+                close += 1;
+            }
+            close.min(lines.len().saturating_sub(1))
+        };
+        for line in lines.iter_mut().take(end + 1).skip(idx) {
+            *line = "";
+        }
+        idx = end + 1;
+    }
+    lines.join("\n")
+}
+
 /// Find every statement on one of `armed` executed against something that is
 /// not a transaction or an explicit connection.
 ///
@@ -253,10 +373,7 @@ fn scan(source: &str, file: &str, armed: &BTreeSet<String>) -> Vec<CallSite> {
         .expect("table regex");
 
     // Unit tests live behind `#[cfg(test)]` and are not application paths.
-    let body = match source.find("\n#[cfg(test)]") {
-        Some(cut) => &source[..cut],
-        None => source,
-    };
+    let body = strip_test_modules(source);
     let lines: Vec<&str> = body.lines().collect();
 
     let mut found = Vec::new();
@@ -267,7 +384,7 @@ fn scan(source: &str, file: &str, armed: &BTreeSet<String>) -> Vec<CallSite> {
         let executor = caps[1].trim();
         // A transaction is already the scoped unit; an explicit connection is
         // managed by its caller. Only pools are unscoped by construction.
-        if executor.contains("tx") || executor.contains("conn") {
+        if executor_is_scoped(executor) {
             continue;
         }
 
@@ -461,5 +578,143 @@ fn the_detector_actually_detects() {
     assert!(
         scan(unarmed, "synthetic.rs", &armed).is_empty(),
         "a table that is not armed must not be reported"
+    );
+}
+
+/// MR6 F4 — the executor filter must skip transactions and NOTHING ELSE.
+///
+/// The old `contains("tx") || contains("conn")` skipped any expression with
+/// those letter-runs anywhere in it. Each pool below is a bare pool the guard
+/// must see; each transaction below is one it must not report, including
+/// `&mut *probe_tx`, which a naive `\btx\b` rule would wrongly flag.
+#[test]
+fn the_executor_filter_skips_transactions_and_not_pools_that_merely_spell_them() {
+    let armed: BTreeSet<String> = ["policy_rules".to_owned()].into_iter().collect();
+
+    let statement = |executor: &str| {
+        format!(
+            "\n        let rows = sqlx::query(\"SELECT name FROM policy_rules WHERE workspace_id = $1\")\n\
+             \x20           .bind(workspace_id)\n\
+             \x20           .fetch_all({executor})\n\
+             \x20           .await?;\n"
+        )
+    };
+
+    // MUST BE FLAGGED. Every one of these is a pool.
+    for pool in [
+        "&ctx.pool",
+        "&self.conn_pool",
+        "&context.db",
+        "&self.pool",
+        "&state.db",
+        "pg",
+    ] {
+        assert_eq!(
+            scan(&statement(pool), "synthetic.rs", &armed).len(),
+            1,
+            "`{pool}` is a bare pool and must be flagged; the substring filter \
+             this replaced skipped the first three of these"
+        );
+    }
+
+    // MUST NOT BE FLAGGED. Every one of these is an already-scoped unit, and
+    // `&mut *probe_tx` is a real call site (`db/refresh_token_repo.rs`).
+    for scoped in [
+        "&mut *tx",
+        "&mut **tx",
+        "&mut *probe_tx",
+        "&mut conn",
+        "&mut probe_conn",
+    ] {
+        assert!(
+            scan(&statement(scoped), "synthetic.rs", &armed).is_empty(),
+            "`{scoped}` is a transaction or caller-managed connection and must \
+             not be reported; a rule that flags it grows the allowlist to \
+             accommodate the scanner"
+        );
+    }
+}
+
+/// MR5 I-3 — only `#[cfg(test)]` MODULES are removed, and application source
+/// after one is still scanned.
+///
+/// The old truncation cut at the first `\n#[cfg(test)]` and discarded the rest
+/// of the file. `dashboard/secure_mode.rs` puts a test module at line 148 of
+/// 703 and every handler below it; `worker/tasks/audit_export.rs` carries the
+/// marker on a `pub const` at line 108 of 1075.
+#[test]
+fn only_test_modules_are_removed_from_the_scan() {
+    let armed: BTreeSet<String> = ["policy_rules".to_owned()].into_iter().collect();
+
+    // A test module in the MIDDLE of a file, with an application statement
+    // after it. The statement after must be flagged; the one inside must not.
+    let mid_file_module = "\
+fn before() {}
+
+#[cfg(test)]
+mod inline_tests {
+    fn fixture() {
+        sqlx::query(\"INSERT INTO policy_rules (id) VALUES ($1)\")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+pub async fn after(&self) {
+    let rows = sqlx::query(\"SELECT name FROM policy_rules WHERE workspace_id = $1\")
+        .fetch_all(&self.pool)
+        .await?;
+}
+";
+    let hits = scan(mid_file_module, "synthetic.rs", &armed);
+    assert_eq!(
+        hits.len(),
+        1,
+        "application source AFTER a test module must still be scanned, and the \
+         fixture INSIDE it must not be reported, got {hits:?}"
+    );
+    // And the reported line is the line in the ORIGINAL file, not in a
+    // compacted copy: `sqlx::query` is line 14 of the fixture above. Blanking
+    // rather than deleting is what keeps `file:line` openable.
+    assert_eq!(
+        hits[0].line, 14,
+        "the surviving hit must be the statement below the module, reported at \
+         its real line number"
+    );
+
+    // `#[cfg(test)]` on a NON-module item must not remove anything.
+    let marker_on_a_function = "\
+#[cfg(test)]
+pub fn helper() -> u8 { 1 }
+
+pub async fn application(&self) {
+    let rows = sqlx::query(\"SELECT name FROM policy_rules WHERE workspace_id = $1\")
+        .fetch_all(&self.pool)
+        .await?;
+}
+";
+    assert_eq!(
+        scan(marker_on_a_function, "synthetic.rs", &armed).len(),
+        1,
+        "a `#[cfg(test)]` on a function must not truncate the file; that cut \
+         removed 967 lines of `worker/tasks/audit_export.rs` from the scan"
+    );
+
+    // `#[cfg(test)] mod tests;` — the path-declaration form.
+    let declaration_form = "\
+#[cfg(test)]
+mod tests;
+
+pub async fn application(&self) {
+    let rows = sqlx::query(\"SELECT name FROM policy_rules WHERE workspace_id = $1\")
+        .fetch_all(&self.pool)
+        .await?;
+}
+";
+    assert_eq!(
+        scan(declaration_form, "synthetic.rs", &armed).len(),
+        1,
+        "a `mod tests;` declaration removes two lines, not the rest of the file"
     );
 }
