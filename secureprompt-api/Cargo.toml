@@ -60,6 +60,11 @@ workspace = true
 [dev-dependencies]
 sqlx = { workspace = true }
 rand = "0.8"
+# MR7 review M1 — `tests/db_role_split.rs` installs a capturing subscriber to
+# assert the `schema_ahead_of_binary` WARNING actually fires. Already a normal
+# dependency of this crate (see above), so this adds no build cost; a
+# dev-dependency entry is what makes it visible to the integration-test crates.
+tracing-subscriber = { workspace = true }
 # WS2-5 — latency budget for the deterministic floor.
 #
 # `default-features = false` drops `plotters`/`rayon`/`html_reports`, which
