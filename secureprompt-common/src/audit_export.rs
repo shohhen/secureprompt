@@ -536,10 +536,21 @@ pub const REQUEST_COVERAGE: &str =
 ///
 /// FU5 moved twelve actions from the "not audited" list into the covered list
 /// and P1A moved ten more. The remaining gaps are named individually rather
-/// than summarised, and
-/// `admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places` fails if a
-/// newly audited action is not named in this string — so this prose cannot fall
-/// behind the code without a red test.
+/// than summarised, and BOTH directions of that claim are now enforced:
+///
+///   * `admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places` fails
+///     if a newly audited action is not named in this string;
+///   * `admin_audit.rs::every_mutating_control_plane_route_is_audited_or_named_as_a_gap`
+///     fails if a mutating control-plane route is neither audited nor named
+///     here as a gap — and fails if this string names a gap for a route that
+///     does not exist.
+///
+/// The second was a convention until MR4's review, and the convention had
+/// lapsed: four mutating routes were named nowhere, one of them
+/// `POST /v1/secure-mode/detokenize`, which returns the original PII in the
+/// clear; and the list named "reassigning an API key to a different member",
+/// an operation `keys.rs` has no route for. An auditor reading "named
+/// individually" concluded the list was exhaustive. It was not.
 pub const CONTROL_COVERAGE: &str =
     "AUDITED ADMINISTRATIVE ACTIONS ONLY. This section carries every row of \
      `raw_capture_audit` (WS3-1), `retention_purge_audit` (WS3-4), \
@@ -561,9 +572,20 @@ pub const CONTROL_COVERAGE: &str =
      and therefore appear NOWHERE in this export: every FAILED or refused \
      dashboard login, whether the email named an account or not; creating a \
      workspace through public signup; refreshing an access token; logging out; \
-     reassigning an API key to a different member; and adding, removing or \
-     excluding a provider's models. Their absence here is not evidence they did \
-     not happen. THE FAILED-LOGIN GAP IS DELIBERATE AND ITS SHAPE MATTERS: an \
+     a member editing their own name or position; requesting a signed export \
+     (this artifact does not record that it was asked for); testing a provider \
+     connection, saved or unsaved, which sends a stored credential outbound; \
+     tokenising content into the vault; RESTORING TOKENISED CONTENT TO THE \
+     ORIGINAL VALUES; and adding, removing or excluding a provider's models. \
+     Their absence here is not evidence they did not happen. THE \
+     RE-IDENTIFICATION GAP IS THE ONE TO READ TWICE: \
+     `POST /v1/secure-mode/detokenize` reads the token vault and returns the \
+     ORIGINAL values in the clear, it is open to every authenticated role, and \
+     NOTHING in this product records who called it or how much they read back. \
+     If your control objective is `every access to unmasked personal data is \
+     attributable`, this artifact does not meet it and no other artifact in \
+     this product does either. THE FAILED-LOGIN GAP IS DELIBERATE AND ITS \
+     SHAPE MATTERS: an \
      attempt against an email that names no account has no workspace to be \
      recorded under, so auditing only the attempts that DO resolve would make \
      the absence of a row mean `no such account`. Rather than ship an \

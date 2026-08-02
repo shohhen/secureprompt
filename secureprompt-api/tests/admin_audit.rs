@@ -2297,3 +2297,386 @@ async fn an_oidc_sign_in_is_audited_as_oidc_through_the_tail_the_callback_delega
     );
     assert_eq!(row.detail["outcome"], json!("session_issued"));
 }
+
+// ── MR4 F5 — the OTHER direction of the coverage claim ────────────────────
+
+/// The control-plane route surface this guard governs, relative to the repo
+/// root. The dashboard router directory plus `license.rs`, which lives outside
+/// it and carries two audited actions.
+///
+/// Deliberately NOT the data plane. `/v1/chat/completions`, `/v1/redact`,
+/// `/v1/vault/stash` and the MCP routes are covered by `REQUEST_COVERAGE`,
+/// which names its own absences; mixing the two planes into one guard would
+/// make each half's allowlist unreadable.
+const CONTROL_PLANE_ROUTE_FILES: &[&str] = &[
+    "secureprompt-api/src/http/routes/dashboard",
+    "secureprompt-api/src/http/routes/license.rs",
+];
+
+/// A mutating route and why the signed manifest is entitled not to mention it.
+enum Coverage {
+    /// It writes a control-plane row. The value is the action string, which
+    /// must therefore appear in `CONTROL_COVERAGE` — the direction
+    /// `the_action_vocabulary_is_pinned_in_three_places` already checks.
+    Audited(&'static str),
+    /// It writes nothing an auditor can read, and `CONTROL_COVERAGE` NAMES it
+    /// as a gap. The value is the exact phrase that must appear in that string.
+    DeclaredGap(&'static str),
+}
+
+/// Every mutating control-plane route, classified. `.0` is
+/// `<file basename> <PATH> <VERB>`, which is what the scanner below produces.
+///
+/// This table is the second direction of the coverage claim, and it is the one
+/// that was missing. `the_action_vocabulary_is_pinned_in_three_places` checks
+/// that every audited action is named in the manifest; nothing checked that
+/// every mutating route is either audited or named as a gap. MR4 F5 found four
+/// that were neither — including `POST /v1/secure-mode/detokenize`, which
+/// returns the ORIGINAL PII in the clear to any authenticated role, while the
+/// manifest told the auditor the gap list was exhaustive ("named
+/// individually").
+const MUTATING_ROUTE_COVERAGE: &[(&str, Coverage)] = &[
+    // twofactor.rs registers the same three paths on two routers (`routes()`
+    // and `build_router()`), so the scanner sees each twice; the key is the
+    // same and the table entry covers both.
+    (
+        "twofactor.rs /enroll POST",
+        Coverage::Audited("two_factor.enrollment_started"),
+    ),
+    (
+        "twofactor.rs /verify POST",
+        Coverage::Audited("two_factor.enabled"),
+    ),
+    (
+        "twofactor.rs /challenge POST",
+        Coverage::Audited("auth.second_factor_verified"),
+    ),
+    (
+        "twofactor.rs /disable POST",
+        Coverage::Audited("two_factor.disabled"),
+    ),
+    ("keys.rs / POST", Coverage::Audited("api_key.created")),
+    ("keys.rs /{id} DELETE", Coverage::Audited("api_key.revoked")),
+    (
+        "keys.rs /{id}/rotate POST",
+        Coverage::Audited("api_key.rotated"),
+    ),
+    // One PUT, three audited actions: `secure_mode.updated`,
+    // `sidecar_policy.updated` and `raw_capture.changed` all move through it.
+    (
+        "secure_mode.rs / PUT",
+        Coverage::Audited("secure_mode.updated"),
+    ),
+    (
+        "secure_mode.rs /tokenize POST",
+        Coverage::DeclaredGap("tokenising content into the vault"),
+    ),
+    (
+        "secure_mode.rs /detokenize POST",
+        Coverage::DeclaredGap("RESTORING TOKENISED CONTENT TO THE ORIGINAL VALUES"),
+    ),
+    (
+        "me.rs /profile PUT",
+        Coverage::DeclaredGap("a member editing their own name or position"),
+    ),
+    (
+        "policy_rules.rs / POST",
+        Coverage::Audited("policy_rule.created"),
+    ),
+    (
+        "policy_rules.rs /{id} PUT",
+        Coverage::Audited("policy_rule.updated"),
+    ),
+    (
+        "policy_rules.rs /{id} DELETE",
+        Coverage::Audited("policy_rule.deleted"),
+    ),
+    (
+        "policy_rules.rs /{id}/enabled PATCH",
+        Coverage::Audited("policy_rule.enabled_changed"),
+    ),
+    (
+        "policy_rules.rs /{id}/dry-run PATCH",
+        Coverage::Audited("policy_rule.dry_run_changed"),
+    ),
+    ("users.rs / POST", Coverage::Audited("user.created")),
+    (
+        "users.rs /{user_id}/sessions DELETE",
+        Coverage::Audited("session.revoked"),
+    ),
+    (
+        "users.rs /{user_id}/sessions/{session_id} DELETE",
+        Coverage::Audited("session.revoked"),
+    ),
+    (
+        "auth.rs /token POST",
+        Coverage::Audited("auth.login_succeeded"),
+    ),
+    (
+        "auth.rs /refresh POST",
+        Coverage::DeclaredGap("refreshing an access token"),
+    ),
+    (
+        "auth.rs /register POST",
+        Coverage::DeclaredGap("creating a workspace through public signup"),
+    ),
+    ("auth.rs /logout POST", Coverage::DeclaredGap("logging out")),
+    (
+        "budgets.rs /{id}/budgets PUT",
+        Coverage::Audited("budget.updated"),
+    ),
+    (
+        "providers.rs / POST",
+        Coverage::Audited("provider_credential.created"),
+    ),
+    (
+        "providers.rs /{id} PUT",
+        Coverage::Audited("provider_credential.updated"),
+    ),
+    (
+        "providers.rs /{id} DELETE",
+        Coverage::Audited("provider_credential.deleted"),
+    ),
+    (
+        "providers.rs /test-connection POST",
+        Coverage::DeclaredGap("testing a provider connection"),
+    ),
+    (
+        "providers.rs /{id}/test-connection POST",
+        Coverage::DeclaredGap("testing a provider connection"),
+    ),
+    (
+        "providers.rs /{id}/models POST",
+        Coverage::DeclaredGap("adding, removing or excluding a provider's models"),
+    ),
+    (
+        "providers.rs /{id}/models/sync POST",
+        Coverage::DeclaredGap("adding, removing or excluding a provider's models"),
+    ),
+    (
+        "providers.rs /{id}/models/bulk-delete POST",
+        Coverage::DeclaredGap("adding, removing or excluding a provider's models"),
+    ),
+    (
+        "providers.rs /{id}/models/{name} DELETE",
+        Coverage::DeclaredGap("adding, removing or excluding a provider's models"),
+    ),
+    (
+        "audit_export.rs / POST",
+        Coverage::DeclaredGap("requesting a signed export"),
+    ),
+    ("license.rs / PUT", Coverage::Audited("license.activated")),
+    ("license.rs / DELETE", Coverage::Audited("license.cleared")),
+];
+
+/// Pull `(path, verbs)` out of every `.route(...)` call in `source`.
+///
+/// A line-oriented scan will not do: `http/mod.rs` and several route files wrap
+/// `.route(` across three lines, and a scanner that silently sees fewer routes
+/// than exist is the shape of guard this whole review is about. So this walks
+/// to the matching close paren and takes the first string literal as the path
+/// and every `post(`/`put(`/`patch(`/`delete(` inside as a verb.
+fn routes_in(source: &str) -> Vec<(String, Vec<&'static str>)> {
+    let mut found = Vec::new();
+    let bytes: Vec<char> = source.chars().collect();
+    let mut idx = 0usize;
+    let needle: Vec<char> = ".route(".chars().collect();
+    while idx + needle.len() <= bytes.len() {
+        if bytes[idx..idx + needle.len()] != needle[..] {
+            idx += 1;
+            continue;
+        }
+        let mut depth = 1i32;
+        let mut cursor = idx + needle.len();
+        let start = cursor;
+        while cursor < bytes.len() && depth > 0 {
+            match bytes[cursor] {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        let call: String = bytes[start..cursor.saturating_sub(1)].iter().collect();
+        idx = cursor;
+
+        let Some(open) = call.find('"') else { continue };
+        let Some(close) = call[open + 1..].find('"') else {
+            continue;
+        };
+        let path = call[open + 1..open + 1 + close].to_owned();
+
+        let mut verbs = Vec::new();
+        for (frag, verb) in [
+            ("post(", "POST"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+            ("delete(", "DELETE"),
+        ] {
+            // `axum::routing::delete(` also ends in `delete(`; both match.
+            if call.contains(frag) {
+                verbs.push(verb);
+            }
+        }
+        if !verbs.is_empty() {
+            found.push((path, verbs));
+        }
+    }
+    found
+}
+
+fn control_plane_route_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("secureprompt-api must have a parent")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    for entry in CONTROL_PLANE_ROUTE_FILES {
+        let path = root.join(entry);
+        if path.is_dir() {
+            let mut files: Vec<_> = std::fs::read_dir(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                .filter_map(Result::ok)
+                .map(|d| d.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+                .collect();
+            files.sort();
+            for file in files {
+                let name = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("utf-8 file name")
+                    .to_owned();
+                if name == "mod.rs" {
+                    continue;
+                }
+                sources.push((
+                    name,
+                    std::fs::read_to_string(&file)
+                        .unwrap_or_else(|e| panic!("read {}: {e}", file.display())),
+                ));
+            }
+        } else {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 file name")
+                .to_owned();
+            sources.push((
+                name,
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+            ));
+        }
+    }
+    sources
+}
+
+/// MR4 F5 — every mutating control-plane route is either audited or NAMED in
+/// the signed manifest as a gap, and the phrase that names it really is in
+/// there.
+///
+/// `CONTROL_COVERAGE` is copied verbatim into every signed compliance manifest
+/// and tells the auditor its gap list is exhaustive: "the remaining gaps are
+/// named individually rather than summarised". Until this test, that half was a
+/// convention. `the_action_vocabulary_is_pinned_in_three_places` only checks
+/// `ALL ⊆ CONTROL_COVERAGE` — that an action the product DOES audit is
+/// mentioned. Nothing checked that a route the product does NOT audit is
+/// mentioned, which is the direction an auditor actually relies on.
+///
+/// Adding a mutating route now fails this test until it is classified, and
+/// classifying it as a gap fails until `CONTROL_COVERAGE` says so.
+#[test]
+fn every_mutating_control_plane_route_is_audited_or_named_as_a_gap() {
+    use secureprompt_common::audit_export::CONTROL_COVERAGE;
+
+    let table: BTreeMap<&str, &Coverage> = MUTATING_ROUTE_COVERAGE
+        .iter()
+        .map(|(key, coverage)| (*key, coverage))
+        .collect();
+    assert_eq!(
+        table.len(),
+        MUTATING_ROUTE_COVERAGE.len(),
+        "duplicate key in MUTATING_ROUTE_COVERAGE; one entry is shadowing another"
+    );
+
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
+    for (file, source) in control_plane_route_sources() {
+        for (path, verbs) in routes_in(&source) {
+            for verb in verbs {
+                scanned.insert(format!("{file} {path} {verb}"));
+            }
+        }
+    }
+
+    // PREMISE: the scanner found a route surface. A parser that silently
+    // matched nothing would make every assertion below vacuously true — the
+    // exact failure this test exists to prevent elsewhere.
+    assert!(
+        scanned.len() >= 25,
+        "premise: the scanner must find the control-plane route surface, found \
+         {} routes: {scanned:?}",
+        scanned.len()
+    );
+
+    let unclassified: Vec<&String> = scanned
+        .iter()
+        .filter(|key| !table.contains_key(key.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "these mutating control-plane routes are neither audited nor named as a \
+         gap in `CONTROL_COVERAGE`, the text copied into every signed \
+         compliance manifest. The manifest tells the auditor its gap list is \
+         exhaustive, so an unclassified route is the manifest making a false \
+         statement. Either audit it, or name it in `CONTROL_COVERAGE` and add \
+         it here: {unclassified:?}"
+    );
+
+    // A gap is only declared if the manifest ACTUALLY says so. Without this the
+    // table would be a second place to write prose that nothing compares.
+    let mut undeclared = Vec::new();
+    for (key, coverage) in MUTATING_ROUTE_COVERAGE {
+        match coverage {
+            Coverage::Audited(action) => {
+                assert!(
+                    CONTROL_COVERAGE.contains(action),
+                    "{key} is classified as audited via `{action}`, which the \
+                     manifest does not name"
+                );
+            }
+            Coverage::DeclaredGap(phrase) => {
+                if !CONTROL_COVERAGE.contains(phrase) {
+                    undeclared.push((key, phrase));
+                }
+            }
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "these routes are classified as DECLARED gaps but `CONTROL_COVERAGE` \
+         does not contain the phrase that names them: {undeclared:?}"
+    );
+
+    // The table may not name a route that does not exist. MR4 F5's other half:
+    // the gap list claimed "reassigning an API key to a different member",
+    // which `keys.rs` has never had a route for — a gap describing an
+    // operation the product does not have.
+    let phantom: Vec<&&str> = table
+        .keys()
+        .filter(|key| !scanned.contains(**key))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "MUTATING_ROUTE_COVERAGE names routes that do not exist. A gap list \
+         that describes operations the product does not have is as misleading \
+         as one that omits operations it does: {phantom:?}"
+    );
+
+    assert!(
+        !CONTROL_COVERAGE.contains("reassigning an API key"),
+        "`CONTROL_COVERAGE` still names API-key reassignment as a gap. \
+         `keys.rs` exposes POST /, DELETE /{{id}} and POST /{{id}}/rotate — \
+         there is no reassignment endpoint, so that gap describes nothing"
+    );
+}
