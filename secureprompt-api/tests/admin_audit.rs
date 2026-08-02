@@ -1258,8 +1258,12 @@ async fn the_action_vocabulary_is_pinned_in_three_places(pool: PgPool) {
 
     // PREMISE: there really is a vocabulary to compare, so three empty sets
     // cannot agree with each other and pass.
+    //
+    // MR4 F8: this floor said 12 while the vocabulary was 22 — a premise that
+    // has drifted ten below the truth stops being a premise. It tracks the
+    // count now; raise it with the vocabulary.
     assert!(
-        in_rust.len() >= 12,
+        in_rust.len() >= 22,
         "premise: the enum must carry the audited actions, found {}",
         in_rust.len()
     );

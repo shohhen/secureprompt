@@ -1532,7 +1532,18 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
     let ws = seed_workspace(&pool).await;
     let app = build_app(pool.clone());
 
-    let hostile_ua = format!("Mozilla/5.0 {}", "A".repeat(4000));
+    // MR4 F9: this used to be `format!("Mozilla/5.0 {}", "A".repeat(4000))`,
+    // which contains no token from `BROWSERS` and none from `PLATFORMS`, so
+    // `client_descriptor` returned `None` and BOTH `is_none_or` assertions
+    // below were satisfied by the `None` rather than by any property of the
+    // reducer. The test proved "an unrecognised UA stores nothing", which is a
+    // different statement from its own name. The hostile string is now
+    // RECOGNISABLE, so the reducer has to produce a `Some` for the length and
+    // the no-verbatim-bytes assertions to bite on.
+    let hostile_ua = format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/{} Safari/537.36",
+        "A".repeat(4000)
+    );
     sign_in(&app, &ws.viewer_email, "not-an-ip-address", &hostile_ua).await;
 
     let row: (Option<String>, Option<String>) = {
@@ -1548,15 +1559,21 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
         row.0, None,
         "a value that is not an IP address must be dropped, not stored"
     );
-    assert!(
-        row.1.as_deref().is_none_or(|d| d.len() <= 64),
-        "the client descriptor must be bounded, got {:?}",
-        row.1
+    // The assertions below are `is_none_or`, so a `None` satisfies them without
+    // exercising anything. This is what makes them non-vacuous: the hostile UA
+    // NAMES a browser and a platform, so the reducer must have produced a
+    // value, and the two claims are about that value.
+    let descriptor = row.1.as_deref().expect(
+        "a recognisable hostile UA must still yield a descriptor, or \
+                 the two assertions below prove nothing",
     );
     assert!(
-        row.1.as_deref().is_none_or(|d| !d.contains("AAAA")),
-        "no part of the raw User-Agent may be stored verbatim, got {:?}",
-        row.1
+        descriptor.len() <= 64,
+        "the client descriptor must be bounded, got {descriptor:?}"
+    );
+    assert!(
+        !descriptor.contains("AAAA"),
+        "no part of the raw User-Agent may be stored verbatim, got {descriptor:?}"
     );
 
     // CONTROL THAT MUST DIFFER: a well-formed device IS recorded, so the two
