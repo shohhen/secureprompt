@@ -99,6 +99,14 @@ pub const MAX_EXPORT_ROWS: u64 = 500_000;
 
 // ── Status vocabulary ─────────────────────────────────────────────────────
 
+/// The status a freshly created export row carries. The worker NEVER writes
+/// it — the API's create handler does, from its own `STATUS_QUEUED` in
+/// `http/routes/dashboard/audit_export.rs`. This copy exists so the tests can
+/// seed the state the worker picks up from, and `#[cfg(test)]` says so:
+/// without it the constant is dead on the binary target and shows up under the
+/// clippy gate's `-A dead_code`, filed there as a "test-support helper".
+/// Marking it is how that stays true instead of being excused.
+#[cfg(test)]
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_COMPLETE: &str = "complete";

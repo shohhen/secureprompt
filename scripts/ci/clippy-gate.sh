@@ -14,11 +14,19 @@
 #
 # WHAT THIS RUNS INSTEAD:
 #   `-D warnings` (so anything new is a hard failure) with pedantic and nursery
-#   dialled back to advisory, plus a NAMED allowlist of the 19 default-level
-#   lints that the tree currently trips. Measured: 44 default-level warnings
-#   across those 19 lints. Each is listed individually rather than hidden
-#   behind a category, so the list is reviewable, greppable, and shrinks
+#   dialled back to advisory, plus a NAMED allowlist of the default-level lints
+#   that the tree currently trips. Each is listed individually rather than
+#   hidden behind a category, so the list is reviewable, greppable, and shrinks
 #   file-by-file as debt is paid.
+#
+#   MEASURED 2026-08-02 (`cargo clippy --workspace --all-targets --
+#   -A clippy::pedantic -A clippy::nursery`, counted from the JSON output):
+#   117 default-level warnings across 17 lints. The header said "44 across
+#   those 19", which was stale in both numbers and in the count of lints: two
+#   allowlisted entries — `clone_on_copy` and `field_reassign_with_default` —
+#   had ZERO occurrences and have been retired, so the gate now enforces them.
+#   The largest remaining entries are `dead_code` (39) and
+#   `too_many_arguments` (32).
 #
 #   The point of the allowlist being explicit: introduce a NEW default-level
 #   clippy lint — including a real bug class like `clippy::await_holding_lock`
@@ -48,14 +56,20 @@ exec cargo clippy --workspace --all-targets -- \
   `# Style opinions, advisory only — see header.` \
   -A clippy::pedantic \
   -A clippy::nursery \
-  `# --- default-level debt allowlist (44 occurrences / 19 lints) --------` \
+  `# --- default-level debt allowlist (117 occurrences / 17 lints) -------` \
   `# behavioural — retire these first` \
   -A clippy::await_holding_lock \
   -A clippy::result_large_err \
-  `# correctness-adjacent but cosmetic in context` \
+  `# THIS ONE IS NOT COSMETIC, and it was filed as such.` \
+  `# assertions_on_constants is the lint that fires on a constant compared` \
+  `# against itself — one of the vacuous-test shapes the MR2/MR3 reviews` \
+  `# found in this tree by hand. Allowlisting it means the gate cannot.` \
+  `# MEASURED: 6 occurrences, at jwt_auth.rs:1018, request_hygiene.rs:280,` \
+  `# telemetry.rs:103-105 and tests/inbound_deadline_streaming.rs:120.` \
+  `# Retiring it is a 6-site job across the middleware and telemetry` \
+  `# surfaces and is the highest-value entry left on this list.` \
   -A clippy::assertions_on_constants \
-  -A clippy::clone_on_copy \
-  -A clippy::field_reassign_with_default \
+  `# cosmetic in context` \
   -A clippy::match_like_matches_macro \
   -A clippy::redundant_closure \
   -A clippy::single_match \
@@ -69,6 +83,19 @@ exec cargo clippy --workspace --all-targets -- \
   -A clippy::doc_lazy_continuation \
   -A clippy::doc_overindented_list_items \
   -A clippy::empty_line_after_doc_comments \
-  `# test-support helpers that only some suites use` \
+  `# dead_code / unused_imports — NOT "test-support helpers that only some` \
+  `# suites use", which is what this heading used to say. MEASURED: 39` \
+  `# dead_code sites, and four of them are production items with zero` \
+  `# callers, not test scaffolding:` \
+  `#   analytics/dashboard_reader.rs:656  fn map_ch_error` \
+  `#   http/middleware/api_key_auth.rs:88 fn make_headers` \
+  `#   secureprompt-mcp/src/main.rs:97    field tool_router` \
+  `# (two more were fixed rather than excused: the worker's STATUS_QUEUED,` \
+  `# which only the tests use and is now #[cfg(test)], and a zero-caller` \
+  `# helper in tests/leak_report.rs, deleted.) dead_code detects a` \
+  `# zero-caller function, which is` \
+  `# exactly the shape behind the documented false comment "used by the` \
+  `# logout handler" on a function nobody called. The rest genuinely are` \
+  `# tests/support/mod.rs helpers used by a subset of suites.` \
   -A dead_code \
   -A unused_imports
