@@ -109,4 +109,50 @@ DO NOTHING`).
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits:   { cpu: "500m", memory: "256Mi" }
+  # MR7 review M2 — this container has no securityContext, and it is the ONE
+  # container in the whole chart that holds the OWNER/MIGRATOR credential.
+  # "Consistent with the existing containers" was the reason it had none; the
+  # blast radius is not consistent with them.
+  #
+  # Safe against this image by construction: secureprompt-api/Dockerfile's
+  # runtime stage is `gcr.io/distroless/cc-debian12:nonroot`, i.e. it already
+  # runs as uid 65532 and ships no shell, so `runAsNonRoot` cannot break a
+  # start-up that works today. The migration step opens a Postgres connection
+  # and writes nothing to the filesystem, so `readOnlyRootFilesystem` costs it
+  # nothing either — and it is the property worth having here, because a
+  # writable rootfs plus an owner-role DSN in the environment is how a
+  # compromised init step persists.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+{{- end }}
+
+{{/*
+Pod annotations that must roll the api and worker Deployments when the secret
+they read changes.
+
+MR7 review M2: neither Deployment carried a `checksum/secret`, so
+`helm upgrade` that changed `app-db-password` alone updated the Secret and
+left the running pods untouched. The initContainer would then set a NEW
+password on `secureprompt_app` while the existing api/worker containers held
+connections authenticated with the OLD one — fine until the first reconnect,
+which is a failure that appears minutes to hours later and looks like a
+network problem.
+
+CAVEAT, stated rather than discovered: under `helm template | kubectl apply`
+`lookup` returns nothing, so secrets.yaml regenerates every value and this
+checksum changes on every render. That is not a defect of this annotation --
+the SECRET changes on every render too, and the pods genuinely do need to
+roll. Under `helm install`/`helm upgrade` against a real cluster, which is what
+the runbook documents, `lookup` finds the existing Secret and both are stable.
+*/}}
+{{- define "secureprompt.secretChecksumAnnotation" -}}
+checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
 {{- end }}
