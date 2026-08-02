@@ -276,21 +276,82 @@ mod migration_backfill_tests {
     }
 }
 
-/// Tests for the policy engine: rule ordering, condition evaluation, dry-run semantics.
+/// Tests for the policy engine's CONDITION evaluation.
 ///
-/// These tests verify:
-/// - Policy engine evaluates rules first-match-wins by priority ASC, id ASC
-/// - dry_run records events without mutating client-visible content by default
-/// - All ADR actions (deny, allow, redact, transform, flag) are handled
-/// - Conditions: detection_class eq/in, confidence_gte/lte, provider eq/in, model eq/in, content_regex matches
+/// # What this module used to claim, and what it actually did (MR1 review I16)
 ///
-/// Note: The public `evaluate` function requires a live Postgres connection.
-/// We test the internal condition helpers directly via cfg(test) visibility.
+/// The header here listed "detection_class eq/in, confidence_gte/lte,
+/// provider eq/in, model eq/in, content_regex matches" as covered, and
+/// finished with "We test the internal condition helpers directly via
+/// cfg(test) visibility". Neither half was true. `content_regex`, `provider`
+/// and `model` had no test at all — which is how C2 shipped: `content_regex`
+/// was evaluated as `str::contains` for the whole of MR1, so every real regex
+/// an operator wrote produced a rule that silently never fired. And the
+/// module did not call the helpers; it re-implemented them inline, so
+/// `detection_class_eq_condition_matches_correctly` asserted that a `json!`
+/// literal round-trips and `confidence_gte_condition_json_structure` asserted
+/// `0.85 == 0.85`.
+///
+/// Every condition field the engine supports is now driven through the real
+/// `rule_matches`, with a negative case for each so a helper that returned
+/// `true` unconditionally would redden.
+///
+/// Ordering, dry-run and the action arms need the real `evaluate`, which needs
+/// Postgres; they are `#[sqlx::test]`s at the bottom of this module rather
+/// than simulations of the engine loop.
 #[cfg(test)]
 mod condition_tests {
     use crate::db::PolicyRuleRow;
     use chrono::Utc;
     use uuid::Uuid;
+
+    use crate::db::WorkspaceRepository;
+    use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+    use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+    use sqlx::PgPool;
+
+    /// One place that builds a `PolicyEvaluationInput`, so every condition
+    /// test below differs only in the field under test.
+    fn matches(rule: &PolicyRuleRow, provider: &str, model: &str, content: &str) -> bool {
+        let detections: Vec<Detection> = Vec::new();
+        rule_matches(
+            rule,
+            &PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId::new(),
+                provider_name: provider,
+                model,
+                content,
+                detections: &detections,
+                fail_closed: false,
+            },
+        )
+    }
+
+    /// As `matches`, but with detections — for the detection-scoped fields.
+    fn matches_with(rule: &PolicyRuleRow, detections: &[Detection]) -> bool {
+        rule_matches(
+            rule,
+            &PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId::new(),
+                provider_name: "none",
+                model: "none",
+                content: "irrelevant",
+                detections,
+                fail_closed: false,
+            },
+        )
+    }
+
+    fn detection(class: &str, confidence: f32) -> Detection {
+        Detection {
+            class: class.to_owned(),
+            confidence,
+            span: None,
+            value: "synthetic-value".to_owned(),
+        }
+    }
 
     fn make_rule(
         priority: i32,
@@ -313,84 +374,200 @@ mod condition_tests {
         }
     }
 
-    // Test rule_matches through the public interface by testing placeholder ordering
-    // We access private helpers via a sibling module in tests
-    #[test]
-    fn rules_ordered_by_priority_asc_then_id_asc() {
-        // This test verifies the ORDER BY priority ASC, id ASC policy requirement.
-        // We create two rules with different priorities and verify the lower-priority (higher number) one
-        // would be evaluated second. Since rule_matches is private, we test the ordering concept
-        // via the PolicyRuleRow sort behavior.
-        let rule_high_priority = make_rule(10, serde_json::json!([]), "deny", false);
-        let rule_low_priority = make_rule(100, serde_json::json!([]), "allow", false);
+    // ── Ordering, dry-run and the action arms, through the real `evaluate` ──
+    //
+    // MR1 review I16: the four tests that used to sit here re-implemented the
+    // engine loop in the test body. `rules_ordered_by_priority_asc_then_id_asc`
+    // sorted a `Vec` and asserted the result — i.e. it tested `i32::cmp`,
+    // while production ordering is a SQL `ORDER BY` in
+    // `policy_repo::list_enabled_rules`. `equal_priority_ordered_by_id_asc`
+    // tested `Uuid::cmp`. `dry_run_rule_does_not_change_action_marker`,
+    // `deny_action_sets_denied_flag` and `allow_action_breaks_evaluation`
+    // each wrote the branch they were checking and then checked it. No
+    // production line's deletion reddened any of them.
+    //
+    // They are replaced by `#[sqlx::test]`s that seed real rows and call the
+    // real `evaluate`. That needs Postgres, which the old header gave as the
+    // reason for simulating instead — but `default_policy_path_tests` at the
+    // top of this file has been driving `evaluate` against a live pool all
+    // along, so the constraint was never real.
 
-        // Simulate the ORDER BY: sort by priority ASC then id ASC
-        let mut rules = vec![rule_low_priority, rule_high_priority];
-        rules.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
+    /// Seed a workspace with NO rules, then insert exactly the ones a test
+    /// wants. `create_with_owner` seeds a default `Redact common PII` rule
+    /// (`db/workspace_repo.rs`), which would otherwise take part in ordering.
+    async fn seed_empty_workspace(pool: &PgPool) -> Uuid {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Ordering Co",
+                &format!("ordering-{}@example.invalid", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
 
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        workspace.id
+    }
+
+    async fn insert_rule(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        id: Uuid,
+        priority: i32,
+        action: &str,
+        dry_run: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, '[]'::jsonb, $5, '{}'::jsonb, true, $6, NOW(), NOW())",
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(format!("{action}-p{priority}"))
+        .bind(priority)
+        .bind(action)
+        .bind(dry_run)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn eval(
+        pool: &PgPool,
+        workspace_id: Uuid,
+    ) -> crate::policy::engine::PolicyEvaluationOutcome {
+        let detections: Vec<Detection> = Vec::new();
+        let mut vault = secureprompt_common::types::TokenVault::default();
+        let mut redaction_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        crate::policy::engine::evaluate(
+            &crate::db::PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace_id),
+                provider_name: "none",
+                model: "none",
+                content: "no conditions, so every rule below matches",
+                detections: &detections,
+                fail_closed: false,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed")
+    }
+
+    /// First match wins by `priority ASC`. Both rules match (empty
+    /// conditions), so the outcome is decided entirely by the order the
+    /// repository returns them in — a SQL `ORDER BY`, not a sort in this
+    /// test.
+    ///
+    /// Falsifier (verified): change `ORDER BY priority ASC, id ASC` to
+    /// `priority DESC` in `policy_repo::list_enabled_rules` — this reddens
+    /// with `denied = false`, because the `allow` rule is reached first.
+    #[sqlx::test]
+    async fn rules_are_evaluated_in_priority_order(pool: PgPool) {
+        let workspace_id = seed_empty_workspace(&pool).await;
+        // Inserted allow-first so insertion order cannot be what decides.
+        insert_rule(&pool, workspace_id, Uuid::new_v4(), 100, "allow", false).await;
+        insert_rule(&pool, workspace_id, Uuid::new_v4(), 10, "deny", false).await;
+
+        let outcome = eval(&pool, workspace_id).await;
+
+        assert_eq!(outcome.rules_evaluated, 2, "premise: both rules are live");
         assert_eq!(
-            rules[0].action, "deny",
-            "First rule after ordering must be the one with priority=10 (deny)"
+            outcome.result.final_action, "deny",
+            "the priority-10 deny rule must be reached before the priority-100 \
+             allow rule"
         );
+        assert!(outcome.denied, "a matched deny rule must set denied");
+    }
+
+    /// The tie-break half: same priority, so `id ASC` decides. Ids are fixed
+    /// rather than random, or the assertion would be a coin flip.
+    ///
+    /// Falsifier (verified): drop `, id ASC` from the same `ORDER BY` — with
+    /// two equal priorities Postgres is then free to return either first and
+    /// this becomes non-deterministic; forcing `id DESC` reddens it outright.
+    #[sqlx::test]
+    async fn equal_priority_is_broken_by_id_ascending(pool: PgPool) {
+        let workspace_id = seed_empty_workspace(&pool).await;
+        let lower = Uuid::from_u128(1);
+        let higher = Uuid::from_u128(2);
+        insert_rule(&pool, workspace_id, higher, 50, "allow", false).await;
+        insert_rule(&pool, workspace_id, lower, 50, "deny", false).await;
+
+        let outcome = eval(&pool, workspace_id).await;
+
+        assert_eq!(outcome.rules_evaluated, 2, "premise: both rules are live");
         assert_eq!(
-            rules[1].action, "allow",
-            "Second rule after ordering must be the one with priority=100 (allow)"
+            outcome.result.final_action, "deny",
+            "at equal priority the lower id must be evaluated first"
         );
     }
 
-    #[test]
-    fn equal_priority_ordered_by_id_asc() {
-        // Two rules with the same priority — lower UUID sorts first
-        let id_a = Uuid::from_u128(1);
-        let id_b = Uuid::from_u128(2);
+    /// A `dry_run` rule records its event and does not decide the request.
+    ///
+    /// The positive control is the second half: the SAME rule with
+    /// `dry_run = false` must produce `deny`. Without it, "final_action is
+    /// allow" would also hold for a rule that simply never matched.
+    ///
+    /// Falsifier (verified): delete the `if rule.dry_run { continue; }` arm
+    /// in `evaluate` — the first half reddens with `deny`.
+    #[sqlx::test]
+    async fn a_dry_run_rule_records_an_event_without_deciding(pool: PgPool) {
+        let workspace_id = seed_empty_workspace(&pool).await;
+        insert_rule(&pool, workspace_id, Uuid::new_v4(), 10, "deny", true).await;
 
-        let mut rule_a = make_rule(50, serde_json::json!([]), "deny", false);
-        rule_a.id = id_a;
-
-        let mut rule_b = make_rule(50, serde_json::json!([]), "allow", false);
-        rule_b.id = id_b;
-
-        let mut rules = vec![rule_b, rule_a];
-        rules.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
-
+        let outcome = eval(&pool, workspace_id).await;
         assert_eq!(
-            rules[0].id, id_a,
-            "Lower UUID must come first at equal priority"
+            outcome.result.final_action, "allow",
+            "a dry_run deny must not change the final action"
         );
+        assert!(!outcome.denied, "a dry_run deny must not deny");
+        assert_eq!(
+            outcome.result.events.len(),
+            1,
+            "a dry_run rule must still record its event — otherwise the mode \
+             is indistinguishable from disabling the rule"
+        );
+
+        // Positive control: the same rule, enforcing.
+        let enforcing = seed_empty_workspace(&pool).await;
+        insert_rule(&pool, enforcing, Uuid::new_v4(), 10, "deny", false).await;
+        let enforced = eval(&pool, enforcing).await;
+        assert_eq!(enforced.result.final_action, "deny");
+        assert!(enforced.denied);
     }
 
-    #[test]
-    fn dry_run_rule_does_not_change_action_marker() {
-        // A dry_run rule: engine records event but does NOT update final_action
-        // We verify this by simulating the engine logic
-        let dry_rule = make_rule(10, serde_json::json!([]), "deny", true);
-        let normal_rule = make_rule(20, serde_json::json!([]), "allow", false);
+    /// An `allow` rule ends evaluation: a lower-priority `deny` behind it
+    /// never runs.
+    ///
+    /// Falsifier (verified): remove the `break` from the `"allow"` arm of
+    /// `evaluate` — the priority-20 deny then overwrites `final_action` and
+    /// this reddens with `denied = true`.
+    #[sqlx::test]
+    async fn an_allow_rule_stops_evaluation(pool: PgPool) {
+        let workspace_id = seed_empty_workspace(&pool).await;
+        insert_rule(&pool, workspace_id, Uuid::new_v4(), 10, "allow", false).await;
+        insert_rule(&pool, workspace_id, Uuid::new_v4(), 20, "deny", false).await;
 
-        // The dry_run path: engine `continue`s without setting final_action
-        // We test the expected behavior: if only dry_run rules match, final_action stays "allow" (default)
-        let mut final_action = "allow".to_owned();
+        let outcome = eval(&pool, workspace_id).await;
 
-        // Simulate engine loop for dry_run rule
-        if dry_rule.dry_run {
-            // Skip action enforcement — only emit event
-            // final_action stays "allow"
-        } else {
-            final_action = dry_rule.action.clone();
-        }
-
-        assert_eq!(
-            final_action, "allow",
-            "dry_run rule must not change final_action"
-        );
-
-        // Simulate normal rule
-        if !normal_rule.dry_run {
-            final_action = normal_rule.action.clone();
-        }
-
-        assert_eq!(
-            final_action, "allow",
-            "normal allow rule changes final_action to allow"
+        assert_eq!(outcome.rules_evaluated, 2, "premise: the deny rule is live");
+        assert_eq!(outcome.result.final_action, "allow");
+        assert!(
+            !outcome.denied,
+            "the deny rule behind the allow must never be reached"
         );
     }
 
@@ -450,81 +627,208 @@ mod condition_tests {
         );
     }
 
+    /// Was: `assert_eq!(conditions[0]["field"].as_str().unwrap(),
+    /// "detection_class")` — a `serde_json` round-trip, never a call into
+    /// this crate. Now driven through `rule_matches`, both directions.
     #[test]
     fn detection_class_eq_condition_matches_correctly() {
-        // Verify condition JSON structure for detection_class eq
-        let conditions = serde_json::json!([
-            { "field": "detection_class", "op": "eq", "value": "email" }
-        ]);
+        let rule = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" }
+            ]),
+            "redact",
+            false,
+        );
 
-        let condition = &conditions[0];
-        let field = condition["field"].as_str().unwrap();
-        let op = condition["op"].as_str().unwrap();
-        let value = condition["value"].as_str().unwrap();
-
-        assert_eq!(field, "detection_class");
-        assert_eq!(op, "eq");
-        assert_eq!(value, "email");
-    }
-
-    #[test]
-    fn confidence_gte_condition_json_structure() {
-        let conditions = serde_json::json!([
-            { "field": "confidence_gte", "op": "gte", "value": 0.85 }
-        ]);
-
-        let condition = &conditions[0];
-        let threshold = condition["value"].as_f64().unwrap();
         assert!(
-            (threshold - 0.85).abs() < 1e-6,
-            "Threshold must be 0.85, got: {threshold}"
+            matches_with(&rule, &[detection("EMAIL_ADDRESS", 0.9)]),
+            "a detection of the named class must satisfy `detection_class eq`"
+        );
+        assert!(
+            !matches_with(&rule, &[detection("PHONE_NUMBER", 0.9)]),
+            "a detection of a DIFFERENT class must not satisfy it — without \
+             this the assertion above would hold for a helper that always \
+             returned true"
+        );
+        assert!(
+            !matches_with(&rule, &[]),
+            "no detections at all must not satisfy a detection-scoped condition"
         );
     }
 
+    /// Was: `assert!((0.85 - 0.85).abs() < 1e-6)`. Now the real threshold
+    /// comparison, on both sides of the boundary and ON it.
     #[test]
-    fn deny_action_sets_denied_flag() {
-        // Simulate the deny branch of the policy engine
-        let mut denied = false;
-        let action = "deny";
+    fn confidence_gte_condition_matches_at_and_above_the_threshold() {
+        let rule = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "confidence_gte", "op": "gte", "value": 0.85 }
+            ]),
+            "redact",
+            false,
+        );
 
-        match action {
-            "deny" => {
-                denied = true;
-            }
-            _ => {}
-        }
-
-        assert!(denied, "deny action must set denied=true");
+        assert!(
+            matches_with(&rule, &[detection("EMAIL_ADDRESS", 0.9)]),
+            "0.90 is above the 0.85 threshold"
+        );
+        assert!(
+            matches_with(&rule, &[detection("EMAIL_ADDRESS", 0.85)]),
+            "`gte` includes the threshold itself — a `>` would redden here"
+        );
+        assert!(
+            !matches_with(&rule, &[detection("EMAIL_ADDRESS", 0.80)]),
+            "0.80 is below the threshold and must not satisfy it"
+        );
     }
 
+    /// MR1 review I16 / C2. `content_regex` had NO test, which is how it
+    /// shipped as `input.content.contains(needle)` — a substring test on a
+    /// field named, documented and presented in the dashboard as a regex.
+    ///
+    /// The first assertion is the exact discriminator: `\d{3}-\d{2}-\d{4}` is
+    /// not a substring of `123-45-6789`, so a `contains` implementation
+    /// answers `false` and this test reddens. That is the assertion whose
+    /// absence let C2 through.
     #[test]
-    fn allow_action_breaks_evaluation() {
-        // Simulate allow: after allow matches, we stop evaluating further rules
-        let rules = vec![
-            make_rule(10, serde_json::json!([]), "allow", false),
-            make_rule(20, serde_json::json!([]), "deny", false),
-        ];
+    fn content_regex_is_evaluated_as_a_regex_not_a_substring() {
+        let rule = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "content_regex", "op": "matches", "value": r"\d{3}-\d{2}-\d{4}" }
+            ]),
+            "deny",
+            false,
+        );
 
-        let mut final_action = "allow".to_owned();
-        let mut denied = false;
+        assert!(
+            matches(&rule, "openai", "gpt-4o", "ssn is 123-45-6789 here"),
+            "a real regex must match the text it describes — `str::contains` \
+             on the pattern itself answers false, which is exactly the defect \
+             this asserts against"
+        );
+        assert!(
+            !matches(&rule, "openai", "gpt-4o", "no identifiers in this text"),
+            "the pattern must not match text it does not describe"
+        );
 
-        for rule in &rules {
-            if rule.dry_run {
-                continue;
-            }
-            final_action = rule.action.clone();
-            match rule.action.as_str() {
-                "allow" => break,
-                "deny" => {
-                    denied = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        // Anchors are the other half of "this is a regex": a substring
+        // implementation cannot express them at all.
+        let anchored = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "content_regex", "op": "matches", "value": r"^sk-[A-Za-z0-9]{8}$" }
+            ]),
+            "deny",
+            false,
+        );
+        assert!(matches(&anchored, "openai", "gpt-4o", "sk-ABCD1234"));
+        assert!(
+            !matches(&anchored, "openai", "gpt-4o", "prefix sk-ABCD1234 suffix"),
+            "`^`/`$` must anchor — a substring test would match here"
+        );
+    }
 
-        assert_eq!(final_action, "allow", "allow rule must be final action");
-        assert!(!denied, "allow rule must not set denied");
+    /// The other branch of the `content_regex` arm: a pattern that does not
+    /// compile. A rule row can carry one (written before `validate_conditions`
+    /// shipped, or inserted straight into Postgres), and the engine must treat
+    /// the condition as UNSATISFIED rather than panicking or matching
+    /// everything.
+    ///
+    /// `false` is the safe answer under both `deny` and `redact`: the rule
+    /// does not fire, `PolicyEvaluationOutcome::unprotected` is set, and the
+    /// fail-closed net takes over. Returning `true` would make a broken
+    /// pattern deny every request.
+    #[test]
+    fn an_invalid_content_regex_is_unsatisfied_rather_than_fatal() {
+        let rule = make_rule(
+            10,
+            // Unclosed group — `regex::Regex::new` rejects it.
+            serde_json::json!([
+                { "field": "content_regex", "op": "matches", "value": "(unclosed" }
+            ]),
+            "deny",
+            false,
+        );
+
+        assert!(
+            !matches(&rule, "openai", "gpt-4o", "(unclosed"),
+            "an uncompilable pattern must leave the condition unsatisfied — \
+             note the content here CONTAINS the pattern verbatim, so a \
+             `str::contains` implementation would answer true"
+        );
+    }
+
+    /// `provider` and `model` are request-scoped conditions and neither had a
+    /// test (MR1 review I16). Both operators, both directions, for each.
+    #[test]
+    fn provider_and_model_conditions_match_the_request() {
+        let provider_eq = make_rule(
+            10,
+            serde_json::json!([{ "field": "provider", "op": "eq", "value": "anthropic" }]),
+            "deny",
+            false,
+        );
+        assert!(matches(&provider_eq, "anthropic", "any", "text"));
+        assert!(!matches(&provider_eq, "openai", "any", "text"));
+
+        let provider_in = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "provider", "op": "in", "value": ["anthropic", "azure"] }
+            ]),
+            "deny",
+            false,
+        );
+        assert!(matches(&provider_in, "azure", "any", "text"));
+        assert!(!matches(&provider_in, "openai", "any", "text"));
+
+        let model_eq = make_rule(
+            10,
+            serde_json::json!([{ "field": "model", "op": "eq", "value": "gpt-4o" }]),
+            "deny",
+            false,
+        );
+        assert!(matches(&model_eq, "any", "gpt-4o", "text"));
+        assert!(
+            !matches(&model_eq, "any", "gpt-4o-mini", "text"),
+            "`eq` is exact — a prefix or substring comparison would match here"
+        );
+
+        let model_in = make_rule(
+            10,
+            serde_json::json!([
+                { "field": "model", "op": "in", "value": ["gpt-4o", "claude-3-opus"] }
+            ]),
+            "deny",
+            false,
+        );
+        assert!(matches(&model_in, "any", "claude-3-opus", "text"));
+        assert!(!matches(&model_in, "any", "gemini-pro", "text"));
+    }
+
+    /// An unknown field or operator falls through `matches_condition`'s `_`
+    /// arm to `false`. Worth pinning next to the arms above: it is what makes
+    /// a typo in the policy UI fail closed rather than matching everything.
+    #[test]
+    fn an_unrecognised_field_or_operator_does_not_match() {
+        let bad_field = make_rule(
+            10,
+            serde_json::json!([{ "field": "provder", "op": "eq", "value": "openai" }]),
+            "deny",
+            false,
+        );
+        assert!(!matches(&bad_field, "openai", "gpt-4o", "text"));
+
+        let bad_op = make_rule(
+            10,
+            serde_json::json!([{ "field": "provider", "op": "equals", "value": "openai" }]),
+            "deny",
+            false,
+        );
+        assert!(!matches(&bad_op, "openai", "gpt-4o", "text"));
     }
 }
 
