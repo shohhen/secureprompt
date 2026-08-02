@@ -338,9 +338,32 @@ async fn the_runtime_role_is_genuinely_powerless(pool: PgPool) {
     );
     assert!(
         !createrole,
-        "{APP_ROLE} has CREATEROLE — with it the role can grant itself \
-         membership of a privileged role and escape the split entirely"
+        "{APP_ROLE} has CREATEROLE — the serving process creates no roles, and \
+         a role attribute nothing needs is a role attribute that only widens \
+         the blast radius of a compromise"
     );
+    // MR7 review M5 — the reason above used to read "with it the role can grant
+    // itself membership of a privileged role and escape the split entirely".
+    // That was true of PostgreSQL 15 and earlier and is FALSE of PostgreSQL 16,
+    // which the chart and every compose file pin. MEASURED on postgres:16.14, as
+    // a NOSUPERUSER / CREATEDB / CREATEROLE / NOBYPASSRLS role: GRANT of an
+    // existing BYPASSRLS role is denied for want of ADMIN OPTION;
+    // `CREATE ROLE x BYPASSRLS`, `ALTER ROLE x BYPASSRLS`,
+    // `CREATE ROLE x SUPERUSER` and `ALTER ROLE self BYPASSRLS` are all denied
+    // because an attribute can only be conferred by a role that already holds
+    // it. PG16 narrowed CREATEROLE to "may administer the roles it created", so
+    // it confers the power to make POWERLESS roles and nothing more.
+    //
+    // The assertion stays -- least privilege does not need a live exploit to
+    // justify it, and this is a supported-downgrade hazard: the same schema on
+    // a PG15 server would make the old sentence true again. What changed is
+    // that the message no longer states something an operator can disprove in
+    // one psql session.
+    //
+    // `scripts/ci/create-nonsuperuser-role.sh` -- which DOES keep CREATEROLE,
+    // because five test files create probe roles as the connected role -- now
+    // asserts that premise on the live server: a PG16 floor plus a real
+    // `SET ROLE` + `CREATE ROLE ... BYPASSRLS` attempt that must be refused.
     assert!(
         canlogin,
         "{APP_ROLE} cannot LOG IN — nothing could serve with it"
