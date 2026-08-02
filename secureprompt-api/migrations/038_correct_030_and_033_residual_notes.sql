@@ -92,6 +92,40 @@
 -- the gate rather than quietly restoring the residual.
 --
 -- ===========================================================================
+-- CORRECTION 3 -- migration 029 states a SCHEDULED erase as an event
+-- ===========================================================================
+--
+-- `029_admin_audit_auth_settings_actions.sql`, under "NO NEW COLUMN, AND IN
+-- PARTICULAR NO ADDRESS AND NO DEVICE", says:
+--
+--   FU4 records the device on the SESSION row and ERASES it when that session
+--   ends (commit f2de9f3). A copy here would undo that erasure permanently,
+--   because this table is never purged.
+--
+-- Nothing erases `refresh_tokens.client_ip` or `client_descriptor` when a
+-- session ends. Not logout, not rotation, not revocation, not expiry. They are
+-- nulled by the PERIODIC `retention.purge` job
+-- (`worker/tasks/retention_purge.rs::scrub_session_device_context`), whose
+-- predicate is `NOT EXISTS (a live row in this chain)`. The practical
+-- difference: a logged-out user's IP address stays on disk until the next purge
+-- run, and INDEFINITELY in any deployment where that job is not scheduled.
+--
+-- Migration 027's own header is accurate ("BOTH are erased by `retention.purge`
+-- as soon as the session stops being live"); 029 and the sibling comment in
+-- `dashboard/auth.rs` dropped the mechanism and read as event-driven. The
+-- auth.rs one is corrected in code. 029 cannot be edited.
+--
+-- The CONCLUSION 029 draws is unaffected and is in fact stronger: the session
+-- copy is erased eventually and `admin_audit` is never purged, so a copy there
+-- would outlive it permanently.
+--
+-- The mechanism itself is well built and this correction is not a criticism of
+-- it: the liveness predicate is per-CHAIN rather than per-ROW, which is correct
+-- and non-obvious (a per-row predicate would erase every live session's device
+-- context one rotation into its life), and scrubbing rather than deleting
+-- preserves replay detection.
+--
+-- ===========================================================================
 -- WHAT THIS MIGRATION CHANGES
 -- ===========================================================================
 --
@@ -99,9 +133,10 @@
 -- 1 into the catalog comments of the three tables whose callers 030 misstated,
 -- so `\d+ workspace_raw_capture` and any schema dump carry it to a reader who
 -- never opens the migration directory -- which is the reader the DB role-split
--- puts at risk. Correction 2 concerns Rust call sites and has no catalog
--- object to hang on; it lives in this header, one file after the one it
--- corrects. `COMMENT ON` is idempotent and re-running it is a no-op.
+-- puts at risk. Correction 3 goes onto the two columns it is about, for the
+-- same reason. Correction 2 concerns Rust call sites and has no catalog object
+-- to hang on; it lives in this header, one file after the one it corrects.
+-- `COMMENT ON` is idempotent and re-running it is a no-op.
 
 COMMENT ON TABLE workspace_raw_capture IS
     'WS3-1. Per-workspace opt-in to storing plaintext prompt/response content, '
@@ -134,3 +169,23 @@ COMMENT ON TABLE retention_purge_audit IS
     'unarmed per-workspace INSERT RAISES rather than vanishing, and `run()` '
     'logs `retention_purge_audit_write_failed` and continues -- so the census '
     'row is what tells an auditor a sweep ran blind.';
+
+COMMENT ON COLUMN refresh_tokens.client_ip IS
+    'FU4 (migration 027). The sign-in address, re-rendered from a successful '
+    '`IpAddr` parse so a non-address is dropped rather than stored, and '
+    'recorded ONCE per session -- never re-recorded on rotation, which would '
+    'make this column a movement log. ERASED BY A SCHEDULED JOB, NOT BY AN '
+    'EVENT: `retention.purge` nulls it once no live row remains in the chain. '
+    'Nothing erases it at logout, rotation, revocation or expiry, so it '
+    'survives until the next purge run and indefinitely where that job is not '
+    'scheduled. Migration 029''s header says "ERASES it when that session '
+    'ends"; 027''s is the accurate one, and 029 cannot be edited because sqlx '
+    'validates migration checksums.';
+
+COMMENT ON COLUMN refresh_tokens.client_descriptor IS
+    'FU4 (migration 027). `{browser} on {platform}`, both halves drawn from '
+    'closed vocabularies in `dashboard/device.rs` -- no byte of the raw '
+    'User-Agent reaches this column, and an unrecognised agent stores NULL '
+    'rather than a fallback. Same erasure semantics as `client_ip`: nulled by '
+    'the scheduled `retention.purge` sweep once the chain has no live row, not '
+    'by any session-ending event, contrary to migration 029''s header.';
