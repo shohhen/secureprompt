@@ -43,7 +43,6 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use deadpool_redis::{Config as RedisConfig, Runtime};
 use secureprompt_api::{app_state::AppState, http::build_router, ml_sidecar::MlSidecarClient};
 use secureprompt_common::config::{
     AppConfig, ClickhouseConfig, DatabaseConfig, JwtConfig, LicenseConfig,
@@ -649,11 +648,14 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
     seed_policy_event(seeded.workspace_a, &own).await;
     seed_latency_sample(seeded.workspace_a, &own).await;
 
-    // Build Redis pool (needed by AppState even if not seeding budget data).
-    let _redis_pool = RedisConfig::from_url(redis_url())
-        .create_pool(Some(Runtime::Tokio1))
-        .expect("redis pool");
-
+    // MR1 review M3: a `let _redis_pool = …` stood here under the comment
+    // "needed by AppState even if not seeding budget data". It was not.
+    // `AppState::new` builds its own pool from `config.redis.url`
+    // (`src/app_state.rs:81`), which is what `build_app` below goes through,
+    // and nothing in this file ever read the binding. Deleted rather than
+    // renamed: a discarded value under a comment asserting a dependency that
+    // does not exist is worse than no line at all — the next reader adds one
+    // to the next matrix test.
     let (_state, router) = build_app(pool);
 
     // Authenticate as admin_a (workspace A). Minted directly rather than via
