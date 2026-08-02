@@ -42,7 +42,6 @@ secureprompt-api/src/providers/mod.rs
 secureprompt-api/src/providers/openai_compat.rs
 secureprompt-api/src/providers/tests.rs
 secureprompt-api/src/providers/vertex.rs
-secureprompt-api/src/redis/mod.rs
 secureprompt-api/src/security/mod.rs
 secureprompt-api/src/security/url_guard.rs
 secureprompt-api/src/token_usage/tests.rs
