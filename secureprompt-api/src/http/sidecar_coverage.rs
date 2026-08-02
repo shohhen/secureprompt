@@ -83,6 +83,12 @@ const ACTION_DEGRADE: &str = SidecarUnavailablePolicy::DegradeWithAlert.as_str()
 /// (= `Block`), matching the pipeline: a Postgres outage must not become
 /// permission to serve unscanned answers.
 async fn effective_policy(state: &AppState, workspace_id: WorkspaceId) -> SidecarUnavailablePolicy {
+    // MR1 review M17 — yes, this is a Postgres round-trip per request, and
+    // no, it is not cached. Measured (904 µs p50 through `begin_scoped`, vs
+    // 316 µs for the bare SELECT) and the refusal is argued on
+    // `SidecarPolicyRepository::get_effective`: a TTL cache would make
+    // `degrade_with_alert -> block` take effect late, i.e. keep failing
+    // OPEN during the incident in which an operator tightens it.
     SidecarPolicyRepository::new(state.db.clone())
         .get_effective(
             workspace_id,

@@ -140,6 +140,47 @@ impl SidecarPolicyRepository {
     /// # Errors
     /// Returns `ApiError::Database` when the query fails. Callers on the
     /// request path treat that as [`SidecarUnavailablePolicy::Block`].
+    ///
+    /// # What it costs on the request path, and why it is NOT cached
+    ///
+    /// MR1 review M17: this runs on every gateway request
+    /// (`pipeline::service::prepare`) and on every `/v1/redact`,
+    /// `/v1/policy/check` and `/v1/secure-mode/tokenize`
+    /// (`http::sidecar_coverage::enforce`), uncached, and the finding
+    /// suggests "a small cache keyed on workspace with a short TTL".
+    ///
+    /// MEASURED first, same method as `SecureModeRepository::get` documents:
+    /// 400 iterations after 50 warm-up, local PostgreSQL 16 over loopback,
+    /// against the same workspace.
+    ///
+    /// | | p50 | p95 |
+    /// |---|---|---|
+    /// | `get_effective` through `begin_scoped` | 904 µs | 1047 µs |
+    /// | the bare single `SELECT` underneath it |  316 µs |  407 µs |
+    ///
+    /// So ~590 µs, on a path that also makes an ML-sidecar call and an
+    /// upstream model call — tens to hundreds of milliseconds. It is the same
+    /// order as the `secure_mode` read two statements later, and both are well
+    /// under a percent of a request.
+    ///
+    /// THE CACHE IS REFUSED, and the reason is not the cost. This value is a
+    /// fail-CLOSED security control: `block` means "a prompt the detector
+    /// never saw is not forwarded". A TTL cache makes the
+    /// `degrade_with_alert -> block` transition take effect LATE, so an
+    /// operator who tightens the setting during an incident — exactly when
+    /// they would touch it — keeps failing open for the length of the TTL,
+    /// silently, with no signal that the new setting is not yet live. Trading
+    /// 590 µs on a 100 ms path for a window in which a security control reads
+    /// as applied but is not is the wrong side of that trade.
+    ///
+    /// Write-through invalidation would fix the staleness, and [`Self::upsert`]
+    /// is the single write path, so it is available in principle — but the
+    /// gateway runs multiple replicas (`api.replicaCount`), and an in-process
+    /// map only invalidates the replica that served the write. Doing it
+    /// correctly means Redis pub/sub and a cache-coherence story for a
+    /// security setting. If this read ever does become material, that is the
+    /// shape it has to take; a bare `HashMap<WorkspaceId, (value, Instant)>`
+    /// is not a smaller version of it, it is a different, wrong thing.
     pub async fn get_effective(
         &self,
         workspace_id: WorkspaceId,

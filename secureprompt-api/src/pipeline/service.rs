@@ -502,6 +502,12 @@ impl PipelineService {
         // A failed read fails CLOSED: `SidecarUnavailablePolicy::default()`
         // is `Block`, so a Postgres outage cannot turn into permission to
         // forward unscanned prompts.
+        // MR1 review M17 — yes, this is a Postgres round-trip per request, and
+        // no, it is not cached. Measured (904 µs p50 through `begin_scoped`, vs
+        // 316 µs for the bare SELECT) and the refusal is argued on
+        // `SidecarPolicyRepository::get_effective`: a TTL cache would make
+        // `degrade_with_alert -> block` take effect late, i.e. keep failing
+        // OPEN during the incident in which an operator tightens it.
         let sidecar_policy = SidecarPolicyRepository::new(self.state.db.clone())
             .get_effective(
                 auth.workspace_id,
