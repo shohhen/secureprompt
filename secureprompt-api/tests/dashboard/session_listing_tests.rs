@@ -91,14 +91,39 @@ fn test_config() -> AppConfig {
 }
 
 fn build_app(pool: PgPool) -> axum::Router {
+    build_router(build_state(pool))
+}
+
+fn build_state(pool: PgPool) -> AppState {
     let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
-    build_router(AppState::new(
+    AppState::new(
         pool,
         test_config(),
         ml,
         Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
-    ))
+    )
 }
+
+/// A SECOND router over the SAME `AppState` with only `redis_pool` swapped for
+/// one pointing at a closed port.
+///
+/// Cloning the state rather than building a fresh one is load-bearing:
+/// `auth_cache` is an `Arc<DashMap>`, so the clone shares the entry a prior
+/// successful request planted. Without a warm entry `degraded_auth_gate`
+/// answers `Block(NoWarmSession)` and the 503 never reaches the handler — which
+/// is how the first draft of `a_redis_failure_leaves_the_session_endable_on_retry`
+/// passed against the very ordering it was written to catch.
+fn offline_redis_router(state: &AppState) -> axum::Router {
+    let mut offline = state.clone();
+    offline.redis_pool =
+        secureprompt_api::redis::build_pool(UNREACHABLE_REDIS).expect("pool builds lazily");
+    build_router(offline)
+}
+
+/// A Redis URL nothing listens on. Port 1 is `tcpmux`, reserved and never bound
+/// by this project's compose stack, so the connection is refused immediately
+/// rather than timing out.
+const UNREACHABLE_REDIS: &str = "redis://127.0.0.1:1";
 
 fn make_jwt(workspace_id: Uuid, user_id: Uuid, role: &str) -> String {
     let now = chrono::Utc::now();
@@ -1596,4 +1621,114 @@ async fn rotation_does_not_re_record_the_device(pool: PgPool) {
     );
 
     forget_keys(&redis_pool().await, ws.viewer, &[]).await;
+}
+
+// ── The Redis half cannot commit the Postgres half behind its back ────────
+
+/// MR4 F4 — ending one session must never leave the administrator with an
+/// error, a durable trail saying it happened, and a live access token.
+///
+/// The handler used to close the refresh chain and write the audit row FIRST
+/// and blacklist the jtis afterwards. A Redis failure at that point committed
+/// the claim and skipped the enforcement, and `find_live_session`'s
+/// `revoked_at IS NULL` gate then answered 404 to every retry — the one lever
+/// an administrator has for a compromised session, gone, with the trail
+/// asserting it was used.
+///
+/// This drives the outage for real: the same router with its Redis URL pointed
+/// at a closed port. Three things must hold after the failure — the chain is
+/// still open, no audit row exists, and the RETRY succeeds. The last one is the
+/// finding: recoverability, not just atomicity.
+#[sqlx::test]
+async fn a_redis_failure_leaves_the_session_endable_on_retry(pool: PgPool) {
+    let ws = seed_workspace(&pool).await;
+    let state = build_state(pool.clone());
+    let app = build_router(state.clone());
+
+    let lost = sign_in(&app, &ws.viewer_email, "203.0.113.7", CHROME_MAC).await;
+    let admin_token = make_jwt(ws.id, ws.admin, "admin");
+
+    // This call also WARMS `auth_cache` for the admin, which is what lets the
+    // offline router below get past `serve_degraded` and into the handler.
+    let listed = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
+    let target_id = session_id(&sessions_of(&listed)[0]);
+
+    // The outage. Identical in every dimension but one.
+    let offline = offline_redis_router(&state);
+    let refused = end_session(&offline, &admin_token, ws.viewer, target_id).await;
+    let status = refused.status();
+    assert!(
+        status.is_server_error(),
+        "an unreachable Redis must surface as a server error, got {status}"
+    );
+    // PREMISE, and the reason this test is not vacuous: the failure must come
+    // from the HANDLER's blacklist write, not from the auth middleware refusing
+    // the request before it ran. A middleware refusal is `503 Service
+    // Unavailable`; `api_error_response(ApiError::Internal(..))` is a 500.
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the request must reach the handler and fail on the Redis WRITE; a 503 \
+         means `degraded_auth_gate` blocked it and nothing below is being tested"
+    );
+
+    // Nothing durable may have happened, because the caller was told nothing
+    // happened.
+    let (open_rows, audit_rows): (i64, i64) = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM refresh_tokens
+             WHERE session_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(target_id)
+        .fetch_one(&mut *scope)
+        .await
+        .expect("count open rows");
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM session_revocation_audit WHERE session_id = $1",
+        )
+        .bind(target_id)
+        .fetch_one(&mut *scope)
+        .await
+        .expect("count audit rows");
+        (open, audited)
+    };
+    assert!(
+        open_rows > 0,
+        "the refresh chain must still be open after a failed revocation; it is \
+         closed, so the durable half committed while the caller got an error"
+    );
+    assert_eq!(
+        audit_rows, 0,
+        "no audit row may claim this session was revoked when the operation \
+         reported failure"
+    );
+
+    // THE FINDING: the retry must not 404. Under the old ordering
+    // `find_live_session` has already been made to answer `None` by the
+    // half-commit above, and this is a 404 with no lever left.
+    let retried = end_session(&app, &admin_token, ws.viewer, target_id).await;
+    let retried_status = retried.status();
+    let retried_body = json_body(retried).await;
+    assert_eq!(
+        retried_status,
+        StatusCode::OK,
+        "the retry after a Redis outage must succeed, not 404: {retried_body}"
+    );
+
+    // CONTROL THAT MUST DIFFER: the successful retry really did end it, so the
+    // three assertions above are the ordering and not a route that never works.
+    assert_eq!(
+        authenticated_read(&app, &lost.access).await,
+        StatusCode::UNAUTHORIZED,
+        "the retry must actually blacklist the access token"
+    );
+    assert_eq!(
+        refresh(&app, &lost.refresh).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "the retry must actually close the refresh chain"
+    );
+
+    let jtis: Vec<String> = jtis_of(&pool, ws.id, ws.viewer).await;
+    forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }

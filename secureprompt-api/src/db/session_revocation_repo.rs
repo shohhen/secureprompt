@@ -282,9 +282,21 @@ impl SessionRevocationRepository {
     /// leaves that session's current access token servable for the remainder of
     /// its own lifetime (≤ `access_ttl` + 60 s leeway) on a pod that cannot
     /// reach Redis. The refresh chain is closed here, durably, so the session
-    /// cannot renew past that one token. A narrow revocation attempted DURING
-    /// an outage fails loudly instead: the handler surfaces the Redis error and
-    /// reports no success.
+    /// cannot renew past that one token.
+    ///
+    /// A narrow revocation attempted DURING an outage never reaches this
+    /// function: `revoke_one_session` in `http/routes/dashboard/users.rs`
+    /// blacklists the jtis BEFORE calling it, so the Redis error surfaces with
+    /// nothing committed — no closed chain, no audit row — and the retry still
+    /// resolves the session.
+    ///
+    /// It has not always been so, and the correction is worth keeping. This
+    /// call used to commit FIRST: a Redis failure afterwards left the chain
+    /// closed and the audit row written while the access token stayed live, and
+    /// `find_live_session`'s `revoked_at IS NULL` gate then answered 404 to
+    /// every retry. The comment that stood here claimed the handler "reports no
+    /// success" — it did report failure, over a durable half-success it could
+    /// not undo or repeat.
     ///
     /// # Errors
     /// Returns `ApiError::Database` for pool/query/commit failures and
