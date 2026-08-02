@@ -458,8 +458,9 @@ async fn prometheus_counters_incremented(pool: PgPool) {
 ///
 /// Deliberately panics rather than skipping when ClickHouse is unreachable.
 /// A tenancy test that silently passes because its fixture never landed is
-/// the exact failure mode WS1-4 exists to eliminate — see
-/// `rls_matrix.rs::is_safe`.
+/// the exact failure mode WS1-4 exists to eliminate — see `rls_matrix.rs`'s
+/// `Verdict::Inconclusive` (the `is_safe` this used to name was replaced by
+/// `classify` in that same fix, and the reference had been stale since).
 pub async fn seed_request_event(workspace_id: Uuid, model: &str) {
     let sql = format!(
         "INSERT INTO {db}.request_events \

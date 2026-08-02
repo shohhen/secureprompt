@@ -1,12 +1,42 @@
-//! Phase 5 / Plan 05-06 — Cross-tenant RLS matrix test (VALIDATION 5-08-01 / T-05-05).
+//! Phase 5 / Plan 05-06 — Cross-tenant **IDOR** matrix (VALIDATION 5-08-01 /
+//! T-05-05).
 //!
 //! Iterates over every dashboard endpoint that accepts a workspace-scoped
 //! parameter. For each endpoint, issues the request using a JWT minted for
 //! workspace A while targeting workspace B. Asserts that every response is
 //! either HTTP 403 Forbidden or returns an empty result set (no data leakage).
 //!
-//! The test is data-driven via an `EndpointCase` manifest so new endpoints
-//! can be added by appending a row — no new test function required.
+//! The test is data-driven via a `Case` manifest so new endpoints can be added
+//! by appending a row — no new test function required.
+//!
+//! # What this file proves, and what it does NOT (MR1 review I5)
+//!
+//! It proves **application** tenancy: the handler-level IDOR guards, and the
+//! `WHERE workspace_id = ?` predicates in the ClickHouse readers underneath
+//! them. It does **not** prove Postgres row-level security, and the earlier
+//! header — "Cross-tenant RLS matrix test" — claimed otherwise.
+//!
+//! `#[sqlx::test]` connects as the role `DATABASE_URL` names, which for the
+//! compose stack is `POSTGRES_USER` — a superuser, and a superuser bypasses
+//! RLS including `FORCE`. Nothing here sets `app.current_workspace_id` on the
+//! connection the app reads through, and nothing does `SET LOCAL ROLE`.
+//! Deleting the whole `CREATE POLICY workspace_isolation` block from
+//! `001_init.sql` reddens no assertion in this file. That premise is not left
+//! as prose — `the_matrix_role_bypasses_rls` below asserts it on the wire, so
+//! the day it stops being true this note fails instead of quietly rotting.
+//!
+//! RLS itself is covered, and covered properly, by the suites that build a
+//! non-`BYPASSRLS` connection on purpose: `tests/rls_unscoped_read_is_invisible.rs`,
+//! `tests/rls_scope_readback.rs`, `tests/rls_repo_scope.rs`,
+//! `tests/rls_missing_predicate.rs`, `tests/db_role_split.rs` and the
+//! `tests/migration_*_rls.rs` family.
+//!
+//! The MODULE is named `cross_tenant_idor` (see `dashboard/mod.rs`) so the
+//! test IDs cargo prints say what is actually being proved. The FILE keeps its
+//! path deliberately: several dated plan and audit documents cite
+//! `tests/dashboard/rls_matrix.rs` by name, and a path that no longer resolves
+//! is worse for the next auditor than a path whose contents say plainly, in
+//! the first screen, what they are.
 
 use axum::{
     body::{to_bytes, Body},
@@ -123,7 +153,7 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "ClickHouse unreachable at {} — the RLS matrix cannot prove \
+                "ClickHouse unreachable at {} — the IDOR matrix cannot prove \
                  isolation without seeded cross-tenant data and must not be \
                  skipped: {e}",
                 clickhouse_url()
@@ -487,6 +517,38 @@ fn classify(status: StatusCode, body: &Value, expect: Expect, canary: &str) -> V
 }
 
 // ---------- Test -------------------------------------------------------------
+
+/// The header's scope claim, asserted rather than asserted-in-prose.
+///
+/// MR1 review I5 found this file named and documented as an *RLS* matrix when
+/// every connection it uses bypasses RLS entirely. A comment saying so would
+/// be the same species of defect as the one being fixed — a claim about the
+/// runtime that nothing checks — so the claim is a test.
+///
+/// If this ever reddens, `#[sqlx::test]`'s role stopped bypassing RLS, the
+/// matrix's verdicts became partly attributable to `workspace_isolation`, and
+/// the header above has to be rewritten before the results mean what they say.
+/// Redden it deliberately by pointing `DATABASE_URL` at a non-superuser role.
+#[sqlx::test]
+async fn the_matrix_role_bypasses_rls(pool: PgPool) -> sqlx::Result<()> {
+    let (role, is_super, bypasses): (String, bool, bool) = sqlx::query_as(
+        "SELECT current_user::text, rolsuper, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    assert!(
+        is_super || bypasses,
+        "the matrix now runs as `{role}` (rolsuper={is_super}, \
+         rolbypassrls={bypasses}), which does NOT bypass row-level security. \
+         Every verdict in this file is now partly attributable to \
+         `workspace_isolation` rather than to the handler guards it is written \
+         to test — rewrite this file's header before trusting a green run."
+    );
+
+    Ok(())
+}
 
 /// VALIDATION 5-08-01 / T-05-05 — cross-tenant matrix.
 ///
