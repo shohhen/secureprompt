@@ -97,10 +97,17 @@ pub const DETECTION_ENGINES_HEADER: &str = "x-secureprompt-engines";
 
 /// Metric/log `action` label for a prompt-side outage in a workspace whose
 /// policy is `block`: the request was rejected before reaching the provider.
-const ACTION_BLOCK: &str = "block";
+///
+/// MR1 review M2 — bound to [`SidecarUnavailablePolicy::as_str`] rather than
+/// re-typed. The label, the stored `workspace_sidecar_policy` value and the
+/// API representation are the same vocabulary and now have one definition;
+/// `http::sidecar_coverage` and `http::middleware::license_gate` bind to the
+/// same place. A rename is a compile error, not a silently split Prometheus
+/// series.
+const ACTION_BLOCK: &str = SidecarUnavailablePolicy::Block.as_str();
 /// Prompt-side outage in a `degrade_with_alert` workspace: the request was
 /// answered on the deterministic floor.
-const ACTION_DEGRADE: &str = "degrade_with_alert";
+const ACTION_DEGRADE: &str = SidecarUnavailablePolicy::DegradeWithAlert.as_str();
 /// Coverage lost on the RESPONSE side, after the upstream call. Deliberately
 /// distinct from [`ACTION_DEGRADE`]: it does NOT mean the workspace chose to
 /// degrade. `block` cannot be honoured this late — the prompt is already
