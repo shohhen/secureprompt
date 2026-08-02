@@ -226,6 +226,11 @@
                   "description": "SSE stream of data: {...} chunks"
                 }
               }
+            },
+            "headers": {
+              "x-secureprompt-sidecar-degraded": {
+                "$ref": "#/components/headers/SidecarDegraded"
+              }
             }
           },
           "401": {
@@ -280,13 +285,20 @@
                   "type": "string"
                 }
               }
+            },
+            "headers": {
+              "x-secureprompt-sidecar-degraded": {
+                "$ref": "#/components/headers/SidecarDegraded"
+              }
             }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
           "402": {
-            "$ref": "#/components/responses/BudgetExceeded"
+            "$ref": "#/components/responses/BudgetExceeded"          },
+          "503": {
+            "$ref": "#/components/responses/SidecarUnavailable"
           }
         }
       }
@@ -323,13 +335,20 @@
                   "additionalProperties": true
                 }
               }
+            },
+            "headers": {
+              "x-secureprompt-sidecar-degraded": {
+                "$ref": "#/components/headers/SidecarDegraded"
+              }
             }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
           "402": {
-            "$ref": "#/components/responses/BudgetExceeded"
+            "$ref": "#/components/responses/BudgetExceeded"          },
+          "503": {
+            "$ref": "#/components/responses/SidecarUnavailable"
           }
         }
       }
@@ -366,10 +385,17 @@
                   "$ref": "#/components/schemas/RedactResponse"
                 }
               }
+            },
+            "headers": {
+              "x-secureprompt-sidecar-degraded": {
+                "$ref": "#/components/headers/SidecarDegraded"
+              }
             }
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/Unauthorized"          },
+          "503": {
+            "$ref": "#/components/responses/SidecarUnavailable"
           }
         }
       }
@@ -438,10 +464,17 @@
                   "$ref": "#/components/schemas/PolicyCheckResponse"
                 }
               }
+            },
+            "headers": {
+              "x-secureprompt-sidecar-degraded": {
+                "$ref": "#/components/headers/SidecarDegraded"
+              }
             }
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/Unauthorized"          },
+          "503": {
+            "$ref": "#/components/responses/SidecarUnavailable"
           }
         }
       }
@@ -1860,6 +1893,21 @@
     }
   },
   "components": {
+    "headers": {
+      "SidecarDegraded": {
+        "description": "WS2-3. Present only when this answer was produced with the deterministic detection floor alone, because the ML sidecar produced no (or incomplete) coverage and the workspace's `sidecar_unavailable` policy is `degrade_with_alert`. The value is the reason. The matching audit row carries `floor_only = true`.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "unconfigured",
+            "disabled",
+            "circuit_open",
+            "all_calls_failed",
+            "partial_coverage"
+          ]
+        }
+      }
+    },
     "securitySchemes": {
       "bearerAuth": {
         "type": "http",

@@ -58,7 +58,6 @@ secureprompt-api/tests/dashboard/settings_tests.rs
 secureprompt-api/tests/dashboard/users_tests.rs
 secureprompt-api/tests/license_routes.rs
 secureprompt-api/tests/mcp_routes.rs
-secureprompt-api/tests/openapi_register_tests.rs
 secureprompt-api/tests/ssrf_guard.rs
 secureprompt-api/tests/twofactor.rs
 secureprompt-common/src/config.rs

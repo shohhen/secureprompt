@@ -132,22 +132,7 @@ paths:
                 description: "SSE stream of data: {...} chunks"
           headers:
             x-secureprompt-sidecar-degraded:
-              description: >-
-                WS2-3. Present only when this answer was produced with the
-                deterministic detection floor alone, because the ML sidecar
-                produced no (or incomplete) coverage and the workspace's
-                `sidecar_unavailable` policy is `degrade_with_alert`. The
-                value is the reason — one of `unconfigured`, `disabled`,
-                `circuit_open`, `all_calls_failed`, `partial_coverage`. The
-                matching audit row carries `floor_only = true`.
-              schema:
-                type: string
-                enum:
-                  - unconfigured
-                  - disabled
-                  - circuit_open
-                  - all_calls_failed
-                  - partial_coverage
+              $ref: "#/components/headers/SidecarDegraded"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
@@ -181,10 +166,15 @@ paths:
             text/event-stream:
               schema:
                 type: string
+          headers:
+            x-secureprompt-sidecar-degraded:
+              $ref: "#/components/headers/SidecarDegraded"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/BudgetExceeded"
+        "503":
+          $ref: "#/components/responses/SidecarUnavailable"
 
   /v1/embeddings:
     post:
@@ -207,10 +197,15 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+          headers:
+            x-secureprompt-sidecar-degraded:
+              $ref: "#/components/headers/SidecarDegraded"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/BudgetExceeded"
+        "503":
+          $ref: "#/components/responses/SidecarUnavailable"
 
   # ── MCP Utilities ─────────────────────────────────────────────────────────────
   /v1/redact:
@@ -238,8 +233,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RedactResponse"
+          headers:
+            x-secureprompt-sidecar-degraded:
+              $ref: "#/components/headers/SidecarDegraded"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/SidecarUnavailable"
 
   /v1/tokens/estimate:
     post:
@@ -287,8 +287,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCheckResponse"
+          headers:
+            x-secureprompt-sidecar-degraded:
+              $ref: "#/components/headers/SidecarDegraded"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/SidecarUnavailable"
 
   # ── Analytics ─────────────────────────────────────────────────────────────────
   /v1/analytics/usage-daily:
@@ -1184,6 +1189,31 @@ components:
         type: string
         format: uuid
       description: IDOR guard — must equal the JWT workspace_id when provided
+
+  headers:
+    # MR1 review M6: this block was written inline under
+    # /v1/chat/completions only, while `with_sidecar_degraded` is applied on
+    # /v1/completions and /v1/embeddings, and `sidecar_coverage::enforce`
+    # additionally sets it on /v1/redact and /v1/policy/check. Five endpoints
+    # carried an undocumented degraded-mode signal. Named here so there is one
+    # definition and the enum cannot drift between paths -- the dashboard's TS
+    # client is generated from this file by openapi-typescript.
+    SidecarDegraded:
+      description: >-
+        WS2-3. Present only when this answer was produced with the
+        deterministic detection floor alone, because the ML sidecar
+        produced no (or incomplete) coverage and the workspace's
+        `sidecar_unavailable` policy is `degrade_with_alert`. The
+        value is the reason. The matching audit row carries
+        `floor_only = true`.
+      schema:
+        type: string
+        enum:
+          - unconfigured
+          - disabled
+          - circuit_open
+          - all_calls_failed
+          - partial_coverage
 
   responses:
     BadRequest:
