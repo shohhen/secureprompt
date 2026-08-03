@@ -9,7 +9,6 @@ secureprompt-api/src/app_state.rs
 secureprompt-api/src/auth/totp.rs
 secureprompt-api/src/db/license_repo.rs
 secureprompt-api/src/db/provider_repo.rs
-secureprompt-api/src/db/secure_mode_repo.rs
 secureprompt-api/src/detection/merge.rs
 secureprompt-api/src/detection/tests.rs
 secureprompt-api/src/http/middleware/api_key_auth.rs
@@ -22,7 +21,6 @@ secureprompt-api/src/http/routes/dashboard/budgets.rs
 secureprompt-api/src/http/routes/dashboard/keys.rs
 secureprompt-api/src/http/routes/dashboard/me.rs
 secureprompt-api/src/http/routes/dashboard/policy_rules.rs
-secureprompt-api/src/http/routes/dashboard/providers.rs
 secureprompt-api/src/http/routes/dashboard/requests.rs
 secureprompt-api/src/http/routes/dashboard/secure_mode.rs
 secureprompt-api/src/http/routes/internal.rs
@@ -37,7 +35,6 @@ secureprompt-api/src/license/mod.rs
 secureprompt-api/src/license/revocation.rs
 secureprompt-api/src/main.rs
 secureprompt-api/src/ml_sidecar/client.rs
-secureprompt-api/src/observability/metrics.rs
 secureprompt-api/src/pipeline/service.rs
 secureprompt-api/src/pipeline/tests.rs
 secureprompt-api/src/providers/credential_test.rs
@@ -45,7 +42,6 @@ secureprompt-api/src/providers/mod.rs
 secureprompt-api/src/providers/openai_compat.rs
 secureprompt-api/src/providers/tests.rs
 secureprompt-api/src/providers/vertex.rs
-secureprompt-api/src/redis/mod.rs
 secureprompt-api/src/security/mod.rs
 secureprompt-api/src/security/url_guard.rs
 secureprompt-api/src/token_usage/tests.rs
@@ -62,7 +58,6 @@ secureprompt-api/tests/dashboard/settings_tests.rs
 secureprompt-api/tests/dashboard/users_tests.rs
 secureprompt-api/tests/license_routes.rs
 secureprompt-api/tests/mcp_routes.rs
-secureprompt-api/tests/openapi_register_tests.rs
 secureprompt-api/tests/ssrf_guard.rs
 secureprompt-api/tests/twofactor.rs
 secureprompt-common/src/config.rs

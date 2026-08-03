@@ -63,114 +63,114 @@ use uuid::Uuid;
 /// administrator-supplied text in a table that is never purged.
 pub const TARGET_LABEL_MAX: usize = 200;
 
-/// Every administrative action FU5 audits.
+/// Declare the audited vocabulary ONCE.
 ///
-/// # This enum is the vocabulary, and it is pinned in three places
+/// MR4 F8: the enum, [`AdminAuditAction::ALL`] and [`AdminAuditAction::as_str`]
+/// used to be three hand-written lists, and the type's own docs called that "a
+/// chain of failures". Three of the four links held. The fourth — *the variant
+/// must appear in `ALL` at all* — was enforced by nothing: `ALL` was a
+/// hand-written `&'static [Self]` with no exhaustiveness derive, so a variant
+/// added to the enum and to both `match`es but to neither `ALL` nor the
+/// migration left both compared sets at 22, the pinning test green, and the
+/// first production INSERT of that action failing on the CHECK constraint in
+/// front of a customer.
 ///
-/// Adding an audited action means adding a variant here. That is not a
-/// convention, it is a chain of failures:
-///
-///   1. [`Self::as_str`] and [`Self::target_type`] are exhaustive `match`es, so
-///      a new variant that is not spelled out **does not compile**.
-///   2. [`Self::ALL`] is reconciled against migration 028's
-///      `admin_audit_action_known` CHECK constraint by
-///      `tests/admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places`,
-///      so a variant with no migration entry **fails a test** — and, if it ever
-///      escaped the test, would fail its production INSERT rather than write an
-///      undocumented action.
-///   3. The same test reconciles [`Self::ALL`] against
-///      `audit_export::CONTROL_COVERAGE`, the prose copied into every signed
-///      manifest, so the auditor's document cannot fall behind the code.
-///
-/// The export itself needs no entry at all: it selects every row of
-/// `admin_audit` without an `action` predicate and passes the value through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AdminAuditAction {
-    ApiKeyCreated,
-    ApiKeyRevoked,
-    ApiKeyRotated,
-    ProviderCredentialCreated,
-    ProviderCredentialUpdated,
-    ProviderCredentialDeleted,
-    PolicyRuleCreated,
-    PolicyRuleUpdated,
-    PolicyRuleDeleted,
-    PolicyRuleEnabledChanged,
-    PolicyRuleDryRunChanged,
-    UserCreated,
-    // P1A — migration 029. The four surfaces FU5 named as unreached.
-    TwoFactorEnrollmentStarted,
-    TwoFactorEnabled,
-    TwoFactorDisabled,
-    LicenseActivated,
-    LicenseCleared,
-    BudgetUpdated,
-    SecureModeUpdated,
-    SidecarPolicyUpdated,
-    LoginSucceeded,
-    SecondFactorVerified,
+/// Generating all three from one list removes the link rather than testing it:
+/// there is no longer a second place for a variant to be missing from.
+/// `target_type` stays a hand-written exhaustive `match` below, because it maps
+/// GROUPS of actions to one object kind and the grouping is the documentation —
+/// and an exhaustive match is already a compile error for a new variant.
+macro_rules! admin_audit_vocabulary {
+    ($( $(#[$meta:meta])* $variant:ident => $action:literal ),+ $(,)?) => {
+        /// Every administrative action FU5 audits.
+        ///
+        /// # This enum is the vocabulary, and it is pinned in three places
+        ///
+        /// Adding an audited action means adding ONE line to
+        /// `admin_audit_vocabulary!`. That is not a convention, it is a chain
+        /// of failures:
+        ///
+        ///   1. The variant, [`Self::ALL`] and [`Self::as_str`] are generated
+        ///      from that one line, so they cannot disagree; and
+        ///      [`Self::target_type`] is an exhaustive `match`, so a new
+        ///      variant that is not spelled out there **does not compile**.
+        ///   2. [`Self::ALL`] is reconciled against migration 028's
+        ///      `admin_audit_action_known` CHECK constraint by
+        ///      `tests/admin_audit.rs::the_action_vocabulary_is_pinned_in_three_places`,
+        ///      so a variant with no migration entry **fails a test** — and, if
+        ///      it ever escaped the test, would fail its production INSERT
+        ///      rather than write an undocumented action.
+        ///   3. The same test reconciles [`Self::ALL`] against
+        ///      `audit_export::CONTROL_COVERAGE`, the prose copied into every
+        ///      signed manifest, so the auditor's document cannot fall behind
+        ///      the code.
+        ///   4. MR5 I-4 —
+        ///      `every_audited_action_writes_the_detail_keys_the_auditors_document_promises`
+        ///      (`tests/admin_audit.rs`) performs one of every action through
+        ///      the API and requires each row's `detail` keys to EQUAL the list
+        ///      `docs/audit-export-format.md` §3.2 gives it. So a new action
+        ///      needs a §3.2 row AND a driver in that test's
+        ///      `drive_every_audited_action`; without the driver the test fails
+        ///      on its own coverage assertion, which is deliberate — an action
+        ///      nobody performs is an action whose documented keys are checked
+        ///      by nothing, which is the defect I-4 named.
+        ///
+        /// The export itself needs no entry at all: it selects every row of
+        /// `admin_audit` without an `action` predicate and passes the value
+        /// through.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum AdminAuditAction {
+            $( $(#[$meta])* $variant ),+
+        }
+
+        impl AdminAuditAction {
+            /// Every variant, generated from the same list as the variants
+            /// themselves — omission is not possible rather than not permitted.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// The stored `action`, which is also the exported `event_type`
+            /// verbatim.
+            ///
+            /// Dotted `object.verb`, matching the shape FU1 chose for the three
+            /// existing control-plane events (`raw_capture.changed`,
+            /// `retention.purge`, `session.revoked`).
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $action ),+
+                }
+            }
+        }
+    };
+}
+
+admin_audit_vocabulary! {
+    ApiKeyCreated => "api_key.created",
+    ApiKeyRevoked => "api_key.revoked",
+    ApiKeyRotated => "api_key.rotated",
+    ProviderCredentialCreated => "provider_credential.created",
+    ProviderCredentialUpdated => "provider_credential.updated",
+    ProviderCredentialDeleted => "provider_credential.deleted",
+    PolicyRuleCreated => "policy_rule.created",
+    PolicyRuleUpdated => "policy_rule.updated",
+    PolicyRuleDeleted => "policy_rule.deleted",
+    PolicyRuleEnabledChanged => "policy_rule.enabled_changed",
+    PolicyRuleDryRunChanged => "policy_rule.dry_run_changed",
+    UserCreated => "user.created",
+    /// P1A — migration 029. The four surfaces FU5 named as unreached.
+    TwoFactorEnrollmentStarted => "two_factor.enrollment_started",
+    TwoFactorEnabled => "two_factor.enabled",
+    TwoFactorDisabled => "two_factor.disabled",
+    LicenseActivated => "license.activated",
+    LicenseCleared => "license.cleared",
+    BudgetUpdated => "budget.updated",
+    SecureModeUpdated => "secure_mode.updated",
+    SidecarPolicyUpdated => "sidecar_policy.updated",
+    LoginSucceeded => "auth.login_succeeded",
+    SecondFactorVerified => "auth.second_factor_verified",
 }
 
 impl AdminAuditAction {
-    /// Every variant. See the type docs for what keeps this honest.
-    pub const ALL: &'static [Self] = &[
-        Self::ApiKeyCreated,
-        Self::ApiKeyRevoked,
-        Self::ApiKeyRotated,
-        Self::ProviderCredentialCreated,
-        Self::ProviderCredentialUpdated,
-        Self::ProviderCredentialDeleted,
-        Self::PolicyRuleCreated,
-        Self::PolicyRuleUpdated,
-        Self::PolicyRuleDeleted,
-        Self::PolicyRuleEnabledChanged,
-        Self::PolicyRuleDryRunChanged,
-        Self::UserCreated,
-        Self::TwoFactorEnrollmentStarted,
-        Self::TwoFactorEnabled,
-        Self::TwoFactorDisabled,
-        Self::LicenseActivated,
-        Self::LicenseCleared,
-        Self::BudgetUpdated,
-        Self::SecureModeUpdated,
-        Self::SidecarPolicyUpdated,
-        Self::LoginSucceeded,
-        Self::SecondFactorVerified,
-    ];
-
-    /// The stored `action`, which is also the exported `event_type` verbatim.
-    ///
-    /// Dotted `object.verb`, matching the shape FU1 chose for the three
-    /// existing control-plane events (`raw_capture.changed`,
-    /// `retention.purge`, `session.revoked`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ApiKeyCreated => "api_key.created",
-            Self::ApiKeyRevoked => "api_key.revoked",
-            Self::ApiKeyRotated => "api_key.rotated",
-            Self::ProviderCredentialCreated => "provider_credential.created",
-            Self::ProviderCredentialUpdated => "provider_credential.updated",
-            Self::ProviderCredentialDeleted => "provider_credential.deleted",
-            Self::PolicyRuleCreated => "policy_rule.created",
-            Self::PolicyRuleUpdated => "policy_rule.updated",
-            Self::PolicyRuleDeleted => "policy_rule.deleted",
-            Self::PolicyRuleEnabledChanged => "policy_rule.enabled_changed",
-            Self::PolicyRuleDryRunChanged => "policy_rule.dry_run_changed",
-            Self::UserCreated => "user.created",
-            Self::TwoFactorEnrollmentStarted => "two_factor.enrollment_started",
-            Self::TwoFactorEnabled => "two_factor.enabled",
-            Self::TwoFactorDisabled => "two_factor.disabled",
-            Self::LicenseActivated => "license.activated",
-            Self::LicenseCleared => "license.cleared",
-            Self::BudgetUpdated => "budget.updated",
-            Self::SecureModeUpdated => "secure_mode.updated",
-            Self::SidecarPolicyUpdated => "sidecar_policy.updated",
-            Self::LoginSucceeded => "auth.login_succeeded",
-            Self::SecondFactorVerified => "auth.second_factor_verified",
-        }
-    }
-
     /// The kind of object `target_id` points at.
     ///
     /// Derived from the action rather than supplied by the call site, so a

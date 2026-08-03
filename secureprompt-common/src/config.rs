@@ -453,9 +453,14 @@ impl JwtConfig {
     }
 }
 
+/// The ONE mutex every env-mutating test in this file takes.
+///
+/// Hoisted out of `mod tests` (MR1 review M5) because it is not that module's
+/// property: the environment is process-global, so a second `#[cfg(test)]`
+/// module in the same file mutating the same variables needs the SAME lock,
+/// not its own and not none. `sidecar_unavailable_default_tests` had none.
 #[cfg(test)]
-mod tests {
-    use super::JwtConfig;
+mod env_guard {
     use std::sync::{Mutex, OnceLock};
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -465,12 +470,18 @@ mod tests {
     /// — it protects no invariant that a panicking test could corrupt.
     /// Unwrapping here turned a single genuine failure into six, hiding which
     /// test actually broke.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_guard::env_lock;
+    use super::JwtConfig;
 
     fn clear_jwt_env() {
         std::env::remove_var("SECUREPROMPT_JWT_SECRET");
@@ -734,17 +745,43 @@ mod tests {
 
 #[cfg(test)]
 mod sidecar_unavailable_default_tests {
+    use super::env_guard::env_lock;
     use super::AppConfig;
 
     /// WS2-3 — the deployment-level escape hatch must open for exactly one
     /// spelling and stay shut for everything else. A PII gateway must not
     /// fail open because an operator mistyped an env var.
     ///
-    /// Single test, sequential asserts on purpose: these mutate process-wide
-    /// environment, so splitting them into separate `#[test]`s would let the
-    /// harness run them concurrently and race.
+    /// Single test, sequential asserts on purpose: the asserts share one
+    /// variable and reading them top to bottom is how the opt-out rule is
+    /// meant to be understood.
+    ///
+    /// MR1 review M5 — that shape used to be justified as the thing that
+    /// PREVENTS racing: "these mutate process-wide environment, so splitting
+    /// them into separate `#[test]`s would let the harness run them
+    /// concurrently and race". It does not. `libtest` runs each `#[test]` on
+    /// its own thread and `std::env::set_var` is process-global, so one test
+    /// is exactly as exposed as five — it just races against tests elsewhere
+    /// in the crate instead of against its own halves.
+    ///
+    /// MEASURED. A temporary sibling `#[test]` in this module writing
+    /// `degrade_with_alert` to this variable in a loop makes this test fail at
+    /// its FIRST assert under the default thread count —
+    /// `assertion left == right failed: unset must fail closed, left:
+    /// "degrade_with_alert", right: "block"` — and pass under
+    /// `--test-threads=1`. Being one test bought nothing.
+    ///
+    /// It was safe only by the accident that nothing else in the crate touched
+    /// this variable. `env_lock()` is the same guard the twelve JWT/license env
+    /// tests in `mod tests` take. Note what it can and cannot do: it serialises
+    /// this test against every test that ALSO takes it, which is now every
+    /// env-mutating test in the file, and it cannot defend against one that
+    /// does not. That is exactly why the mutex is hoisted to file scope rather
+    /// than living inside `mod tests` — so the next person adding an
+    /// env-mutating module here finds it.
     #[test]
     fn only_the_exact_opt_out_value_disables_fail_closed() {
+        let _g = env_lock();
         const VAR: &str = "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT";
 
         std::env::remove_var(VAR);

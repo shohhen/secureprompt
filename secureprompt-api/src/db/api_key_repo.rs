@@ -475,6 +475,26 @@ impl ApiKeyRepository {
     /// compose Postgres 16: 0.016 ms average. Against the pre-existing shape of
     /// this method — one `workspaces` scan plus a transaction PER WORKSPACE —
     /// that is not the term worth optimising, and the loop itself is.
+    ///
+    /// # The loop is O(tenants) per authenticated request — a real backlog item
+    ///
+    /// MR6 F6 accepted the reasoning above and asked that the loop not stay an
+    /// aside, so it is written out here. Every gateway request presenting an
+    /// API key costs one `workspaces` scan plus five round trips per workspace
+    /// until the hash matches, and it degrades LINEARLY with tenant count: at
+    /// 200 tenants that is roughly 1,000 round trips on the hottest path in the
+    /// product, and a key belonging to the last workspace created pays the
+    /// worst case every time.
+    ///
+    /// The clean fix is the shape migration 032 already gave `refresh_tokens`:
+    /// a `SECURITY DEFINER` by-hash lookup, keyed on `key_hash` instead of the
+    /// refresh-token hash, so possession of the secret — not an enumeration of
+    /// tenants — is what resolves the row. The possession-probe pattern
+    /// (`db::scope::begin_refresh_token_probe`, policy `FOR SELECT` only,
+    /// equality on a caller-supplied hash, GUC read back inside the
+    /// transaction) generalises directly and its threat analysis is in 032's
+    /// header. Not done here: it needs a migration and its own RLS suite, which
+    /// is a change of its own rather than a remediation.
     pub async fn authenticate_api_key(
         &self,
         presented_key: &str,

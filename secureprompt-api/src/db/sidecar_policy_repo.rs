@@ -140,6 +140,47 @@ impl SidecarPolicyRepository {
     /// # Errors
     /// Returns `ApiError::Database` when the query fails. Callers on the
     /// request path treat that as [`SidecarUnavailablePolicy::Block`].
+    ///
+    /// # What it costs on the request path, and why it is NOT cached
+    ///
+    /// MR1 review M17: this runs on every gateway request
+    /// (`pipeline::service::prepare`) and on every `/v1/redact`,
+    /// `/v1/policy/check` and `/v1/secure-mode/tokenize`
+    /// (`http::sidecar_coverage::enforce`), uncached, and the finding
+    /// suggests "a small cache keyed on workspace with a short TTL".
+    ///
+    /// MEASURED first, same method as `SecureModeRepository::get` documents:
+    /// 400 iterations after 50 warm-up, local PostgreSQL 16 over loopback,
+    /// against the same workspace.
+    ///
+    /// | | p50 | p95 |
+    /// |---|---|---|
+    /// | `get_effective` through `begin_scoped` | 904 µs | 1047 µs |
+    /// | the bare single `SELECT` underneath it |  316 µs |  407 µs |
+    ///
+    /// So ~590 µs, on a path that also makes an ML-sidecar call and an
+    /// upstream model call — tens to hundreds of milliseconds. It is the same
+    /// order as the `secure_mode` read two statements later, and both are well
+    /// under a percent of a request.
+    ///
+    /// THE CACHE IS REFUSED, and the reason is not the cost. This value is a
+    /// fail-CLOSED security control: `block` means "a prompt the detector
+    /// never saw is not forwarded". A TTL cache makes the
+    /// `degrade_with_alert -> block` transition take effect LATE, so an
+    /// operator who tightens the setting during an incident — exactly when
+    /// they would touch it — keeps failing open for the length of the TTL,
+    /// silently, with no signal that the new setting is not yet live. Trading
+    /// 590 µs on a 100 ms path for a window in which a security control reads
+    /// as applied but is not is the wrong side of that trade.
+    ///
+    /// Write-through invalidation would fix the staleness, and [`Self::upsert`]
+    /// is the single write path, so it is available in principle — but the
+    /// gateway runs multiple replicas (`api.replicaCount`), and an in-process
+    /// map only invalidates the replica that served the write. Doing it
+    /// correctly means Redis pub/sub and a cache-coherence story for a
+    /// security setting. If this read ever does become material, that is the
+    /// shape it has to take; a bare `HashMap<WorkspaceId, (value, Instant)>`
+    /// is not a smaller version of it, it is a different, wrong thing.
     pub async fn get_effective(
         &self,
         workspace_id: WorkspaceId,
@@ -231,5 +272,82 @@ impl SidecarPolicyRepository {
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
         Ok(after)
+    }
+}
+
+#[cfg(test)]
+mod action_label_vocabulary_tests {
+    use super::SidecarUnavailablePolicy;
+
+    /// Migration 018, read at compile time. `include_str!` is relative to
+    /// THIS file, and `sqlx` validates migration checksums, so the text this
+    /// test reads is the text that shipped.
+    const MIGRATION_018: &str = include_str!("../../migrations/018_sidecar_failure_policy.sql");
+
+    /// MR1 review M2 — one vocabulary, checked against the artefacts that
+    /// cannot be bound to it at compile time.
+    ///
+    /// `SidecarUnavailablePolicy::as_str` is simultaneously three things: the
+    /// value stored in `workspace_sidecar_policy.sidecar_unavailable`, the
+    /// API/JSON representation, and the `action` label on
+    /// `secureprompt_sidecar_unavailable_total`. M2 found the label re-typed
+    /// as bare literals in `pipeline::service` and `http::sidecar_coverage`;
+    /// both now bind to this enum, so Rust-side drift is a compile error and
+    /// asserting it here would be tautological.
+    ///
+    /// What is NOT bindable, and is therefore what this test is for: the
+    /// `CHECK` constraint in migration 018. It is a shipped, checksum-frozen
+    /// artefact that enumerates the same two strings. Rename a variant's
+    /// spelling and `upsert` starts writing a value the constraint rejects —
+    /// at which point the enum, the database and the metric series disagree
+    /// three ways.
+    ///
+    /// FALSIFIER: change `Self::Block => "block"` to any other spelling in
+    /// `as_str` above. 018 still says `'block'`, so this reddens with the
+    /// exact string that went missing.
+    #[test]
+    fn every_policy_spelling_is_one_the_shipped_check_constraint_accepts() {
+        let check_line = MIGRATION_018
+            .lines()
+            .find(|l| l.contains("CHECK (sidecar_unavailable IN"))
+            .expect(
+                "migration 018 no longer has a `CHECK (sidecar_unavailable IN ...)` line — \
+                 either the constraint moved or a later migration replaced it; this test \
+                 must be repointed at whatever now constrains the column",
+            );
+
+        for policy in [
+            SidecarUnavailablePolicy::Block,
+            SidecarUnavailablePolicy::DegradeWithAlert,
+        ] {
+            let quoted = format!("'{}'", policy.as_str());
+            assert!(
+                check_line.contains(&quoted),
+                "{policy:?} serialises to {:?}, which migration 018's CHECK constraint \
+                 does not accept. `upsert` would write a value the database rejects, and \
+                 the `action` label on secureprompt_sidecar_unavailable_total would move \
+                 to a new series. Constraint line: {check_line}",
+                policy.as_str()
+            );
+
+            // Round-trip: the parser must recognise its own output. Without
+            // this, a rename could satisfy the line above via the OTHER
+            // variant's spelling and still fail closed on every read.
+            assert_eq!(
+                SidecarUnavailablePolicy::from_db(policy.as_str()),
+                policy,
+                "from_db does not recognise as_str's output for {policy:?}"
+            );
+        }
+
+        // The constraint must not accept a spelling no variant produces —
+        // that would be a stored value `from_db` silently coerces to `block`.
+        let accepted = check_line.matches('\'').count() / 2;
+        assert_eq!(
+            accepted, 2,
+            "migration 018's CHECK accepts {accepted} values but the enum has 2; a value \
+             the enum cannot produce is one `from_db` would coerce to `block` with only a \
+             warn! line. Constraint line: {check_line}"
+        );
     }
 }

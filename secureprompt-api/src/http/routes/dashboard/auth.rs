@@ -389,8 +389,19 @@ pub(crate) async fn record_login(
     };
     // NOTHING ABOUT THE REQUEST GOES IN. Not the address, not the User-Agent,
     // and not FU4's `{browser} on {os}` reduction of it: FU4 stores the device
-    // on the SESSION row and ERASES it when that session ends, and this table
-    // is never purged, so a copy here would undo that erasure permanently.
+    // on the SESSION row, and this table is never purged, so a copy here would
+    // outlive the session's own copy permanently.
+    //
+    // MR4 F6: that used to read "ERASES it when that session ends", which
+    // describes an event. Nothing erases `client_ip` / `client_descriptor` at
+    // logout, at rotation, at revocation or at expiry. They are nulled by the
+    // PERIODIC `retention.purge` job (`scrub_session_device_context`), whose
+    // predicate is "no live row remains in this chain" — so a logged-out user's
+    // address stays on disk until the next run, and INDEFINITELY in any
+    // deployment where that job is not scheduled. Migration 027's header is
+    // accurate about this; the two comments derived from it were not. The
+    // argument for keeping the device out of `admin_audit` is unaffected and is
+    // in fact stronger: the session copy is erased eventually, this one never.
     let entry =
         AdminAuditEntry::on_own_account(AdminAuditAction::LoginSucceeded, user_id, email, role)
             .with_detail(json!({

@@ -59,7 +59,7 @@
 //! managed Postgres whose role an administrator created separately. That path
 //! is `scripts/db/setup-app-role.sh`, and the error message says so.
 
-use secureprompt_api::db::migrations::{ensure_pg_migrations, MIGRATOR};
+use secureprompt_api::db::migrations::{ensure_pg_migrations, versions_ahead_of_binary, MIGRATOR};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, Row};
 
@@ -338,9 +338,32 @@ async fn the_runtime_role_is_genuinely_powerless(pool: PgPool) {
     );
     assert!(
         !createrole,
-        "{APP_ROLE} has CREATEROLE — with it the role can grant itself \
-         membership of a privileged role and escape the split entirely"
+        "{APP_ROLE} has CREATEROLE — the serving process creates no roles, and \
+         a role attribute nothing needs is a role attribute that only widens \
+         the blast radius of a compromise"
     );
+    // MR7 review M5 — the reason above used to read "with it the role can grant
+    // itself membership of a privileged role and escape the split entirely".
+    // That was true of PostgreSQL 15 and earlier and is FALSE of PostgreSQL 16,
+    // which the chart and every compose file pin. MEASURED on postgres:16.14, as
+    // a NOSUPERUSER / CREATEDB / CREATEROLE / NOBYPASSRLS role: GRANT of an
+    // existing BYPASSRLS role is denied for want of ADMIN OPTION;
+    // `CREATE ROLE x BYPASSRLS`, `ALTER ROLE x BYPASSRLS`,
+    // `CREATE ROLE x SUPERUSER` and `ALTER ROLE self BYPASSRLS` are all denied
+    // because an attribute can only be conferred by a role that already holds
+    // it. PG16 narrowed CREATEROLE to "may administer the roles it created", so
+    // it confers the power to make POWERLESS roles and nothing more.
+    //
+    // The assertion stays -- least privilege does not need a live exploit to
+    // justify it, and this is a supported-downgrade hazard: the same schema on
+    // a PG15 server would make the old sentence true again. What changed is
+    // that the message no longer states something an operator can disprove in
+    // one psql session.
+    //
+    // `scripts/ci/create-nonsuperuser-role.sh` -- which DOES keep CREATEROLE,
+    // because five test files create probe roles as the connected role -- now
+    // asserts that premise on the live server: a PG16 floor plus a real
+    // `SET ROLE` + `CREATE ROLE ... BYPASSRLS` attempt that must be refused.
     assert!(
         canlogin,
         "{APP_ROLE} cannot LOG IN — nothing could serve with it"
@@ -471,6 +494,118 @@ async fn boot_as_the_runtime_role_refuses_a_schema_that_is_behind(pool: PgPool) 
         err.contains(&head.to_string()),
         "the refusal must name the missing migration so an operator can act \
          on it. Got: {err}"
+    );
+
+    probe.close().await;
+}
+
+/// MR7 review M1 — the symmetric case: a schema AHEAD of the binary.
+///
+/// `verify_schema_at_head` checked one direction only (every embedded version
+/// must be applied), so a rolled-back deployment running an OLDER image against
+/// a NEWER schema passed silently and served. Given this file's premise — that
+/// "we skipped migrations" and "migrations never ran" must not look alike —
+/// "we rolled back onto a newer schema" must not look like a normal boot.
+///
+/// BOTH HALVES ARE ASSERTED, and they pull in opposite directions:
+///
+///   * it must still BOOT. Refusing would make rollback impossible, which is
+///     the one lever an operator has during an incident. A test that only
+///     checked for the warning would be satisfied by a build that warned and
+///     then bailed.
+///   * it must SAY SO. The warning is captured off a real `tracing`
+///     subscriber driving the real `ensure_pg_migrations`, not re-derived from
+///     `versions_ahead_of_binary` in the test.
+///
+/// FALSIFIERS: delete the `if !ahead.is_empty()` block -> the capture assertion
+/// fails; turn the `warn!` into a `bail!` -> the boot assertion fails.
+#[sqlx::test]
+async fn boot_as_the_runtime_role_warns_when_the_schema_is_ahead(pool: PgPool) {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that appends everything to a shared buffer.
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // A version this binary can never embed: migration filenames are
+    // timestamps/ordinals well below this.
+    const FUTURE_VERSION: i64 = 999_999_999;
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, installed_on, success, checksum, execution_time)
+         VALUES ($1, 'a migration from a newer release', NOW(), TRUE, '\\x00', 0)",
+    )
+    .bind(FUTURE_VERSION)
+    .execute(&pool)
+    .await
+    .expect("simulate a rollback: the database carries a newer release's migration");
+
+    // PREMISE: the pure comparison must see it. If this is empty the capture
+    // assertion below could pass for the wrong reason (some unrelated warn).
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(&pool)
+            .await
+            .expect("read applied versions");
+    assert_eq!(
+        versions_ahead_of_binary(&applied),
+        vec![FUTURE_VERSION],
+        "premise: the seeded version must be the only one this binary lacks"
+    );
+
+    let probe = app_role_pool(&pool).await;
+
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(Capture(Arc::clone(&buf)))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+
+    // `set_default` rather than `with_default`: the call under test is async,
+    // and the guard keeps this thread's subscriber installed across the await
+    // without needing a block-on shim.
+    let guard = tracing::subscriber::set_default(subscriber);
+    let booted = ensure_pg_migrations(&probe).await;
+    drop(guard);
+
+    booted.expect(
+        "a schema AHEAD of the binary must still boot — refusing would make \
+         rollback impossible",
+    );
+
+    let logged = String::from_utf8(buf.lock().expect("capture buffer").clone())
+        .expect("captured log is utf-8");
+    assert!(
+        logged.contains("schema_ahead_of_binary"),
+        "booting against a newer schema must warn; nothing was logged at WARN. \
+         Captured: {logged:?}"
+    );
+    assert!(
+        logged.contains(&FUTURE_VERSION.to_string()),
+        "the warning must NAME the versions this binary does not embed, or an \
+         operator cannot tell a deliberate rollback from a mis-deployed image. \
+         Captured: {logged:?}"
     );
 
     probe.close().await;

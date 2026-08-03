@@ -746,9 +746,24 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 /// `WHERE workspace_id = $1` below excludes those global rows from this
 /// workspace's inventory regardless.
 ///
-/// `users` is NOT in that list and is counted below unprotected by RLS —
-/// see Part 2 of migration 031's header for the measured defect and why
-/// arming it is a DB-role-split change rather than a one-line policy.
+/// THREE tables counted below are NOT in that list and are read unprotected by
+/// RLS. MR5 M-1: this paragraph named one of them and was presented as an
+/// exhaustive measurement with a single stated exception, which is the shape a
+/// reader trusts.
+///
+///   * `users` — see Part 2 of migration 031's header for the measured defect
+///     and why arming it is a DB-role-split change rather than a one-line
+///     policy.
+///   * `token_vault_entries` (counted below) — holds the tokenised-value
+///     mapping, i.e. the material that reverses redaction. Tenancy rests
+///     entirely on this function's `WHERE workspace_id = $1`.
+///   * `user_backup_codes` (counted below) — has no `workspace_id` of its own
+///     and is reached by joining `users`, so it inherits whatever `users` has,
+///     which today is nothing.
+///
+/// For all three, the `WHERE workspace_id = $1` predicates below are the only
+/// tenancy control, and this endpoint's own counts are what would expose a
+/// mistake in them.
 ///
 /// When that GUC is unset the predicate is NULL for every row,
 /// so a bare count returns ZERO — see the header of migration 020, which

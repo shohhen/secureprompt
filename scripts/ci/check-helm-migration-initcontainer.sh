@@ -23,6 +23,19 @@
 #      and the pod sits in Init:CrashLoopBackOff forever. `Never` is allowed:
 #      an air-gapped install side-loads an exact image and has no registry.
 #   3. The initContainer runs `--migrate-only` and nothing else.
+#   4. (MR7 M2) The initContainer carries a securityContext with
+#      `runAsNonRoot`, `readOnlyRootFilesystem` and `allowPrivilegeEscalation:
+#      false`. It is the one container in the chart holding the OWNER/MIGRATOR
+#      credential, and a writable rootfs plus an owner-role DSN in the
+#      environment is how a compromised init step persists. Safe by
+#      construction against this image: the runtime stage is
+#      `gcr.io/distroless/cc-debian12:nonroot`.
+#   5. (MR7 M2) Both Deployments carry a `checksum/secret` pod annotation.
+#      Without it a `helm upgrade` that changed `app-db-password` alone updated
+#      the Secret and left the pods running — the initContainer then set a NEW
+#      password on `secureprompt_app` while the serving containers held
+#      connections on the OLD one, which fails at the next reconnect, minutes
+#      or hours later, looking like a network fault.
 #
 # It does NOT assert that only one Deployment carries the initContainer.
 # Concurrency is handled where it actually lives: MIGRATION_STEP_LOCK_KEY in
@@ -88,9 +101,39 @@ check_mode() {
             }
         }
 
+        # MR7 M2 — securityContext on the container that holds the owner DSN.
+        # Matched at the initContainer field indent (10 spaces) so a serving
+        # container cannot satisfy it, and the values are matched exactly:
+        # `runAsNonRoot: false` must not count as "has a securityContext".
+        section == "init" && name == "db-migrate" && /^          securityContext:/ { in_sc = 1; next }
+        in_sc && /^          [a-z]/ { in_sc = 0 }
+        in_sc && /^            runAsNonRoot: true$/              { sc_nonroot++ }
+        in_sc && /^            readOnlyRootFilesystem: true$/    { sc_rofs++ }
+        in_sc && /^            allowPrivilegeEscalation: false$/ { sc_nopriv++ }
+
+        # MR7 M2 — the checksum annotation on the two Deployments that carry
+        # the initContainer. Counted per rendered Deployment name so a single
+        # annotation cannot satisfy both.
+        /^  name: .*-(api|worker)$/ { deploy = $2 }
+        /^        checksum\/secret: / { if (deploy != "") { checksum[deploy] = 1 } }
+
         END {
             if (seen_migrate == 0) {
                 print "no db-migrate initContainer was rendered at all — the schema would be applied by whatever serves it, or not at all."
+            }
+            if (sc_nonroot < seen_migrate) {
+                print "the db-migrate initContainer is missing `runAsNonRoot: true` (" sc_nonroot+0 " of " seen_migrate " rendered) — it is the only container holding the OWNER/MIGRATOR credential."
+            }
+            if (sc_rofs < seen_migrate) {
+                print "the db-migrate initContainer is missing `readOnlyRootFilesystem: true` (" sc_rofs+0 " of " seen_migrate ")."
+            }
+            if (sc_nopriv < seen_migrate) {
+                print "the db-migrate initContainer is missing `allowPrivilegeEscalation: false` (" sc_nopriv+0 " of " seen_migrate ")."
+            }
+            n_checksum = 0
+            for (d in checksum) { n_checksum++ }
+            if (n_checksum < 2) {
+                print "only " n_checksum " of the 2 Deployments carrying the db-migrate initContainer has a checksum/secret pod annotation; a helm upgrade that rotates app-db-password would leave the other one running on the old credential until its next reconnect."
             }
         }
     ')"
@@ -115,4 +158,4 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
-echo "helm render OK: owner credential confined to the initContainer, which never pulls IfNotPresent and runs --migrate-only."
+echo "helm render OK: owner credential confined to the initContainer, which never pulls IfNotPresent, runs --migrate-only, drops privileges, and whose Deployments roll when the secret changes."

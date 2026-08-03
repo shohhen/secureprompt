@@ -1532,7 +1532,18 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
     let ws = seed_workspace(&pool).await;
     let app = build_app(pool.clone());
 
-    let hostile_ua = format!("Mozilla/5.0 {}", "A".repeat(4000));
+    // MR4 F9: this used to be `format!("Mozilla/5.0 {}", "A".repeat(4000))`,
+    // which contains no token from `BROWSERS` and none from `PLATFORMS`, so
+    // `client_descriptor` returned `None` and BOTH `is_none_or` assertions
+    // below were satisfied by the `None` rather than by any property of the
+    // reducer. The test proved "an unrecognised UA stores nothing", which is a
+    // different statement from its own name. The hostile string is now
+    // RECOGNISABLE, so the reducer has to produce a `Some` for the length and
+    // the no-verbatim-bytes assertions to bite on.
+    let hostile_ua = format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/{} Safari/537.36",
+        "A".repeat(4000)
+    );
     sign_in(&app, &ws.viewer_email, "not-an-ip-address", &hostile_ua).await;
 
     let row: (Option<String>, Option<String>) = {
@@ -1548,20 +1559,28 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
         row.0, None,
         "a value that is not an IP address must be dropped, not stored"
     );
-    assert!(
-        row.1.as_deref().is_none_or(|d| d.len() <= 64),
-        "the client descriptor must be bounded, got {:?}",
-        row.1
+    // The two claims below are about a VALUE, not about an `Option`. The
+    // pre-F9 form was `assert!(row.1.as_deref().is_none_or(|d| …))` twice, and
+    // a `None` satisfied both without exercising the reducer at all; the
+    // `expect` is what removes that escape, and the hostile UA naming a browser
+    // and a platform is what makes the `expect` reachable.
+    let descriptor = row.1.as_deref().expect(
+        "a recognisable hostile UA must still yield a descriptor, or \
+                 the two assertions below prove nothing",
     );
     assert!(
-        row.1.as_deref().is_none_or(|d| !d.contains("AAAA")),
-        "no part of the raw User-Agent may be stored verbatim, got {:?}",
-        row.1
+        descriptor.len() <= 64,
+        "the client descriptor must be bounded, got {descriptor:?}"
+    );
+    assert!(
+        !descriptor.contains("AAAA"),
+        "no part of the raw User-Agent may be stored verbatim, got {descriptor:?}"
     );
 
-    // CONTROL THAT MUST DIFFER: a well-formed device IS recorded, so the two
-    // `None`s above are the validators and not a write path that stores
-    // nothing at all.
+    // CONTROL THAT MUST DIFFER: a well-formed device IS recorded, so the
+    // dropped IP above is the validator refusing a non-address and not a write
+    // path that stores nothing at all — and the descriptor assertions are the
+    // reducer bounding a real value, not an empty column.
     let second = seed_workspace(&pool).await;
     sign_in(&app, &second.viewer_email, "203.0.113.7", CHROME_MAC).await;
     let good: (Option<String>, Option<String>) = {

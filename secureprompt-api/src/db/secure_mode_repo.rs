@@ -106,6 +106,51 @@ impl SecureModeRepository {
     /// comment at its call site for why that costs no availability the
     /// request path had.
     ///
+    /// # What it costs, measured — and the reduction that was refused
+    ///
+    /// MR5 M-2: this is on the per-request path (`pipeline::service` calls it
+    /// once per chat request) and `begin_scoped` took it from one `SELECT` to
+    /// five round trips — `BEGIN`, `set_config`, the read-back, this `SELECT`,
+    /// `COMMIT`. The change shipped with no measurement, so here is one.
+    ///
+    /// 400 iterations after 50 warm-up, local PostgreSQL 16 over loopback,
+    /// against the same row:
+    ///
+    /// | | p50 | p95 |
+    /// |---|---|---|
+    /// | `get` through `begin_scoped` | 903 µs | 1096 µs |
+    /// | the bare single `SELECT` it replaced | 346 µs | 430 µs |
+    ///
+    /// ~557 µs added, 2.6x. Loopback RTT is ~0, so that figure is protocol and
+    /// parse cost, not network; across a real link the four extra round trips
+    /// dominate and the delta tracks 4 x RTT. Set against the path it sits on
+    /// — an ML-sidecar call plus an upstream model call, tens to hundreds of
+    /// milliseconds — it is well under a percent of a request, which is why it
+    /// is documented here rather than cached.
+    ///
+    /// **The obvious 5-to-4 reduction is refused, and the refusal is
+    /// measured.** Folding `set_config` and the read-back into one statement
+    /// (`SELECT set_config(...), current_setting(...)`) would destroy exactly
+    /// the defect the read-back catches. Executed against PostgreSQL 16:
+    ///
+    ///   * folded into ONE statement on a bare (autocommit) connection — both
+    ///     halves return the workspace id, so the check passes;
+    ///   * the same two statements as SEPARATE round trips on that same bare
+    ///     connection — the second returns NULL, because a transaction-local
+    ///     setting applied outside a transaction is gone when the statement
+    ///     ends. **This is the "armed on a pool, not on a transaction" bug**,
+    ///     the one `rls_call_site_guard` and `rls_scope_arming_guard` exist
+    ///     for, and only the separate round trip sees it;
+    ///   * control: the same two separate statements INSIDE a transaction —
+    ///     the second returns the value, so the NULL above is the pool and not
+    ///     a broken query.
+    ///
+    /// Caching is the other candidate and is deliberately NOT taken here: a
+    /// TTL would delay when an administrator turning secure mode ON takes
+    /// effect, which is a product decision about a security control rather
+    /// than a remediation, and it interacts with the fail-closed behaviour the
+    /// paragraph above describes.
+    ///
     /// # Errors
     /// `ApiError::Database` on SQL failure, `ApiError::Internal` when the
     /// tenancy scope does not arm.
@@ -209,7 +254,8 @@ impl SecureModeRepository {
         let new_enabled = enabled.unwrap_or(current.enabled);
         let new_level = level.unwrap_or(&current.level).to_owned();
         let new_block_pii = block_on_pii_detection.unwrap_or(current.block_on_pii_detection);
-        let new_block_inj = block_on_injection_detection.unwrap_or(current.block_on_injection_detection);
+        let new_block_inj =
+            block_on_injection_detection.unwrap_or(current.block_on_injection_detection);
         let new_redact = redact_pii_in_responses.unwrap_or(current.redact_pii_in_responses);
 
         let row = sqlx::query(
@@ -240,8 +286,18 @@ impl SecureModeRepository {
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
         let mut changed = serde_json::Map::new();
-        changed_field(&mut changed, "enabled", &json!(current.enabled), &json!(new_enabled));
-        changed_field(&mut changed, "level", &json!(current.level), &json!(new_level));
+        changed_field(
+            &mut changed,
+            "enabled",
+            &json!(current.enabled),
+            &json!(new_enabled),
+        );
+        changed_field(
+            &mut changed,
+            "level",
+            &json!(current.level),
+            &json!(new_level),
+        );
         changed_field(
             &mut changed,
             "block_on_pii_detection",

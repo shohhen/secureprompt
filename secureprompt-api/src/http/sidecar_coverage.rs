@@ -56,16 +56,25 @@ use crate::{
 
 /// Metric/log `action` label for a coverage loss in a `block` workspace.
 ///
-/// Deliberately the SAME string the pipeline uses for its own block path
-/// (`pipeline::service::ACTION_BLOCK`, private there) so
+/// BOUND TO THE ENUM AT COMPILE TIME, not re-typed. There is exactly one
+/// source of truth for this vocabulary —
+/// [`SidecarUnavailablePolicy::as_str`], which is also the value stored in
+/// `workspace_sidecar_policy.sidecar_unavailable` — so
 /// `secureprompt_sidecar_unavailable_total` stays one series per
 /// (reason, action) across every route and
-/// `monitoring/prometheus/alerts.yml` needs no new rule. The integration
-/// tests assert the fully-rendered label text, so a drift between the two
-/// definitions fails a test rather than quietly splitting the series.
-const ACTION_BLOCK: &str = "block";
+/// `monitoring/prometheus/alerts.yml` needs no new rule.
+///
+/// MR1 review M2: this used to be a bare `"block"` literal, one of three
+/// independent copies (here, `pipeline::service`, and
+/// `http::middleware::license_gate` — only the last was bound to the enum).
+/// The comment that stood here claimed "the integration tests assert the
+/// fully-rendered label text, so a drift between the two definitions fails a
+/// test". Relying on that was the defect: a drift here splits a Prometheus
+/// series, which is the failure mode alerting notices LAST. Binding makes the
+/// drift a compile error instead, and makes the copies not copies.
+const ACTION_BLOCK: &str = SidecarUnavailablePolicy::Block.as_str();
 /// Same, for a `degrade_with_alert` workspace.
-const ACTION_DEGRADE: &str = "degrade_with_alert";
+const ACTION_DEGRADE: &str = SidecarUnavailablePolicy::DegradeWithAlert.as_str();
 
 /// Read the workspace's effective `sidecar_unavailable` policy, failing
 /// CLOSED.
@@ -74,6 +83,12 @@ const ACTION_DEGRADE: &str = "degrade_with_alert";
 /// (= `Block`), matching the pipeline: a Postgres outage must not become
 /// permission to serve unscanned answers.
 async fn effective_policy(state: &AppState, workspace_id: WorkspaceId) -> SidecarUnavailablePolicy {
+    // MR1 review M17 — yes, this is a Postgres round-trip per request, and
+    // no, it is not cached. Measured (904 µs p50 through `begin_scoped`, vs
+    // 316 µs for the bare SELECT) and the refusal is argued on
+    // `SidecarPolicyRepository::get_effective`: a TTL cache would make
+    // `degrade_with_alert -> block` take effect late, i.e. keep failing
+    // OPEN during the incident in which an operator tightens it.
     SidecarPolicyRepository::new(state.db.clone())
         .get_effective(
             workspace_id,

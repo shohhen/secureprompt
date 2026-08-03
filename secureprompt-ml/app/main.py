@@ -162,14 +162,42 @@ async def lifespan(app: FastAPI):
 # app.main:app` can ever serve a request) rather than only inside a route
 # handler, so a misconfigured deployment fails loudly at container start
 # instead of accepting traffic it can't actually authenticate.
-if not config.INTERNAL_TOKEN:
+#
+# MR1 review M12: this used to be a bare `if not config.INTERNAL_TOKEN`, which
+# accepts `"   "`, `"\t"` and `"0"`. Whitespace-only is not a bypass — HTTP
+# strips optional whitespace around a header value, so the header can never
+# match and the sidecar merely becomes unusable in a way nothing reports — but
+# `"0"` is a bootable ONE-CHARACTER shared secret on the credential that guards
+# /internal/model-key, the model-IP boundary. Both are now refused at import.
+#
+# The 16-character floor is a deliberate availability trade, stated rather than
+# hidden: a deployment running a shorter token stops booting until it is
+# rotated. Every token this repo generates is longer — `scripts/init-env.sh`
+# and every `docker-compose*.yml` message say `openssl rand -hex 32` (64
+# chars), the Helm chart generates 32 bytes, and the test suite's own token is
+# 27 characters — so this refuses hand-typed secrets, which is the population
+# it is aimed at.
+_MIN_INTERNAL_TOKEN_LEN = 16
+_stripped_internal_token = config.INTERNAL_TOKEN.strip()
+
+if not _stripped_internal_token:
     raise RuntimeError(
-        "ML_SIDECAR_INTERNAL_TOKEN is not set — refusing to start. Every "
-        "ML-sidecar route other than /health, /ready, and /metrics requires "
-        "this shared secret to authenticate the gateway. Set "
-        "ML_SIDECAR_INTERNAL_TOKEN before starting the sidecar (see "
-        "secureprompt-common's LicenseConfig::internal_token on the gateway "
-        "side, which must be set to the same value)."
+        "ML_SIDECAR_INTERNAL_TOKEN is not set (or is only whitespace) — "
+        "refusing to start. Every ML-sidecar route other than /health, "
+        "/ready, and /metrics requires this shared secret to authenticate "
+        "the gateway. Set ML_SIDECAR_INTERNAL_TOKEN before starting the "
+        "sidecar (see secureprompt-common's LicenseConfig::internal_token on "
+        "the gateway side, which must be set to the same value)."
+    )
+
+if len(_stripped_internal_token) < _MIN_INTERNAL_TOKEN_LEN:
+    raise RuntimeError(
+        f"ML_SIDECAR_INTERNAL_TOKEN is {len(_stripped_internal_token)} "
+        f"characters — refusing to start. This is the shared secret that "
+        f"guards every detection, scan, secure-file and /internal/model-key "
+        f"call, so it must be at least {_MIN_INTERNAL_TOKEN_LEN} characters. "
+        "Generate one with `openssl rand -hex 32` and set it on both the "
+        "sidecar and the gateway."
     )
 
 # Fix-round finding: docker-compose.yml defaulted ML_SIDECAR_INTERNAL_TOKEN
@@ -197,20 +225,56 @@ def _valid_internal_token(auth_header: str) -> bool:
     is empty — never authenticate against an empty secret (belt-and-braces;
     the module-level boot gate above already prevents that state at
     startup).
+
+    COMPARES BYTES, NOT ``str`` (MR1 review M9). ``hmac.compare_digest``
+    raises ``TypeError`` when either ``str`` operand contains a character
+    outside ASCII, and Starlette decodes raw header bytes as latin-1 — so
+    ``Authorization: Bearer \\xc3\\xa9`` produced an UNHANDLED ``TypeError``,
+    i.e. a 500 with a traceback, PRE-AUTH, on every guarded route. It failed
+    closed (no bypass) but it was a one-byte unauthenticated
+    error/log-amplification vector.
+
+    latin-1 is the correct re-encoding, not utf-8: it is the codec Starlette
+    decoded the wire bytes with, so ``.encode("latin-1")`` recovers exactly
+    the bytes the client sent, whatever they were. A caller that hands this
+    function a ``str`` carrying codepoints above U+00FF did not come off the
+    wire at all; that is rejected rather than coerced.
+
+    Still constant-time for the matching-length case, which is the property
+    that matters — ``compare_digest`` on ``bytes`` is the documented
+    timing-safe path.
     """
-    expected = f"Bearer {config.INTERNAL_TOKEN}"
-    return bool(config.INTERNAL_TOKEN) and hmac.compare_digest(auth_header, expected)
+    if not config.INTERNAL_TOKEN:
+        return False
+    try:
+        provided = auth_header.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    expected = f"Bearer {config.INTERNAL_TOKEN}".encode("utf-8")
+    return hmac.compare_digest(provided, expected)
 
 
 async def _require_internal_token(request: Request) -> None:
     """FastAPI dependency: 401s any request without a valid bearer token.
 
     Applied via ``dependencies=[Depends(_require_internal_token)]`` on every
-    route except ``/health``, ``/ready`` (container/k8s probes depend on
-    these staying open) and the ``/metrics`` Prometheus scrape mount
-    (monitoring/prometheus/prometheus.yml has no bearer_token configured for
-    this job, and /metrics exposes only aggregate counters — no request or
-    document content).
+    route except:
+
+    * ``/health`` and ``/ready`` — container/k8s probes depend on these
+      staying open;
+    * the ``/metrics`` Prometheus scrape mount —
+      monitoring/prometheus/prometheus.yml has no bearer_token configured for
+      this job, and /metrics exposes only aggregate counters, no request or
+      document content;
+    * ``/internal/model-key`` — NOT unauthenticated. It is gated by an
+      equivalent inline ``_valid_internal_token`` check in its own handler
+      rather than by this dependency, because it must distinguish "no token"
+      from "wrong token" in its own error shape.
+
+    MR1 review M14: this list used to name only the first three, which reads
+    as "everything else goes through this dependency" and would send a
+    reviewer auditing the model-IP boundary to the wrong place. The sibling
+    docstring on ``_valid_internal_token`` has always got it right.
     """
     if not _valid_internal_token(request.headers.get("authorization", "")):
         raise HTTPException(status_code=401, detail="unauthorized")

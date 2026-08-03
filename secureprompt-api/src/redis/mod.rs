@@ -14,6 +14,48 @@ use secureprompt_common::{errors::ApiError, kms::KmsBackend};
 
 /// Build a `deadpool-redis` pool from the on-prem Redis URL.
 ///
+/// # Why this sets no timeouts, MEASURED (MR3 F16)
+///
+/// F16 reported that an unanswering Redis — reachable at the IP level and not
+/// replying, i.e. a partition or a blackholed SYN rather than a refusal —
+/// "does not degrade, it stalls": that `pool.get()` would block until the
+/// 150 s inbound `TimeoutLayer` returned a 504, so `jwt_auth`'s outage policy
+/// would never run. Its suggested fix was to configure `deadpool`'s wait and
+/// response timeouts, which are indeed all `None` here.
+///
+/// Both halves of that were measured, and both are wrong.
+///
+/// 1. **The checkout is already bounded at ~1.00 s.** `session_gates` against
+///    TEST-NET-1 (`192.0.2.1`, RFC 5737, routed nowhere) returned
+///    `Err(Internal("redis checkout failed: ... timed out"))` in 1.0017 s.
+///    Against a fake server that COMPLETES the TCP handshake and then never
+///    sends a byte — the "thrashing server" mode, which the blackhole does
+///    not cover — it returned the same error in 1.0020 s. So the outage
+///    policy IS reached, promptly, in both slow-fail modes.
+/// 2. **Configuring `deadpool`'s timeouts would change nothing.** Setting
+///    `Timeouts { wait, create, recycle }` to 60 s each still returned in
+///    1.0018 s. `deadpool` timeouts are upper bounds; they cannot lengthen a
+///    shorter one underneath, and they are not what is binding here.
+///
+/// What is binding is the `redis` client's own defaults, applied inside the
+/// `get_multiplexed_async_connection()` that `deadpool-redis` 0.23 calls at
+/// `src/lib.rs:155`: `DEFAULT_CONNECTION_TIMEOUT = 1 s` and
+/// `DEFAULT_RESPONSE_TIMEOUT = 500 ms` (`redis` 1.2.0, `src/client.rs:180`
+/// and `:182`). The response timeout is the one that covers a command issued
+/// on an already-established connection, which is the case `deadpool` is not
+/// in the path for at all.
+///
+/// So no timeout is set here, deliberately: adding one would be inert, and a
+/// comment claiming it fixed the stall would be false.
+///
+/// THE REAL EXPOSURE, which is not the one F16 named: this bound is a
+/// DEPENDENCY DEFAULT, not a decision this repository makes. If a future
+/// `redis` release changes either constant to `None`, the gateway silently
+/// acquires exactly the stall F16 described and nothing here would say so.
+/// That is what `tests/redis_slow_outage.rs` exists to catch, and it is also
+/// why that file asserts an OUTCOME (bounded, and an error the policy can
+/// act on) rather than a number.
+///
 /// # Errors
 /// Returns `ApiError::Internal` when `Config::from_url` rejects the URL or
 /// the pool cannot be constructed (misconfigured `max_size`, etc.).
@@ -371,10 +413,7 @@ pub async fn store_oidc_state(
 ///
 /// # Errors
 /// `ApiError::Internal` on Redis failure.
-pub async fn consume_oidc_state(
-    pool: &Pool,
-    state_id: &str,
-) -> Result<Option<String>, ApiError> {
+pub async fn consume_oidc_state(pool: &Pool, state_id: &str) -> Result<Option<String>, ApiError> {
     let mut conn = pool
         .get()
         .await
@@ -393,11 +432,7 @@ pub async fn consume_oidc_state(
 ///
 /// # Errors
 /// `ApiError::Internal` on Redis failure.
-pub async fn enqueue_task(
-    pool: &Pool,
-    queue: &str,
-    payload: &str,
-) -> Result<(), ApiError> {
+pub async fn enqueue_task(pool: &Pool, queue: &str, payload: &str) -> Result<(), ApiError> {
     let mut conn = pool
         .get()
         .await
@@ -454,8 +489,8 @@ mod tests {
     /// while a live deployment kept writing another.
     #[test]
     fn session_revocation_key_has_stable_shape() {
-        let user = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555")
-            .expect("valid uuid");
+        let user =
+            uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("valid uuid");
         assert_eq!(
             session_revocation_key(&user),
             "session_revoked:11111111-2222-3333-4444-555555555555"

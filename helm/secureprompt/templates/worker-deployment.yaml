@@ -13,10 +13,11 @@ spec:
     metadata:
       labels:
         app: {{ include "secureprompt.fullname" . }}-worker
-      {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
       annotations:
+        {{- include "secureprompt.secretChecksumAnnotation" . | nindent 8 }}
+        {{- if and .Values.serviceMesh.enabled (eq .Values.serviceMesh.provider "linkerd") }}
         linkerd.io/inject: enabled
-      {{- end }}
+        {{- end }}
     spec:
       initContainers:
         {{- include "secureprompt.dbMigrateInitContainer" . | nindent 8 }}

@@ -176,11 +176,58 @@ async fn verify_schema_at_head(conn: &mut PgConnection) -> anyhow::Result<()> {
         );
     }
 
+    // MR7 review M1 — the check above is one-directional: every EMBEDDED
+    // version must be applied. The symmetric case, a database whose schema is
+    // AHEAD of this binary, passed silently and served.
+    //
+    // That is a rollback: a bad release is reverted, the pods come back on the
+    // previous image, and the database still carries the newer release's
+    // migrations. This MUST NOT refuse to boot — refusing would make rollback,
+    // the one lever an operator has during an incident, impossible. But given
+    // this file's whole premise, that "we skipped migrations" and "migrations
+    // never ran" must not look alike, "we rolled back onto a newer schema"
+    // must not look like a normal boot either. It is the state in which a
+    // dropped column, a tightened CHECK or a new NOT NULL shows up as a
+    // runtime error in one handler rather than as a startup failure.
+    let ahead = versions_ahead_of_binary(&applied);
+    if !ahead.is_empty() {
+        tracing::warn!(
+            ahead = ?ahead,
+            ahead_count = ahead.len(),
+            embedded_head = MIGRATOR.iter().map(|m| m.version).max(),
+            "schema_ahead_of_binary: this database has migrations this binary \
+             does not embed. Serving anyway — this is the expected shape during \
+             a rollback and refusing would make rollback impossible — but any \
+             column or constraint those migrations changed is unknown to this \
+             build. If this is NOT a deliberate rollback, the deployment is \
+             running an image older than its database."
+        );
+    }
+
     tracing::info!(
         applied = applied.len(),
         "Postgres schema is at the embedded migration head"
     );
     Ok(())
+}
+
+/// Versions `_sqlx_migrations` records that this binary does not embed.
+///
+/// Split out from [`verify_schema_at_head`] so the comparison is directly
+/// testable, and `pub` so `tests/db_role_split.rs` can assert the warning
+/// above fires on the state it names rather than on a re-implementation of it.
+///
+/// Sorted, so the log line and any assertion on it are deterministic.
+#[must_use]
+pub fn versions_ahead_of_binary(applied: &[i64]) -> Vec<i64> {
+    let embedded: std::collections::HashSet<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+    let mut ahead: Vec<i64> = applied
+        .iter()
+        .copied()
+        .filter(|v| !embedded.contains(v))
+        .collect();
+    ahead.sort_unstable();
+    ahead
 }
 
 /// Migrations the tracking-table bootstrap is NOT allowed to take on faith,
