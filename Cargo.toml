@@ -11,7 +11,8 @@ resolver = "2"
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "compression-br"] }
+# `limit` — WS4-5 `RequestBodyLimitLayer`, the edge body-size limit.
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "compression-br"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +47,11 @@ failsafe = "1.3"
 clickhouse = { version = "0.15", features = ["inserter", "uuid", "chrono", "rustls-tls"] }
 tokio-cron-scheduler = { version = "0.15" }
 aes-gcm = "0.10"
+# Hoisted from secureprompt-api (WS4-1): `secureprompt-common::audit_export`
+# signs export manifests with it too, and the license/attestation code in the
+# api verifies with it. One version, declared once, so a bump cannot land in
+# one crate and not the other.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 dashmap = "6"
 # oauth2 v5.0.0 (2025-01-21 stable). CRITICAL: use set_auth_uri/set_token_uri,

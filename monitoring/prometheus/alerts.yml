@@ -65,6 +65,24 @@ groups:
           summary: "Gateway served requests with no ML PII coverage ({{ $labels.reason }} / {{ $labels.action }})"
           description: "secureprompt_sidecar_unavailable_total increased by {{ $value | printf \"%.0f\" }} in the last 5 minutes with reason={{ $labels.reason }}. action=degrade_with_alert means requests were answered using the deterministic Rust detection floor ONLY (audit rows carry floor_only = true); action=block means those requests were rejected with 503. Either way the ML sidecar is producing no detection coverage."
 
+      - alert: LicenseGateEngaged
+        expr: increase(secureprompt_license_gate_engaged_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway license is not in good standing ({{ $labels.reason }} / {{ $labels.action }})"
+          description: "secureprompt_license_gate_engaged_total increased by {{ $value | printf \"%.0f\" }} in the last 5 minutes with reason={{ $labels.reason }}. reason=license_revalidation_lost means the signed offline-revalidation budget is exhausted because the gateway cannot reach the license server — those requests were served but marked with the x-secureprompt-license-degraded header, and every licensed entitlement is withheld. reason=license_revoked means the vendor revoked this lic_id and those requests were rejected with 403. In both cases /v1/license stays reachable for an admin to install a replacement — see docs/runbooks/license-recovery.md."
+
+      - alert: AuthSessionStoreUnreachable
+        expr: increase(secureprompt_auth_gate_engaged_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JWT auth cannot read the session gates ({{ $labels.reason }} / {{ $labels.action }})"
+          description: "secureprompt_auth_gate_engaged_total increased by {{ $value | printf \"%.0f\" }} in the last 5 minutes with reason={{ $labels.reason }}. Every increment means Redis was unreachable on an authenticated dashboard request, so `jti_blacklist:{jti}` could not be read. reason=logout_unverifiable is the one that SERVED the request: it was answered from a warm per-pod auth cache (max 60s old) and marked with the x-secureprompt-auth-degraded header — an access token whose holder logged out before the outage would be accepted in that window. reason=revoked_durably means an administrator's revocation was read from session_revocation_audit in Postgres and the request was rejected with 401 — the control held. reason=session_store_lost means Redis AND Postgres were both unreachable and the request was rejected with 503; reason=no_warm_session means Redis was unreachable and the pod had no cached session, also 503. Restore Redis: the dashboard 503s once the 60s window lapses. The data plane (/v1/chat/completions) is gated by api_key_auth and is NOT affected."
+
       - alert: ClickHouseSchemaStale
         expr: secureprompt_clickhouse_schema_mismatch > 0
         for: 1m

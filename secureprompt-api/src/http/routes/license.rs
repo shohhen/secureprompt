@@ -165,7 +165,24 @@ async fn activate_license(
     // Live-swap the license snapshot.
     let now = chrono::Utc::now().timestamp();
     let snapshot = load_and_verify_token(body.token.trim(), &vk, now);
+    let new_lic_id = snapshot.lic_id.clone();
     state.license.set(snapshot);
+
+    // WS4-4 — a revocation is a verdict about one `lic_id`. Installing a
+    // DIFFERENT vendor-signed license supersedes it, so a revoked gateway
+    // recovers from the console with no container restart and no SQL against
+    // `license_activation`. Re-pasting the revoked token clears nothing (see
+    // `LicenseState::clear_revocation_if_superseded`), and `lic_id` is `None`
+    // unless the replacement is Valid — an expired license cannot lift a
+    // revocation either.
+    if let Some(lic_id) = new_lic_id.as_deref() {
+        if state.license.clear_revocation_if_superseded(lic_id) {
+            tracing::warn!(
+                lic_id,
+                "revocation superseded by a newly activated license — gateway is serving again"
+            );
+        }
+    }
 
     // Best-effort model-key push (ignore errors).
     best_effort_push(&state).await;

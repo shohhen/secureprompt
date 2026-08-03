@@ -8,6 +8,7 @@ use crate::{
                 adjust_workspace_tokens, enforce_rate_limit, estimate_tokens_from_text,
                 pre_check_budget, BudgetGate,
             },
+            request_hygiene::request_id_from_headers,
         },
         model_router::resolve_model,
         streaming::force_include_usage,
@@ -147,6 +148,7 @@ pub async fn chat_completions(
         extra_params,
         client_ip,
         user_agent,
+        request_id: request_id_from_headers(&headers),
     };
 
     // Live streaming path: genuine incremental SSE from upstream, flushed
@@ -287,6 +289,7 @@ pub async fn completions(
                 extra_params,
                 client_ip,
                 user_agent,
+                request_id: request_id_from_headers(&headers),
             },
         )
         .await;
@@ -387,6 +390,7 @@ pub async fn embeddings(
                 extra_params: Value::Object(request.extra.clone()),
                 client_ip,
                 user_agent,
+                request_id: request_id_from_headers(&headers),
             },
         )
         .await;

@@ -37,3 +37,7 @@ pub mod users;
 
 #[path = "secure_mode_tests.rs"]
 pub mod secure_mode;
+
+// WS4-3 — admin-initiated session revocation.
+#[path = "session_revocation_tests.rs"]
+pub mod session_revocation;

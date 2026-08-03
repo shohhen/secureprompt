@@ -67,6 +67,100 @@ pub async fn blacklist_jti(pool: &Pool, jti: &str, ttl_secs: u64) -> Result<(), 
     Ok(())
 }
 
+/// WS4-3 — read both session gates in ONE Redis round trip.
+///
+/// `jwt_auth::require` needs two facts about every presented access token:
+/// whether its own `jti` was blacklisted by `POST /v1/auth/logout`, and
+/// whether an administrator has since revoked all sessions for the user it
+/// names. Fetching them separately would double the per-request Redis
+/// checkouts on the hottest authenticated path; this issues `EXISTS` and `GET`
+/// on one connection.
+///
+/// Returns `(jti_blacklisted, revoked_before_unix)`. The second value is
+/// `None` when no revocation watermark exists for the user — the ordinary
+/// case, and the reason the caller must not treat "no key" as "revoked".
+///
+/// # Errors
+/// Returns `ApiError::Internal` if the connection cannot be acquired or
+/// either command fails. The caller decides what an unreachable Redis means;
+/// this function never guesses.
+pub async fn session_gates(
+    pool: &Pool,
+    jti: &str,
+    user_id: &uuid::Uuid,
+) -> Result<(bool, Option<i64>), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
+    let blacklisted: i64 = cmd("EXISTS")
+        .arg(jti_key(jti))
+        .query_async(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+    let revoked_before: Option<i64> = cmd("GET")
+        .arg(session_revocation_key(user_id))
+        .query_async(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+    Ok((blacklisted == 1, revoked_before))
+}
+
+/// WS4-3 — plant the per-user revocation watermark.
+///
+/// Every access token for `user_id` whose `iat` is at or before `at_unix` is
+/// refused from the next request onward. Keyed by USER, not by token id: the
+/// jti blacklist can only revoke a token somebody is holding, and an
+/// administrator terminating a lost laptop's session has never seen that
+/// token's jti — it is not stored anywhere and no endpoint lists it.
+///
+/// `SET ... EX`, so a later revocation for the same user simply overwrites
+/// with a later watermark. That is correct: watermarks only move forward, and
+/// the newest one subsumes every earlier one.
+///
+/// # Errors
+/// Returns `ApiError::Internal` on checkout or command failure. The caller
+/// MUST surface that failure — a revocation whose watermark did not land is a
+/// revocation that did not happen for already-minted access tokens.
+pub async fn revoke_sessions_before(
+    pool: &Pool,
+    user_id: &uuid::Uuid,
+    at_unix: i64,
+    ttl_secs: u64,
+) -> Result<(), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
+    cmd("SET")
+        .arg(session_revocation_key(user_id))
+        .arg(at_unix)
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async::<()>(&mut conn)
+        .await
+        .map_err(|error| redis_error(&error))?;
+    Ok(())
+}
+
+/// How long a revocation watermark must outlive the revocation itself.
+///
+/// The watermark exists only to refuse access tokens that were ALREADY minted
+/// when the revocation happened; the refresh chain is closed in Postgres and
+/// stays closed. The longest-lived such token is one minted in the same second
+/// as the revocation, which `jwt_auth::require` accepts until
+/// `iat + access_ttl_secs + leeway`, where the leeway is the 60 s
+/// `Validation::leeway` that middleware sets. After that the token is expired
+/// on its own terms and the watermark is dead weight, so the key is allowed to
+/// expire rather than accumulating one entry per revoked user forever.
+///
+/// The extra 60 s beyond the leeway is slack for clock skew between the
+/// gateway that wrote the watermark and the one that reads it.
+#[must_use]
+pub const fn revocation_watermark_ttl_secs(access_ttl_secs: u64) -> u64 {
+    access_ttl_secs + 120
+}
+
 /// Stash a file-scan token→value map (JSON) under a random ref with a TTL, so
 /// the chat pipeline can preload its vault and restore file PII in the response.
 /// The ref (a UUID) travels in the message as an opaque `[[sp:v=…]]` marker — the
@@ -326,6 +420,16 @@ fn jti_key(jti: &str) -> String {
     format!("jti_blacklist:{jti}")
 }
 
+/// WS4-3 — the per-user revocation watermark key.
+///
+/// `pub` because `GET /v1/data-inventory` names the key shape to auditors and
+/// the integration tests clean up after themselves; both must read the shape
+/// from here rather than restating it.
+#[must_use]
+pub fn session_revocation_key(user_id: &uuid::Uuid) -> String {
+    format!("session_revoked:{user_id}")
+}
+
 fn redis_error(error: &RedisError) -> ApiError {
     ApiError::Internal(format!("redis error: {error}"))
 }
@@ -341,6 +445,43 @@ mod tests {
     #[test]
     fn jti_key_has_stable_shape() {
         assert_eq!(jti_key("abc"), "jti_blacklist:abc");
+    }
+
+    /// WS4-3: the revocation key shape is quoted verbatim in
+    /// `GET /v1/data-inventory` (`session_revoked:{user_id}`) and used by
+    /// `tests/dashboard/session_revocation_tests.rs`. Changing it silently
+    /// would leave the inventory describing a key class that no longer exists
+    /// while a live deployment kept writing another.
+    #[test]
+    fn session_revocation_key_has_stable_shape() {
+        let user = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555")
+            .expect("valid uuid");
+        assert_eq!(
+            session_revocation_key(&user),
+            "session_revoked:11111111-2222-3333-4444-555555555555"
+        );
+        // Distinct from the jti blacklist: two key classes, two lifetimes,
+        // two meanings. A shared prefix would make one DEL clear the other.
+        assert!(!session_revocation_key(&user).starts_with("jti_blacklist"));
+    }
+
+    /// The watermark must outlive every access token that existed when it was
+    /// written: `access_ttl + 60 s` of `Validation::leeway`, plus slack. A TTL
+    /// shorter than that re-admits a revoked token when the key expires, which
+    /// is the failure nobody would see.
+    #[test]
+    fn watermark_ttl_outlives_the_tokens_it_must_refuse() {
+        // The deployment default (`JwtConfig.access_ttl_secs = 900`).
+        assert_eq!(revocation_watermark_ttl_secs(900), 1_020);
+        for access_ttl in [1_u64, 60, 900, 3_600, 86_400] {
+            let ttl = revocation_watermark_ttl_secs(access_ttl);
+            assert!(
+                ttl >= access_ttl + 60,
+                "TTL {ttl} for access_ttl {access_ttl} expires before a token \
+                 minted in the revocation second stops being accepted \
+                 (access_ttl + 60s leeway)"
+            );
+        }
     }
 
     #[test]

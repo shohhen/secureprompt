@@ -673,3 +673,476 @@ async fn activation_relays_wrapped_blob_not_plaintext(pool: PgPool) {
         "relayed body must NOT contain 'key_hex' (no plaintext key): {captured}"
     );
 }
+
+// ── WS4-4 — the license gate must never brick its own recovery path ──────────
+//
+// A gateway whose license goes revoked or hard-stale used to 403 `/v1/license`
+// itself — the one endpoint an operator needs in order to install a
+// replacement. The recorded field recovery was "disable the env token, recreate
+// the API container, reach Unlicensed, activate from the console". These tests
+// pin that sequence out of existence.
+
+/// Response header naming the license condition a request was served under.
+/// Literal (not the crate constant) on purpose: if the constant is renamed, the
+/// wire contract these tests assert must still be re-stated deliberately.
+const LICENSE_DEGRADED_HEADER: &str = "x-secureprompt-license-degraded";
+
+/// Mint a compact token carrying offline-revalidation budgets, so a test can
+/// drive `LicenseState` into the hard-stale band deterministically.
+/// Returns `(compact_token, lic_id)`.
+fn mint_token_with_budgets(
+    sk: &SigningKey,
+    not_before: &str,
+    expires_at: &str,
+    soft_secs: u64,
+    hard_secs: u64,
+) -> (String, String) {
+    let lic_id = Uuid::new_v4().to_string();
+    let lic = License {
+        v: 1,
+        lic_id: lic_id.clone(),
+        customer: Customer {
+            id: "test-customer".into(),
+            name: "Budgeted Co".into(),
+        },
+        deployment: Deployment {
+            scope: "single-node".into(),
+            max_nodes: 1,
+            sign_pubkey: "p".into(),
+            wrapped_attestation_key: String::new(),
+        },
+        entitlements: Entitlements {
+            not_before: not_before.into(),
+            expires_at: expires_at.into(),
+            seats: 10,
+            features: vec![],
+            components: vec![],
+            revalidate_soft_secs: Some(soft_secs),
+            revalidate_hard_secs: Some(hard_secs),
+        },
+        model: ModelGrant {
+            wrapped_key: "w".into(),
+            models: vec![],
+        },
+        integrity: Integrity {
+            image_digests: BTreeMap::new(),
+        },
+        iss: "sp-admin".into(),
+        iat: not_before.into(),
+    };
+    let env = sign_license(&lic, sk).expect("sign license");
+    let token = envelope_to_token(&env).expect("encode token");
+    (token, lic_id)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` — the strict shape `sp_license::sign::parse_rfc3339`
+/// accepts — for `offset_secs` before now.
+fn rfc3339_secs_ago(offset_secs: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(offset_secs))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+/// Drive the gateway into the hard-stale band with a REAL signed token: valid
+/// signature, inside its validity window, but anchored at a `not_before` far
+/// older than its hard revalidation budget and never credited with a freshness
+/// assertion. Returns the token so a test can prove re-activating the SAME
+/// license does not launder its staleness away.
+fn force_hard_stale(state: &AppState, sk: &SigningKey) -> String {
+    let (token, _lic_id) = mint_token_with_budgets(
+        sk,
+        "2020-01-01T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        60,
+        120,
+    );
+    let snapshot = secureprompt_api::license::load_and_verify_token(
+        &token,
+        &sk.verifying_key(),
+        chrono::Utc::now().timestamp(),
+    );
+    // Premise assertions: without these, "hard stale" could silently be
+    // "Unlicensed because the fixture didn't verify", and every assertion
+    // below would be about the wrong state.
+    assert_eq!(
+        snapshot.status,
+        secureprompt_api::license::LicenseStatus::Valid,
+        "premise: the hard-stale fixture must be a signature-valid, in-window license"
+    );
+    assert_eq!(
+        snapshot.revalidate_hard_secs,
+        Some(120),
+        "premise: the fixture must carry a hard revalidation budget"
+    );
+    state.license.set(snapshot);
+    assert!(
+        state.license.is_hard_stale(),
+        "premise: the fixture must actually put LicenseState into the hard-stale band"
+    );
+    assert!(
+        !state.license.is_revoked(),
+        "premise: hard-stale must not be the sticky revoked flag"
+    );
+    token
+}
+
+/// A signature-valid replacement license an operator would paste into the
+/// console: budgets intact, anchored 60s ago so it is genuinely fresh against
+/// its own 14d/30d policy rather than fresh because it has no policy at all.
+fn mint_replacement_license(sk: &SigningKey) -> (String, String) {
+    mint_token_with_budgets(
+        sk,
+        &rfc3339_secs_ago(60),
+        "2099-01-01T00:00:00Z",
+        1_209_600,
+        2_592_000,
+    )
+}
+
+/// HARD-STALE: `/v1/license` must answer, and a non-allowlisted route must
+/// DEGRADE (serve + say so in a header) rather than 403 — the WS2-3
+/// `degrade_with_alert` shape, not a second vocabulary.
+#[sqlx::test]
+async fn hard_stale_serves_recovery_route_and_degrades_the_rest(pool: PgPool) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    // Positive control: a HEALTHY gateway serves both, with no degraded header.
+    let healthy_license = get_req(&router, "/v1/license", &jwt).await;
+    assert_eq!(healthy_license.status(), StatusCode::OK);
+    let healthy_users = get_req(&router, "/v1/users", &jwt).await;
+    assert_eq!(healthy_users.status(), StatusCode::OK);
+    assert!(
+        healthy_users.headers().get(LICENSE_DEGRADED_HEADER).is_none(),
+        "premise: a healthy gateway must NOT mark responses degraded"
+    );
+
+    force_hard_stale(&state, &sk);
+
+    // THE DEFECT: the recovery endpoint itself was 403-ed here.
+    let resp = get_req(&router, "/v1/license", &jwt).await;
+    let (status, body) = read_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "hard-stale gateway must still answer its own recovery route: {body}"
+    );
+
+    // Hard-stale DEGRADES the rest of the surface instead of hard-403ing it.
+    let degraded = get_req(&router, "/v1/users", &jwt).await;
+    assert_eq!(
+        degraded.status(),
+        StatusCode::OK,
+        "hard-stale must degrade, not block"
+    );
+    assert_eq!(
+        degraded
+            .headers()
+            .get(LICENSE_DEGRADED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("license_revalidation_lost"),
+        "a degraded answer must name the bounded reason it was degraded for"
+    );
+
+    // "Loudly" means the Prometheus series `LicenseGateEngaged` fires on, with
+    // the same bounded (reason, action) label shape WS2-3 uses.
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revalidation_lost", "degrade_with_alert"),
+        1,
+        "the one degraded request must be counted exactly once"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        0,
+        "hard-stale must not be reported as a revocation"
+    );
+    assert!(
+        state.metrics.render_prometheus().contains(
+            "secureprompt_license_gate_engaged_total{reason=\"license_revalidation_lost\",action=\"degrade_with_alert\"} 1"
+        ),
+        "the counter must be exposed on /metrics"
+    );
+    Ok(())
+}
+
+/// REVOKED: `/v1/license` must answer, and the rest of the surface must STILL
+/// be 403. This is the control that must differ — it proves allowlisting the
+/// recovery route did not disarm the gate.
+#[sqlx::test]
+async fn revoked_serves_recovery_route_but_still_blocks_everything_else(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    // Premise: both routes work before the revocation.
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::OK,
+        "premise: /v1/users must be reachable before revocation"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        0,
+        "premise: a healthy gateway engages the gate zero times"
+    );
+
+    state.license.mark_revoked("lic-under-test");
+    assert!(state.license.is_revoked(), "premise: the sticky flag must be set");
+
+    let resp = get_req(&router, "/v1/license", &jwt).await;
+    let (status, body) = read_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "revoked gateway must still answer its own recovery route: {body}"
+    );
+
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "revoked must stay fail-closed everywhere except the recovery route"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .license_gate_engaged_count("license_revoked", "block"),
+        1,
+        "the blocked request is counted; the allowlisted one is not"
+    );
+    Ok(())
+}
+
+/// The trap: "above the license gate" must NOT become "above authentication".
+/// `/v1/license` is admin-gated, and stays admin-gated in the blocked states.
+#[sqlx::test]
+async fn recovery_route_is_above_the_license_gate_not_above_auth(pool: PgPool) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, _user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+
+    state.license.mark_revoked("lic-under-test");
+
+    // No credentials at all → 401, not 200 and not a license 403.
+    let anon = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/license")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        anon.status(),
+        StatusCode::UNAUTHORIZED,
+        "the allowlisted recovery route must still require authentication"
+    );
+
+    // Authenticated but not admin → 403 from RBAC (GET, PUT and DELETE).
+    let viewer_jwt = mint_jwt(ws, Uuid::new_v4(), "viewer");
+    assert_eq!(
+        get_req(&router, "/v1/license", &viewer_jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "viewer GET must still be RBAC-refused"
+    );
+    let (replacement, _) = mint_replacement_license(&sk);
+    assert_eq!(
+        put_req(&router, "/v1/license", json!({"token": replacement}), &viewer_jwt)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "viewer PUT must still be RBAC-refused — a non-admin cannot re-license the gateway"
+    );
+    assert_eq!(
+        delete_req(&router, "/v1/license", &viewer_jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "viewer DELETE must still be RBAC-refused"
+    );
+    Ok(())
+}
+
+/// Acceptance: a simulated hard-stale gateway accepts a replacement license
+/// with no DB surgery and no restart — the console PUT is sufficient.
+#[sqlx::test]
+async fn hard_stale_accepts_replacement_license_without_db_surgery(pool: PgPool) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    let stale_token = force_hard_stale(&state, &sk);
+
+    let (replacement, _lic_id) = mint_replacement_license(&sk);
+    let resp = put_req(&router, "/v1/license", json!({"token": replacement}), &jwt).await;
+    let (status, body) = read_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "replacement PUT must succeed: {body}");
+    assert_eq!(body["status"], "Valid", "gateway must be Valid again: {body}");
+    assert_eq!(body["source"], "db", "replacement must be persisted: {body}");
+    assert!(
+        !state.license.is_hard_stale(),
+        "activating a fresh license must clear the hard-stale condition"
+    );
+
+    // And the surface recovers with no degraded marker.
+    let recovered = get_req(&router, "/v1/users", &jwt).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert!(
+        recovered.headers().get(LICENSE_DEGRADED_HEADER).is_none(),
+        "a re-licensed gateway must stop marking responses degraded"
+    );
+
+    // Control that must differ: re-activating the SAME stale license does not
+    // launder its staleness — the anchor is the license's own not_before, and
+    // pasting it again must not reset the offline countdown.
+    let replay = put_req(&router, "/v1/license", json!({"token": stale_token}), &jwt).await;
+    assert_eq!(replay.status(), StatusCode::OK, "replay PUT is accepted");
+    assert!(
+        state.license.is_hard_stale(),
+        "re-pasting the stale license must NOT buy fresh offline budget"
+    );
+    Ok(())
+}
+
+/// Acceptance: a REVOKED gateway is superseded by a different license without a
+/// restart — and re-pasting the revoked one changes nothing.
+#[sqlx::test]
+async fn revoked_is_superseded_by_a_different_license_but_not_by_itself(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    // Activate license A, then have the vendor revoke exactly that lic_id.
+    let (token_a, lic_a) = mint_replacement_license(&sk);
+    assert_eq!(
+        put_req(&router, "/v1/license", json!({"token": token_a}), &jwt).await.status(),
+        StatusCode::OK
+    );
+    state.license.mark_revoked(&lic_a);
+    assert!(state.license.is_revoked(), "premise: revoked");
+    assert_eq!(
+        state.license.revoked_lic_id().as_deref(),
+        Some(lic_a.as_str()),
+        "premise: the revocation names the license that was actually activated"
+    );
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "premise: a revoked gateway is fail-closed"
+    );
+
+    // Re-pasting the SAME revoked license must not lift the revocation.
+    assert_eq!(
+        put_req(&router, "/v1/license", json!({"token": token_a}), &jwt).await.status(),
+        StatusCode::OK,
+        "the recovery route answers"
+    );
+    assert!(
+        state.license.is_revoked(),
+        "re-activating the revoked license {lic_a} must NOT clear the revocation"
+    );
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "still fail-closed after replaying the revoked token"
+    );
+
+    // A DIFFERENT, vendor-signed license supersedes it — no restart, no SQL.
+    let (token_b, _lic_b) = mint_replacement_license(&sk);
+    assert_eq!(
+        put_req(&router, "/v1/license", json!({"token": token_b}), &jwt).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        !state.license.is_revoked(),
+        "a different, signature-valid license must supersede the revocation"
+    );
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::OK,
+        "the gateway must serve again after being re-licensed"
+    );
+    Ok(())
+}
+
+/// The console reaches `/v1/license` from a browser, so the FULL request path
+/// includes a CORS preflight. `CorsLayer` is applied outside the license gate
+/// in `build_router`, so `OPTIONS` short-circuits above it — asserted here
+/// rather than left as a claim about layer ordering.
+#[sqlx::test]
+async fn cors_preflight_for_the_recovery_route_survives_revocation(pool: PgPool) -> sqlx::Result<()> {
+    let sk = SigningKey::generate(&mut OsRng);
+    let (ws, user) = seed_admin(&pool).await?;
+    let (state, router) = build_app_with_keys(pool.clone(), &sk);
+    let jwt = mint_jwt(ws, user, "admin");
+
+    state.license.mark_revoked("lic-under-test");
+    // Premise: the gate really is engaged in this state — otherwise a 200
+    // preflight would prove nothing.
+    assert_eq!(
+        get_req(&router, "/v1/users", &jwt).await.status(),
+        StatusCode::FORBIDDEN,
+        "premise: the gate must be blocking non-allowlisted routes right now"
+    );
+
+    // Premise: this test reads the default CORS origin `build_router` falls
+    // back to when SECUREPROMPT_CORS_ORIGINS is unset.
+    let cors_env = std::env::var("SECUREPROMPT_CORS_ORIGINS").ok();
+    assert!(
+        cors_env.is_none() || cors_env.as_deref() == Some("http://localhost:3000"),
+        "premise: expected the default CORS origin, got SECUREPROMPT_CORS_ORIGINS={cors_env:?}"
+    );
+
+    let preflight = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/license")
+                .header("Origin", "http://localhost:3000")
+                .header("Access-Control-Request-Method", "PUT")
+                .header("Access-Control-Request-Headers", "authorization,content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        preflight.status().is_success(),
+        "a browser preflight for the recovery route must not be license-403ed, got {}",
+        preflight.status()
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://localhost:3000"),
+        "the preflight must actually be answered by the CORS layer"
+    );
+    assert!(
+        preflight
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m.contains("PUT")),
+        "PUT must be an allowed method — that is the activation call"
+    );
+    Ok(())
+}

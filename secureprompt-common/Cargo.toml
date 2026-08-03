@@ -15,6 +15,11 @@ zeroize = { workspace = true }
 aes-gcm = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+# WS4-1 — audit-export digest chain + detached signature. Ed25519 (asymmetric)
+# rather than an HMAC because the auditor must be able to verify with public
+# material alone; see `audit_export`'s module docs.
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
 vaultrs = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

@@ -371,8 +371,24 @@ async fn dispatch_task(
             metrics.record_task(task_types::ANALYTICS_FLUSH, "stub");
         }
         task_types::AUDIT_EXPORT => {
-            tracing::debug!("audit.export — no-op stub (Phase 7 implementation)");
-            metrics.record_task(task_types::AUDIT_EXPORT, "stub");
+            // WS4-1 — was a `tracing::debug!` no-op stub, which is why
+            // `audit.export` was not a control: the product sold banks a
+            // tamper-evident audit trail and shipped a handler that did
+            // nothing. The outcome is recorded on the `audit_exports` row so a
+            // refusal reaches the auditor who asked, not just this log line.
+            let outcome = tasks::audit_export::run(pg, ch, &task).await;
+            let ok = outcome.ok();
+            tracing::info!(
+                export_id = ?outcome.export_id,
+                status = outcome.status,
+                total_rows = outcome.total_rows,
+                total_pages = outcome.total_pages,
+                "audit.export finished"
+            );
+            metrics.record_task(
+                task_types::AUDIT_EXPORT,
+                if ok { "ok" } else { "error" },
+            );
         }
         task_types::RETENTION_PURGE => {
             let outcome = tasks::retention_purge::run(pg, ch).await;

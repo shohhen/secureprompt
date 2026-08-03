@@ -394,11 +394,28 @@ pub async fn logout(
     // be in the future, but a 1s minimum avoids a Redis error on a race).
     let now = Utc::now().timestamp();
     let remaining = (ctx.exp - now).max(1) as u64;
+    // FU3 — this early return is load-bearing beyond its own request. The jti
+    // blacklist is the ONE session control with no Redis-independent record,
+    // so `jwt_auth::require` degrades rather than fails closed on it when Redis
+    // is unreachable. That degrade is only defensible because a logout
+    // attempted during the outage cannot report success: the error goes back to
+    // the caller instead. A best-effort `let _ =` here would turn a logout the
+    // user watched succeed into one that never happened.
+    // `logout_during_a_redis_outage_does_not_report_success` in
+    // `tests/auth_redis_outage.rs` drives it against a dead Redis.
     if let Err(err) = sp_redis::blacklist_jti(&state.redis_pool, &ctx.jti, remaining).await {
         return api_error_to_response(err);
     }
 
     // Phase 6 / Plan 06-01 — evict from in-process auth cache on logout (D-16).
+    //
+    // FU3 — LOCAL only, and unlike the revocation case this one does leave a
+    // residual: a `jti` blacklisted before Redis became unreachable is not
+    // visible to another pod's degraded path, because nothing outside Redis
+    // records it. That residual is what `AuthOutage::LogoutUnverifiable`
+    // names on the response header and in
+    // `secureprompt_auth_gate_engaged_total`, and what
+    // `DEGRADED_AUTH_CACHE_TTL_SECS` bounds to 60 s.
     state.auth_cache.remove(&ctx.user_id);
 
     // Revoke-all refresh rows for this user — no-op if none are active.

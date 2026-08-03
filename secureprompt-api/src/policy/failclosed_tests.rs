@@ -1500,3 +1500,660 @@ mod ssn_opt_in_tests {
         );
     }
 }
+
+/// WS1, migration half — `024_demote_ssn_to_opt_in.sql`.
+///
+/// 017 / 019 / 020 all back-filled `SSN` / `US_SSN` into every workspace, so
+/// removing them from `DEFAULT_POLICY_CLASSES` changes NEW workspaces only.
+/// Without this migration the demotion would leave every existing deployment
+/// redacting a class the product no longer supports by default.
+///
+/// `#[sqlx::test]` runs every migration before the test body, so a workspace
+/// a test creates is already new-shaped; to prove the migration itself does
+/// anything, these write a PRE-DEMOTION-shaped rule and then execute the
+/// migration file's own SQL against it. Same technique as
+/// `migration_019_tests` above.
+#[cfg(test)]
+mod migration_024_tests {
+    use crate::db::workspace_repo::{DEFAULT_POLICY_CLASSES, OPT_IN_ONLY_CLASSES};
+    use crate::db::WorkspaceRepository;
+    use sqlx::{PgPool, Row};
+    use uuid::Uuid;
+
+    const MIGRATION_SQL: &str = include_str!("../../migrations/024_demote_ssn_to_opt_in.sql");
+
+    /// The untouched seed as it stood immediately BEFORE the demotion.
+    ///
+    /// Built from the two consts rather than hard-coded, so it cannot drift
+    /// when a class is added later — and deliberately in an order matching
+    /// NEITHER the Rust const nor migration 020, which is what proves the
+    /// migration's set-equality test really is order-independent.
+    fn pre_demotion_seed() -> Vec<String> {
+        DEFAULT_POLICY_CLASSES
+            .iter()
+            .chain(OPT_IN_ONLY_CLASSES.iter())
+            .map(|class| (*class).to_owned())
+            .collect()
+    }
+
+    fn as_json_array(classes: &[String]) -> String {
+        serde_json::to_string(classes).unwrap()
+    }
+
+    async fn seed_rule(pool: &PgPool, name: &str, classes: &[String]) -> Uuid {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "SSN Demotion Migration Co",
+                &format!("ssn-migration-{}@example.invalid", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let rule_id = Uuid::new_v4();
+        let conditions: serde_json::Value = serde_json::from_str(&format!(
+            r#"[{{"field":"detection_class","op":"in","value":{}}}]"#,
+            as_json_array(classes)
+        ))
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, $3, 100, $4, 'redact', '{}'::jsonb, true, false, NOW(), NOW())",
+        )
+        .bind(rule_id)
+        .bind(workspace.id)
+        .bind(name)
+        .bind(&conditions)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        rule_id
+    }
+
+    async fn classes_of(pool: &PgPool, rule_id: Uuid) -> Vec<String> {
+        let row = sqlx::query("SELECT conditions FROM policy_rules WHERE id = $1")
+            .bind(rule_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let conditions: serde_json::Value = row.get("conditions");
+        conditions[0]["value"]
+            .as_array()
+            .expect("value array")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// THE HEADLINE. Both spellings leave an untouched seeded rule and
+    /// nothing else does.
+    #[sqlx::test]
+    async fn demotes_both_spellings_from_an_untouched_seeded_rule(pool: PgPool) {
+        let rule_id = seed_rule(&pool, "Redact common PII", &pre_demotion_seed()).await;
+
+        // PREMISE: both classes must be present BEFORE, else a migration that
+        // did nothing at all would pass the assertions below.
+        let before = classes_of(&pool, rule_id).await;
+        assert!(before.contains(&"SSN".to_owned()), "{before:?}");
+        assert!(before.contains(&"US_SSN".to_owned()), "{before:?}");
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            !after.contains(&"SSN".to_owned()),
+            "the floor's `SSN` spelling survived the demotion: {after:?}"
+        );
+        assert!(
+            !after.contains(&"US_SSN".to_owned()),
+            "Presidio's `US_SSN` spelling survived the demotion — leaving \
+             either one makes the demotion cosmetic: {after:?}"
+        );
+
+        // NOTHING ELSE MOVED. Asserted as full set equality, not spot checks:
+        // a migration that emptied the array would satisfy the two assertions
+        // above and destroy the workspace's protection.
+        let mut sorted = after.clone();
+        sorted.sort();
+        let mut expected: Vec<String> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            sorted, expected,
+            "the demoted rule must be exactly DEFAULT_POLICY_CLASSES: {after:?}"
+        );
+    }
+
+    /// The second untouched shape: what 020 leaves on a workspace that was
+    /// seeded before `GCP_KEY` / `AZURE_KEY` were replaced. The dead names
+    /// must SURVIVE — they match nothing, so removing them would change no
+    /// behaviour while risking one.
+    #[sqlx::test]
+    async fn demotes_the_020_reconciled_legacy_shape(pool: PgPool) {
+        let mut classes = pre_demotion_seed();
+        classes.push("GCP_KEY".to_owned());
+        classes.push("AZURE_KEY".to_owned());
+        let rule_id = seed_rule(&pool, "Redact common PII", &classes).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            !after.contains(&"SSN".to_owned()) && !after.contains(&"US_SSN".to_owned()),
+            "the 020-reconciled legacy shape must be demoted too, otherwise \
+             every workspace older than the dead-name fix keeps redacting \
+             SSN: {after:?}"
+        );
+        assert!(
+            after.contains(&"GCP_KEY".to_owned()) && after.contains(&"AZURE_KEY".to_owned()),
+            "the dead names must survive — this migration demotes, it does not \
+             tidy: {after:?}"
+        );
+    }
+
+    /// THE CONSERVATIVE HALF, and the opposite posture to 020. An admin who
+    /// customised the rule may name SSN deliberately; silently stripping it
+    /// would be the same class of defect as the back-fill that created this
+    /// situation.
+    ///
+    /// Widened, unlike in 020 — which back-filled widened rules because ADDING
+    /// a class to someone's customised rule is safe and REMOVING one is not.
+    #[sqlx::test]
+    async fn leaves_a_rule_an_admin_widened_alone(pool: PgPool) {
+        let mut classes = pre_demotion_seed();
+        classes.push("LOCATION".to_owned());
+        let rule_id = seed_rule(&pool, "Redact common PII", &classes).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            after.contains(&"SSN".to_owned()) && after.contains(&"US_SSN".to_owned()),
+            "a rule the admin customised must be left exactly as they left \
+             it — they may have named SSN deliberately: {after:?}"
+        );
+        assert!(after.contains(&"LOCATION".to_owned()), "{after:?}");
+    }
+
+    /// The same rule from the other direction. An admin who removed a class
+    /// meant it, and this migration must not treat their rule as a seed.
+    #[sqlx::test]
+    async fn leaves_a_rule_an_admin_narrowed_alone(pool: PgPool) {
+        let narrowed = vec![
+            "PERSON".to_owned(),
+            "EMAIL_ADDRESS".to_owned(),
+            "SSN".to_owned(),
+        ];
+        let rule_id = seed_rule(&pool, "Redact common PII", &narrowed).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            classes_of(&pool, rule_id).await,
+            narrowed,
+            "a narrowed rule must be left byte for byte as the admin left it"
+        );
+    }
+
+    /// Only the SEEDED rule is in scope. An admin's own rule that happens to
+    /// carry the same class list is theirs.
+    #[sqlx::test]
+    async fn leaves_an_unrelated_rule_alone(pool: PgPool) {
+        let rule_id = seed_rule(&pool, "Block secrets", &pre_demotion_seed()).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            after.contains(&"SSN".to_owned()),
+            "only the seeded 'Redact common PII' rule may be demoted: {after:?}"
+        );
+    }
+
+    /// A workspace created AFTER the demotion already carries the new shape.
+    /// The migration must be a no-op on it rather than an error — and in
+    /// particular must not match it against the pre-demotion seed and then
+    /// trip its own post-condition.
+    #[sqlx::test]
+    async fn leaves_an_already_demoted_rule_alone(pool: PgPool) {
+        let current: Vec<String> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
+        let rule_id = seed_rule(&pool, "Redact common PII", &current).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            classes_of(&pool, rule_id).await,
+            current,
+            "an already-demoted rule must be untouched"
+        );
+    }
+
+    #[sqlx::test]
+    async fn is_idempotent(pool: PgPool) {
+        let rule_id = seed_rule(&pool, "Redact common PII", &pre_demotion_seed()).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let once = classes_of(&pool, rule_id).await;
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let twice = classes_of(&pool, rule_id).await;
+
+        assert_eq!(once, twice, "re-running the migration must change nothing");
+    }
+
+    /// Multi-workspace: the RLS loop must visit EVERY workspace, not just the
+    /// first. A `set_config` hoisted out of the loop, or a loop that exits
+    /// early, would demote one and leave the rest redacting SSN.
+    #[sqlx::test]
+    async fn demotes_every_workspace_not_just_the_first(pool: PgPool) {
+        let seed = pre_demotion_seed();
+        let first = seed_rule(&pool, "Redact common PII", &seed).await;
+        let second = seed_rule(&pool, "Redact common PII", &seed).await;
+        let third = seed_rule(&pool, "Redact common PII", &seed).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        for (label, rule_id) in [("first", first), ("second", second), ("third", third)] {
+            let after = classes_of(&pool, rule_id).await;
+            assert!(
+                !after.contains(&"SSN".to_owned()),
+                "{label} workspace was not demoted: {after:?}"
+            );
+        }
+    }
+
+    /// Set equality, not sequence equality. A rule whose classes are in a
+    /// different order — which `jsonb` does not normalise and an admin's
+    /// round-trip through the policy UI can easily produce — is still the
+    /// untouched seed and must still be demoted.
+    #[sqlx::test]
+    async fn recognises_the_seed_regardless_of_element_order(pool: PgPool) {
+        let mut shuffled = pre_demotion_seed();
+        shuffled.reverse();
+        let rule_id = seed_rule(&pool, "Redact common PII", &shuffled).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            !after.contains(&"SSN".to_owned()) && !after.contains(&"US_SSN".to_owned()),
+            "element order must not decide whether a rule is the seed: {after:?}"
+        );
+    }
+}
+
+/// DRIFT GUARD — `024_demote_ssn_to_opt_in.sql` vs the two Rust consts.
+///
+/// Same duplication hazard as 020, and the same remedy: SQL cannot read a
+/// Rust `const`, so both lists are enumerated again in the migration between
+/// marker comments and parsed back out here.
+///
+/// 024 carries TWO lists and both can rot independently:
+///   * the PRE-DEMOTION SEED SHAPE decides which rules are recognised as an
+///     untouched seed. If a class is added to `DEFAULT_POLICY_CLASSES` and
+///     not here, every workspace seeded after that point stops matching and
+///     is silently skipped.
+///   * the OPT-IN ONLY CLASSES decide what is stripped. If a class is demoted
+///     in Rust and not here, new workspaces are seeded without it while
+///     existing ones keep it.
+#[cfg(test)]
+mod migration_024_drift_tests {
+    use crate::db::workspace_repo::{DEFAULT_POLICY_CLASSES, OPT_IN_ONLY_CLASSES};
+    use std::collections::BTreeSet;
+
+    const MIGRATION_024: &str = include_str!("../../migrations/024_demote_ssn_to_opt_in.sql");
+
+    const SEED_BEGIN: &str = "-- >>> PRE-DEMOTION SEED SHAPE";
+    const SEED_END: &str = "-- <<< END PRE-DEMOTION SEED SHAPE";
+    const OPT_IN_BEGIN: &str = "-- >>> OPT-IN ONLY CLASSES";
+    const OPT_IN_END: &str = "-- <<< END OPT-IN ONLY CLASSES";
+
+    /// Extract the quoted class names from a marker-delimited block.
+    fn block_classes(begin: &str, end: &str) -> BTreeSet<String> {
+        let start = MIGRATION_024
+            .find(begin)
+            .unwrap_or_else(|| panic!("024 must carry the `{begin}` marker"));
+        let stop = MIGRATION_024[start..]
+            .find(end)
+            .unwrap_or_else(|| panic!("024 must carry the `{end}` marker"))
+            + start;
+
+        let mut classes = BTreeSet::new();
+        let mut rest = &MIGRATION_024[start..stop];
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            classes.insert(after[..close].to_owned());
+            rest = &after[close + 1..];
+        }
+        classes
+    }
+
+    /// PREMISE for both tests below. An extraction that silently returned an
+    /// empty set would make an equality assertion fail loudly on one side and
+    /// prove nothing on the other; the shapes are asserted explicitly.
+    #[test]
+    fn the_marker_blocks_parse_to_the_expected_shape() {
+        let seed = block_classes(SEED_BEGIN, SEED_END);
+        assert!(
+            seed.len() > 30,
+            "premise: the seed block must hold the real class list, parsed {} \
+             entries: {seed:?}",
+            seed.len()
+        );
+        for expected in ["PINFL", "BEARER_TOKEN", "EMAIL_ADDRESS", "SSN"] {
+            assert!(
+                seed.contains(expected),
+                "premise: the seed block must contain {expected}: {seed:?}"
+            );
+        }
+
+        // The parse must read its OWN block only. `GCP_KEY` / `AZURE_KEY`
+        // appear elsewhere in 024 (assembling the legacy shape) and are
+        // deliberately NOT inside either block, so finding one here would
+        // mean the extraction over-reached.
+        assert!(
+            !seed.contains("GCP_KEY"),
+            "premise: the seed parse leaked outside its marker block: {seed:?}"
+        );
+
+        let opt_in = block_classes(OPT_IN_BEGIN, OPT_IN_END);
+        assert_eq!(
+            opt_in.len(),
+            2,
+            "premise: the opt-in block must hold exactly the two SSN \
+             spellings: {opt_in:?}"
+        );
+    }
+
+    /// The seed shape the migration recognises must be exactly what a
+    /// workspace carried immediately before the demotion: everything seeded
+    /// today, plus everything demoted.
+    #[test]
+    fn migration_024_seed_shape_equals_the_defaults_plus_the_opt_ins() {
+        let expected: BTreeSet<String> = DEFAULT_POLICY_CLASSES
+            .iter()
+            .chain(OPT_IN_ONLY_CLASSES.iter())
+            .map(|class| (*class).to_owned())
+            .collect();
+
+        assert_eq!(
+            block_classes(SEED_BEGIN, SEED_END),
+            expected,
+            "024's PRE-DEMOTION SEED SHAPE must equal DEFAULT_POLICY_CLASSES \
+             + OPT_IN_ONLY_CLASSES. It is what the migration compares a rule \
+             against to decide the rule is an untouched seed, so a class \
+             missing here means every workspace seeded after that class was \
+             added no longer matches and is silently skipped."
+        );
+    }
+
+    /// What the migration strips must be exactly what Rust demoted.
+    #[test]
+    fn migration_024_strips_exactly_the_opt_in_only_classes() {
+        let expected: BTreeSet<String> = OPT_IN_ONLY_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
+
+        assert_eq!(
+            block_classes(OPT_IN_BEGIN, OPT_IN_END),
+            expected,
+            "024 strips a different set of classes than OPT_IN_ONLY_CLASSES \
+             demotes, so new workspaces and existing ones would disagree \
+             about which classes are opt-in"
+        );
+    }
+}
+
+/// `024_demote_ssn_to_opt_in.sql` executed by a NON-SUPERUSER, NOBYPASSRLS
+/// role.
+///
+/// WHY THIS MODULE EXISTS, measured rather than assumed. Deleting the
+/// `PERFORM set_config('app.current_workspace_id', ...)` line from 024
+/// entirely — the exact mutation that reproduces the `017` defect — left
+/// `migration_024_tests` above at 12 passed / 0 failed. Those tests connect
+/// through the `#[sqlx::test]` pool, whose role is a SUPERUSER
+/// (`rolsuper = t`, `rolbypassrls = t`), and superusers bypass RLS
+/// unconditionally. A migration test that only ever runs as superuser cannot
+/// observe an RLS defect at all, so without this module 024's whole
+/// RLS-safety claim would be a comment nobody had executed.
+///
+/// Same technique and the same role as `tests/migration_020_rls.rs`: FIXTURE
+/// setup goes through the ordinary superuser pool (the application itself
+/// still depends on connecting as a BYPASSRLS role — the DB role-split is a
+/// separate backlog item), and only the MIGRATION runs on the low-privilege
+/// connection.
+#[cfg(test)]
+mod migration_024_rls_tests {
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx::{Connection, PgConnection, PgPool, Row};
+    use uuid::Uuid;
+
+    const MIGRATION_SQL: &str = include_str!("../../migrations/024_demote_ssn_to_opt_in.sql");
+
+    const RLS_ROLE: &str = "secureprompt_runner";
+    const RLS_PASSWORD: &str = "secureprompt";
+
+    /// The pre-demotion seed, built from the two consts so it cannot drift.
+    fn pre_demotion_seed() -> String {
+        let classes: Vec<&str> = crate::db::workspace_repo::DEFAULT_POLICY_CLASSES
+            .iter()
+            .chain(crate::db::workspace_repo::OPT_IN_ONLY_CLASSES.iter())
+            .copied()
+            .collect();
+        serde_json::to_string(&classes).unwrap()
+    }
+
+    /// Raw inserts through the privileged pool, deliberately not through
+    /// `create_with_owner`: the low-privilege role cannot insert into
+    /// `policy_rules` at all, and this suite is about the migration, not the
+    /// seeding path.
+    async fn seed_rule(pool: &PgPool, rule_name: &str, classes: &str) -> Uuid {
+        let workspace_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
+            .bind(workspace_id)
+            .bind("RLS Demotion Co")
+            .execute(pool)
+            .await
+            .expect("workspace insert");
+
+        let rule_id = Uuid::new_v4();
+        let conditions: serde_json::Value = serde_json::from_str(&format!(
+            r#"[{{"field":"detection_class","op":"in","value":{classes}}}]"#
+        ))
+        .expect("fixture class list is valid JSON");
+
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, $3, 100, $4, 'redact', '{}'::jsonb, true, false, NOW(), NOW())",
+        )
+        .bind(rule_id)
+        .bind(workspace_id)
+        .bind(rule_name)
+        .bind(&conditions)
+        .execute(pool)
+        .await
+        .expect("policy rule insert");
+
+        rule_id
+    }
+
+    async fn classes_of(pool: &PgPool, rule_id: Uuid) -> Vec<String> {
+        let row = sqlx::query("SELECT conditions FROM policy_rules WHERE id = $1")
+            .bind(rule_id)
+            .fetch_one(pool)
+            .await
+            .expect("rule must still exist");
+        let conditions: serde_json::Value = row.get("conditions");
+        conditions[0]["value"]
+            .as_array()
+            .expect("conditions[0].value must be an array")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// Create the role if absent, then hand this test database's tables to
+    /// it. Idempotent and concurrency-safe: roles are cluster-global while
+    /// `#[sqlx::test]` databases are per-test, so several tests race here.
+    async fn ensure_low_privilege_role(pool: &PgPool) {
+        sqlx::raw_sql(&format!(
+            "DO $$
+             BEGIN
+                 CREATE ROLE {RLS_ROLE}
+                     LOGIN PASSWORD '{RLS_PASSWORD}'
+                     NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+             EXCEPTION
+                 WHEN duplicate_object THEN NULL;
+             END $$;"
+        ))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "could not create the {RLS_ROLE} role ({e}). In CI this role \
+                 is created by scripts/ci/create-nonsuperuser-role.sh; \
+                 locally the connecting role needs CREATEROLE. This module \
+                 refuses to fall back to the superuser connection, because a \
+                 migration test that runs as superuser cannot observe an RLS \
+                 defect at all."
+            )
+        });
+
+        sqlx::raw_sql(&format!(
+            "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+             GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+             GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+        ))
+        .execute(pool)
+        .await
+        .expect("grants on the test database");
+    }
+
+    /// Open a connection to the SAME `#[sqlx::test]` database as `RLS_ROLE`
+    /// and assert ON THE WIRE that it really is powerless. Without these
+    /// premise assertions the module is worthless: if a base image or a stray
+    /// `ALTER ROLE` handed this role SUPERUSER or BYPASSRLS, both tests below
+    /// would keep passing while exercising no RLS at all.
+    async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
+        ensure_low_privilege_role(pool).await;
+
+        let options: PgConnectOptions = (*pool.connect_options())
+            .clone()
+            .username(RLS_ROLE)
+            .password(RLS_PASSWORD);
+
+        let mut conn = PgConnection::connect_with(&options)
+            .await
+            .expect("low-privilege connection to the test database");
+
+        let row = sqlx::query(
+            "SELECT current_user::text AS who, rolsuper, rolbypassrls
+             FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("identity probe");
+
+        let who: String = row.get("who");
+        let superuser: bool = row.get("rolsuper");
+        let bypassrls: bool = row.get("rolbypassrls");
+
+        assert_eq!(who, RLS_ROLE, "premise: connected as the wrong role");
+        assert!(
+            !superuser,
+            "premise: {who} is a SUPERUSER, so it bypasses RLS and this test \
+             proves nothing"
+        );
+        assert!(
+            !bypassrls,
+            "premise: {who} has BYPASSRLS, so it bypasses RLS and this test \
+             proves nothing"
+        );
+
+        conn
+    }
+
+    /// CHARACTERISATION + PREMISE for the test below: prove this harness can
+    /// actually SEE the defect. A bare `UPDATE policy_rules ...` — the shape
+    /// 017 ships, and what 024 would degrade to if its `set_config` were
+    /// hoisted out of the loop — reports ZERO rows affected and does NOT
+    /// error, even though the row is right there and the superuser pool reads
+    /// it fine.
+    #[sqlx::test]
+    async fn a_bare_update_silently_matches_zero_rows_under_rls(pool: PgPool) {
+        let rule_id = seed_rule(&pool, "Redact common PII", &pre_demotion_seed()).await;
+
+        // PREMISE: the row exists and is visible to the privileged pool, so a
+        // zero row count below is about RLS and not about an empty table.
+        let before = classes_of(&pool, rule_id).await;
+        assert!(
+            before.contains(&"SSN".to_owned()),
+            "premise: the fixture rule must exist and carry SSN: {before:?}"
+        );
+
+        let mut conn = low_privilege_connection(&pool).await;
+        let affected = sqlx::query("UPDATE policy_rules SET updated_at = NOW()")
+            .execute(&mut conn)
+            .await
+            .expect("a bare UPDATE under RLS SUCCEEDS — that is the defect")
+            .rows_affected();
+
+        assert_eq!(
+            affected, 0,
+            "premise: a bare UPDATE must be invisible to this role, otherwise \
+             the connection is not actually RLS-constrained and the test \
+             below proves nothing"
+        );
+    }
+
+    /// THE PROPERTY: 024's loop-over-`workspaces` shape survives a role that
+    /// cannot bypass RLS. This is the assertion behind the migration header's
+    /// RLS-safety claim.
+    #[sqlx::test]
+    async fn demotion_applies_under_a_nonsuperuser_role(pool: PgPool) {
+        let rule_id = seed_rule(&pool, "Redact common PII", &pre_demotion_seed()).await;
+
+        let before = classes_of(&pool, rule_id).await;
+        assert!(
+            before.contains(&"SSN".to_owned()) && before.contains(&"US_SSN".to_owned()),
+            "premise: both spellings must be present before: {before:?}"
+        );
+
+        let mut conn = low_privilege_connection(&pool).await;
+        sqlx::raw_sql(MIGRATION_SQL)
+            .execute(&mut conn)
+            .await
+            .expect("024 must apply cleanly as a NOSUPERUSER/NOBYPASSRLS role");
+
+        let after = classes_of(&pool, rule_id).await;
+        assert!(
+            !after.contains(&"SSN".to_owned()) && !after.contains(&"US_SSN".to_owned()),
+            "024 SHIPPED AS A NO-OP under RLS — the same defect as 017. The \
+             loop over `workspaces` with `set_config` per workspace is what \
+             prevents this: {after:?}"
+        );
+        assert!(
+            after.contains(&"PERSON".to_owned()) && after.contains(&"STIR".to_owned()),
+            "nothing but the demoted classes may be removed: {after:?}"
+        );
+    }
+}

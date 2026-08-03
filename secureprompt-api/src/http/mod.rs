@@ -8,15 +8,21 @@ pub mod streaming;
 
 use crate::app_state::AppState;
 use axum::{
+    extract::DefaultBodyLimit,
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::from_fn_with_state,
+    middleware::{from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use secureprompt_common::errors::ApiError;
 use serde_json::json;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 pub fn build_router(state: AppState) -> Router {
     // MCP utility routes — registered below the OpenAI compat routes.
@@ -150,6 +156,18 @@ pub fn build_router(state: AppState) -> Router {
                     middleware::jwt_auth::require,
                 )),
         )
+        // WS4-1 — the signed audit-trail export. Admin-gated inside the
+        // handlers, exactly like `data-inventory` and `leak-report`, and
+        // deliberately NOT on the license gate's recovery allowlist: it is
+        // ordinary dashboard functionality, not recovery infrastructure.
+        .nest(
+            "/v1/audit-exports",
+            routes::dashboard::audit_export::routes()
+                .route_layer(from_fn_with_state(
+                    state.clone(),
+                    middleware::jwt_auth::require,
+                )),
+        )
         .nest(
             "/v1/secure-mode",
             routes::dashboard::secure_mode::routes()
@@ -172,7 +190,72 @@ pub fn build_router(state: AppState) -> Router {
             middleware::license_gate::enforce,
         ))
         .with_state(state)
+        // ── WS4-5 — request-path hygiene ──────────────────────────────────
+        //
+        // Applied as separate `.layer()` calls, not one `ServiceBuilder`, and
+        // that is load-bearing rather than stylistic: `RequestBodyLimitLayer`
+        // rewrites the request body type to `Limited<Body>` and the response
+        // type to `ResponseBody<_>`, which `axum::middleware::from_fn` (whose
+        // `Next` is typed on `Request<Body>`/`Response<Body>`) will not accept
+        // on either side. `Router::layer` re-normalizes through `IntoResponse`
+        // after every call, so each layer composes with the router instead of
+        // with its neighbour.
+        //
+        // INNERMOST FIRST — the last `.layer()` is the outermost:
+        //
+        //   1. inbound deadline   — backstop; see `request_hygiene` for why it
+        //                           is set ABOVE the upstream deadline.
+        //   2. body limit         — refuses on `Content-Length` before any
+        //                           byte is read; `DefaultBodyLimit` keeps
+        //                           axum's per-extractor limit in agreement so
+        //                           a chunked body with no `Content-Length` is
+        //                           cut at the same number.
+        //   3. TraceLayer         — inside the span made below, so a 413 and a
+        //                           504 are both logged WITH their request id.
+        //   4. request id         — outermost hygiene layer on purpose: every
+        //                           response, including the two rejections
+        //                           above, carries `x-request-id`.
+        //   5. CORS               — unchanged, still outermost overall. A
+        //                           rejection a browser cannot read is not
+        //                           useful to the dashboard.
+        //
+        // All five sit ABOVE the license gate, and above authentication and
+        // rate-limiting (which run inside the handlers). That is the whole
+        // point of a body limit: a limit that runs after the expensive work is
+        // not a limit.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            inbound_deadline(),
+        ))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes()))
+        .layer(DefaultBodyLimit::max(max_body_bytes()))
+        .layer(TraceLayer::new_for_http().make_span_with(middleware::request_hygiene::make_span))
+        .layer(from_fn(middleware::request_hygiene::propagate))
         .layer(cors_layer())
+}
+
+/// Operator-configured maximum request body.
+///
+/// Read from the environment here for the same reason [`cors_layer`] does:
+/// these are router-shaped knobs, not request-shaped ones, and threading them
+/// through `AppConfig` would touch every construction site in the test suite
+/// without making anything more testable — the decision itself is a pure
+/// function in `middleware::request_hygiene`, unit-tested there.
+fn max_body_bytes() -> usize {
+    middleware::request_hygiene::parse_max_body_bytes(
+        std::env::var(middleware::request_hygiene::MAX_BODY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Operator-configured inbound deadline.
+fn inbound_deadline() -> std::time::Duration {
+    middleware::request_hygiene::parse_request_deadline(
+        std::env::var(middleware::request_hygiene::DEADLINE_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Browser-facing CORS for the dashboard. Origins are comma-separated in

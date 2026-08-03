@@ -2,7 +2,9 @@
 //!
 //! These tests are the standing AUTH-05 CI gate.
 
-use secureprompt_api::db::{ApiKeyRepository, PolicyRepository};
+use secureprompt_api::db::{
+    ApiKeyRepository, PolicyRepository, RevocationRecord, SessionRevocationRepository,
+};
 use secureprompt_common::types::WorkspaceId;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -142,5 +144,144 @@ async fn workspace_a_cannot_see_workspace_b_keys(pool: PgPool) -> sqlx::Result<(
         b_keys_in_a_result.len()
     );
 
+    Ok(())
+}
+
+// ── WS4-3: session revocation must not reach across workspaces ────────────
+
+/// `SessionRevocationRepository` is the repo behind
+/// `DELETE /v1/users/{user_id}/sessions`. The HTTP-level control lives in
+/// `tests/dashboard/session_revocation_tests.rs`; this is the same assertion
+/// one layer down, where the SQL is, so a handler-only guard cannot be
+/// mistaken for tenancy (Global Constraint 3).
+#[sqlx::test(fixtures("workspace_a", "workspace_b"))]
+async fn session_revocation_target_lookup_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    let user_a = seed_user(&pool, ws_a().0, "revoke-a@example.com", "viewer").await?;
+    let user_b = seed_user(&pool, ws_b().0, "revoke-b@example.com", "viewer").await?;
+    let repo = SessionRevocationRepository::new(pool);
+
+    // PREMISE: each user really is findable inside their OWN workspace, so a
+    // `None` below is tenancy and not a broken query.
+    assert!(
+        repo.find_target(ws_a().0, user_a)
+            .await
+            .expect("query must succeed")
+            .is_some(),
+        "premise: workspace A's own user must be findable"
+    );
+    assert!(
+        repo.find_target(ws_b().0, user_b)
+            .await
+            .expect("query must succeed")
+            .is_some(),
+        "premise: workspace B's own user must be findable"
+    );
+
+    assert!(
+        repo.find_target(ws_a().0, user_b)
+            .await
+            .expect("query must succeed")
+            .is_none(),
+        "CROSS-TENANT LEAK: workspace A resolved a workspace B user as a \
+         revocation target"
+    );
+    assert!(
+        repo.find_target(ws_b().0, user_a)
+            .await
+            .expect("query must succeed")
+            .is_none(),
+        "CROSS-TENANT LEAK: workspace B resolved a workspace A user as a \
+         revocation target"
+    );
+    Ok(())
+}
+
+/// And the write half: revoking inside workspace A must not close workspace
+/// B's refresh tokens, even for a user id supplied by the caller.
+#[sqlx::test(fixtures("workspace_a", "workspace_b"))]
+async fn session_revocation_write_cannot_close_another_workspaces_refresh_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let user_a = seed_user(&pool, ws_a().0, "write-a@example.com", "viewer").await?;
+    let user_b = seed_user(&pool, ws_b().0, "write-b@example.com", "viewer").await?;
+    let admin_a = seed_user(&pool, ws_a().0, "write-admin-a@example.com", "admin").await?;
+    seed_refresh_row(&pool, ws_a().0, user_a).await?;
+    seed_refresh_row(&pool, ws_b().0, user_b).await?;
+
+    let repo = SessionRevocationRepository::new(pool.clone());
+    let target = repo
+        .find_target(ws_a().0, user_a)
+        .await
+        .expect("query")
+        .expect("workspace A's own user");
+    let outcome = repo
+        .revoke(&RevocationRecord {
+            workspace_id: ws_a().0,
+            actor_user_id: admin_a,
+            actor_email: Some("write-admin-a@example.com"),
+            actor_role: "admin",
+            target: &target,
+            revoked_before_unix: 1_800_000_000,
+        })
+        .await
+        .expect("revoke must succeed");
+    assert_eq!(
+        outcome.refresh_tokens_revoked, 1,
+        "premise: the revocation must actually have closed workspace A's row, \
+         or the assertion below passes vacuously"
+    );
+
+    let b_active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_b)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        b_active, 1,
+        "CROSS-TENANT LEAK: a workspace A revocation closed workspace B's \
+         refresh token"
+    );
+
+    let b_audit: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(ws_b().0)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(b_audit, 0, "no audit row may be written for workspace B");
+    Ok(())
+}
+
+async fn seed_user(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    email: &str,
+    role: &str,
+) -> sqlx::Result<Uuid> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, workspace_id, email, password_hash, role, created_at, updated_at)
+         VALUES ($1, $2, $3, 'x', $4, NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(email)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+async fn seed_refresh_row(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO refresh_tokens (id, user_id, workspace_id, token_hash, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour', NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(format!("hash-{}", Uuid::new_v4().simple()))
+    .execute(pool)
+    .await?;
     Ok(())
 }
