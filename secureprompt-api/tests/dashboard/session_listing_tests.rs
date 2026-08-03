@@ -207,6 +207,26 @@ async fn json_body(resp: axum::response::Response) -> Value {
     }
 }
 
+/// The access-token jtis a user's refresh rows carry, read from inside the
+/// workspace's armed scope.
+///
+/// Purely a CLEANUP read — the tests use it to delete the Redis blacklist keys
+/// a run leaves behind, and nothing asserts on it. It is scoped anyway because
+/// the unscoped version does not merely return the wrong answer under a
+/// non-bypassing role: it raises `22P02` and the old `unwrap_or_default()`
+/// swallowed that into an empty list, so the keys silently survived into the
+/// next test.
+async fn jtis_of(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> Vec<String> {
+    let mut scope = super::fixtures::scoped(pool, workspace_id).await;
+    sqlx::query_scalar(
+        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *scope)
+    .await
+    .unwrap_or_default()
+}
+
 /// What one sign-in gives back. `access` and `refresh` are the real tokens the
 /// gateway minted, so the tests below drive the same loop a browser does.
 struct SignIn {
@@ -438,12 +458,14 @@ async fn rotating_a_session_does_not_turn_it_into_two(pool: PgPool) {
 
     // PREMISE: the rotation really did add a row. If it did not, "still one
     // session" below would be true for the wrong reason.
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE user_id = $1")
         .bind(ws.viewer)
-        .fetch_one(&pool)
+        .fetch_one(&mut *scope)
         .await
         .expect("count rows");
     assert_eq!(rows, 2, "premise: rotation writes a second refresh row");
+    drop(scope);
 
     let after = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
     assert_eq!(
@@ -479,15 +501,20 @@ async fn a_session_the_server_never_saw_end_ages_out_of_the_listing(pool: PgPool
 
     // The laptop was closed and never came back. Nothing tells the gateway;
     // the refresh row simply reaches its own expiry.
-    let aged: u64 = sqlx::query(
-        "UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 second'
-         WHERE user_id = $1 AND client_ip = '203.0.113.7'",
-    )
-    .bind(ws.viewer)
-    .execute(&pool)
-    .await
-    .expect("age the row")
-    .rows_affected();
+    let aged: u64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        let affected = sqlx::query(
+            "UPDATE refresh_tokens SET expires_at = NOW() - INTERVAL '1 second'
+             WHERE user_id = $1 AND client_ip = '203.0.113.7'",
+        )
+        .bind(ws.viewer)
+        .execute(&mut *scope)
+        .await
+        .expect("age the row")
+        .rows_affected();
+        scope.commit().await.expect("commit the aged row");
+        affected
+    };
     assert_eq!(aged, 1, "premise: exactly one row was aged out");
 
     let after = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
@@ -525,12 +552,14 @@ async fn the_listing_never_returns_the_token_hash_or_the_jti(pool: PgPool) {
 
     // PREMISE: the values we are looking for really are stored, so their
     // absence from the response is the handler's doing and not an empty table.
-    let stored: (String, Option<String>) =
+    let stored: (String, Option<String>) = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
         sqlx::query_as("SELECT token_hash, access_jti FROM refresh_tokens WHERE user_id = $1")
             .bind(ws.viewer)
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .expect("the row stores a hash and a jti");
+            .expect("the row stores a hash and a jti")
+    };
     let jti = stored
         .1
         .expect("premise: the sign-in recorded its access jti");
@@ -616,13 +645,7 @@ async fn ending_one_session_leaves_the_other_signed_in(pool: PgPool) {
         "the ended session must leave the listing: {remaining}"
     );
 
-    let jtis: Vec<String> = sqlx::query_scalar(
-        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let jtis: Vec<String> = jtis_of(&pool, ws.id, ws.viewer).await;
     forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }
 
@@ -660,13 +683,16 @@ async fn a_revoked_refresh_token_is_not_mistaken_for_a_stolen_one(pool: PgPool) 
         refresh(&app, &ended.refresh).await.status(),
         StatusCode::UNAUTHORIZED
     );
-    let survivors: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let survivors: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_scalar(
+            "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(ws.viewer)
+        .fetch_one(&mut *scope)
+        .await
+        .expect("count")
+    };
     assert_eq!(
         survivors, 1,
         "retrying a revoked refresh token must not revoke the user's other \
@@ -689,25 +715,22 @@ async fn a_revoked_refresh_token_is_not_mistaken_for_a_stolen_one(pool: PgPool) 
         StatusCode::UNAUTHORIZED,
         "the spent token must not work twice"
     );
-    let after_replay: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let after_replay: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_scalar(
+            "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(ws.viewer)
+        .fetch_one(&mut *scope)
+        .await
+        .expect("count")
+    };
     assert_eq!(
         after_replay, 0,
         "control: a genuine replay must still revoke every active refresh row"
     );
 
-    let jtis: Vec<String> = sqlx::query_scalar(
-        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let jtis: Vec<String> = jtis_of(&pool, ws.id, ws.viewer).await;
     forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }
 
@@ -723,10 +746,13 @@ async fn ending_one_session_writes_an_audit_row_naming_that_session(pool: PgPool
 
     // PREMISE: the table starts empty, so a row found afterwards was written
     // by this action.
-    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
-        .fetch_one(&pool)
-        .await
-        .expect("premise count");
+    let before: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
+            .fetch_one(&mut *scope)
+            .await
+            .expect("premise count")
+    };
     assert_eq!(before, 0, "premise: the audit table starts empty");
 
     let listed = json_body(list_sessions(&app, &admin_token, ws.viewer).await).await;
@@ -738,14 +764,16 @@ async fn ending_one_session_writes_an_audit_row_naming_that_session(pool: PgPool
         StatusCode::OK
     );
 
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
     let row = sqlx::query(
         "SELECT workspace_id, actor_user_id, actor_role, target_user_id, target_role,
                 session_id, refresh_tokens_revoked
          FROM session_revocation_audit",
     )
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await
     .expect("exactly one audit row");
+    drop(scope);
     assert_eq!(row.get::<Uuid, _>("workspace_id"), ws.id);
     assert_eq!(row.get::<Uuid, _>("actor_user_id"), ws.admin);
     assert_eq!(row.get::<String, _>("actor_role"), "admin");
@@ -763,13 +791,7 @@ async fn ending_one_session_writes_an_audit_row_naming_that_session(pool: PgPool
     );
 
     let _ = signed_in;
-    let jtis: Vec<String> = sqlx::query_scalar(
-        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let jtis: Vec<String> = jtis_of(&pool, ws.id, ws.viewer).await;
     forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }
 
@@ -801,11 +823,13 @@ async fn the_user_wide_lever_still_records_itself_as_user_wide(pool: PgPool) {
         "WS4-3's route must keep working unchanged"
     );
 
-    let session_id: Option<Uuid> =
+    let session_id: Option<Uuid> = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
         sqlx::query_scalar("SELECT session_id FROM session_revocation_audit")
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
-            .expect("one audit row");
+            .expect("one audit row")
+    };
     assert_eq!(
         session_id, None,
         "a user-wide revocation names no session; NULL is what distinguishes it"
@@ -898,13 +922,7 @@ async fn a_user_may_see_and_end_their_own_sessions_without_being_an_admin(pool: 
         "per-session self-service must not have widened the user-wide lever"
     );
 
-    let jtis: Vec<String> = sqlx::query_scalar(
-        "SELECT access_jti FROM refresh_tokens WHERE user_id = $1 AND access_jti IS NOT NULL",
-    )
-    .bind(ws.viewer)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let jtis: Vec<String> = jtis_of(&pool, ws.id, ws.viewer).await;
     forget_keys(&redis_pool().await, ws.viewer, &jtis).await;
 }
 
@@ -989,7 +1007,11 @@ async fn an_admin_may_not_read_or_end_an_owners_sessions(pool: PgPool) {
     let app = build_app(pool.clone());
 
     // Give the owner a session without going through the 2FA-gated login path.
+    // Seeded through the workspace's armed scope: `refresh_tokens` is
+    // ENABLE + FORCE ROW LEVEL SECURITY, so on the bare pool this INSERT is
+    // refused with 42501 under any role that cannot bypass RLS.
     let owner_session = Uuid::new_v4();
+    let mut owner_scope = super::fixtures::scoped(&pool, ws.id).await;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, expires_at, created_at,
@@ -1006,9 +1028,13 @@ async fn an_admin_may_not_read_or_end_an_owners_sessions(pool: PgPool) {
     )))
     .bind(owner_session)
     .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
+    .execute(&mut *owner_scope)
     .await
     .expect("seed owner session");
+    owner_scope
+        .commit()
+        .await
+        .expect("commit the seeded owner session");
 
     let admin_token = make_jwt(ws.id, ws.admin, "admin");
     assert_eq!(
@@ -1095,13 +1121,19 @@ async fn sessions_cannot_be_read_or_ended_across_workspaces(pool: PgPool) {
         StatusCode::OK,
         "workspace B's session must be untouched"
     );
-    let active_b: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(b.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    // Read from INSIDE WORKSPACE B's OWN armed scope. A bare-pool read is
+    // filtered to nothing under a non-bypassing role, which would make every
+    // claim about workspace B below a claim about the reader instead.
+    let active_b: i64 = {
+        let mut b_scope = super::fixtures::scoped(&pool, b.id).await;
+        sqlx::query_scalar(
+            "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(b.viewer)
+        .fetch_one(&mut *b_scope)
+        .await
+        .expect("count")
+    };
     assert_eq!(active_b, 1, "workspace B's refresh row must survive");
 
     // POSITIVE CONTROL: the same admin inside their OWN workspace works, so the
@@ -1123,12 +1155,32 @@ async fn sessions_cannot_be_read_or_ended_across_workspaces(pool: PgPool) {
         "control: in-workspace narrow revocation must succeed"
     );
 
-    let rows: i64 =
+    // CONTROL for the absence-claim: the identical query, on the identical
+    // table, from workspace A's scope returns 1. Without it a zero from B's
+    // scope would be equally well explained by a broken query or by an
+    // end-session route that wrote no audit row at all.
+    let rows_a: i64 = {
+        let mut a_scope = super::fixtures::scoped(&pool, a.id).await;
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(a.id)
+            .fetch_one(&mut *a_scope)
+            .await
+            .expect("count")
+    };
+    assert_eq!(
+        rows_a, 1,
+        "control: the in-workspace narrow revocation must have written A's \
+         audit row, or the zero asserted for B below proves nothing"
+    );
+
+    let rows: i64 = {
+        let mut b_scope = super::fixtures::scoped(&pool, b.id).await;
         sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
             .bind(b.id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *b_scope)
             .await
-            .expect("count");
+            .expect("count")
+    };
     assert_eq!(rows, 0, "no audit row may be written for workspace B");
 
     forget_keys(&redis_pool().await, a.viewer, &[]).await;
@@ -1224,12 +1276,34 @@ async fn migration_002_rls_hides_sessions_from_an_unscoped_read(pool: PgPool) {
     sign_in(&app, &a.viewer_email, "203.0.113.7", CHROME_MAC).await;
     sign_in(&app, &b.viewer_email, "198.51.100.22", FIREFOX_WINDOWS).await;
 
-    // PREMISE: the superuser pool sees both, so anything the low-privilege
-    // connection cannot see is RLS and not an empty table.
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM refresh_tokens")
-        .fetch_one(&pool)
-        .await
-        .expect("premise count");
+    // PREMISE: both rows really exist, so anything the low-privilege
+    // connection cannot see below is RLS and not an empty table.
+    //
+    // Counted from EACH workspace's own armed scope and summed. A single
+    // unscoped `count(*)` over the pool only tells the truth while the pool is
+    // a BYPASSRLS superuser; under `secureprompt_runner` it raises
+    // `22P02 invalid input syntax for type uuid: ""` instead of answering.
+    let mut total = 0_i64;
+    for workspace in [a.id, b.id] {
+        let mut scope = super::fixtures::scoped(&pool, workspace).await;
+        // The explicit `WHERE workspace_id` is not redundant with the scope,
+        // and must stay. Under `secureprompt_runner` the RLS policy already
+        // restricts the read to this tenant; under the compose SUPERUSER
+        // nothing does, and without the predicate this count would be 2 for
+        // both workspaces. The premise being established is "both rows
+        // exist", and it has to hold under either role.
+        let seen: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1")
+                .bind(workspace)
+                .fetch_one(&mut *scope)
+                .await
+                .expect("premise count");
+        assert_eq!(
+            seen, 1,
+            "premise: workspace {workspace} must see exactly its own session row"
+        );
+        total += seen;
+    }
     assert_eq!(total, 2, "premise: two session rows exist");
 
     let mut conn = low_privilege_connection(&pool).await;
@@ -1316,12 +1390,15 @@ async fn a_narrow_revocation_does_not_raise_the_user_wide_watermark(pool: PgPool
 
     // PREMISE: the narrow revocation DID write a row, so the `None` below is
     // the filter and not an empty table.
-    let rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM session_revocation_audit WHERE session_id IS NOT NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let rows: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_scalar(
+            "SELECT count(*) FROM session_revocation_audit WHERE session_id IS NOT NULL",
+        )
+        .fetch_one(&mut *scope)
+        .await
+        .expect("count")
+    };
     assert_eq!(rows, 1, "premise: the narrow revocation wrote an audit row");
 
     assert_eq!(
@@ -1433,13 +1510,14 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
     let hostile_ua = format!("Mozilla/5.0 {}", "A".repeat(4000));
     sign_in(&app, &ws.viewer_email, "not-an-ip-address", &hostile_ua).await;
 
-    let row: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT client_ip, client_descriptor FROM refresh_tokens WHERE user_id = $1",
-    )
-    .bind(ws.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("the sign-in wrote a row");
+    let row: (Option<String>, Option<String>) = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_as("SELECT client_ip, client_descriptor FROM refresh_tokens WHERE user_id = $1")
+            .bind(ws.viewer)
+            .fetch_one(&mut *scope)
+            .await
+            .expect("the sign-in wrote a row")
+    };
 
     assert_eq!(
         row.0, None,
@@ -1461,13 +1539,14 @@ async fn a_hostile_user_agent_and_ip_are_not_stored_verbatim(pool: PgPool) {
     // nothing at all.
     let second = seed_workspace(&pool).await;
     sign_in(&app, &second.viewer_email, "203.0.113.7", CHROME_MAC).await;
-    let good: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT client_ip, client_descriptor FROM refresh_tokens WHERE user_id = $1",
-    )
-    .bind(second.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("the control sign-in wrote a row");
+    let good: (Option<String>, Option<String>) = {
+        let mut scope = super::fixtures::scoped(&pool, second.id).await;
+        sqlx::query_as("SELECT client_ip, client_descriptor FROM refresh_tokens WHERE user_id = $1")
+            .bind(second.viewer)
+            .fetch_one(&mut *scope)
+            .await
+            .expect("the control sign-in wrote a row")
+    };
     assert_eq!(good.0.as_deref(), Some("203.0.113.7"));
     assert_eq!(good.1.as_deref(), Some("Chrome on macOS"));
 
@@ -1492,19 +1571,21 @@ async fn rotation_does_not_re_record_the_device(pool: PgPool) {
         "premise: the refresh must rotate"
     );
 
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
     let with_context: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM refresh_tokens
          WHERE user_id = $1 AND (client_ip IS NOT NULL OR client_descriptor IS NOT NULL)",
     )
     .bind(ws.viewer)
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await
     .expect("count");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE user_id = $1")
         .bind(ws.viewer)
-        .fetch_one(&pool)
+        .fetch_one(&mut *scope)
         .await
         .expect("count");
+    drop(scope);
 
     assert_eq!(total, 2, "premise: rotation wrote a second row");
     assert_eq!(

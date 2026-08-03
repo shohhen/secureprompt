@@ -174,20 +174,14 @@ async fn main() -> anyhow::Result<()> {
             let metrics = metrics_rotation.clone();
             Box::pin(async move {
                 let started = Instant::now();
-                let result = sqlx::query(
-                    "UPDATE api_keys
-                     SET status = 'revoked', revoked_at = NOW()
-                     WHERE status = 'rotating'
-                       AND rotated_at + (rotation_grace_secs || ' seconds')::INTERVAL <= NOW()"
-                )
-                .execute(&pool)
-                .await;
-                let ok = result.is_ok();
-                match result {
-                    Ok(r) => tracing::info!(rows_affected = r.rows_affected(), "rotation cleanup complete"),
-                    Err(e) => tracing::error!(error = %e, "rotation cleanup failed"),
-                }
-                metrics.record_job("rotation_cleanup", started.elapsed(), ok);
+                let outcome = tasks::api_key_rotation::run(&pool).await;
+                tracing::info!(
+                    keys_revoked = outcome.keys_revoked,
+                    workspaces_swept = outcome.workspaces_swept,
+                    failures = outcome.failures,
+                    "rotation cleanup complete"
+                );
+                metrics.record_job("rotation_cleanup", started.elapsed(), outcome.all_ok());
             })
         })
         .context("Failed to create rotation cleanup job")?,

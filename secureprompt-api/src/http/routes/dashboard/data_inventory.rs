@@ -746,6 +746,22 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 /// inventory that silently reports 0 `api_keys` is precisely the false
 /// assurance this endpoint exists to prevent.
 ///
+/// The arming goes through [`crate::db::scope::arm_scope`] rather than a bare
+/// `set_config`, because that helper READS THE SETTING BACK inside the
+/// transaction. Without the read-back, a scope that did not take is not an
+/// error here — it is an inventory of ZEROES, which is precisely the false
+/// assurance the paragraph above says this endpoint exists to prevent. Since
+/// migration 033's `NULLIF` sweep the unscoped read is uniformly invisible
+/// rather than sometimes raising `22P02`, so nothing else can tell the two
+/// apart.
+///
+/// `arm_scope`'s `ApiError::Database` is NOT passed through: it carries the
+/// Postgres message and `http::api_error_response` renders an `ApiError`'s
+/// message into the response body, which is the leak [`pg_err`] exists to
+/// close. Its `ApiError::Internal` is `db::scope::SCOPE_NOT_ARMED`, a fixed
+/// string from this repository with no store text in it, and is returned as
+/// written.
+///
 /// `set_config(..., true)` is transaction-LOCAL, so the setting cannot leak
 /// onto a pooled connection and follow some later request.
 ///
@@ -755,11 +771,26 @@ fn pg_err(stage: &'static str, e: &sqlx::Error) -> ApiError {
 async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiError> {
     let mut tx = pool.begin().await.map_err(|e| pg_err("begin", &e))?;
 
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(ws.to_string())
-        .execute(&mut *tx)
+    crate::db::scope::arm_scope(&mut tx, ws)
         .await
-        .map_err(|e| pg_err("set_config", &e))?;
+        .map_err(|e| match e {
+            internal @ ApiError::Internal(_) => internal,
+            other => {
+                tracing::error!(
+                    stage = "arm_scope",
+                    error = %other,
+                    "data-inventory could not arm the tenancy scope; the store's \
+                     message is logged here and deliberately NOT returned"
+                );
+                ApiError::Database(
+                    "the data inventory could not be produced: this workspace's \
+                     tenancy scope could not be armed, so every Postgres count \
+                     would have been taken under a row-level-security policy \
+                     that admits nothing. No partial inventory is returned."
+                        .to_owned(),
+                )
+            }
+        })?;
 
     let sql = format!(
         "SELECT
@@ -1319,8 +1350,9 @@ async fn get_data_inventory(
              filters on it, so an expired entry stops resolving immediately. The ROWS are \
              deleted by the worker's `retention.purge` job (daily 04:00), which writes a \
              `retention_purge_audit` record with the cutoff, the deleted range, and a \
-             recount taken after the delete. Before WS3-4 that job was a no-op stub and \
-             these rows accumulated forever.",
+             recount taken after the delete — read that class's note for what the recount \
+             does and does not establish. Before WS3-4 that job was a no-op stub and these \
+             rows accumulated forever.",
         ),
         governed_by: None,
         enabled: None,
@@ -1441,7 +1473,11 @@ async fn get_data_inventory(
              disable replay detection. The upper bound on how long an address is held is \
              therefore the refresh-token lifetime (default 30 days) from the session's last \
              use, plus up to 24h until the next run. The decision is made per rotation CHAIN, \
-             not per row.",
+             not per row. The scrub runs once per workspace inside a transaction scoped to \
+             that workspace, so this workspace's run leaves a `retention_purge_audit` row \
+             carrying THIS workspace's id and count; a run that could not reach a workspace \
+             records `status = error` on the run's global census row rather than a zero \
+             that reads as `nothing to erase`.",
         ),
         governed_by: None,
         enabled: None,
@@ -1592,18 +1628,35 @@ async fn get_data_inventory(
         class: "retention_purge_audit".to_owned(),
         store: "postgres",
         location: "retention_purge_audit".to_owned(),
-        description: "Proof-of-purge records: one row per scope per `retention.purge` run, \
-                      with the cutoff, rows deleted, the deleted range, and a recount taken \
-                      after the delete.",
+        description: "Proof-of-purge records: one row per scope per `retention.purge` run \
+                      — and, for the scopes that sweep tenant by tenant, one row per \
+                      workspace plus a global census row saying how many workspaces the \
+                      run could reach. Each carries the cutoff, rows deleted, the deleted \
+                      range, and a recount taken after the delete.",
         sensitivity: "audit_trail",
         row_count: Some(pg.n("c_retention_purge_audit")),
         row_count_status: "counted",
         row_count_detail: None,
         encryption: Encryption::plain(
-            "Counts and timestamps only. NOTE what this table does NOT prove: it is \
+            "Counts and timestamps only. NOTE what this table does NOT prove, and READ THIS \
+             BEFORE CITING `rows_remaining_past_cutoff` AT ANYONE. (1) It is \
              self-attestation written by the purge process into a database that same \
              process can modify, and a logical DELETE is not an assurance that the bytes \
-             are irrecoverable from backups or unmerged parts.",
+             are irrecoverable from backups or unmerged parts. (2) The recount is a \
+             SELF-recount, not an independent check: the job re-runs its own \
+             `what still violates the policy` query on the same connection, through the \
+             same row-level-security filter as the delete. It therefore catches a job that \
+             MISCOUNTED what it deleted, and it CANNOT catch a job that could not SEE the \
+             rows — a filter that hides them hides them from both statements and the two \
+             then agree on zero. That is not hypothetical: it is exactly what the \
+             `refresh_tokens.device_context` scope did under a role that does not bypass \
+             row-level security, emitting `rows_deleted = 0, \
+             rows_remaining_past_cutoff = 0, status = ok` while ended sessions kept their \
+             IP addresses. What covers `could not see` is `status` and the per-run census \
+             row, not this number. (3) A per-workspace row CAN be re-derived by anyone who \
+             can scope a connection to that workspace, the tenant included; a row with \
+             `workspace_id IS NULL` covers every tenant at once and can only be re-derived \
+             by someone who can see them all.",
         ),
         retention: Retention::none(
             "Append-only and never purged, by design. Rows whose `workspace_id` is this \

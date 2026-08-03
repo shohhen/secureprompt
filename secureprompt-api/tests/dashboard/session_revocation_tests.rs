@@ -224,8 +224,15 @@ async fn json_body(resp: axum::response::Response) -> Value {
 
 /// Insert an active refresh row for `user_id` and return the raw token, so a
 /// test can attempt the full reconstitution loop through `/v1/auth/refresh`.
+///
+/// SEEDS THROUGH AN ARMED SCOPE. `refresh_tokens` is ENABLE + FORCE ROW LEVEL
+/// SECURITY (migration 002), so on the bare pool this INSERT is refused with
+/// `42501 new row violates row-level security policy for table
+/// "refresh_tokens"` under any role that cannot bypass RLS — measured on
+/// `secureprompt_runner`, three tests in this file.
 async fn issue_refresh_token(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> String {
     let raw = format!("rt-{}", Uuid::new_v4().simple());
+    let mut tx = super::fixtures::scoped(pool, workspace_id).await;
     sqlx::query(
         "INSERT INTO refresh_tokens (id, user_id, workspace_id, token_hash, expires_at, created_at)
          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour', NOW())",
@@ -234,9 +241,10 @@ async fn issue_refresh_token(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -
     .bind(user_id)
     .bind(workspace_id)
     .bind(hash_refresh_token(&raw))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("seed refresh token");
+    tx.commit().await.expect("commit seeded refresh token");
     raw
 }
 
@@ -338,11 +346,34 @@ async fn revocation_kills_the_refresh_token_too(pool: PgPool) {
          /v1/auth/refresh"
     );
 
+    // Verify from INSIDE the workspace's own armed scope — the visibility the
+    // product has. A bare-pool read is filtered to zero under a non-bypassing
+    // role, which would satisfy `active == 0` because the reader cannot see
+    // the row rather than because the row was revoked.
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+
+    // PREMISE / CONTROL: this scope can see this user's refresh rows at all.
+    // Same table, same user, same transaction — only `revoked_at IS NULL`
+    // differs between the two counts, so a zero below is the revocation and
+    // not the reader.
+    let all_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE user_id = $1")
+            .bind(ws.viewer)
+            .fetch_one(&mut *scope)
+            .await
+            .expect("count refresh rows");
+    assert!(
+        all_rows >= 2,
+        "premise: this scope must see the refresh rows seeded for the viewer \
+         (two were issued, plus whatever the probe rotation minted), or the \
+         active-row count below is vacuous. Saw {all_rows}"
+    );
+
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
     )
     .bind(ws.viewer)
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await
     .expect("count refresh rows");
     assert_eq!(active, 0, "no active refresh row may survive revocation");
@@ -362,10 +393,20 @@ async fn revocation_writes_an_audit_row_that_reads_alone(pool: PgPool) {
 
     // PREMISE: nothing is in the table before the action, so a row found
     // afterwards was written by it.
-    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
-        .fetch_one(&pool)
-        .await
-        .expect("premise count");
+    //
+    // BOTH reads run through the SAME armed scope, opened twice. That is what
+    // makes the zero mean something: the identical query on the identical
+    // scope returns 1 after the revocation, so the 0 before it is an empty
+    // table and not a reader that cannot see. On the bare pool under
+    // `secureprompt_runner` this read raises 22P02 rather than answering,
+    // because a committed `set_config(..., true)` leaves the GUC as `''`.
+    let before: i64 = {
+        let mut scope = super::fixtures::scoped(&pool, ws.id).await;
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
+            .fetch_one(&mut *scope)
+            .await
+            .expect("premise count")
+    };
     assert_eq!(before, 0, "premise: the audit table starts empty");
 
     assert_eq!(
@@ -373,12 +414,13 @@ async fn revocation_writes_an_audit_row_that_reads_alone(pool: PgPool) {
         StatusCode::OK
     );
 
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
     let row = sqlx::query(
         "SELECT workspace_id, actor_user_id, actor_email, actor_role, target_user_id, \
                 target_email, target_role, refresh_tokens_revoked, revoked_before_unix \
          FROM session_revocation_audit",
     )
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await
     .expect("exactly one audit row");
 
@@ -421,9 +463,10 @@ async fn the_audit_row_counts_the_refresh_rows_it_killed(pool: PgPool) {
         StatusCode::OK
     );
 
+    let mut scope = super::fixtures::scoped(&pool, ws.id).await;
     let counted: i64 =
         sqlx::query_scalar("SELECT refresh_tokens_revoked FROM session_revocation_audit")
-            .fetch_one(&pool)
+            .fetch_one(&mut *scope)
             .await
             .expect("audit row");
     assert_eq!(counted, 3, "the audit row must count what it revoked");
@@ -432,7 +475,7 @@ async fn the_audit_row_counts_the_refresh_rows_it_killed(pool: PgPool) {
         "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
     )
     .bind(ws.admin)
-    .fetch_one(&pool)
+    .fetch_one(&mut *scope)
     .await
     .expect("count");
     assert_eq!(
@@ -588,13 +631,21 @@ async fn revocation_cannot_reach_into_another_workspace(pool: PgPool) {
         StatusCode::OK,
         "workspace B's session must be untouched"
     );
-    let active_b: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(b.viewer)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    // Everything about workspace B is read from INSIDE WORKSPACE B's OWN
+    // armed scope — the only vantage point from which "workspace B has no
+    // audit row" is a claim about the data rather than about the reader.
+    // Each read opens its own short scope rather than holding one across the
+    // HTTP calls below.
+    let active_b: i64 = {
+        let mut b_scope = super::fixtures::scoped(&pool, b.id).await;
+        sqlx::query_scalar(
+            "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(b.viewer)
+        .fetch_one(&mut *b_scope)
+        .await
+        .expect("count")
+    };
     assert_eq!(active_b, 1, "workspace B's refresh row must survive");
 
     // POSITIVE CONTROL: the same admin revoking inside their OWN workspace
@@ -604,12 +655,33 @@ async fn revocation_cannot_reach_into_another_workspace(pool: PgPool) {
         StatusCode::OK,
         "control: in-workspace revocation must succeed"
     );
-    let rows: i64 =
+
+    // CONTROL for the absence-claim below: the identical query, on the
+    // identical table, from workspace A's scope must return 1. Without it a
+    // zero from B's scope would be equally well explained by a broken query,
+    // a missing table, or a revocation route that wrote nothing at all.
+    let rows_a: i64 = {
+        let mut a_scope = super::fixtures::scoped(&pool, a.id).await;
+        sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
+            .bind(a.id)
+            .fetch_one(&mut *a_scope)
+            .await
+            .expect("count")
+    };
+    assert_eq!(
+        rows_a, 1,
+        "control: the in-workspace revocation must have written A's audit row, \
+         or the zero asserted for B below proves nothing"
+    );
+
+    let rows: i64 = {
+        let mut b_scope = super::fixtures::scoped(&pool, b.id).await;
         sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
             .bind(b.id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *b_scope)
             .await
-            .expect("count");
+            .expect("count")
+    };
     assert_eq!(rows, 0, "no audit row may be written for workspace B");
 
     forget_watermark(&redis_pool().await, a.viewer).await;
@@ -709,12 +781,39 @@ async fn migration_026_rls_isolates_the_revocation_trail_from_a_nonsuperuser(poo
         StatusCode::OK
     );
 
-    // PREMISE: the superuser pool sees both, so anything the low-privilege
-    // connection cannot see is RLS and not an empty table.
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit")
-        .fetch_one(&pool)
+    // PREMISE: both rows really exist, so anything the low-privilege
+    // connection cannot see below is RLS and not an empty table.
+    //
+    // Counted from EACH workspace's own armed scope and summed, rather than
+    // with one unscoped `count(*)` over the pool. The unscoped read only tells
+    // the truth when the pool happens to be a BYPASSRLS superuser; point
+    // DATABASE_URL at `secureprompt_runner` and it raises
+    // `22P02 invalid input syntax for type uuid: ""` instead of answering,
+    // because a committed transaction-local `set_config` leaves the GUC as the
+    // empty string rather than unsetting it.
+    let mut total = 0_i64;
+    for workspace in [a.id, b.id] {
+        let mut scope = super::fixtures::scoped(&pool, workspace).await;
+        // The explicit `WHERE workspace_id` is not redundant with the scope,
+        // and must stay. Under `secureprompt_runner` the RLS policy already
+        // restricts the read to this tenant; under the compose SUPERUSER
+        // nothing does, and without the predicate this count would be 2 for
+        // both workspaces. The premise being established is "both rows
+        // exist", and it has to hold under either role.
+        let seen: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1",
+        )
+        .bind(workspace)
+        .fetch_one(&mut *scope)
         .await
         .expect("premise count");
+        assert_eq!(
+            seen, 1,
+            "premise: workspace {workspace} must see exactly its own \
+             revocation row"
+        );
+        total += seen;
+    }
     assert_eq!(total, 2, "premise: two revocation rows exist");
 
     let mut conn = low_privilege_connection(&pool).await;

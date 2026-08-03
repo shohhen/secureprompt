@@ -25,24 +25,26 @@
 //! `#[sqlx::test]` pool: a suite that only ever runs as superuser proves
 //! nothing about RLS.
 //!
-//! SCOPE — deliberately narrow. Running the FULL test suite as a
-//! NOSUPERUSER/NOBYPASSRLS role produces ~85 failures, all
-//! `violates row-level security policy for table "policy_rules"` originating
-//! in `workspace_repo`'s default-rule seeding: the application itself depends
-//! on connecting as a BYPASSRLS role today (tracked as WS6-1-FU2 / the
-//! "DB role-split" backlog item). These tests therefore do all their FIXTURE
-//! setup through the ordinary superuser pool and only execute the MIGRATION
-//! under the low-privilege role.
+//! SCOPE — this suite now runs correctly under EITHER role, and is listed in
+//! the `test:rls-nonsuperuser` CI job as well as the ordinary `test` job.
 //!
-//! MEASURED, so nobody has to re-derive it: pointing `DATABASE_URL` at
-//! `secureprompt_runner` and running THIS suite fails 7/7 before it reaches a
-//! single assertion —
+//! It did not always. MEASURED before the conversion: pointing `DATABASE_URL`
+//! at `secureprompt_runner` failed 7/7 before reaching a single assertion —
 //!   `error 42501: new row violates row-level security policy for table
-//!    "policy_rules"` at the fixture insert.
-//! That is why this file is NOT added to the `test:rls-nonsuperuser` CI job
-//! and runs in the ordinary `test` job instead: the RLS coverage comes from
-//! the connection the migration executes on, not from the job's DATABASE_URL.
+//!    "policy_rules"` at `seed_rule`'s INSERT.
+//! The fixtures assumed the `#[sqlx::test]` pool could bypass RLS. They now
+//! seed AND verify through `db::scope::begin_scoped`, the same armed
+//! transaction the repositories open — which is not elevation, so a read
+//! through it means what the assertion says it means under both roles.
+//!
+//! The one thing that could NOT become scoped is the POSITIVE CONTROL in
+//! `bare_update_silently_matches_zero_rows_under_rls`. It used to be "the
+//! same statement over the superuser pool must match 1 row", which stops
+//! being a control the moment the pool is not a superuser. It is now "the
+//! same statement, from an ARMED scope, must match 1 row" — one dimension
+//! changed (the GUC), same guarantee, and true under both roles.
 
+use secureprompt_api::db::scope::begin_scoped;
 use secureprompt_api::db::workspace_repo::DEFAULT_POLICY_CLASSES;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection, PgPool, Row};
@@ -71,14 +73,30 @@ const LEGACY_NINE: &str = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CA
 const POST_019_WITHOUT_017: &str = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY","SSN","IBAN","GOOGLE_API_KEY","GCP_SERVICE_ACCOUNT_EMAIL","AZURE_STORAGE_CONNECTION_STRING","OPENAI_API_KEY","ANTHROPIC_API_KEY","STRIPE_SECRET_KEY","STRIPE_PUBLISHABLE_KEY","GITHUB_PAT","GITHUB_FINE_GRAINED_PAT","GITHUB_OAUTH_TOKEN","GITHUB_REFRESH_TOKEN","SLACK_BOT_TOKEN","SLACK_USER_TOKEN","SLACK_APP_TOKEN","PRIVATE_KEY_PEM","RSA_PRIVATE_KEY","OPENSSH_PRIVATE_KEY","POSTGRESQL_URI","MONGODB_URI","WEBHOOK_URL","BEARER_TOKEN","BASIC_AUTH_HEADER","PASSWORD_ASSIGNMENT","OAUTH_CLIENT_SECRET","API_TOKEN_GENERIC","JWT"]"#;
 
 // ---------------------------------------------------------------------------
-// Fixture helpers — all run through the (superuser) `#[sqlx::test]` pool.
+// Fixture helpers. Every statement that touches `policy_rules` — seed and
+// verify alike — runs inside `begin_scoped`, so this file behaves identically
+// whether `DATABASE_URL` names the compose superuser or `secureprompt_runner`.
 // ---------------------------------------------------------------------------
+
+/// The two ids a fixture hands back. The WORKSPACE is part of the handle
+/// because every read of the rule has to name the tenant it belongs to —
+/// `policy_rules` is FORCE ROW LEVEL SECURITY, so there is no such thing as
+/// reading it without saying whose it is.
+#[derive(Clone, Copy)]
+struct SeededRule {
+    workspace_id: Uuid,
+    rule_id: Uuid,
+}
 
 /// Insert a workspace and a policy rule directly, bypassing
 /// `WorkspaceRepository::create_with_owner`. Raw inserts keep the fixture
 /// independent of the seeding path these tests are not about, and avoid
 /// dragging `users` / `api_keys` into a migration test.
-async fn seed_rule(pool: &PgPool, workspace: &str, rule_name: &str, classes: &str) -> Uuid {
+///
+/// The `policy_rules` INSERT runs inside `begin_scoped` — the application's
+/// own armed transaction. `workspaces` is not RLS-armed, so that one insert
+/// stays on the pool.
+async fn seed_rule(pool: &PgPool, workspace: &str, rule_name: &str, classes: &str) -> SeededRule {
     let workspace_id = Uuid::new_v4();
     sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
         .bind(workspace_id)
@@ -93,6 +111,9 @@ async fn seed_rule(pool: &PgPool, workspace: &str, rule_name: &str, classes: &st
     ))
     .expect("fixture class list is valid JSON");
 
+    let mut scope = begin_scoped(pool, workspace_id)
+        .await
+        .expect("armed scope for the workspace being seeded");
     sqlx::query(
         "INSERT INTO policy_rules
             (id, workspace_id, name, priority, conditions, action, action_params,
@@ -103,17 +124,31 @@ async fn seed_rule(pool: &PgPool, workspace: &str, rule_name: &str, classes: &st
     .bind(workspace_id)
     .bind(rule_name)
     .bind(&conditions)
-    .execute(pool)
+    .execute(&mut *scope)
     .await
     .expect("policy rule insert");
+    scope.commit().await.expect("commit the seeded rule");
 
-    rule_id
+    SeededRule {
+        workspace_id,
+        rule_id,
+    }
 }
 
-async fn classes_of(pool: &PgPool, rule_id: Uuid) -> Vec<String> {
+/// Read the rule's class list back FROM INSIDE ITS OWN WORKSPACE'S SCOPE.
+///
+/// `fetch_one` is load-bearing and must stay: it is what stops a scope that
+/// cannot see the row from being mistaken for a rule whose class list is
+/// empty. Several assertions below are of the form "X is absent from the
+/// result"; with `fetch_optional` and a default they would all pass on a
+/// reader that sees nothing.
+async fn classes_of(pool: &PgPool, rule: SeededRule) -> Vec<String> {
+    let mut scope = begin_scoped(pool, rule.workspace_id)
+        .await
+        .expect("armed scope for the workspace being read");
     let row = sqlx::query("SELECT conditions FROM policy_rules WHERE id = $1")
-        .bind(rule_id)
-        .fetch_one(pool)
+        .bind(rule.rule_id)
+        .fetch_one(&mut *scope)
         .await
         .expect("rule must still exist");
     let conditions: serde_json::Value = row.get("conditions");
@@ -221,16 +256,16 @@ async fn low_privilege_connection(pool: &PgPool) -> PgConnection {
 /// CHARACTERISATION + PREMISE for everything below: prove the harness can
 /// actually see the defect. A bare `UPDATE policy_rules ...` — the shape 017
 /// ships — reports ZERO rows affected and does NOT error, even though the row
-/// is right there and the superuser pool can read it.
+/// is right there and an ARMED reader can see it.
 ///
 /// If this test ever passes trivially (0 rows because there is no row), the
 /// `before` assertion below catches it.
 #[sqlx::test]
 async fn bare_update_silently_matches_zero_rows_under_rls(pool: PgPool) {
-    let rule_id = seed_rule(&pool, "Bare Update Co", "Redact common PII", LEGACY_NINE).await;
+    let rule = seed_rule(&pool, "Bare Update Co", "Redact common PII", LEGACY_NINE).await;
 
-    // PREMISE: the row exists and is visible to the privileged pool.
-    let before = classes_of(&pool, rule_id).await;
+    // PREMISE: the row exists and is visible from its own workspace's scope.
+    let before = classes_of(&pool, rule).await;
     assert!(
         before.contains(&"PERSON".to_owned()),
         "premise: the fixture rule must exist before the probe: {before:?}"
@@ -258,37 +293,49 @@ async fn bare_update_silently_matches_zero_rows_under_rls(pool: PgPool) {
     );
 
     // ...and the row really was untouched.
-    let after = classes_of(&pool, rule_id).await;
+    let after = classes_of(&pool, rule).await;
     assert_eq!(
         before, after,
         "the no-op UPDATE must not have changed the row"
     );
 
-    // POSITIVE CONTROL — the SAME statement, on the SAME row, over the
-    // superuser pool, must affect ONE row. Without this the zero above could
-    // just as well mean "the WHERE clause never matched anything" and the test
-    // would be measuring a typo instead of RLS.
+    // POSITIVE CONTROL — the SAME statement, on the SAME row, from an ARMED
+    // scope, must affect ONE row. Without this the zero above could just as
+    // well mean "the WHERE clause never matched anything" and the test would
+    // be measuring a typo instead of RLS.
+    //
+    // This used to run over `&pool` and be described as "when RLS is
+    // bypassed". That only held while the pool was a superuser: point
+    // `DATABASE_URL` at `secureprompt_runner` and the control matched 0 too,
+    // so the test lost the very thing that made its zero mean something.
+    // Arming the scope changes exactly ONE dimension — the GUC — between the
+    // two runs, which is a stricter control than changing the role, and it is
+    // true under both roles.
+    let mut armed = begin_scoped(&pool, rule.workspace_id)
+        .await
+        .expect("armed scope for the control update");
     let privileged = sqlx::query(
         "UPDATE policy_rules
          SET conditions = jsonb_set(conditions, '{0,value}', '[\"MUTATED\"]'::jsonb)
          WHERE name = 'Redact common PII'",
     )
-    .execute(&pool)
+    .execute(&mut *armed)
     .await
-    .expect("the privileged UPDATE must succeed");
+    .expect("the armed UPDATE must succeed");
 
     assert_eq!(
         privileged.rows_affected(),
         1,
-        "positive control: the identical statement must match the row when \
-         RLS is bypassed. It matched {} — the fixture, not RLS, is what made \
-         the low-privilege run report zero.",
+        "positive control: the identical statement must match the row once \
+         app.current_workspace_id is armed. It matched {} — the fixture, not \
+         RLS, is what made the unarmed run report zero.",
         privileged.rows_affected()
     );
+    armed.commit().await.expect("commit the control update");
     assert_eq!(
-        classes_of(&pool, rule_id).await,
+        classes_of(&pool, rule).await,
         vec!["MUTATED".to_owned()],
-        "positive control: the privileged UPDATE must actually have written"
+        "positive control: the armed UPDATE must actually have written"
     );
 }
 
@@ -302,12 +349,12 @@ async fn bare_update_silently_matches_zero_rows_under_rls(pool: PgPool) {
 /// fails with every class reported missing.
 #[sqlx::test]
 async fn migration_020_backfills_under_a_non_superuser_role(pool: PgPool) {
-    let rule_id = seed_rule(&pool, "Legacy Nine Co", "Redact common PII", LEGACY_NINE).await;
+    let rule = seed_rule(&pool, "Legacy Nine Co", "Redact common PII", LEGACY_NINE).await;
 
     // PREMISE — assert the ABSENCE we are about to fix. A migration that did
     // nothing would still pass a "the classes are present" assertion if the
     // fixture had already contained them.
-    let before: BTreeSet<String> = classes_of(&pool, rule_id).await.into_iter().collect();
+    let before: BTreeSet<String> = classes_of(&pool, rule).await.into_iter().collect();
     let missing_before: Vec<&&str> = DEFAULT_POLICY_CLASSES
         .iter()
         .filter(|class| !before.contains(**class))
@@ -327,7 +374,7 @@ async fn migration_020_backfills_under_a_non_superuser_role(pool: PgPool) {
         .await
         .expect("migration 020 must execute cleanly");
 
-    let after: BTreeSet<String> = classes_of(&pool, rule_id).await.into_iter().collect();
+    let after: BTreeSet<String> = classes_of(&pool, rule).await.into_iter().collect();
     let still_missing: Vec<&&str> = DEFAULT_POLICY_CLASSES
         .iter()
         .filter(|class| !after.contains(**class))
@@ -353,7 +400,7 @@ async fn migration_020_backfills_under_a_non_superuser_role(pool: PgPool) {
 /// gap without disturbing what 019 achieved.
 #[sqlx::test]
 async fn migration_020_repairs_a_database_where_017_no_opped(pool: PgPool) {
-    let rule_id = seed_rule(
+    let rule = seed_rule(
         &pool,
         "Post 019 Co",
         "Redact common PII",
@@ -364,7 +411,7 @@ async fn migration_020_repairs_a_database_where_017_no_opped(pool: PgPool) {
     // PREMISE: this fixture is the post-019 shape — credentials present, the
     // six Uzbek classes absent. Asserting BOTH halves is what makes the test
     // about 017's gap rather than about 019.
-    let before: BTreeSet<String> = classes_of(&pool, rule_id).await.into_iter().collect();
+    let before: BTreeSet<String> = classes_of(&pool, rule).await.into_iter().collect();
     assert!(before.contains("BEARER_TOKEN"), "premise: {before:?}");
     assert!(before.contains("JWT"), "premise: {before:?}");
     for uzbek in ["PINFL", "STIR", "MFO", "PASSPORT_NUMBER", "UZCARD", "HUMO"] {
@@ -380,7 +427,7 @@ async fn migration_020_repairs_a_database_where_017_no_opped(pool: PgPool) {
         .await
         .expect("migration 020 must execute cleanly");
 
-    let after: BTreeSet<String> = classes_of(&pool, rule_id).await.into_iter().collect();
+    let after: BTreeSet<String> = classes_of(&pool, rule).await.into_iter().collect();
     for uzbek in ["PINFL", "STIR", "MFO", "PASSPORT_NUMBER", "UZCARD", "HUMO"] {
         assert!(
             after.contains(uzbek),
@@ -403,7 +450,7 @@ async fn migration_020_repairs_a_database_where_017_no_opped(pool: PgPool) {
 #[sqlx::test]
 async fn migration_020_leaves_a_narrowed_rule_alone(pool: PgPool) {
     let narrowed = r#"["PERSON","EMAIL_ADDRESS"]"#;
-    let rule_id = seed_rule(&pool, "Narrowed Co", "Redact common PII", narrowed).await;
+    let rule = seed_rule(&pool, "Narrowed Co", "Redact common PII", narrowed).await;
 
     let mut conn = low_privilege_connection(&pool).await;
     sqlx::raw_sql(MIGRATION_020)
@@ -412,7 +459,7 @@ async fn migration_020_leaves_a_narrowed_rule_alone(pool: PgPool) {
         .expect("migration 020 must execute cleanly");
 
     assert_eq!(
-        classes_of(&pool, rule_id).await,
+        classes_of(&pool, rule).await,
         vec!["PERSON".to_owned(), "EMAIL_ADDRESS".to_owned()],
         "a rule an admin narrowed must be left exactly as the admin left it"
     );
@@ -421,7 +468,7 @@ async fn migration_020_leaves_a_narrowed_rule_alone(pool: PgPool) {
 /// POSITIVE CONTROL, second axis: only the seeded rule NAME is back-filled.
 #[sqlx::test]
 async fn migration_020_leaves_an_unrelated_rule_alone(pool: PgPool) {
-    let rule_id = seed_rule(&pool, "Unrelated Co", "Block secrets", LEGACY_NINE).await;
+    let rule = seed_rule(&pool, "Unrelated Co", "Block secrets", LEGACY_NINE).await;
 
     let mut conn = low_privilege_connection(&pool).await;
     sqlx::raw_sql(MIGRATION_020)
@@ -429,7 +476,7 @@ async fn migration_020_leaves_an_unrelated_rule_alone(pool: PgPool) {
         .await
         .expect("migration 020 must execute cleanly");
 
-    let after = classes_of(&pool, rule_id).await;
+    let after = classes_of(&pool, rule).await;
     assert!(
         !after.contains(&"PINFL".to_owned()),
         "only the seeded 'Redact common PII' rule may be back-filled: {after:?}"
@@ -441,19 +488,19 @@ async fn migration_020_leaves_an_unrelated_rule_alone(pool: PgPool) {
 /// deployment), and a duplicated class array is a UI defect at best.
 #[sqlx::test]
 async fn migration_020_is_idempotent_under_a_non_superuser_role(pool: PgPool) {
-    let rule_id = seed_rule(&pool, "Idempotent Co", "Redact common PII", LEGACY_NINE).await;
+    let rule = seed_rule(&pool, "Idempotent Co", "Redact common PII", LEGACY_NINE).await;
 
     let mut conn = low_privilege_connection(&pool).await;
     sqlx::raw_sql(MIGRATION_020)
         .execute(&mut conn)
         .await
         .expect("first run");
-    let once = classes_of(&pool, rule_id).await;
+    let once = classes_of(&pool, rule).await;
     sqlx::raw_sql(MIGRATION_020)
         .execute(&mut conn)
         .await
         .expect("second run");
-    let twice = classes_of(&pool, rule_id).await;
+    let twice = classes_of(&pool, rule).await;
 
     assert_eq!(once, twice, "re-running 020 must not change anything");
 
@@ -470,9 +517,9 @@ async fn migration_020_is_idempotent_under_a_non_superuser_role(pool: PgPool) {
 /// every single-workspace test above.
 #[sqlx::test]
 async fn migration_020_backfills_every_workspace(pool: PgPool) {
-    let mut rule_ids = Vec::new();
+    let mut rules = Vec::new();
     for index in 0..3 {
-        rule_ids.push(
+        rules.push(
             seed_rule(
                 &pool,
                 &format!("Multi Tenant Co {index}"),
@@ -483,8 +530,11 @@ async fn migration_020_backfills_every_workspace(pool: PgPool) {
         );
     }
 
-    for rule_id in &rule_ids {
-        let before = classes_of(&pool, *rule_id).await;
+    // PREMISE, per workspace. `classes_of` reads through THAT workspace's own
+    // scope and `fetch_one`s, so a workspace the reader cannot see fails here
+    // loudly instead of contributing a silently empty "before".
+    for rule in &rules {
+        let before = classes_of(&pool, *rule).await;
         assert!(!before.contains(&"PINFL".to_owned()), "premise: {before:?}");
     }
 
@@ -494,8 +544,8 @@ async fn migration_020_backfills_every_workspace(pool: PgPool) {
         .await
         .expect("migration 020 must execute cleanly");
 
-    for (index, rule_id) in rule_ids.iter().enumerate() {
-        let after = classes_of(&pool, *rule_id).await;
+    for (index, rule) in rules.iter().enumerate() {
+        let after = classes_of(&pool, *rule).await;
         assert!(
             after.contains(&"PINFL".to_owned()),
             "workspace {index} was not visited by the loop: {after:?}"

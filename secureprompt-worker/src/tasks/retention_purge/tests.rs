@@ -381,13 +381,10 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
     insert_capture(workspace_id, recent, 2).await;
 
     // The operator LOWERS retention to 7 days, after the rows were written.
-    sqlx::query(
-        "INSERT INTO workspace_raw_capture (workspace_id, enabled, retention_days)
-         VALUES ($1, true, 7)",
-    )
-    .bind(workspace_id)
-    .execute(&pool)
-    .await?;
+    // `workspace_raw_capture` is armed (migration 030), so the write goes
+    // through the same scoped helper the P1H tests below use — a bare-pool
+    // INSERT here is refused with `42501` under `secureprompt_runner`.
+    set_capture_retention(&pool, workspace_id, 7).await?;
 
     // ── PRE-STATE.
     assert_eq!(
@@ -422,11 +419,13 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
          deleting by something other than the configured window"
     );
 
-    let rows = audit_rows(&pool, outcome.run_id, "request_content_captures").await?;
-    let mine: Vec<_> = rows
-        .iter()
-        .filter(|r| r.get::<Option<Uuid>, _>("workspace_id") == Some(workspace_id))
-        .collect();
+    // Read from THIS workspace's armed scope. `retention_purge_audit` is armed
+    // (migration 030) and this row is per-workspace, so a bare read answers
+    // nothing under `secureprompt_runner` — the assertion below would then be
+    // measuring the reader rather than the purge.
+    let mine =
+        audit_rows_for_workspace(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES, workspace_id)
+            .await?;
     assert_eq!(
         mine.len(),
         1,
@@ -447,6 +446,29 @@ async fn purge_applies_lowered_retention_to_already_captured_content(
 
 // ── (c) FU4: session device context ───────────────────────────────────────
 
+/// Arm one transaction to a workspace, the way every fixture and every read in
+/// this file that touches an ARMED table has to.
+///
+/// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration
+/// 002, so a bare-pool INSERT into it is refused with `42501` when
+/// `DATABASE_URL` names `secureprompt_runner`, and a bare-pool SELECT of it
+/// answers zero rows since migration 033. MEASURED: before this helper existed,
+/// `purge_scrubs_device_context_from_ended_sessions_only` and
+/// `a_rotated_but_live_session_keeps_its_device_context` both failed under the
+/// runner with `new row violates row-level security policy for table
+/// "refresh_tokens"`, and the suite could only ever run as a superuser — which
+/// is the one role that cannot observe any of what it tests.
+async fn arm(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
 /// Insert one session's sign-in row. `expires_in_hours` in the past makes the
 /// session dead; `revoked` makes it dead a different way. Both are ways a
 /// session ends, and both must lead to the device context being erased.
@@ -458,6 +480,8 @@ async fn insert_session(
     revoked: bool,
 ) -> sqlx::Result<Uuid> {
     let session_id = Uuid::new_v4();
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, created_at, expires_at,
@@ -474,12 +498,28 @@ async fn insert_session(
     .bind(revoked)
     .bind(session_id)
     .bind(Uuid::new_v4().to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(session_id)
 }
 
-async fn device_context_of(pool: &PgPool, session_id: Uuid) -> sqlx::Result<(i64, i64)> {
+/// The device context on one session, read FROM A SCOPE THAT WOULD SEE IT.
+///
+/// The workspace is a PARAMETER rather than something this helper looks up,
+/// because looking it up would mean reading `refresh_tokens` unarmed — the very
+/// read whose silent zero every assertion here is written against. Under
+/// `secureprompt_runner` a bare-pool version of this query answers `(0, 0)`,
+/// which is byte-identical to "the row was deleted" and to "the context was
+/// scrubbed". Every caller pairs its absence claim with a control row this same
+/// helper DOES return.
+async fn device_context_of(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    session_id: Uuid,
+) -> sqlx::Result<(i64, i64)> {
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     let row = sqlx::query(
         "SELECT COUNT(*)::BIGINT AS total,
                 COUNT(*) FILTER (
@@ -488,8 +528,9 @@ async fn device_context_of(pool: &PgPool, session_id: Uuid) -> sqlx::Result<(i64
          FROM refresh_tokens WHERE session_id = $1",
     )
     .bind(session_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((row.get("total"), row.get("with_context")))
 }
 
@@ -535,7 +576,7 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
     // having written any.
     for (name, session) in [("expired", expired), ("revoked", revoked), ("live", live)] {
         assert_eq!(
-            device_context_of(&pool, session).await?,
+            device_context_of(&pool, workspace_id, session).await?,
             (1, 1),
             "premise: the {name} session must carry device context before the purge"
         );
@@ -545,7 +586,7 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
 
     // The two dead sessions are scrubbed...
     for (name, session) in [("expired", expired), ("revoked", revoked)] {
-        let (total, with_context) = device_context_of(&pool, session).await?;
+        let (total, with_context) = device_context_of(&pool, workspace_id, session).await?;
         assert_eq!(
             with_context, 0,
             "the {name} session's device context must be erased once the session \
@@ -562,28 +603,53 @@ async fn purge_scrubs_device_context_from_ended_sessions_only(pool: PgPool) -> s
     // ...and the live one is NOT. Without this the whole test would pass for a
     // job that erased every device column in the table.
     assert_eq!(
-        device_context_of(&pool, live).await?,
+        device_context_of(&pool, workspace_id, live).await?,
         (1, 1),
         "a LIVE session must keep the context that makes it identifiable in the \
          listing — scrubbing it would leave an administrator unable to tell \
          which session to end"
     );
 
-    // The proof-of-purge record. `rows_deleted` counts rows SCRUBBED for this
-    // scope; the post-check must be able to recompute zero.
-    let rows = audit_rows(&pool, outcome.run_id, "refresh_tokens.device_context").await?;
-    assert_eq!(rows.len(), 1, "one audit row for the device-context scope");
+    // The proof-of-purge trail. `rows_deleted` counts rows SCRUBBED for this
+    // scope, and it is attributed to the workspace whose people's addresses
+    // were erased — read from THAT workspace's armed scope, which is also the
+    // only lens from which the number can be re-derived by anyone but a DBA.
+    let mine = audit_rows_for_workspace(
+        &pool,
+        outcome.run_id,
+        SCOPE_SESSION_DEVICE_CONTEXT,
+        workspace_id,
+    )
+    .await?;
     assert_eq!(
-        rows[0].get::<i64, _>("rows_deleted"),
+        mine.len(),
+        1,
+        "one audit row for this workspace's device-context scrub"
+    );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_deleted"),
         2,
         "exactly the two ended sessions"
     );
     assert_eq!(
-        rows[0].get::<i64, _>("rows_remaining_past_cutoff"),
+        mine[0].get::<i64, _>("rows_remaining_past_cutoff"),
         0,
         "no ended session may still be carrying device context"
     );
-    assert_eq!(rows[0].get::<String, _>("status"), "ok");
+    assert_eq!(mine[0].get::<String, _>("status"), "ok");
+
+    // And the census: the one global record that says the scope RAN, written
+    // whether or not any workspace had work. It carries no counts of its own —
+    // the per-workspace records do — so `total_deleted()` cannot double-count.
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the run must write exactly one global census record for the \
+         device-context scope"
+    );
+    assert_eq!(census[0].get::<String, _>("status"), "ok");
+    assert_eq!(census[0].get::<i64, _>("rows_deleted"), 0);
     Ok(())
 }
 
@@ -606,6 +672,8 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
     // The sign-in row: carries the device, and is REVOKED because it rotated.
     let session_id = insert_session(&pool, workspace_id, user_id, 24, true).await?;
     // Its successor: live, no device context, same session.
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
     sqlx::query(
         "INSERT INTO refresh_tokens
              (id, user_id, workspace_id, token_hash, created_at, expires_at, session_id, access_jti)
@@ -617,18 +685,23 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
     .bind(Uuid::new_v4().simple().to_string())
     .bind(session_id)
     .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // PREMISE: the row holding the context really is revoked, so a row-level
-    // scrub WOULD erase it and this test is not passing by accident.
+    // scrub WOULD erase it and this test is not passing by accident. Read on
+    // the SAME armed transaction as the insert above — `bool_or` over an empty
+    // set is NULL, so a blind read would fail decoding into `bool` rather than
+    // answering `false`, but an armed read that is proving a premise should not
+    // be relying on that.
     let revoked_row_holds_context: bool = sqlx::query_scalar(
         "SELECT bool_or(revoked_at IS NOT NULL AND client_ip IS NOT NULL)
          FROM refresh_tokens WHERE session_id = $1",
     )
     .bind(session_id)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     assert!(
         revoked_row_holds_context,
         "premise: the device context must sit on a REVOKED row, which is what \
@@ -637,7 +710,7 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
 
     run(&pool, &ch_client()).await;
 
-    let (total, with_context) = device_context_of(&pool, session_id).await?;
+    let (total, with_context) = device_context_of(&pool, workspace_id, session_id).await?;
     assert_eq!(
         total, 2,
         "premise: both rows of the chain are still present"
@@ -791,38 +864,1083 @@ async fn write_audit_records_both_global_and_per_workspace_scopes_under_rls(
              the row's own workspace to get it past the policy",
     );
 
-    // Read back through the PRIVILEGED pool: what landed on disk, not what
-    // the writes claimed.
-    let scopes: Vec<String> = sqlx::query_scalar(
-        "SELECT scope FROM retention_purge_audit WHERE run_id = $1 ORDER BY scope",
+    // Read back what landed on disk, not what the writes claimed — and read
+    // each shape through a lens that WOULD see it. `pool` is only a privileged
+    // connection when `DATABASE_URL` names a superuser; under the runner it is
+    // as filtered as `low`, so a bare read of the per-workspace row answers
+    // nothing whether or not the row exists. That ambiguity is the disease this
+    // whole file is about, so the two shapes are read separately.
+    let global_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM retention_purge_audit
+         WHERE run_id = $1 AND workspace_id IS NULL ORDER BY scope",
     )
     .bind(run_id)
     .fetch_all(&pool)
     .await?;
     assert_eq!(
-        scopes,
+        global_scopes,
         vec![
             SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
-            SCOPE_CONTENT_CAPTURES.to_owned(),
             SCOPE_TOKEN_VAULT.to_owned(),
         ],
-        "all three scopes of the run must be on disk. A missing per-workspace \
-         scope is the silent gap: the purge ran and left no evidence."
+        "both GLOBAL scopes must be on disk: `workspace_id IS NULL` satisfies \
+         030's policy with nothing armed, so these are the rows that survive a \
+         run in which arming a scope is what failed."
     );
 
-    // And the per-workspace row is attributed to the right tenant — the scope
-    // was armed to that workspace, not merely to something.
-    let attributed: Option<Uuid> = sqlx::query_scalar(
-        "SELECT workspace_id FROM retention_purge_audit WHERE run_id = $1 AND scope = $2",
+    // The per-workspace row, read from ITS OWN armed scope — which is also the
+    // control proving the read above is not simply blind, since the same
+    // connection returns this row only once the scope is armed.
+    let per_workspace =
+        audit_rows_for_workspace(&pool, run_id, SCOPE_CONTENT_CAPTURES, workspace).await?;
+    assert_eq!(
+        per_workspace.len(),
+        1,
+        "a PER-WORKSPACE scope row must be on disk. Zero is the silent gap: the \
+         purge ran and left no evidence."
+    );
+    assert_eq!(
+        per_workspace[0].get::<Option<Uuid>, _>("workspace_id"),
+        Some(workspace),
+        "the per-workspace record must carry the workspace it is about — the \
+         scope was armed to that workspace, not merely to something"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// P1H — the capture sweep under a non-bypassing role
+// ===========================================================================
+//
+// # The failure being measured
+//
+// `workspace_raw_capture` has been under FORCE ROW LEVEL SECURITY since
+// migration 030. Migration 033 rewrote its `workspace_isolation` policy with
+// `NULLIF`, which was the intended semantics and which removed the one face of
+// the defect that shouted: an unscoped read no longer raises `22P02`, it
+// returns the EMPTY SET.
+//
+// `purge_content_captures` reads that table ON A BARE POOL to learn each
+// workspace's CURRENT retention. Under a NOSUPERUSER/NOBYPASSRLS role the read
+// therefore answers `Ok(vec![])` — not an error — and the function builds one
+// record PER SETTINGS ROW, so the result is an EMPTY vector.
+// `PurgeOutcome::all_ok` is `records.iter().all(...)`, which is VACUOUSLY TRUE
+// over the empty set. The job logs `retention.purge complete`, records
+// `record_job(..., ok = true)`, and the captured PLAINTEXT PROMPTS — the most
+// sensitive rows this product stores — are never purged and the audit trail
+// does not even mention the scope.
+//
+// The three tests below are, in order: the plaintext survives while the job
+// says `ok`; "nothing to do" is recorded and is distinguishable; "I could not
+// see" is recorded and is NOT success.
+//
+// All fixture content is a synthetic ciphertext stand-in, never plaintext PII.
+
+/// `workspace_raw_capture` is ARMED, so this INSERT is armed too. A bare-pool
+/// fixture write would be refused with `42501` under the runner role, and the
+/// suite could not run at all.
+async fn set_capture_retention(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    retention_days: i32,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO workspace_raw_capture (workspace_id, enabled, retention_days)
+         VALUES ($1, true, $2)",
+    )
+    .bind(workspace_id)
+    .bind(retention_days)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// One workspace's configured retention, read FROM A SCOPE THAT WOULD SEE IT.
+///
+/// `None` means the row is genuinely absent, never "RLS hid it" — the caller
+/// gets that guarantee only because this read arms the scope first. Every
+/// absence premise below goes through here and is paired with a control
+/// workspace whose row this same helper DOES return.
+async fn armed_capture_retention(pool: &PgPool, workspace_id: Uuid) -> sqlx::Result<Option<i32>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let days: Option<i32> = sqlx::query_scalar(
+        "SELECT retention_days FROM workspace_raw_capture WHERE workspace_id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(days)
+}
+
+/// Proof-of-purge rows for one scope, read from a scope that WOULD see them.
+///
+/// The bare-pool [`audit_rows`] above is fine for the two GLOBAL scopes, whose
+/// `workspace_id IS NULL` satisfies 030's policy unarmed. It is NOT fine for a
+/// per-workspace row: under the runner role a bare read returns nothing whether
+/// the row exists or not, which is the exact ambiguity these tests are about.
+async fn audit_rows_for_workspace(
+    pool: &PgPool,
+    run_id: Uuid,
+    scope: &str,
+    workspace_id: Uuid,
+) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+        .bind(workspace_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM retention_purge_audit
+         WHERE run_id = $1 AND scope = $2 AND workspace_id = $3
+         ORDER BY completed_at",
     )
     .bind(run_id)
-    .bind(SCOPE_CONTENT_CAPTURES)
-    .fetch_one(&pool)
+    .bind(scope)
+    .bind(workspace_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// The run's ONE global record for a sweeping scope — the census that says the
+/// sweep happened at all. `workspace_id IS NULL`, so a bare read sees it under
+/// either role.
+///
+/// Taken as a PARAMETER rather than fixed to the capture scope, because P1J
+/// gives `refresh_tokens.device_context` a census of exactly the same shape and
+/// two mechanisms that only look alike are how a second one drifts from the
+/// first.
+async fn sweep_census(
+    pool: &PgPool,
+    run_id: Uuid,
+    scope: &str,
+) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        "SELECT * FROM retention_purge_audit
+         WHERE run_id = $1 AND scope = $2 AND workspace_id IS NULL",
+    )
+    .bind(run_id)
+    .bind(scope)
+    .fetch_all(pool)
+    .await
+}
+
+/// Postgres answering whether a policy will actually bind THIS connection on
+/// THIS table — not a role attribute, and not a catalog flag.
+async fn row_security_active(pool: &PgPool, table: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT row_security_active($1)")
+        .bind(format!("public.{table}"))
+        .fetch_one(pool)
+        .await
+}
+
+/// Premise asserted by every test here: the low-privilege pool really is
+/// filtered on the table the sweep reads. Without it a role that turned out to
+/// bypass RLS would keep all three green while measuring nothing.
+async fn assert_capture_settings_are_policed(low: &PgPool) {
+    assert!(
+        row_security_active(low, "workspace_raw_capture")
+            .await
+            .expect("row_security_active probe"),
+        "premise: row security is not active on workspace_raw_capture for this \
+         connection, so the sweep below runs unfiltered and measures nothing"
+    );
+}
+
+/// THE DEFECT. Captured plaintext past the workspace's CURRENT retention must
+/// be gone after a run under a role that cannot bypass RLS.
+///
+/// `all_ok()` is asserted BEFORE the deletion, deliberately: under migration
+/// 033 this job's failure mode is SILENCE, not an error, so the RED failure
+/// this test was written against reads "the job reported success and the
+/// plaintext is still there" rather than "the job errored".
+///
+/// The 2-day-old capture is the POSITIVE CONTROL that must DIFFER: without it
+/// the test would pass for a sweep that deleted the whole table.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn captured_plaintext_is_purged_under_a_non_bypassing_role(pool: PgPool) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = seed_workspace(&pool).await?;
+
+    // Captured while retention was long; the operator has since lowered it.
+    let old = Uuid::new_v4();
+    let recent = Uuid::new_v4();
+    insert_capture(workspace_id, old, 30).await;
+    insert_capture(workspace_id, recent, 2).await;
+    set_capture_retention(&pool, workspace_id, 7).await?;
+
+    // ── PRE-STATE.
+    assert_eq!(
+        armed_capture_retention(&pool, workspace_id).await?,
+        Some(7),
+        "premise: the workspace must have a retention setting the sweep could \
+         act on. If this is None the test is measuring a missing fixture, not RLS."
+    );
+    assert_eq!(
+        capture_count(workspace_id).await,
+        2,
+        "premise: both capture rows must exist before the purge"
+    );
+    let not_yet_ttl_eligible = ch_query(&format!(
+        "SELECT count() FROM request_content_captures
+         WHERE workspace_id = '{workspace_id}' AND expires_at > now()"
+    ))
+    .await;
+    assert_eq!(
+        not_yet_ttl_eligible, "2",
+        "premise: BOTH rows must still be inside their stamped expires_at, so \
+         ClickHouse's own TTL would not delete either and anything that \
+         disappears did so because this job ran"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_capture_settings_are_policed(&low).await;
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // The silent-success half of the defect. This assertion PASSED before the
+    // fix, and that is the point: the job never signalled anything.
+    assert!(
+        outcome.all_ok(),
+        "the purge reported a failure: {:?}. Under migration 033 the failure \
+         mode of this job is silence, so an error here is a different bug.",
+        outcome.records
+    );
+
+    // ── POST-STATE. This is the assertion that was RED.
+    assert!(
+        !capture_exists(old).await,
+        "captured PLAINTEXT past the workspace's retention survived a run that \
+         reported `ok`. Under a non-bypassing role the bare-pool read of \
+         workspace_raw_capture returns the empty set, so the sweep visited no \
+         workspace, produced no record, and `all_ok()` was vacuously true over \
+         the empty set."
+    );
+    // POSITIVE CONTROL. Must DIFFER from the row above.
+    assert!(
+        capture_exists(recent).await,
+        "the sweep deleted a 2-day-old capture under a 7-day retention — it is \
+         deleting by something other than the configured window"
+    );
+
+    // The proof-of-purge trail names the tenant it acted on.
+    let mine =
+        audit_rows_for_workspace(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES, workspace_id)
+            .await?;
+    assert_eq!(
+        mine.len(),
+        1,
+        "exactly one proof-of-purge record for this workspace's captured \
+         content. Zero is the silent gap: the purge either did not happen or \
+         left no evidence that it did."
+    );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_deleted"),
+        1,
+        "exactly the one past-retention row"
+    );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_remaining_past_cutoff"),
+        0,
+        "nothing past the lowered cutoff may remain"
+    );
+    assert_eq!(mine[0].get::<String, _>("status"), "ok");
+    Ok(())
+}
+
+/// "NOTHING TO DO", recorded as such.
+///
+/// Workspace A has capture switched off entirely — no `workspace_raw_capture`
+/// row — and workspace B has one with nothing past its window. A run must:
+/// report success, write the census record that says the scope RAN, write B's
+/// per-workspace record with `rows_deleted = 0`, and write NO record for A.
+///
+/// The ABSENCE of A's settings row is asserted from a scope that WOULD see it,
+/// with B's row — read by the SAME helper, in the SAME run, under the SAME
+/// role — as the control proving that scope is not simply blind. Without that
+/// pair, "A has no settings" and "RLS hid A's settings" are the same
+/// observation, which is the disease this whole change is about.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_capture_sweep_with_nothing_to_do_still_records_the_scope(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let unconfigured = seed_workspace(&pool).await?;
+    let configured = seed_workspace(&pool).await?;
+    set_capture_retention(&pool, configured, 7).await?;
+
+    // Inside the window: nothing for the sweep to delete anywhere.
+    let inside = Uuid::new_v4();
+    insert_capture(configured, inside, 2).await;
+
+    // ── PREMISE PAIR. The control first, so the absence below means absence.
+    assert_eq!(
+        armed_capture_retention(&pool, configured).await?,
+        Some(7),
+        "premise/control: the configured workspace's settings row must be \
+         VISIBLE from its own armed scope, or the None below proves nothing"
+    );
+    assert_eq!(
+        armed_capture_retention(&pool, unconfigured).await?,
+        None,
+        "premise: the unconfigured workspace must genuinely have no settings row"
+    );
+    assert_ne!(
+        unconfigured, configured,
+        "premise: the two fixtures must be different workspaces"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_capture_settings_are_policed(&low).await;
+
+    let outcome = run(&low, &ch_client()).await;
+
+    assert!(
+        outcome.all_ok(),
+        "a run with nothing eligible must still succeed: {:?}",
+        outcome.records
+    );
+    assert!(
+        capture_exists(inside).await,
+        "the sweep deleted a capture inside its retention window on a run that \
+         had nothing to do"
+    );
+
+    // THE CENSUS. This is what makes "nothing to do" distinguishable from "I
+    // could not see anything": the scope is named in the trail on every run,
+    // whether or not any workspace had work.
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the run must write exactly one global census record for the capture \
+         scope. Zero means the trail simply OMITS the scope, and an absence is \
+         harder to notice than a row that says nothing happened."
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "ok",
+        "the sweep could read every workspace's settings, so its census must \
+         say so"
+    );
+    assert_eq!(
+        census[0].get::<i64, _>("rows_deleted"),
+        0,
+        "the census deletes nothing itself; the per-workspace records carry the \
+         counts and total_deleted() must not double-count them"
+    );
+
+    let for_configured =
+        audit_rows_for_workspace(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES, configured).await?;
+    assert_eq!(
+        for_configured.len(),
+        1,
+        "the configured workspace was swept and must have its own record"
+    );
+    assert_eq!(
+        for_configured[0].get::<i64, _>("rows_deleted"),
+        0,
+        "nothing was past the window, so nothing may be reported as deleted"
+    );
+    assert_eq!(for_configured[0].get::<String, _>("status"), "ok");
+
+    // And no record for the workspace that has capture switched off — read
+    // from ITS armed scope, so this absence is an absence.
+    let for_unconfigured =
+        audit_rows_for_workspace(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES, unconfigured)
+            .await?;
+    assert!(
+        for_unconfigured.is_empty(),
+        "a workspace with no capture settings has nothing to purge and must not \
+         get a proof-of-purge record, got {} of them",
+        for_unconfigured.len()
+    );
+    Ok(())
+}
+
+/// "I COULD NOT SEE ANYTHING" is NOT success.
+///
+/// The sweep enumerates `workspaces` on a bare pool, which is sound only
+/// because that table is not policed. This test arms it — the future migration
+/// the enumeration's comment warns about — and requires the run to FAIL rather
+/// than sweep zero workspaces and report `ok`.
+///
+/// It is the exact counterpart of the test above: same code path, same role,
+/// and the outcome record must DIFFER. Without this pair the census record
+/// would be a constant that says `ok` no matter what the job could see.
+///
+/// PREMISES: the workspace IS enumerable before arming and is NOT after (the
+/// before/after pair is what makes the second reading mean "hidden"), and there
+/// really was work to do — a past-retention capture row and a settings row
+/// saying so — so `ok` would be a lie rather than a technicality.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    ensure_capture_table().await;
+    let workspace_id = seed_workspace(&pool).await?;
+    set_capture_retention(&pool, workspace_id, 7).await?;
+
+    let doomed = Uuid::new_v4();
+    insert_capture(workspace_id, doomed, 30).await;
+
+    let low = low_privilege_pool(&pool).await;
+    assert_capture_settings_are_policed(&low).await;
+
+    // ── PREMISE: there is real work. Both halves, or `ok` could be honest.
+    assert_eq!(
+        armed_capture_retention(&pool, workspace_id).await?,
+        Some(7),
+        "premise: the workspace must have a retention setting"
+    );
+    assert!(
+        capture_exists(doomed).await,
+        "premise: a 30-day-old capture must exist to be past a 7-day retention"
+    );
+
+    // ── PREMISE/CONTROL: the enumeration WORKS before the table is armed.
+    let visible_before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_before.contains(&workspace_id),
+        "premise: the low-privilege pool must be able to enumerate workspaces \
+         BEFORE the table is armed, or the empty reading afterwards is not \
+         caused by what this test thinks"
+    );
+
+    // The future migration. No policy at all, so ENABLE alone is default-deny
+    // for a non-owner; FORCE covers the case where the connecting role owns the
+    // table, which it does when DATABASE_URL is already the runner.
+    sqlx::raw_sql(
+        "ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&pool)
+    .await?;
+
+    assert!(
+        row_security_active(&low, "workspaces").await?,
+        "premise: arming workspaces did not make row security active for the \
+         low-privilege pool, so the enumeration below is not actually filtered"
+    );
+    let visible_after: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_after.is_empty(),
+        "premise: the armed table must hide every workspace from this pool, \
+         got {visible_after:?}"
+    );
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // THE POINT. Sweeping zero workspaces because it cannot read them is not
+    // success.
+    assert!(
+        !outcome.all_ok(),
+        "the purge reported SUCCESS while it could not see a single workspace. \
+         There was a settings row and a past-retention capture, so this run \
+         did nothing and said it was fine: {:?}",
+        outcome.records
+    );
+
+    // FAIL CLOSED: an unreadable settings table must never be read as
+    // `retention is zero, delete everything`.
+    assert!(
+        capture_exists(doomed).await,
+        "the sweep deleted captured content while it could not read the \
+         retention that governs it"
+    );
+
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_CONTENT_CAPTURES).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the failure must still be recorded — a run that could not see is the \
+         one an auditor most needs in the trail"
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "error",
+        "the census must DIFFER from the succeeding run's; a constant `ok` \
+         would make the record worthless"
+    );
+    assert!(
+        census[0]
+            .get::<Option<String>, _>("error")
+            .is_some_and(|e| e.contains("workspaces")),
+        "the recorded error must name what could not be read, got {:?}",
+        census[0].get::<Option<String>, _>("error")
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// P1J — the FU4 device-context scrub under a non-bypassing role
+// ===========================================================================
+//
+// # The failure being measured, and why it is worse than the capture sweep's
+//
+// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration 002.
+// Migration 032 rewrote its `workspace_isolation` policy with `NULLIF`, so an
+// unscoped read of it does not raise `22P02` — it answers the EMPTY SET.
+//
+// `scrub_session_device_context` ran BOTH of its statements on a bare pool. The
+// UPDATE therefore matched zero rows, which is not an error, and the record it
+// produced was `rows_deleted = 0`, `rows_remaining_past_cutoff = 0`,
+// `status = 'ok'` — BYTE-IDENTICAL to the record a run with genuinely nothing
+// to scrub writes. The IP address and the `{browser} on {os}` descriptor
+// migration 027 puts on every sign-in row stayed on disk, and
+// `GET /v1/data-inventory` went on declaring them erased when the session ends.
+//
+// The second half is what makes it the worst shape in this workstream.
+// `rows_remaining_past_cutoff` is the field migration 023 offers as the one an
+// auditor re-derives — "a job that lied about `rows_deleted` still has to face
+// a `rows_remaining_past_cutoff` that anyone can recompute". It was recomputed
+// through the SAME filter that produced the zero it was checking, so it agreed.
+// A compliance attestation whose own verification step confirms its error is
+// worse than one that merely lies, because the check designed to catch it
+// AGREES.
+//
+// The three tests below are, in order: the context survives while the job says
+// `ok` AND the recount confirms zero; "nothing to scrub" is recorded and is
+// distinguishable; "I could not see" is recorded and is NOT success.
+//
+// All fixture PII is synthetic.
+
+/// Premise asserted by every test here: the low-privilege pool really is
+/// filtered on the table the scrub reads and writes. Without it a role that
+/// turned out to bypass RLS would keep all three green while measuring nothing.
+async fn assert_session_rows_are_policed(low: &PgPool) {
+    assert!(
+        row_security_active(low, "refresh_tokens")
+            .await
+            .expect("row_security_active probe"),
+        "premise: row security is not active on refresh_tokens for this \
+         connection, so the scrub below runs unfiltered and measures nothing"
+    );
+}
+
+/// `rows_remaining_past_cutoff`, RE-DERIVED BY THE TEST — a second connection,
+/// armed to the workspace, running the predicate the job records against.
+///
+/// This is the whole point of the P1J change and it is deliberately NOT a call
+/// into the job's own code. The defect was that the job's post-delete recount
+/// went through the same blind filter as the delete, so the two agreed on zero;
+/// a check that shares the failure is not a check. Callers pair the number this
+/// returns with the number the job WROTE and require them to match, with a
+/// control row proving this scope is not itself blind.
+async fn ended_sessions_still_carrying_context(
+    pool: &PgPool,
+    workspace_id: Uuid,
+) -> sqlx::Result<i64> {
+    let mut tx = pool.begin().await?;
+    arm(&mut tx, workspace_id).await?;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM refresh_tokens r
+         WHERE r.workspace_id = $1
+           AND (r.client_ip IS NOT NULL OR r.client_descriptor IS NOT NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM refresh_tokens live
+               WHERE live.session_id = r.session_id
+                 AND live.workspace_id = r.workspace_id
+                 AND live.revoked_at IS NULL
+                 AND live.expires_at > NOW()
+           )",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Every `rows_remaining_past_cutoff` this run recorded for one scope, so a
+/// test can say "no record of this scope reports a single row still carrying
+/// device context" rather than picking one row and hoping it is the right one.
+fn recorded_remaining(outcome: &PurgeOutcome, scope: &str) -> Vec<i64> {
+    outcome
+        .records
+        .iter()
+        .filter(|r| r.scope == scope)
+        .map(|r| r.rows_remaining_past_cutoff)
+        .collect()
+}
+
+/// THE DEFECT. FU4's device context on an ENDED session must be gone after a
+/// run under a role that cannot bypass RLS — and the number the record offers
+/// for checking that must not be able to agree with the wrong answer.
+///
+/// `all_ok()` is asserted BEFORE the privacy assertion, deliberately: since
+/// migration 032 this scope's failure mode is SILENCE, not an error, so the RED
+/// this test was written against reads "the job reported success, the address is
+/// still on disk, and the recount says there is nothing left" rather than "the
+/// job errored". A test that expected an error here would be testing the
+/// pre-032 world.
+///
+/// MEASURED RED, under `secureprompt_runner`, before the fix:
+///   all_ok() = true; recorded rows_remaining_past_cutoff = [0];
+///   independently re-derived from the workspace's armed scope = 2;
+///   the expired session still reading (1, 1).
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn session_device_context_is_scrubbed_under_a_non_bypassing_role(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+
+    let expired = insert_session(&pool, workspace_id, user_id, -1, false).await?;
+    let revoked = insert_session(&pool, workspace_id, user_id, 24, true).await?;
+    let live = insert_session(&pool, workspace_id, user_id, 24, false).await?;
+
+    // ── PRE-STATE, from a scope that WOULD see it. Without these, "the context
+    // is gone" is satisfied by never having written any.
+    for (name, session) in [("expired", expired), ("revoked", revoked), ("live", live)] {
+        assert_eq!(
+            device_context_of(&pool, workspace_id, session).await?,
+            (1, 1),
+            "premise: the {name} session must carry device context before the run"
+        );
+    }
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+        2,
+        "premise: exactly the two ended sessions are eligible. This is the \
+         number the job's own record has to match afterwards, so a wrong \
+         premise here would make the comparison meaningless."
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    // ── PREMISE: the pool the job runs on sees NOTHING through a bare read.
+    // This is the mechanism of the defect, and it is also why every assertion
+    // in this test is armed: on this connection `(0, 0)` is what "the row does
+    // not exist", "the row was deleted" and "the context was scrubbed" all
+    // look like.
+    let blind: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM refresh_tokens WHERE session_id = $1")
+            .bind(expired)
+            .fetch_one(&low)
+            .await?;
+    assert_eq!(
+        blind, 0,
+        "premise: a BARE read on the job's own pool must see nothing here. If \
+         it sees the row, this connection is not filtered and the test below \
+         proves nothing about RLS."
+    );
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // ── The silent-success half. This assertion PASSED before the fix and that
+    // is the point: the job never signalled anything.
+    assert!(
+        outcome.all_ok(),
+        "the purge reported a failure: {:?}. Since migration 032 the failure \
+         mode of this scope is silence, so an error here is a different bug.",
+        outcome.records
+    );
+
+    // ── THE SELF-CONFIRMATION. The number the job WROTE, against the same
+    // number re-derived on a different connection from a scope proven above to
+    // see these rows. Before the fix the job wrote 0 and the truth was 2, and
+    // nothing in the audit trail disagreed with the job.
+    let independent = ended_sessions_still_carrying_context(&pool, workspace_id).await?;
+    let recorded = recorded_remaining(&outcome, SCOPE_SESSION_DEVICE_CONTEXT);
+    assert!(
+        !recorded.is_empty(),
+        "premise: the run recorded no `{SCOPE_SESSION_DEVICE_CONTEXT}` record \
+         at all, so there is no number to check: {:?}",
+        outcome.records
+    );
+    assert!(
+        recorded.iter().all(|&n| n == independent),
+        "the proof-of-purge recount and an independent re-derivation of the \
+         SAME predicate disagree: the trail says {recorded:?} rows are still \
+         past the boundary, a scope that can see them says {independent}. \
+         Recomputing the check through the same filter that produced the number \
+         it is meant to check is what made this defect self-confirming."
+    );
+    assert_eq!(
+        independent, 0,
+        "ended sessions are still carrying device context after a run that \
+         reported `ok`. Under a non-bypassing role the bare-pool UPDATE matched \
+         zero rows — which is not an error — so the IP addresses stayed on disk \
+         and `GET /v1/data-inventory` went on declaring them erased."
+    );
+
+    // ── POST-STATE, per session, from a scope that WOULD see it.
+    for (name, session) in [("expired", expired), ("revoked", revoked)] {
+        let (total, with_context) = device_context_of(&pool, workspace_id, session).await?;
+        assert_eq!(
+            with_context, 0,
+            "the {name} session's device context must be erased once the \
+             session is over"
+        );
+        assert_eq!(
+            total, 1,
+            "...but the ROW must survive: deleting it would turn a replayed \
+             refresh token into a plain 401 and lose the replay detection \
+             migration 002 describes"
+        );
+    }
+    // POSITIVE CONTROL. Must DIFFER from the two above, or this test would pass
+    // for a job that emptied the column on every row it could reach.
+    assert_eq!(
+        device_context_of(&pool, workspace_id, live).await?,
+        (1, 1),
+        "a LIVE session must keep the context that makes it identifiable in the \
+         listing"
+    );
+
+    // ── The trail, attributed to the tenant whose people's addresses were
+    // erased. Read from THAT workspace's armed scope — the lens from which the
+    // number above can be re-derived by the tenant themselves.
+    let mine = audit_rows_for_workspace(
+        &pool,
+        outcome.run_id,
+        SCOPE_SESSION_DEVICE_CONTEXT,
+        workspace_id,
+    )
     .await?;
     assert_eq!(
-        attributed,
-        Some(workspace),
-        "the per-workspace record must carry the workspace it is about"
+        mine.len(),
+        1,
+        "exactly one proof-of-purge record for this workspace's device-context \
+         scrub. Zero is the silent gap: the scrub either did not happen or left \
+         no evidence that it did."
     );
+    assert_eq!(
+        mine[0].get::<i64, _>("rows_deleted"),
+        2,
+        "exactly the two ended sessions"
+    );
+    assert_eq!(mine[0].get::<i64, _>("rows_remaining_past_cutoff"), 0);
+    assert_eq!(mine[0].get::<String, _>("status"), "ok");
+    Ok(())
+}
+
+/// "NOTHING TO SCRUB", recorded as such.
+///
+/// One workspace holds a LIVE session only and another holds no session at all.
+/// A run must report success, write the census record that says the scope RAN,
+/// and write NO per-workspace record for either — because neither had anything
+/// to say, and the census is what makes that absence readable.
+///
+/// STATED PLAINLY: the `all_ok()` and "the live context survives" halves of this
+/// test passed before the fix, because a job that scrubs nothing scrubs nothing
+/// wrongly. It is the CONTROL on the census — the counterpart run whose record
+/// must say `ok` where
+/// `a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly`'s says
+/// `error`. Without the pair, `ok` would be a constant.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_device_context_scrub_with_nothing_to_do_still_records_the_scope(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let with_live = seed_workspace(&pool).await?;
+    let empty = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, with_live).await?;
+    let live = insert_session(&pool, with_live, user_id, 24, false).await?;
+
+    // ── PREMISE PAIR. The control first, so the absence below means absence.
+    assert_eq!(
+        device_context_of(&pool, with_live, live).await?,
+        (1, 1),
+        "premise/control: the live session's row must be VISIBLE from its own \
+         armed scope, or the zeroes below prove nothing"
+    );
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, with_live).await?,
+        0,
+        "premise: nothing in this workspace is eligible — the only session is \
+         live"
+    );
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, empty).await?,
+        0,
+        "premise: the second workspace holds no sessions at all"
+    );
+    assert_ne!(
+        with_live, empty,
+        "premise: the two fixtures must be different workspaces"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    let outcome = run(&low, &ch_client()).await;
+
+    assert!(
+        outcome.all_ok(),
+        "a run with nothing eligible must still succeed: {:?}",
+        outcome.records
+    );
+    assert_eq!(
+        device_context_of(&pool, with_live, live).await?,
+        (1, 1),
+        "the scrub erased a LIVE session's device context on a run that had \
+         nothing to do"
+    );
+
+    // THE CENSUS. This is what makes "nothing to scrub" distinguishable from "I
+    // could not see anything": the scope is named in the trail on every run.
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the run must write exactly one global census record for the \
+         device-context scope. Zero means the trail simply OMITS the scope, and \
+         an absence is harder to notice than a row that says nothing happened."
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "ok",
+        "the scrub could reach every workspace, so its census must say so"
+    );
+    assert_eq!(
+        census[0].get::<i64, _>("rows_deleted"),
+        0,
+        "the census scrubs nothing itself; the per-workspace records carry the \
+         counts and total_deleted() must not double-count them"
+    );
+
+    // No per-workspace record for either — read from THEIR armed scopes, so
+    // these absences are absences.
+    for (name, workspace_id) in [("with a live session", with_live), ("empty", empty)] {
+        let rows = audit_rows_for_workspace(
+            &pool,
+            outcome.run_id,
+            SCOPE_SESSION_DEVICE_CONTEXT,
+            workspace_id,
+        )
+        .await?;
+        assert!(
+            rows.is_empty(),
+            "the {name} workspace had nothing to scrub and nothing left over, \
+             so it must not get a proof-of-purge record, got {} of them",
+            rows.len()
+        );
+    }
+    Ok(())
+}
+
+/// "I COULD NOT SEE ANYTHING" is NOT success, for this scope too.
+///
+/// The scrub reaches every tenant by enumerating `workspaces`, which is sound
+/// only because that table is not policed. This test arms it — the future
+/// migration `enumerate_workspaces` warns about — and requires the run to FAIL
+/// rather than visit zero workspaces and report `ok`.
+///
+/// It is the exact counterpart of the test above: same code path, same role, and
+/// the census record must DIFFER.
+///
+/// PREMISES: the workspace IS enumerable before arming and is NOT after (the
+/// before/after pair is what makes the second reading mean "hidden"), and there
+/// really was work to do — an ended session still carrying an address — so `ok`
+/// would be a lie rather than a technicality.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace_id = seed_workspace(&pool).await?;
+    let user_id = seed_user(&pool, workspace_id).await?;
+    let ended = insert_session(&pool, workspace_id, user_id, -1, false).await?;
+
+    let low = low_privilege_pool(&pool).await;
+    assert_session_rows_are_policed(&low).await;
+
+    // ── PREMISE: there is real work.
+    assert_eq!(
+        ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+        1,
+        "premise: one ended session must be carrying device context, or `ok` \
+         would be an honest answer"
+    );
+
+    // ── PREMISE/CONTROL: the enumeration WORKS before the table is armed.
+    let visible_before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_before.contains(&workspace_id),
+        "premise: the low-privilege pool must be able to enumerate workspaces \
+         BEFORE the table is armed, or the empty reading afterwards is not \
+         caused by what this test thinks"
+    );
+
+    // The future migration. No policy at all, so ENABLE alone is default-deny
+    // for a non-owner; FORCE covers the case where the connecting role owns the
+    // table, which it does when DATABASE_URL is already the runner.
+    sqlx::raw_sql(
+        "ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&pool)
+    .await?;
+
+    assert!(
+        row_security_active(&low, "workspaces").await?,
+        "premise: arming workspaces did not make row security active for the \
+         low-privilege pool, so the enumeration below is not actually filtered"
+    );
+    let visible_after: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_after.is_empty(),
+        "premise: the armed table must hide every workspace from this pool, \
+         got {visible_after:?}"
+    );
+
+    let outcome = run(&low, &ch_client()).await;
+
+    // THE POINT. Visiting zero workspaces because it cannot read them is not
+    // success.
+    assert!(
+        !outcome.all_ok(),
+        "the purge reported SUCCESS while it could not see a single workspace. \
+         An ended session was still carrying an IP address, so this run did \
+         nothing and said it was fine: {:?}",
+        outcome.records
+    );
+
+    // FAIL CLOSED, and the row is untouched rather than half-scrubbed.
+    assert_eq!(
+        device_context_of(&pool, workspace_id, ended).await?,
+        (1, 1),
+        "the ended session's row must be exactly as it was — a scrub that \
+         cannot enumerate its tenants must change nothing"
+    );
+
+    let census = sweep_census(&pool, outcome.run_id, SCOPE_SESSION_DEVICE_CONTEXT).await?;
+    assert_eq!(
+        census.len(),
+        1,
+        "the failure must still be recorded — a run that could not see is the \
+         one an auditor most needs in the trail"
+    );
+    assert_eq!(
+        census[0].get::<String, _>("status"),
+        "error",
+        "the census must DIFFER from the succeeding run's; a constant `ok` \
+         would make the record worthless"
+    );
+    assert!(
+        census[0]
+            .get::<Option<String>, _>("error")
+            .is_some_and(|e| e.contains("workspaces")),
+        "the recorded error must name what could not be read, got {:?}",
+        census[0].get::<Option<String>, _>("error")
+    );
+
+    // And the recount must NOT report zero-remaining on a run that saw nothing.
+    // `PurgeRecord::failure` records -1 precisely so that "I did not measure"
+    // cannot be read as "there is nothing left".
+    let recorded = recorded_remaining(&outcome, SCOPE_SESSION_DEVICE_CONTEXT);
+    assert!(
+        recorded.iter().all(|&n| n < 0),
+        "a run that could not enumerate its tenants must not publish a \
+         rows_remaining_past_cutoff an auditor would read as `all clear`, got \
+         {recorded:?}"
+    );
+    Ok(())
+}
+
+/// Two tenants, and each record names the rows that are actually its own.
+///
+/// This is the test the `r.workspace_id = $2` predicates in
+/// `scrub_one_workspace_device_context` exist for, and it runs on the crate's
+/// OWN pool rather than through `low_privilege_pool` — deliberately, because
+/// that is the pool whose privileges differ between the two gate jobs. Under
+/// `DATABASE_URL=…secureprompt@…` it is a SUPERUSER and bypasses row-level
+/// security entirely, so the explicit predicate is the ONLY thing keeping the
+/// first workspace's UPDATE from scrubbing the whole deployment and every later
+/// workspace from reporting zero. Under `…secureprompt_runner@…` the policy
+/// does that work and the predicate is redundant. The statement has to mean the
+/// same thing either way, and this is what measures that it does.
+///
+/// MEASURED with `r.workspace_id = $2` removed from the UPDATE, under the
+/// superuser DATABASE_URL: `exactly this workspace's one ended session` failed
+/// with left 2, right 1 — one tenant's proof-of-purge record claiming the other
+/// tenant's rows.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn each_workspaces_device_scrub_is_recorded_against_its_own_tenant(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let first = seed_workspace(&pool).await?;
+    let second = seed_workspace(&pool).await?;
+    let first_user = seed_user(&pool, first).await?;
+    let second_user = seed_user(&pool, second).await?;
+
+    let first_ended = insert_session(&pool, first, first_user, -1, false).await?;
+    let first_live = insert_session(&pool, first, first_user, 24, false).await?;
+    let second_ended = insert_session(&pool, second, second_user, -1, false).await?;
+    let second_live = insert_session(&pool, second, second_user, 24, false).await?;
+
+    // ── PREMISE. One eligible session EACH, so a record claiming two is a
+    // record that crossed the boundary and a record claiming zero is one that
+    // never reached its tenant.
+    for (name, workspace_id) in [("first", first), ("second", second)] {
+        assert_eq!(
+            ended_sessions_still_carrying_context(&pool, workspace_id).await?,
+            1,
+            "premise: the {name} workspace must have exactly one eligible session"
+        );
+    }
+    assert_ne!(first, second, "premise: two distinct tenants");
+
+    let outcome = run(&pool, &ch_client()).await;
+    assert!(
+        outcome.all_ok(),
+        "the purge reported a failure: {:?}",
+        outcome.records
+    );
+
+    for (name, workspace_id, ended, live) in [
+        ("first", first, first_ended, first_live),
+        ("second", second, second_ended, second_live),
+    ] {
+        let rows = audit_rows_for_workspace(
+            &pool,
+            outcome.run_id,
+            SCOPE_SESSION_DEVICE_CONTEXT,
+            workspace_id,
+        )
+        .await?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the {name} workspace must have exactly one device-context record of \
+             its own"
+        );
+        assert_eq!(
+            rows[0].get::<i64, _>("rows_deleted"),
+            1,
+            "exactly this workspace's one ended session"
+        );
+        assert_eq!(rows[0].get::<i64, _>("rows_remaining_past_cutoff"), 0);
+        assert_eq!(
+            device_context_of(&pool, workspace_id, ended).await?,
+            (1, 0),
+            "the {name} workspace's ended session must be scrubbed, row intact"
+        );
+        assert_eq!(
+            device_context_of(&pool, workspace_id, live).await?,
+            (1, 1),
+            "the {name} workspace's LIVE session must keep its device context"
+        );
+    }
     Ok(())
 }

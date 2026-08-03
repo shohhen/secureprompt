@@ -213,7 +213,7 @@ fn store_unavailable(context: &'static str, error: &dyn std::fmt::Display) -> Ap
 
 // ── Tenancy-scoped access ─────────────────────────────────────────────────
 
-/// Open a transaction with `app.current_workspace_id` set.
+/// Open a transaction with `app.current_workspace_id` set AND VERIFIED.
 ///
 /// Migration 025 puts FORCE ROW LEVEL SECURITY on `audit_exports` and
 /// `audit_export_pages`, keyed on this GUC. With it unset the policy predicate
@@ -222,6 +222,22 @@ fn store_unavailable(context: &'static str, error: &dyn std::fmt::Display) -> Ap
 /// than like a bug. The explicit `workspace_id = $n` in every statement is
 /// still the filter; RLS is defence in depth (Global Constraint 3). Same
 /// pattern, and the same measured reason, as `leak_report::registered_models`.
+///
+/// The body delegates the arming to [`crate::db::scope::arm_scope`] rather
+/// than issuing its own `set_config`, because that helper READS THE SETTING
+/// BACK inside the transaction. Before migration 033 an unscoped read on a
+/// recycled pooled connection would sometimes raise `22P02`; 033's `NULLIF`
+/// sweep made it uniformly invisible, which is the semantics `001_init.sql`
+/// intended and which leaves the read-back as the only thing that can tell
+/// "no exports" from "no scope".
+///
+/// `arm_scope`'s own error is not passed through untouched: `ApiError::Database`
+/// carries the Postgres message and `http::api_error_response` renders an
+/// `ApiError`'s message straight into the response body, which is the exact
+/// leak [`store_unavailable`] exists to close. Its `ApiError::Internal` is
+/// `db::scope::SCOPE_NOT_ARMED`, a fixed string from this repository with no
+/// store text in it, so that one is returned as written — it says something
+/// true and specific that a generic 500 would not.
 async fn begin_scoped(
     state: &AppState,
     workspace_id: Uuid,
@@ -231,11 +247,12 @@ async fn begin_scoped(
         .begin()
         .await
         .map_err(|e| store_unavailable("opening a transaction", &e))?;
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(workspace_id.to_string())
-        .execute(&mut *tx)
+    crate::db::scope::arm_scope(&mut tx, workspace_id)
         .await
-        .map_err(|e| store_unavailable("scoping the transaction to your workspace", &e))?;
+        .map_err(|e| match e {
+            internal @ ApiError::Internal(_) => internal,
+            other => store_unavailable("scoping the transaction to your workspace", &other),
+        })?;
     Ok(tx)
 }
 

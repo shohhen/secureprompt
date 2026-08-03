@@ -1419,11 +1419,18 @@ async fn retention_purge_audit_cannot_adopt_the_standard_workspace_policy(pool: 
     );
 
     ensure_low_privilege_role(&pool).await;
+    // The counterfactual is the STANDARD policy exactly as the schema carries
+    // it after migration 033 — `NULLIF` included — so that what is swapped in
+    // is the policy the other fifteen armed tables actually have and not a
+    // historical form of it. The scope is ARMED below, so the setting is a
+    // valid uuid and `NULLIF` changes nothing this test measures; it is here
+    // for accuracy, and this test passed identically with and without it.
     sqlx::raw_sql(
         "ALTER TABLE retention_purge_audit OWNER TO secureprompt_runner;
          DROP POLICY workspace_isolation_or_global ON retention_purge_audit;
          CREATE POLICY workspace_isolation ON retention_purge_audit
-             USING (workspace_id = current_setting('app.current_workspace_id', true)::uuid);",
+             USING (workspace_id
+                    = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);",
     )
     .execute(&pool)
     .await
@@ -1461,12 +1468,28 @@ async fn retention_purge_audit_cannot_adopt_the_standard_workspace_policy(pool: 
 /// that DROPPING a table from 030's list is red even if someone also deletes
 /// the test that covered it, and so the exact predicate is pinned rather than
 /// inferred from behaviour.
+///
+/// The `NULLIF` in both constants is migration 033's, not 030's. A released
+/// transaction-local `set_config` reverts to the EMPTY STRING rather than to
+/// NULL, so the bare `(current_setting(…, true))::uuid` these two predicates
+/// shipped with raised `22P02 invalid input syntax for type uuid: ""` on any
+/// pooled connection that had previously carried a scope, instead of filtering.
+/// 033 swept every armed policy in the schema; this test is what pins the
+/// resulting text. MEASURED before that sweep, this assertion failed with
+/// exactly the two forms swapped, which is why the update is here and not a
+/// second constant.
+///
+/// What 030 owns and what this still checks is the DIFFERENCE between the two:
+/// three tables get the plain workspace predicate and `retention_purge_audit`
+/// gets the one that also admits `workspace_id IS NULL`.
 #[sqlx::test]
 async fn migration_030_arms_four_tables_with_two_deliberately_different_policies(pool: PgPool) {
     const STANDARD: &str =
-        "(workspace_id = (current_setting('app.current_workspace_id'::text, true))::uuid)";
+        "(workspace_id = (NULLIF(current_setting('app.current_workspace_id'::text, \
+                            true), ''::text))::uuid)";
     const OR_GLOBAL: &str = "((workspace_id IS NULL) OR (workspace_id = \
-                             (current_setting('app.current_workspace_id'::text, true))::uuid))";
+                             (NULLIF(current_setting('app.current_workspace_id'::text, true), \
+                             ''::text))::uuid))";
 
     for (table, policy, qual) in [
         ("workspace_sidecar_policy", "workspace_isolation", STANDARD),

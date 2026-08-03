@@ -9,6 +9,7 @@
 //! `/v1/auth/refresh`. Entropy comes from the 32-byte random payload, so
 //! SHA-256 over full-entropy input is sufficient pre-image protection.
 
+use crate::db::scope;
 use chrono::{DateTime, Utc};
 use secureprompt_common::errors::ApiError;
 use sha2::{Digest, Sha256};
@@ -116,8 +117,7 @@ impl RefreshTokenRepository {
         let id = Uuid::new_v4();
         let hash = hash_refresh_token(row.raw_token);
 
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        bind_workspace(&mut tx, row.workspace_id).await?;
+        let mut tx = scope::begin_scoped(&self.pool, row.workspace_id).await?;
         sqlx::query(
             "INSERT INTO refresh_tokens
                  (id, user_id, workspace_id, token_hash, expires_at, created_at,
@@ -181,7 +181,18 @@ impl RefreshTokenRepository {
         let old_hash = hash_refresh_token(old_raw);
         let new_hash = hash_refresh_token(new_raw);
 
-        // Pre-lookup — bypasses RLS so we can find the owning workspace.
+        // Pre-lookup. CROSS-TENANT BY NECESSITY: the presented token is thirty-
+        // two bytes of entropy and does not name its workspace, so this read is
+        // what DISCOVERS the scope the write below is armed to.
+        //
+        // It runs inside a POSSESSION PROBE rather than on the bare pool.
+        // Migration 032's `refresh_token_possession` policy admits, for SELECT
+        // only, the single row whose `token_hash` this transaction names — so a
+        // role that does not bypass RLS finds the row it was handed and still
+        // finds nothing else. On the bare pool this returned `None` under such
+        // a role and `rotate` answered `NotFound`, which 401s every
+        // `/v1/auth/refresh` in the deployment.
+        let mut probe_tx = scope::begin_refresh_token_probe(&self.pool, &old_hash).await?;
         let pre = sqlx::query(
             "SELECT id, user_id, workspace_id, expires_at, revoked_at, replaced_by, session_id
              FROM refresh_tokens
@@ -189,9 +200,12 @@ impl RefreshTokenRepository {
              LIMIT 1",
         )
         .bind(&old_hash)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *probe_tx)
         .await
         .map_err(db_err)?;
+        // Read-only, and the probe must not stay armed while the scoped write
+        // below runs on another checkout of the pool.
+        probe_tx.rollback().await.map_err(db_err)?;
 
         let Some(row) = pre else {
             return Ok(RotationOutcome::NotFound);
@@ -224,8 +238,7 @@ impl RefreshTokenRepository {
 
         // Perform the atomic rotate under workspace RLS.
         let new_id = Uuid::new_v4();
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        bind_workspace(&mut tx, workspace_id).await?;
+        let mut tx = scope::begin_scoped(&self.pool, workspace_id).await?;
 
         // Insert the successor FIRST so replaced_by can reference it. No
         // `client_ip` / `client_descriptor` columns here, on purpose — see the
@@ -276,8 +289,28 @@ impl RefreshTokenRepository {
         })
     }
 
-    /// Revoke every active refresh row for the user. Invoked on replay
-    /// detection (threat T-05-03).
+    /// Revoke every active refresh row for the user. This is what
+    /// `POST /v1/auth/logout` calls, and what replay detection calls
+    /// (threat T-05-03).
+    ///
+    /// # The two halves, and which one is load-bearing
+    ///
+    /// The `users` read is on the bare pool because `users` is NOT under row-
+    /// level security — deliberately, and migration 031 Part 2 is the record of
+    /// why and of what has to happen before it can be. `tests/
+    /// migration_031_rls.rs::users_is_not_armed_and_this_is_the_open_defect` is
+    /// the tripwire that fires if that changes; when it does, THIS read becomes
+    /// a silent zero and logout stops revoking, because a missing user row is
+    /// resolved to `Ok(())` three lines down.
+    ///
+    /// The UPDATE goes through [`scope::begin_scoped`], not a bare
+    /// `set_config`, and that is the load-bearing half. An UPDATE whose scope
+    /// did not arm is filtered by the policy's `USING` clause and matches ZERO
+    /// rows WITHOUT erroring — the loud-write intuition only holds for INSERT,
+    /// where `WITH CHECK` rejects. `begin_scoped` reads the setting back, so an
+    /// unarmed logout raises instead of returning 204 over a session that is
+    /// still refreshable. Measured: `logout_revokes_the_refresh_token_under_a_
+    /// non_bypassing_role` fails if the arming is removed.
     ///
     /// # Errors
     /// Returns `ApiError::Database` for pool/query failures.
@@ -294,8 +327,7 @@ impl RefreshTokenRepository {
         };
         let workspace_id: Uuid = record.get("workspace_id");
 
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        bind_workspace(&mut tx, workspace_id).await?;
+        let mut tx = scope::begin_scoped(&self.pool, workspace_id).await?;
         sqlx::query(
             "UPDATE refresh_tokens
              SET revoked_at = NOW()
@@ -309,9 +341,31 @@ impl RefreshTokenRepository {
         Ok(())
     }
 
-    /// Look up an active (non-revoked, non-expired) refresh row by raw
-    /// token. Used by the logout handler to best-effort revoke the
-    /// current refresh row of the user who just logged out.
+    /// Look up an active (non-revoked, non-expired) refresh row by the SHA-256
+    /// of its raw token.
+    ///
+    /// # Who calls this
+    ///
+    /// NOTHING, as of this commit — verified by grep across every tracked file
+    /// in the repository. The doc comment this replaces said "Used by the
+    /// logout handler to best-effort revoke the current refresh row of the user
+    /// who just logged out", and that has been false since `bc2b586` introduced
+    /// the method: `dashboard::auth::logout` calls
+    /// [`Self::revoke_all_for_user`]. The claim is recorded here because
+    /// `tests/rls_call_site_guard.rs` graded this method's silent zero as the
+    /// severe one ON THAT COMMENT, and a reader who inherits the entry needs to
+    /// know the comment was the only evidence for it.
+    ///
+    /// It is kept, and fixed, rather than deleted because it is the same
+    /// cross-tenant by-hash primitive `rotate`'s pre-lookup needs, and the
+    /// scoping it now carries is the thing worth pinning.
+    ///
+    /// # Scoping
+    ///
+    /// CROSS-TENANT BY NECESSITY, and therefore run inside the same possession
+    /// probe as `rotate`'s pre-lookup — see
+    /// [`scope::begin_refresh_token_probe`]. On the bare pool this returned
+    /// `None` for a live row under a role that does not bypass RLS.
     ///
     /// # Errors
     /// Returns `ApiError::Database` for pool/query failures.
@@ -319,6 +373,7 @@ impl RefreshTokenRepository {
         &self,
         hash: &str,
     ) -> Result<Option<RefreshTokenRow>, ApiError> {
+        let mut probe_tx = scope::begin_refresh_token_probe(&self.pool, hash).await?;
         let row = sqlx::query(
             "SELECT id, user_id, workspace_id, token_hash, expires_at,
                     revoked_at, replaced_by, created_at
@@ -328,9 +383,10 @@ impl RefreshTokenRepository {
              LIMIT 1",
         )
         .bind(hash)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *probe_tx)
         .await
         .map_err(db_err)?;
+        probe_tx.rollback().await.map_err(db_err)?;
         Ok(row.map(|record| RefreshTokenRow {
             id: record.get("id"),
             user_id: record.get("user_id"),
@@ -353,18 +409,6 @@ pub fn hash_refresh_token(raw: &str) -> String {
 
 fn db_err(error: sqlx::Error) -> ApiError {
     ApiError::Database(error.to_string())
-}
-
-async fn bind_workspace(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workspace_id: Uuid,
-) -> Result<(), ApiError> {
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-        .bind(workspace_id.to_string())
-        .execute(&mut **tx)
-        .await
-        .map_err(db_err)?;
-    Ok(())
 }
 
 #[cfg(test)]

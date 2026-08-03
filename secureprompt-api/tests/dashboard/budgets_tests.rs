@@ -401,16 +401,48 @@ async fn rls_isolation(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Direct SQL check: only workspace A's row exists.
-    let rows = sqlx::query(
-        "SELECT workspace_id FROM workspace_budgets WHERE workspace_id = $1 OR workspace_id = $2",
-    )
-    .bind(ws_a.workspace_id)
-    .bind(ws_b.workspace_id)
-    .fetch_all(&pool)
-    .await?;
-    assert_eq!(rows.len(), 1, "only workspace A's row must exist");
-    let ws_stored: Uuid = rows[0].get("workspace_id");
+    //
+    // Asked ONCE PER WORKSPACE, from that workspace's own armed scope, rather
+    // than as one `WHERE a OR b` over the bare pool. `workspace_budgets` is
+    // ENABLE + FORCE ROW LEVEL SECURITY, so the combined query cannot be
+    // answered honestly from a single vantage point: under a non-bypassing
+    // role it returns nothing at all (measured: `left: 0` under
+    // `secureprompt_runner`), and under a superuser it returns both rows
+    // regardless of whether RLS works.
+    //
+    // The A read is the CONTROL for the B read: identical statement, identical
+    // table, same transaction shape, differing only in which tenant is armed.
+    let a_rows = {
+        let mut a_scope = fixtures::scoped(&pool, ws_a.workspace_id).await;
+        sqlx::query("SELECT workspace_id FROM workspace_budgets WHERE workspace_id = $1")
+            .bind(ws_a.workspace_id)
+            .fetch_all(&mut *a_scope)
+            .await?
+    };
+    assert_eq!(
+        a_rows.len(),
+        1,
+        "control: workspace A's PUT must have written exactly one row, or the \
+         zero asserted for B below proves nothing"
+    );
+    let ws_stored: Uuid = a_rows[0].get("workspace_id");
     assert_eq!(ws_stored, ws_a.workspace_id);
+
+    let b_rows = {
+        let mut b_scope = fixtures::scoped(&pool, ws_b.workspace_id).await;
+        sqlx::query("SELECT workspace_id FROM workspace_budgets WHERE workspace_id = $1")
+            .bind(ws_b.workspace_id)
+            .fetch_all(&mut *b_scope)
+            .await?
+    };
+    assert!(
+        b_rows.is_empty(),
+        "workspace A's PUT wrote into workspace B: {:?}",
+        b_rows
+            .iter()
+            .map(|row| row.get::<Uuid, _>("workspace_id"))
+            .collect::<Vec<_>>()
+    );
     Ok(())
 }
 

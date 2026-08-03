@@ -1,14 +1,66 @@
 //! Dashboard test fixtures — seeds two workspaces with distinct users and API
 //! keys. Reused by Plans 03/04/05/06 cross-tenant matrix tests (per D-13 +
 //! threat T-05-05).
+//!
+//! # THE RULE THIS SUITE FOLLOWS — read before adding a helper here
+//!
+//! **Seed however you must; assert as the application would.**
+//!
+//! Every write to an RLS-armed table — in a fixture OR in a test body — goes
+//! through [`scoped`], and so does every verification read of one. [`scoped`]
+//! is `secureprompt_api::db::scope::begin_scoped`, the same armed transaction
+//! the repositories open: it sets `app.current_workspace_id`, reads it back,
+//! and fails loudly if it did not take.
+//!
+//! It is deliberately NOT an elevated path, which is why one helper can serve
+//! both halves. An elevated seeder would have to be quarantined from the
+//! assertions (a fixture that seeds with elevated rights and then asserts with
+//! elevated rights proves nothing); an ARMED transaction has exactly the
+//! visibility the product has, so a read through it means what the assertion
+//! says it means.
+//!
+//! ## The vacuity this replaces
+//!
+//! A verification read on the BARE pool is the trap. Under the compose
+//! superuser it is honest, because superusers bypass RLS. Under
+//! `secureprompt_runner` (NOSUPERUSER + NOBYPASSRLS) the same read is filtered
+//! to nothing — so `assert_eq!(count, 0)` starts passing because the reader
+//! cannot SEE the row rather than because no row was written. Every
+//! absence-assertion in this suite therefore reads from a scope that WOULD see
+//! the row, and carries a premise proving that scope sees a control row.
+//!
+//! MEASURED (2026-07-31, `secureprompt_runner`): before this change
+//! `seed_two_workspaces` failed at its `api_keys` INSERT with `42501 new row
+//! violates row-level security policy for table "api_keys"`, taking 21
+//! dashboard tests with it. `workspaces` and `users` are NOT RLS-armed
+//! (`pg_class.relrowsecurity = false` for both), so those inserts stay on the
+//! bare pool.
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
     Argon2,
 };
 use secureprompt_api::db::api_key_repo::hash_api_key;
-use sqlx::PgPool;
+use secureprompt_api::db::scope::begin_scoped;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
+
+/// Open the application's own armed transaction for `workspace_id`.
+///
+/// Thin wrapper over `secureprompt_api::db::scope::begin_scoped` so that every
+/// call site in the dashboard suite reads as a deliberate act and can be
+/// grepped for. Used for BOTH seeding and verification reads — see the module
+/// header for why one helper is correct for both.
+///
+/// Panics rather than returning, because the only way it fails is "this test
+/// touched an armed table without saying which tenant the row belongs to",
+/// which is a bug in the test and not a condition to handle.
+#[allow(dead_code)]
+pub async fn scoped(pool: &PgPool, workspace_id: Uuid) -> Transaction<'static, Postgres> {
+    begin_scoped(pool, workspace_id)
+        .await
+        .unwrap_or_else(|e| panic!("armed scope for workspace {workspace_id}: {e}"))
+}
 
 #[allow(dead_code)]
 pub const WS_A_UUID: &str = "cafe0a00-0000-0000-0000-000000000000";
@@ -218,10 +270,15 @@ pub async fn seed_two_workspaces(pool: &PgPool) -> sqlx::Result<SeededWorkspaces
         .await?;
     }
 
+    // `api_keys` is ENABLE + FORCE ROW LEVEL SECURITY, so each key is written
+    // from inside ITS OWN workspace's armed scope. One scope cannot serve both:
+    // `app.current_workspace_id` names exactly one tenant, and a single scope
+    // held across both inserts would reject the second with 42501.
     for (workspace_id, raw_key) in [
         (workspace_a, API_KEY_A),
         (workspace_b, API_KEY_B),
     ] {
+        let mut tx = scoped(pool, workspace_id).await;
         sqlx::query(
             "INSERT INTO api_keys (id, workspace_id, name, key_hash, created_at)
              VALUES ($1, $2, $3, $4, NOW())",
@@ -230,8 +287,9 @@ pub async fn seed_two_workspaces(pool: &PgPool) -> sqlx::Result<SeededWorkspaces
         .bind(workspace_id)
         .bind("default")
         .bind(hash_api_key(raw_key))
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
 
     Ok(SeededWorkspaces {

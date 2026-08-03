@@ -75,57 +75,107 @@ struct CallSite {
 ///   * FALSE POSITIVE of the textual scanner — the statement is correctly
 ///     scoped by construction in a way a line-oriented regex cannot see.
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
-    (
-        "secureprompt-api/src/db/refresh_token_repo.rs",
-        "refresh_tokens",
-        2,
-        "REAL DEFECT. Cross-tenant BY NECESSITY: a refresh token is an opaque random string \
-         and does not name its workspace, so `rotate`'s pre-lookup and \
-         `find_active_by_hash` must find the row before they can know which \
-         scope to arm. Under a non-bypassing role both return None. `rotate` \
-         then reports NotFound and every session refresh 401s — loud, and \
-         fail-closed. `find_active_by_hash` is the dangerous one: it is the \
-         logout path's best-effort revoke, so None means LOGOUT SILENTLY DOES \
-         NOT REVOKE THE REFRESH TOKEN and the session survives the sign-out. \
-         Fixing it needs one of: a SECURITY DEFINER lookup owned by a \
-         BYPASSRLS role (blocked on the ownership decision this workstream \
-         does not own), or making the caller pass the workspace it already \
-         holds in its JWT.",
-    ),
-    (
-        "secureprompt-worker/src/tasks/retention_purge.rs",
-        "refresh_tokens",
-        2,
-        "REAL DEFECT. Cross-tenant BY DESIGN: `scrub_session_device_context` erases client \
-         IP and device strings for ENDED sessions across every workspace. \
-         Under a non-bypassing role the UPDATE matches zero rows, so the IP \
-         addresses stay on disk indefinitely — and the second statement, the \
-         re-derivation an auditor recomputes and which `must be zero`, is \
-         filtered by the SAME predicate and also returns zero. Both halves \
-         lie consistently and the job reports status `ok`. Fix: loop over \
-         `workspaces` arming the scope per workspace, as migrations 019/020 do.",
-    ),
-    (
-        "secureprompt-worker/src/tasks/retention_purge.rs",
-        "workspace_raw_capture",
-        1,
-        "REAL DEFECT. Cross-tenant BY DESIGN: reads every workspace's CURRENT retention \
-         setting to decide what captured content to purge. Under a \
-         non-bypassing role it returns no rows, which this code cannot \
-         distinguish from `no workspace has enabled capture`, so captured \
-         PLAINTEXT PROMPTS are never purged and the record still says `ok`. \
-         Same fix: drive it from a loop over `workspaces` with the scope armed.",
-    ),
-    (
-        "secureprompt-worker/src/main.rs",
-        "api_keys",
-        1,
-        "REAL DEFECT, least severe. Cross-tenant BY DESIGN: the worker's \
-         startup key-cache warm reads every workspace's keys. Under a \
-         non-bypassing role it loads nothing; that direction fails CLOSED \
-         (requests miss the cache and fall through to a scoped lookup) which \
-         is why it is last in this list.",
-    ),
+    // FIXED and therefore GONE, recorded here in prose because the entry
+    // itself may not stay: `secureprompt-api/src/db/refresh_token_repo.rs` /
+    // `refresh_tokens`, two statements, `rotate`'s pre-lookup and
+    // `find_active_by_hash`. Both now run inside
+    // `db::scope::begin_refresh_token_probe`, a transaction armed with the
+    // token hash that migration 032's `refresh_token_possession` policy admits
+    // for SELECT only. `tests/rls_refresh_token_scope.rs` drives both through a
+    // NOSUPERUSER/NOBYPASSRLS pool.
+    //
+    // The entry graded `find_active_by_hash` the severe one because "it is the
+    // logout path's best-effort revoke". It is not, and never was: the method
+    // has no callers anywhere in the repository and `dashboard::auth::logout`
+    // calls `revoke_all_for_user`. The claim came from the method's own doc
+    // comment, which was false from `bc2b586`. Logout's revoke was measured
+    // under the non-bypassing role BEFORE any fix and was already correct;
+    // `logout_revokes_the_refresh_token_under_a_non_bypassing_role` pins it.
+    //
+    // ALSO FIXED and therefore GONE (P1G): `secureprompt-worker/src/main.rs` /
+    // `api_keys`, one statement. It now lives in
+    // `secureprompt-worker/src/tasks/api_key_rotation.rs` and runs once per
+    // workspace inside a scope-armed, read-back transaction, so nothing of it
+    // remains on a bare pool.
+    //
+    // Its reason string was wrong, and wrong in the direction that stops the
+    // next reader looking. It called the site "the worker's startup key-cache
+    // warm", a READ that "fails CLOSED", and graded it least severe on that
+    // basis. There is no key-cache warm anywhere in the worker: `grep -rn
+    // api_keys secureprompt-worker/src` returned that one line and nothing
+    // else, and it was a WRITE — the 03:00 rotation-cleanup
+    // `UPDATE api_keys SET status = 'revoked'`.
+    //
+    // Its CONSEQUENCE was wrong too, in both directions, so it is recorded
+    // here as measured rather than as argued. Under `SET ROLE
+    // secureprompt_runner` the unarmed UPDATE reports `UPDATE 0` and does NOT
+    // error, while the armed one reports `UPDATE 1` — so the sweep was a
+    // permanent no-op that recorded `record_job(..., ok = true)`. But the
+    // rotated key did NOT stay usable: `authenticate_api_key` re-derives the
+    // same boundary in its own WHERE (`rotated_at + grace > NOW()`), the exact
+    // complement of the sweep's predicate, so the key stops authenticating at
+    // the boundary whether the sweep ran or not. Measured on a past-grace
+    // 'rotating' row: `authenticates = 0`, against an in-grace control row on
+    // the same connection at `1`. What rotted was the RECORD — `status` stayed
+    // `'rotating'` and `revoked_at` stayed NULL, so `GET /v1/keys` showed a
+    // dead credential as never-revoked and a re-rotation of it took
+    // `ApiKeyRepository::rotate`'s idempotent branch forever: 200 OK,
+    // `grace_expires_at` already in the past, no new key, no admin-audit row.
+    // `secureprompt-api/tests/rls_api_key_grace_window.rs` and
+    // `tasks::api_key_rotation::tests` pin both halves.
+    //
+    // ALSO FIXED and therefore GONE (P1H):
+    // `secureprompt-worker/src/tasks/retention_purge.rs` /
+    // `workspace_raw_capture`, one statement — the bare-pool
+    // `SELECT workspace_id, retention_days` that told the capture purge what
+    // each tenant's CURRENT retention is. `purge_content_captures` now
+    // enumerates `workspaces` and reads each workspace's setting inside a
+    // scope-armed, read-back transaction, so nothing of it remains on a bare
+    // pool. This guard is what proved the site was gone: it failed
+    // `allowlist says 1, found 0` before this entry was deleted.
+    //
+    // Its reason string was RIGHT about the consequence and WRONG about the
+    // severity, in the direction that understates it. It ended
+    // "...so the run reports success AND the proof-of-purge trail simply omits
+    // the scope" — which was correct, and was itself a correction of an
+    // earlier tail claiming "the record still says `ok`". What it did not say
+    // is that the omission was TOTAL: `records` was empty, so `all_ok()` was
+    // an `all(...)` over the EMPTY SET, `total_deleted()` was 0, and
+    // `main.rs`'s `record_job("retention_purge", …, ok = true)` fired on a run
+    // in which captured plaintext prompts — the most sensitive rows this
+    // product stores — were retained indefinitely with no alert of any kind.
+    // MEASURED under `secureprompt_runner` before the fix, in
+    // `captured_plaintext_is_purged_under_a_non_bypassing_role`: `all_ok()`
+    // TRUE, records `[token_vault_entries, refresh_tokens.device_context]`,
+    // and a 30-day-old capture still on disk under a 7-day retention.
+    //
+    // ALSO FIXED and therefore GONE (P1J):
+    // `secureprompt-worker/src/tasks/retention_purge.rs` / `refresh_tokens`,
+    // TWO statements — the FU4 device-context scrub's UPDATE and the recount
+    // beside it. `scrub_session_device_context` now enumerates `workspaces` and
+    // scrubs each one inside a scope-armed, read-back transaction, with the
+    // recount in a SECOND armed transaction over committed state. This guard is
+    // what proved the site was gone: it failed `allowlist says 2, found 0`
+    // before this entry was deleted.
+    //
+    // Its reason string was RIGHT, including the second half — which is the
+    // only allowlist reason on this branch that understated nothing. Recorded
+    // here because the entry does not survive to say it: under
+    // `secureprompt_runner` the UPDATE matched zero rows, which is not an
+    // error, so the IP addresses stayed on disk; and the recount — the field
+    // migration 023 offers as the one an auditor re-derives — was filtered by
+    // the SAME predicate, returned zero, and AGREED. The emitted record was
+    // `rows_deleted = 0`, `rows_remaining_past_cutoff = 0`, `status = 'ok'`:
+    // byte-identical to a genuine no-op's, with the check designed to catch the
+    // error confirming it.
+    //
+    // MEASURED under the runner role before the fix, in
+    // `session_device_context_is_scrubbed_under_a_non_bypassing_role`: two
+    // ended sessions still reading `(1, 1)`, `all_ok()` TRUE, the trail
+    // reporting `[0]` rows past the boundary, and an independent re-derivation
+    // from the workspace's own armed scope answering 2. The suggested fix in
+    // the entry ("loop over `workspaces` arming the scope per workspace") is
+    // what was done.
     (
         "secureprompt-worker/src/tasks/retention_purge.rs",
         "retention_purge_audit",
