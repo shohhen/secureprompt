@@ -49,6 +49,10 @@ JWT_SECRET="$(gen)"
 PROVIDER_KEY="$(gen)"
 ML_TOKEN="$(gen)"
 NEXTAUTH="$(gen)"
+# WS1-P0 role split: docker-compose.yml builds BOTH the runtime DATABASE_URL and
+# the password `db-migrate` sets on `secureprompt_app` from this one variable, so
+# generating it here cannot leave the role and the URL disagreeing.
+APP_DB_PASSWORD="$(gen)"
 
 cp .env.example "$TARGET"
 
@@ -69,6 +73,7 @@ replace SECUREPROMPT_JWT_SECRET   "$JWT_SECRET"
 replace SECUREPROMPT_PROVIDER_KEY "$PROVIDER_KEY"
 replace ML_SIDECAR_INTERNAL_TOKEN "$ML_TOKEN"
 replace NEXTAUTH_SECRET           "$NEXTAUTH"
+replace SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
 
 echo "Wrote $TARGET with freshly generated secrets."
 echo

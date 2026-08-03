@@ -15,6 +15,53 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------------------------------------------------------------------------
+  # DB ROLE SPLIT (WS1-P0). One-shot: applies the Postgres schema as the
+  # OWNER/MIGRATOR role, provisions the runtime role, exits.
+  #
+  # WHY THIS IS A SEPARATE SERVICE AND NOT PART OF THE API's BOOT
+  # ------------------------------------------------------------
+  # `postgres:16` creates POSTGRES_USER as a SUPERUSER, and superusers bypass
+  # row-level security unconditionally. Running the product as that role means
+  # the sixteen armed RLS policies on this schema protect nothing at runtime.
+  #
+  # But migrations genuinely need what the runtime must not have: CREATE ON
+  # SCHEMA public and table ownership (measured — 018/021/023 fail without
+  # CREATE, 022 fails with `must be owner of table token_vault_entries`). One
+  # connection cannot hold both sets of rights, so they are two steps.
+  #
+  # Running the migration here rather than inside the API means the `api` and
+  # `worker` containers below never receive the owner credential at all. A
+  # second admin pool inside the API process would have applied the schema just
+  # as well, but would have left the owner URL in the environment of the
+  # process that serves untrusted input.
+  #
+  # `service_completed_successfully` on api/worker makes the ordering explicit:
+  # nothing serves until this exits 0. It is idempotent — re-running it on an
+  # up-to-date database applies nothing and re-asserts the runtime role.
+  # ---------------------------------------------------------------------------
+  db-migrate:
+    build:
+      context: .
+      dockerfile: secureprompt-api/Dockerfile
+      # Forward the host ssh agent so cargo can fetch the private sp-license dep.
+      ssh:
+        - default
+    command: ["--migrate-only"]
+    restart: "no"
+    environment:
+      # The OWNER role. Only this service gets it.
+      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      # The password this step sets on the runtime role, and the same value the
+      # api/worker URLs below are built from — so the two cannot disagree.
+      # Dev default matches the (equally hardcoded) owner password above; set it
+      # in .env for anything you would not throw away.
+      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   redis:
     image: valkey/valkey:8.1.6-alpine
     ports:
@@ -144,7 +191,11 @@ services:
       ssh:
         - default
     environment:
-      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      # RUNTIME role (WS1-P0 role split): NOSUPERUSER, NOBYPASSRLS, owns no
+      # table and cannot create one — so the RLS policies on this schema
+      # actually apply to it. Migrations are applied by `db-migrate` above,
+      # which is the only service holding the owner credential.
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       ML_SIDECAR_URL: http://secureprompt-ml:8080
@@ -186,6 +237,8 @@ services:
     ports:
       - "8080:8080"
     depends_on:
+      db-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -203,7 +256,11 @@ services:
       ssh:
         - default
     environment:
-      DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
+      # RUNTIME role (WS1-P0 role split): NOSUPERUSER, NOBYPASSRLS, owns no
+      # table and cannot create one — so the RLS policies on this schema
+      # actually apply to it. Migrations are applied by `db-migrate` above,
+      # which is the only service holding the owner credential.
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: info
       CLICKHOUSE_URL: http://clickhouse:8123
@@ -216,6 +273,8 @@ services:
       # comment for why there is no insecure default here.
       ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
     depends_on:
+      db-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

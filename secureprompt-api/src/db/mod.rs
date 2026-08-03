@@ -2,6 +2,8 @@ pub mod admin_audit_repo;
 pub mod api_key_repo;
 pub mod budget_repo;
 pub mod license_repo;
+// WS1-P0 — schema application, and whether the connected role may perform it.
+pub mod migrations;
 pub mod policy_repo;
 pub mod provider_repo;
 pub mod raw_capture_repo;

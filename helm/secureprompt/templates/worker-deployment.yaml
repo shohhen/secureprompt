@@ -18,6 +18,8 @@ spec:
         linkerd.io/inject: enabled
       {{- end }}
     spec:
+      initContainers:
+        {{- include "secureprompt.dbMigrateInitContainer" . | nindent 8 }}
       containers:
         - name: worker
           image: "{{ .Values.global.imageRegistry | default "" }}{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"

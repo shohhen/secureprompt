@@ -6,81 +6,80 @@ use secureprompt_common::{
     },
     telemetry::init_telemetry,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-/// Embedded sqlx migrations (all .sql files in `secureprompt-api/migrations/`).
-/// Sorted by the leading numeric prefix in each filename.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+use secureprompt_api::db::migrations::{ensure_pg_migrations, run_migration_step};
 
-/// Apply pending Postgres migrations on startup.
+/// The default DATABASE_URL. Points at the OWNER/MIGRATOR role, because a
+/// developer running the binary by hand against a fresh database needs it to
+/// create the schema. A deployment that has adopted the DB role split
+/// overrides this with the runtime role's URL for the serving processes, and
+/// keeps the owner URL only for `--migrate-only`.
+const DEFAULT_DATABASE_URL: &str = "postgres://secureprompt:secureprompt@localhost:5432/secureprompt";
+
+/// `secureprompt-api --migrate-only`: apply the Postgres schema as the
+/// owner/migrator role, provision the runtime role, and exit.
 ///
-/// Two cases to handle:
-/// 1. **Fresh DB** (no `workspaces` table): `MIGRATOR.run` creates everything
-///    from scratch, including the `_sqlx_migrations` tracking table.
-/// 2. **Existing DB without sqlx tracking** (the case we just hit — someone
-///    applied migrations manually via `psql`, then redeployed): the tables
-///    are already there, but `_sqlx_migrations` is missing, so a naive
-///    `MIGRATOR.run` would try to recreate `workspaces` and fail. We
-///    detect this and bootstrap the tracking table by marking every
-///    embedded migration as already applied.
-async fn ensure_pg_migrations(pool: &PgPool) -> anyhow::Result<()> {
-    let workspaces_exists: bool = sqlx::query_scalar(
-        "SELECT to_regclass('public.workspaces') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await?;
-    let tracking_exists: bool = sqlx::query_scalar(
-        "SELECT to_regclass('public._sqlx_migrations') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await?;
+/// This is the whole reason the API no longer migrates its own database in the
+/// deployed shape. `sqlx::migrate!` needs `CREATE ON SCHEMA public` and table
+/// ownership (measured: 018/021/023 fail without CREATE; 022 fails with `must
+/// be owner of table token_vault_entries`), and the serving role must have
+/// neither, because a NOBYPASSRLS role is the only kind row-level security
+/// applies to. One connection cannot hold both sets of rights, so they are two
+/// steps.
+///
+/// Run as a one-shot before the API and worker start — a compose service with
+/// `service_completed_successfully`, a Kubernetes initContainer, or by hand.
+/// The serving containers then never hold the owner credential at all, which a
+/// second admin pool inside the API process could not have achieved.
+///
+/// Deliberately handled BEFORE `AppConfig` is built: this step needs
+/// DATABASE_URL and nothing else, so the migration service does not have to be
+/// given the JWT secret, the provider key or the ML sidecar token just to run
+/// DDL.
+async fn migrate_only() -> anyhow::Result<()> {
+    init_telemetry(&TelemetryConfig {
+        otel_enabled: false,
+        prometheus_enabled: false,
+        log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+    });
 
-    if workspaces_exists && !tracking_exists {
-        tracing::warn!(
-            "Postgres has existing schema but no sqlx tracking table — bootstrapping _sqlx_migrations from embedded migration set"
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.into());
+
+    // One connection: this process applies DDL and exits. Nothing serves.
+    let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+
+    // Absent means "leave the password alone" — correct for a deployment that
+    // manages the runtime role out of band (managed Postgres, an external
+    // secret manager), and for a re-run where the password has not changed.
+    let app_password = std::env::var("SECUREPROMPT_APP_DB_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if app_password.is_none() {
+        tracing::info!(
+            "SECUREPROMPT_APP_DB_PASSWORD unset — leaving the runtime role's \
+             password unchanged"
         );
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-                version         BIGINT PRIMARY KEY,
-                description     TEXT NOT NULL,
-                installed_on    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                success         BOOLEAN NOT NULL,
-                checksum        BYTEA NOT NULL,
-                execution_time  BIGINT NOT NULL
-            )",
-        )
-        .execute(pool)
-        .await?;
-        for m in MIGRATOR.iter() {
-            sqlx::query(
-                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-                 VALUES ($1, $2, TRUE, $3, 0) ON CONFLICT (version) DO NOTHING",
-            )
-            .bind(m.version)
-            .bind(m.description.as_ref())
-            .bind(&m.checksum[..])
-            .execute(pool)
-            .await?;
-        }
     }
 
-    MIGRATOR.run(pool).await?;
-    tracing::info!(
-        applied = MIGRATOR.iter().count(),
-        "Postgres migrations up to date"
-    );
+    run_migration_step(&pool, app_password.as_deref()).await?;
+    pool.close().await;
+
+    tracing::info!("migration step complete");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--migrate-only") {
+        return migrate_only().await;
+    }
+
     let config = AppConfig {
         database: DatabaseConfig {
-            url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://secureprompt:secureprompt@localhost:5432/secureprompt".into()
-            }),
+            url: std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.into()),
             max_connections: 10,
         },
         redis: RedisConfig {

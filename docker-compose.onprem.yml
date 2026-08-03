@@ -17,6 +17,13 @@ services:
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
 
+  # WS1-P0 role split: the one-shot migration step runs the API image with
+  # `--migrate-only`. It must be pinned here too, or an air-gapped host falls
+  # back to the base file's `build:` and has no registry to fetch from.
+  db-migrate:
+    image: secureprompt/api:${SP_VERSION:-0.1.0}
+    pull_policy: never
+
   api:
     image: secureprompt/api:${SP_VERSION:-0.1.0}
     pull_policy: never
