@@ -1,3 +1,38 @@
+//! Per-workspace secure mode (migration 007) — the redaction control itself.
+//!
+//! `enabled`, `level` and the three block/redact toggles are read on the
+//! request path by [`crate::pipeline::service`] to decide whether PII is
+//! redacted and whether a detection blocks the call.
+//!
+//! ## Row-level security
+//!
+//! Migration 007 created this table with no row-level security and no stated
+//! reason. The reason a reader found instead was circular: 018 declared "NO
+//! ROW-LEVEL SECURITY, matching `workspace_secure_mode` (007)", 021 cited 007
+//! and 018, and 007 itself said nothing — three tables sharing one argument
+//! whose root was an empty cell. Migration 030 armed 018's and 021's tables
+//! after measuring that both were readable and writable across tenants, which
+//! left this one as the last table in the schema justified only by citations
+//! from tables that no longer lack a policy.
+//!
+//! Measured before migration 031, from a NOSUPERUSER/NOBYPASSRLS role armed to
+//! workspace A with `policy_rules` isolated on the same connection as a
+//! positive control: workspace A's scope read workspace B's row and got back
+//! `level = 'strict'`. Binding `workspace_id` in these three queries protected
+//! these three queries and nothing else.
+//!
+//! Migration 031 arms the table with the standard `workspace_isolation`
+//! policy, so BOTH methods below go through [`crate::db::scope::begin_scoped`],
+//! which sets `app.current_workspace_id` transaction-locally and READS IT
+//! BACK. The read-back is the point, because the two halves of an unarmed
+//! scope fail differently: an INSERT is rejected (loud) while a SELECT returns
+//! the EMPTY SET and reports no error. Silent is the dangerous half here —
+//! [`SecureModeRepository::get`] resolves "no row" to
+//! [`SecureModeRow::default`], and that default is `enabled: false`. An
+//! unarmed read would not merely hide this table; it would switch redaction
+//! OFF for a workspace that switched it on, and the request path would carry
+//! on with policy-only behaviour having logged nothing.
+
 use chrono::{DateTime, Utc};
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use serde_json::{json, Value};
@@ -45,7 +80,20 @@ impl SecureModeRepository {
     }
 
     /// Returns the current config, or defaults when no row exists yet.
+    ///
+    /// Runs inside [`begin_scoped`] because migration 031 arms this table:
+    /// with `app.current_workspace_id` unset the policy predicate is NULL for
+    /// every row and this SELECT returns nothing, which `map_or_else` below
+    /// resolves to `enabled: false` — redaction off, silently, for a workspace
+    /// that turned it on. The read-back inside `begin_scoped` converts that
+    /// silence into an error the caller can log.
+    ///
+    /// # Errors
+    /// `ApiError::Database` on SQL failure, `ApiError::Internal` when the
+    /// tenancy scope does not arm.
     pub async fn get(&self, workspace_id: WorkspaceId) -> Result<SecureModeRow, ApiError> {
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
         let row = sqlx::query(
             "SELECT workspace_id, enabled, level,
                     block_on_pii_detection, block_on_injection_detection,
@@ -54,9 +102,13 @@ impl SecureModeRepository {
              WHERE workspace_id = $1",
         )
         .bind(workspace_id.0)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
 
         Ok(row.map_or_else(
             || SecureModeRow {

@@ -13,7 +13,7 @@
 //! All fixture PII is synthetic.
 
 use super::*;
-use sqlx::{PgPool, Row as _};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// The gateway's own analytics database, so the ClickHouse assertions run
@@ -646,6 +646,183 @@ async fn a_rotated_but_live_session_keeps_its_device_context(pool: PgPool) -> sq
         with_context, 1,
         "a session that has merely ROTATED is still live, and must keep its \
          device context — the scrub decides per CHAIN, not per row"
+    );
+    Ok(())
+}
+
+// ── proof-of-purge under a non-bypassing role ─────────────────────────────
+
+/// Same role, password and attributes as
+/// `secureprompt-api/tests/migration_017_023_rls.rs` and
+/// `scripts/ci/create-nonsuperuser-role.sh`.
+const RLS_ROLE: &str = "secureprompt_runner";
+const RLS_PASSWORD: &str = "secureprompt";
+
+/// A pool onto the same test database as a NOSUPERUSER, NOBYPASSRLS role,
+/// with that powerlessness asserted ON THE WIRE.
+///
+/// Without the premise assertions this helper is worthless: a role that turned
+/// out to be SUPERUSER would keep the test below green while exercising no
+/// row-level security at all.
+async fn low_privilege_pool(pool: &PgPool) -> PgPool {
+    sqlx::raw_sql(&format!(
+        "DO $$
+         BEGIN
+             CREATE ROLE {RLS_ROLE}
+                 LOGIN PASSWORD '{RLS_PASSWORD}'
+                 NOSUPERUSER CREATEDB CREATEROLE NOBYPASSRLS;
+         EXCEPTION
+             WHEN duplicate_object THEN NULL;
+             WHEN unique_violation THEN NULL;
+         END $$;"
+    ))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("could not create the {RLS_ROLE} role: {e}"));
+
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL TABLES IN SCHEMA public TO {RLS_ROLE};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {RLS_ROLE};"
+    ))
+    .execute(pool)
+    .await
+    .expect("grants on the test database");
+
+    let options: sqlx::postgres::PgConnectOptions = (*pool.connect_options())
+        .clone()
+        .username(RLS_ROLE)
+        .password(RLS_PASSWORD);
+    let low = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .min_connections(2)
+        .connect_with(options)
+        .await
+        .expect("low-privilege pool onto the test database");
+
+    let row = sqlx::query(
+        "SELECT current_user::text AS who, rolsuper, rolbypassrls
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&low)
+    .await
+    .expect("identity probe");
+    let who: String = row.get("who");
+    assert_eq!(who, RLS_ROLE, "premise: connected as the wrong role");
+    assert!(
+        !row.get::<bool, _>("rolsuper"),
+        "premise: {who} is a SUPERUSER and bypasses RLS"
+    );
+    assert!(
+        !row.get::<bool, _>("rolbypassrls"),
+        "premise: {who} has BYPASSRLS"
+    );
+    low
+}
+
+/// The purge job's proof-of-purge write, under a role that cannot bypass RLS.
+///
+/// Migration 030 armed `retention_purge_audit`. The job writes TWO shapes of
+/// row in one run and they need different things from the policy:
+///
+///   * GLOBAL scopes (`workspace_id IS NULL`) — the token vault and the
+///     session device-context scrub. 030's policy admits them without any
+///     scope armed, which is why the job can keep writing them from a bare
+///     pool.
+///   * PER-WORKSPACE scopes (`request_content_captures`, one row per
+///     workspace). These are rejected unless `app.current_workspace_id` is
+///     armed to that row's workspace — and a run covers MANY workspaces, so
+///     one scope for the whole run would not do.
+///
+/// `run()` logs the failure as `retention_purge_audit_write_failed` and
+/// carries on, so a rejected write does NOT fail the job: the purge would
+/// happen and its evidence would silently not exist. That is the shape this
+/// test exists to prevent.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn write_audit_records_both_global_and_per_workspace_scopes_under_rls(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let workspace = seed_workspace(&pool).await?;
+
+    // PREMISE: the table really is armed, or this test measures nothing.
+    let (enabled, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+         WHERE oid = to_regclass('public.retention_purge_audit')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        enabled && forced,
+        "premise: migration 030 must ENABLE and FORCE row-level security on \
+         retention_purge_audit"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+    let run_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    let record = |scope: &str, workspace_id: Option<Uuid>| PurgeRecord {
+        scope: scope.to_owned(),
+        workspace_id,
+        cutoff: now,
+        rows_deleted: 3,
+        oldest_deleted: None,
+        newest_deleted: None,
+        rows_remaining_past_cutoff: 0,
+        status: "ok".to_owned(),
+        error: None,
+        started_at: now,
+    };
+
+    write_audit(&low, run_id, &record(SCOPE_TOKEN_VAULT, None))
+        .await
+        .expect("a GLOBAL scope row must be writable with no scope armed");
+    write_audit(&low, run_id, &record(SCOPE_SESSION_DEVICE_CONTEXT, None))
+        .await
+        .expect("the second global scope must be writable too");
+    write_audit(
+        &low,
+        run_id,
+        &record(SCOPE_CONTENT_CAPTURES, Some(workspace)),
+    )
+    .await
+    .expect(
+        "a PER-WORKSPACE scope row must be writable — the job has to arm \
+             the row's own workspace to get it past the policy",
+    );
+
+    // Read back through the PRIVILEGED pool: what landed on disk, not what
+    // the writes claimed.
+    let scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM retention_purge_audit WHERE run_id = $1 ORDER BY scope",
+    )
+    .bind(run_id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        scopes,
+        vec![
+            SCOPE_SESSION_DEVICE_CONTEXT.to_owned(),
+            SCOPE_CONTENT_CAPTURES.to_owned(),
+            SCOPE_TOKEN_VAULT.to_owned(),
+        ],
+        "all three scopes of the run must be on disk. A missing per-workspace \
+         scope is the silent gap: the purge ran and left no evidence."
+    );
+
+    // And the per-workspace row is attributed to the right tenant — the scope
+    // was armed to that workspace, not merely to something.
+    let attributed: Option<Uuid> = sqlx::query_scalar(
+        "SELECT workspace_id FROM retention_purge_audit WHERE run_id = $1 AND scope = $2",
+    )
+    .bind(run_id)
+    .bind(SCOPE_CONTENT_CAPTURES)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        attributed,
+        Some(workspace),
+        "the per-workspace record must carry the workspace it is about"
     );
     Ok(())
 }

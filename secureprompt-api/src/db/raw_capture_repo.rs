@@ -22,21 +22,35 @@
 //! default, it is `enabled: false`, and the sole way to leave it is an
 //! admin-authenticated write that lands a row in `raw_capture_audit`.
 //!
-//! ## Why `workspace_raw_capture` has no row-level security
+//! ## Row-level security
 //!
-//! Same position as [`crate::db::sidecar_policy_repo`], and the same honest
-//! caveat: the codebase's actual pattern is RLS **plus** a `set_config` on
-//! the same connection (see [`crate::db::budget_repo`]), which is a few lines
-//! of work, not impossible. RLS is omitted here because every method below
-//! binds the authenticated `workspace_id` explicitly, so there is no
-//! cross-tenant read to prevent, and because adding it to this table alone
-//! while `workspace_secure_mode` (007) and `workspace_sidecar_policy` (018)
-//! stay un-RLS'd would be inconsistency for its own sake. Adding RLS to all
-//! three together is a reasonable follow-up.
+//! This module used to say `workspace_raw_capture` has none, and that the
+//! omission was safe because every method here binds the authenticated
+//! `workspace_id` explicitly, so "there is no cross-tenant read to prevent".
+//! That was wrong in the way absence arguments usually are: measured from a
+//! NOSUPERUSER/NOBYPASSRLS role armed to another workspace, both tables were
+//! readable AND writable across tenants — a foreign scope could append a
+//! forged row to `raw_capture_audit`, which is a source of the SIGNED
+//! compliance export, and could flip another workspace's `enabled` to true,
+//! switching plaintext prompt retention on for a tenant that never asked.
+//! Binding `workspace_id` in these five queries protected these five queries.
+//!
+//! Migration 030 arms both tables with the standard `workspace_isolation`
+//! policy, so every method below goes through [`crate::db::scope::begin_scoped`],
+//! which sets `app.current_workspace_id` transaction-locally and READS IT
+//! BACK. The read-back is the point: with the GUC unset the policy predicate
+//! is NULL, and the two halves fail differently — an INSERT is rejected
+//! (loud) while a SELECT returns the EMPTY SET and reports no error. Silent
+//! is the dangerous half here, because [`Self::get_effective`] resolves "no
+//! row" to [`RawCaptureSettings::default`]: an opted-in workspace would read
+//! back as capture-off, and `audit_trail` would report that nobody ever
+//! enabled it.
 
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+use crate::db::scope::begin_scoped;
 
 /// WS3-2 — retention for captured content when a workspace has opted in but
 /// has not named a window. Days, counted from the request timestamp.
@@ -116,20 +130,29 @@ impl RawCaptureRepository {
     /// [`Self::get_effective`]; do not treat `None` as a setting.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the query fails.
+    /// Returns `ApiError::Database` when the query fails and
+    /// `ApiError::Internal` when the tenancy scope does not arm — the latter
+    /// in preference to returning `None`, which the caller would read as "this
+    /// workspace never opted in".
     pub async fn get(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Option<RawCaptureSettings>, ApiError> {
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
         let row = sqlx::query(
             "SELECT enabled, retention_days
              FROM workspace_raw_capture
              WHERE workspace_id = $1",
         )
         .bind(workspace_id.0)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
 
         Ok(row.map(|r| RawCaptureSettings {
             enabled: r.get::<bool, _>("enabled"),
@@ -165,7 +188,8 @@ impl RawCaptureRepository {
     /// Returns the stored settings.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the write fails.
+    /// Returns `ApiError::Database` when the write fails and
+    /// `ApiError::Internal` when the tenancy scope does not arm.
     pub async fn upsert_audited(
         &self,
         workspace_id: WorkspaceId,
@@ -173,14 +197,30 @@ impl RawCaptureRepository {
         actor_user_id: Option<Uuid>,
         actor_email: Option<&str>,
     ) -> Result<RawCaptureSettings, ApiError> {
-        let before = self.get_effective(workspace_id).await?;
         let retention_days = RawCaptureSettings::clamp_retention(settings.retention_days);
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        // `begin_scoped` rather than a bare `begin`: migration 030 put FORCE
+        // ROW LEVEL SECURITY on both tables written below, so without the GUC
+        // the settings INSERT is rejected outright. The BEFORE state is read
+        // INSIDE this transaction rather than through a separate
+        // `get_effective` call — one scoped transaction instead of two, and
+        // the value the audit row records is then the one this statement
+        // actually overwrote rather than one read a moment earlier.
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
+        let before = sqlx::query(
+            "SELECT enabled, retention_days
+             FROM workspace_raw_capture
+             WHERE workspace_id = $1",
+        )
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .map_or_else(RawCaptureSettings::default, |r| RawCaptureSettings {
+            enabled: r.get::<bool, _>("enabled"),
+            retention_days: r.get::<i32, _>("retention_days"),
+        });
 
         let row = sqlx::query(
             "INSERT INTO workspace_raw_capture
@@ -249,12 +289,17 @@ impl RawCaptureRepository {
     /// `GET /v1/secure-mode` consumers and by the WS3-1 tests.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the query fails.
+    /// Returns `ApiError::Database` when the query fails and
+    /// `ApiError::Internal` when the tenancy scope does not arm — the latter
+    /// in preference to returning an empty trail, which reads as "nobody ever
+    /// enabled plaintext capture".
     pub async fn audit_trail(
         &self,
         workspace_id: WorkspaceId,
         limit: i64,
     ) -> Result<Vec<RawCaptureAuditEntry>, ApiError> {
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
         let rows = sqlx::query(
             "SELECT actor_user_id, actor_email,
                     enabled_before, enabled_after,
@@ -266,9 +311,13 @@ impl RawCaptureRepository {
         )
         .bind(workspace_id.0)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
 
         Ok(rows
             .into_iter()

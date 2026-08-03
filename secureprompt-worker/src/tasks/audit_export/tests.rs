@@ -1867,3 +1867,8 @@ async fn every_audited_action_reaches_the_signed_export(pool: PgPool) -> sqlx::R
 
     Ok(())
 }
+
+// P2A — `docs/audit-export-format.md` executed against a real export. A CHILD
+// of this module rather than a sibling, so it reuses the seeding and read-back
+// helpers above instead of growing a second, drifting copy of them.
+mod doc_gate;

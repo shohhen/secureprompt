@@ -331,6 +331,81 @@ bench:
     - cargo bench -p secureprompt-api --bench detection_floor -- --test
 
 # ---------------------------------------------------------------------------
+# P2A — docs/audit-export-format.md, EXECUTED.
+#
+# That document is the only artifact in the product a third party uses to check
+# our integrity claims: it carries the reference Python verifier a bank auditor
+# runs against a signed export. Nothing tested it, and it drifted four times in
+# one day. Executing it has already caught two bugs every Rust test missed —
+# a chain seed that was not derivable from the published manifest (WS4-1) and a
+# "three audited actions" claim made in six places when there were twelve (FU5).
+#
+# The two tests here extract that Python OUT OF THE MARKDOWN at run time — not
+# a copy, which would drift and defeat the point — and run it against bytes a
+# real export produced through the real job, then against nine tampered copies
+# RE-SIGNED with the private key, so the chain and the manifest are what have to
+# catch them rather than the signature.
+#
+# WHY THIS IS ITS OWN JOB. The verifier does its Ed25519 check with the Python
+# `cryptography` package. Measured by running the image: rust:1.89-bookworm
+# ships python3 3.11.2 and neither `cryptography` nor pip. The shared `test`
+# job therefore cannot run these, and adding the package to `.rust-gate` would
+# pay for it in `fmt`, `clippy` and `bench` too. So: one job, one apt install.
+#
+# THEY ARE NOT SKIPPED ANYWHERE. Both carry `#[ignore]` with a row in
+# scripts/ci/quarantine.tsv, and this job runs them BY NAME with `--ignored`.
+# `require_python()` in doc_gate.rs PANICS rather than skipping when the
+# interpreter is missing, and the `grep -q "2 passed"` below is what stops a
+# renamed test from matching nothing: `cargo test -- --exact <typo>` reports
+# "0 passed" and exits 0, which is a green job that ran no tests.
+#
+# TO FOLD THIS BACK INTO `test`: put python3-cryptography in .rust-gate's
+# before_script, drop both #[ignore]s and both quarantine rows, delete this job.
+# ---------------------------------------------------------------------------
+test:audit-export-doc:
+  extends: .rust-gate
+  stage: test
+  # Both stores, because a genuine export reads BOTH planes: ClickHouse
+  # `request_events` and the four Postgres control-plane audit tables. Versions
+  # pinned to match the `test` job and docker-compose.yml.
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+    - name: clickhouse/clickhouse-server:24.8
+      alias: clickhouse
+  variables:
+    DATABASE_URL: "postgres://secureprompt:secureprompt@postgres:5432/secureprompt"
+    CLICKHOUSE_URL: "http://clickhouse:8123"
+    CLICKHOUSE_DB: "sp_analytics"
+    CLICKHOUSE_SKIP_USER_SETUP: "1"
+  script:
+    - |
+      apt-get update -qq && apt-get install -y -qq python3 python3-cryptography
+      # Prove the interpreter can do the one thing the document needs it for,
+      # before spending ten minutes compiling.
+      python3 -c "import cryptography.hazmat.primitives.asymmetric.ed25519" \
+        && echo "OK: python3 can verify Ed25519"
+    - bash scripts/ci/clickhouse-migrate.sh
+    - |
+      # `set -o pipefail` because of the `| tee` below: without it the
+      # pipeline's status is tee's, which is always 0, and a failing cargo run
+      # would report green. The grep guard would still catch it, but a job that
+      # depends on two independent things going right is a job that goes wrong.
+      set -o pipefail
+      # BY NAME, not a bare `--ignored`: that would also sweep in the two
+      # ClickHouse migration tests quarantined for an unrelated reason.
+      cargo test -p secureprompt-worker --bins -- \
+        --ignored --exact --test-threads=1 --nocapture \
+        tasks::audit_export::tests::doc_gate::the_documents_verifier_accepts_a_real_export_and_rejects_every_tampering \
+        tasks::audit_export::tests::doc_gate::the_documents_steps_5_and_6_are_load_bearing \
+        | tee doc-gate.log
+      # See the header: a filter that matches nothing is a green job that
+      # verified nothing. `cargo test -- --exact <typo>` prints "0 passed" and
+      # exits 0.
+      grep -q "2 passed" doc-gate.log \
+        || { echo "FAIL: the doc gate did not run both tests — were they renamed?"; exit 1; }
+
+# ---------------------------------------------------------------------------
 # The AUTH-05 gate, carried over from the retired .github/workflows/ci.yml.
 #
 # WHY A SEPARATE JOB WITH A DIFFERENT ROLE: the `test` job above connects as
@@ -342,17 +417,40 @@ bench:
 # a non-BYPASSRLS role that statement matches ZERO rows and still reports
 # success. Only a NOSUPERUSER / NOBYPASSRLS role can catch that class of bug.
 #
-# WHY IT IS SCOPED TO cross_tenant RATHER THAN THE WHOLE SUITE: measured on
-# this branch, running the FULL gate as `secureprompt_runner` produces 85
-# failures across 4 suites, all of the form
-#   `new row violates row-level security policy for table "policy_rules"`
-# originating in workspace_repo's default-rule seeding. That is a real finding
-# about the product — the app currently depends on connecting as a
-# BYPASSRLS role — but fixing it means changing workspace_repo.rs, which is
-# out of WS6-1's scope. Making this job run everything today would put the
-# pipeline back in the permanently-red state this workstream exists to end.
-# Tracked as WS6-1-FU2, and it feeds the open "DB role-split" item.
-# Expand this job's scope as those failures are fixed; do not delete the job.
+# WHY IT IS STILL SCOPED TO A LIST RATHER THAN THE WHOLE SUITE.
+#
+# The original reason was the keystone defect: `workspace_repo`'s default-rule
+# seeding inserted into `policy_rules` — armed since 001_init.sql — with no
+# `app.current_workspace_id` set, so registration itself was refused under a
+# non-bypassing role. THAT IS NOW FIXED (`db::scope::arm_scope`, called inside
+# the creating transaction once the workspace has an id). Re-measured after the
+# fix, `cargo test -p secureprompt-api --lib` as `secureprompt_runner` went
+# from 40 failures to 30, and `cross_tenant` from 4/5 to 5/5.
+#
+# WHAT KEEPS THE REST OUT, measured suite by suite as `secureprompt_runner`:
+#   --lib                      695 passed / 30 failed
+#   dashboard                  ~87 failed
+#   admin_audit                 1 passed / 22 failed
+#   migration_017_023_rls       6 passed /  8 failed
+#   migration_020_rls           0 passed /  7 failed
+#   rls_repo_scope              0 passed /  5 failed
+#   raw_content_capture         1 passed /  7 failed
+#   data_inventory             18 passed /  3 failed
+# Every one of those residual failures is in TEST FIXTURE or VERIFICATION SQL,
+# not in an application path: the suites were written on the assumption that
+# `#[sqlx::test]`'s pool bypasses RLS, so they seed armed tables on a bare pool
+# (`42501 new row violates row-level security policy for ...`) or read them back
+# unscoped. Two shapes recur and both need care rather than bulk edits:
+#   * a fixture that leaves a SESSION-level `set_config(..., false)` on a
+#     pooled connection (tests/fixtures/workspace_*.sql), so which workspace a
+#     later insert can write depends on which connection the pool hands out;
+#   * a verification read that becomes a VACUOUS PASS — `assert_eq!(count, 0)`
+#     satisfied by RLS filtering rather than by the code being right. One such
+#     was found and fixed in cross_tenant.rs; assume there are siblings.
+#
+# So: widen this list as each suite's fixtures are converted to `begin_scoped`.
+# Do not delete the job, and do not widen it to a suite that has not been run
+# under the runner role first.
 # ---------------------------------------------------------------------------
 test:rls-nonsuperuser:
   extends: .rust-gate
@@ -370,7 +468,12 @@ test:rls-nonsuperuser:
   script:
     - apt-get update -qq && apt-get install -y -qq postgresql-client
     - bash scripts/ci/create-nonsuperuser-role.sh
+    # Each of these was RUN as `secureprompt_runner` and observed green before
+    # being listed here. Separate invocations rather than one comma list, so a
+    # failure names the suite that failed.
     - cargo test -p secureprompt-api --test cross_tenant -- --test-threads=4 --nocapture
+    - cargo test -p secureprompt-api --test rls_workspace_creation -- --test-threads=4 --nocapture
+    - cargo test -p secureprompt-api --test rls_call_site_guard -- --test-threads=4 --nocapture
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.

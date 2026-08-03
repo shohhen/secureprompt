@@ -2,6 +2,7 @@
 //!
 //! These tests are the standing AUTH-05 CI gate.
 
+use secureprompt_api::db::scope::begin_scoped;
 use secureprompt_api::db::{
     ApiKeyRepository, PolicyRepository, RevocationRecord, SessionRevocationRepository,
 };
@@ -235,11 +236,22 @@ async fn session_revocation_write_cannot_close_another_workspaces_refresh_rows(
          or the assertion below passes vacuously"
     );
 
+    // BOTH verification reads go through workspace B's OWN armed scope.
+    //
+    // On a bare pool under a non-bypassing role these are filtered to zero, and
+    // that turns the second assertion into a vacuous pass: `b_audit == 0` would
+    // be satisfied by RLS hiding the row rather than by the revocation having
+    // correctly declined to write one. Reading from inside B's scope is the
+    // only way the count means what the assertion says it means.
+    let mut b_scope = begin_scoped(&pool, ws_b().0)
+        .await
+        .expect("an armed scope for workspace B");
+
     let b_active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
     )
     .bind(user_b)
-    .fetch_one(&pool)
+    .fetch_one(&mut *b_scope)
     .await?;
     assert_eq!(
         b_active, 1,
@@ -250,7 +262,7 @@ async fn session_revocation_write_cannot_close_another_workspaces_refresh_rows(
     let b_audit: i64 =
         sqlx::query_scalar("SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1")
             .bind(ws_b().0)
-            .fetch_one(&pool)
+            .fetch_one(&mut *b_scope)
             .await?;
     assert_eq!(b_audit, 0, "no audit row may be written for workspace B");
     Ok(())
@@ -276,7 +288,22 @@ async fn seed_user(
     Ok(id)
 }
 
+/// Seed a refresh row THROUGH AN ARMED SCOPE.
+///
+/// `refresh_tokens` has been under FORCE ROW LEVEL SECURITY since migration
+/// 002, so this INSERT is refused with
+/// `42501 new row violates row-level security policy for table
+/// "refresh_tokens"` whenever the connecting role cannot bypass RLS. It only
+/// appeared to work because the `workspace_a` / `workspace_b` fixtures leave a
+/// SESSION-level `app.current_workspace_id` on whichever pooled connection ran
+/// them — so which workspace this function could write depended on which
+/// connection the pool happened to hand out. `begin_scoped` is
+/// transaction-local and names the workspace explicitly, so it is deterministic
+/// under both roles.
 async fn seed_refresh_row(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> sqlx::Result<()> {
+    let mut tx = begin_scoped(pool, workspace_id)
+        .await
+        .expect("an armed scope for the workspace being seeded");
     sqlx::query(
         "INSERT INTO refresh_tokens (id, user_id, workspace_id, token_hash, expires_at, created_at)
          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour', NOW())",
@@ -285,7 +312,8 @@ async fn seed_refresh_row(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> s
     .bind(user_id)
     .bind(workspace_id)
     .bind(format!("hash-{}", Uuid::new_v4().simple()))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }

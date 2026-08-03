@@ -288,6 +288,31 @@ impl WorkspaceRepository {
             }
         })?;
 
+        // ARM THE TENANCY SCOPE, now that the workspace has an id.
+        //
+        // `policy_rules` is under FORCE ROW LEVEL SECURITY (001_init.sql:78-95)
+        // with `USING (workspace_id = current_setting('app.current_workspace_id',
+        // true)::uuid)` and no separate WITH CHECK, so Postgres reuses that
+        // expression as the write check. Unset, the GUC makes the predicate
+        // NULL and the seed INSERT below is REFUSED with
+        // `42501 new row violates row-level security policy for table
+        // "policy_rules"` — measured, and the reason the whole application
+        // could only ever run as a BYPASSRLS superuser.
+        //
+        // This cannot be `begin_scoped`: the scope names a workspace that does
+        // not exist until the INSERT above returns, and all three inserts must
+        // share one transaction so a duplicate email rolls the workspace back.
+        // `arm_scope` is the same set-AND-READ-BACK seam applied to a
+        // transaction that is already open.
+        //
+        // WHAT THIS ADMITS, precisely: for the remainder of this transaction,
+        // statements may touch rows whose `workspace_id` is `ws.id`. `ws.id`
+        // comes from `gen_random_uuid()` two statements ago and is not
+        // caller-influenced, so the scope can only ever name a workspace
+        // created microseconds earlier that contains nothing. No policy was
+        // changed and no existing tenant becomes reachable.
+        crate::db::scope::arm_scope(&mut tx, ws.id).await?;
+
         // Seed the workspace with a "Redact common PII" rule so chat
         // traffic is safe by default. Without this, brand-new workspaces
         // run with zero rules → policy engine returns `allow` → the

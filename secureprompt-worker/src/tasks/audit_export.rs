@@ -321,9 +321,25 @@ fn control_sort_key(row: &ControlRow) -> (DateTime<Utc>, String, Uuid) {
 
 /// Read every audited administrative action for one workspace and window.
 ///
-/// Runs inside a transaction opened by [`begin_scoped`], so the RLS-armed
-/// table is readable and — more importantly — so a silent zero from an unset
-/// GUC has already been refused before this function is reached.
+/// Runs inside a transaction opened by [`begin_scoped`], so a silent zero from
+/// an unset GUC has already been refused before any row is read.
+///
+/// The four source tables are ALL under FORCE ROW LEVEL SECURITY, but they did
+/// not start that way and the difference mattered. `session_revocation_audit`
+/// (026) and `admin_audit` (028) were armed by the migrations that created
+/// them. `raw_capture_audit` (021) and `retention_purge_audit` (023) were NOT:
+/// until migration 030 this comment said "the RLS-armed table is readable" of
+/// a table with no policy at all, and the only thing keeping one tenant's
+/// audit rows out of another tenant's SIGNED attestation was the
+/// `WHERE workspace_id = $1` on each query below. Measured from a
+/// NOSUPERUSER/NOBYPASSRLS role, a foreign scope could read and write both.
+/// Both predicates are kept: RLS is defence in depth here, not the filter.
+///
+/// `retention_purge_audit` carries the ONE non-standard policy in the schema —
+/// it also admits `workspace_id IS NULL` — because its global purge scopes are
+/// counted, not exported, by the `excluded` query at the end of this function.
+/// Under the standard policy that count would silently read 0 and the
+/// manifest's exclusion disclosure would become a false zero.
 async fn fetch_control_rows(
     pg: &PgPool,
     req: &ExportRequest,
