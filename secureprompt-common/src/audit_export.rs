@@ -31,11 +31,32 @@
 //!   defeats pagination. It also cannot tell an auditor WHICH page was
 //!   altered.
 //!
-//! The chain gives all three properties at once: count (`total_pages` is
-//! signed), order (`chain_i = SHA256(chain_{i-1} ‖ digest_i)`), and locality
-//! (a mismatch names the page). The chain's seed — [`genesis`] — binds the
-//! export id, workspace, window, format and page size, so a page lifted from a
-//! DIFFERENT export of the same shape cannot be spliced in.
+//! The signed manifest gives all three properties. Which PART gives which is
+//! worth stating exactly, because it was got wrong here for a while and the
+//! three tests named above were credited to the wrong mechanism:
+//!
+//! * **count** — the signed `total_pages`, checked as `PageCountMismatch`.
+//! * **order** and **locality** — the POSITIONAL page list. `pages[i]`
+//!   describes the (i+1)th file, so a reordered, substituted or spliced-in
+//!   page fails its own SHA-256 and the error names it (`PageDigestMismatch`).
+//! * **one value that identifies THIS export** — the chain. `chain_root`
+//!   commits to the whole ordered digest list and is seeded from this export's
+//!   own header ([`genesis`] binds export id, workspace, window, format and
+//!   page size), so two exports with byte-identical pages still have different
+//!   roots. That is the string an auditor pins and recomputes, and
+//!   `docs/audit-export-format.md`'s recipe is how.
+//!
+//! MEASURED: make [`chain_step`] ignore its `prev` argument — destroying every
+//! ordering property the chain has — and `pages_reordered_fail_verification`,
+//! `a_page_from_another_export_cannot_be_spliced_in` and
+//! `a_whole_page_removed_fails_verification` all stay GREEN; only
+//! `the_chain_is_recomputable_from_the_manifest_text_alone` notices. The chain
+//! is belt to the digest list's braces, and its own three checks
+//! ([`VerifyError::GenesisMismatch`], [`VerifyError::ChainBroken`],
+//! [`VerifyError::ChainRootMismatch`]) went unpinned until
+//! `a_chain_genesis_the_header_does_not_imply_fails_verification` and its two
+//! siblings were written — before them all three could be deleted from
+//! [`verify_export`] with the entire suite still passing.
 //!
 //! The signature is **Ed25519, i.e. asymmetric, deliberately**. An HMAC over
 //! the same manifest would be equally tamper-evident but only to someone

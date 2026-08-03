@@ -67,12 +67,31 @@ use sqlx::{Connection, PgPool, Row};
 /// asserted-powerless by `034_app_role_runtime_grants.sql`.
 const APP_ROLE: &str = "secureprompt_app";
 
-/// Password used only to open a probe connection from this suite. Migration 001
-/// creates the role with a placeholder password; deployments set a real one out
-/// of band (`scripts/db/setup-app-role.sh`, or `secureprompt-api --migrate-only`
-/// with `SECUREPROMPT_APP_DB_PASSWORD`). It is written once per test binary —
-/// see `APP_PASSWORD_SET` for why writing it per-test is not safe.
-const APP_PROBE_PASSWORD: &str = "app_probe_password";
+/// Fallback password for the probe connection, used when the environment does
+/// not say what the runtime role's password should be. Migration 001 creates
+/// the role with a placeholder; deployments set a real one out of band
+/// (`scripts/db/setup-app-role.sh`, or `secureprompt-api --migrate-only` with
+/// `SECUREPROMPT_APP_DB_PASSWORD`).
+const APP_PROBE_PASSWORD_FALLBACK: &str = "app_probe_password";
+
+/// The password this suite puts on the runtime role.
+///
+/// `secureprompt_app` is CLUSTER-GLOBAL while `#[sqlx::test]` databases are
+/// per-test, so `ALTER ROLE secureprompt_app WITH PASSWORD` reaches everything
+/// else on the same Postgres — including the compose `api` and `worker`, which
+/// under the role split now connect as exactly this role. Before the split
+/// nothing connected as it and the write was harmless; now `cargo test` would
+/// lock a running stack out of its own database until `db-migrate` re-ran.
+///
+/// So when the environment says what the password is, use THAT: the write
+/// becomes a no-op rewrite of the same value instead of a rotation. The
+/// fallback only applies where nothing else is using the role.
+fn app_probe_password() -> String {
+    std::env::var("SECUREPROMPT_APP_DB_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| APP_PROBE_PASSWORD_FALLBACK.to_string())
+}
 
 /// `ALTER ROLE` rewrites one row of the cluster-global `pg_authid`. Several
 /// tests in this file need the runtime role to have a known password, they run
@@ -90,10 +109,11 @@ static APP_PASSWORD_SET: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::cons
 async fn ensure_app_role_password(pool: &PgPool) {
     APP_PASSWORD_SET
         .get_or_init(|| async {
-            sqlx::raw_sql(&format!(
-                "ALTER ROLE {APP_ROLE} WITH LOGIN PASSWORD '{APP_PROBE_PASSWORD}';"
-            ))
-            .execute(pool)
+            secureprompt_api::db::migrations::set_role_password(
+                pool,
+                APP_ROLE,
+                &app_probe_password(),
+            )
             .await
             .expect("set a known password on the runtime role for this probe");
         })
@@ -114,7 +134,7 @@ async fn app_role_connection(pool: &PgPool) -> PgConnection {
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
         .username(APP_ROLE)
-        .password(APP_PROBE_PASSWORD);
+        .password(&app_probe_password());
 
     let mut conn = PgConnection::connect_with(&options)
         .await
@@ -269,12 +289,32 @@ async fn the_runtime_role_cannot_create_objects_in_the_public_schema(pool: PgPoo
     );
 }
 
-/// The mandated powerless-assertion, in the same shape as
-/// `scripts/ci/create-nonsuperuser-role.sh`: without it a future base image or
-/// a stray GRANT could hand the runtime role superuser and the entire suite
-/// would keep passing while enforcing nothing.
+/// The mandated powerless-assertion.
+///
+/// PROVED IN REVIEW: this test used to read five `pg_roles` attribute columns
+/// and nothing else, so it PASSED with the live `secureprompt_app` granted
+/// membership of a BYPASSRLS role — the exact state its own doc-comment
+/// promised it would catch ("a stray GRANT could hand the runtime role
+/// superuser and the entire suite would keep passing while enforcing
+/// nothing"). The membership check had been added to the production assertion
+/// and never to the test named for the guarantee.
+///
+/// So it now calls the PRODUCTION assertion rather than re-implementing a
+/// weaker subset of it: whatever a deployment refuses to start on, this
+/// refuses to pass on. The attribute checks below are kept because they are
+/// STRICTER than production's — CREATEDB, CREATEROLE and LOGIN are not things
+/// the migration step refuses on, but a runtime role with CREATEROLE can grant
+/// itself membership of a privileged role and escape the split entirely.
 #[sqlx::test]
 async fn the_runtime_role_is_genuinely_powerless(pool: PgPool) {
+    secureprompt_api::db::migrations::assert_runtime_role_is_powerless(&pool)
+        .await
+        .expect(
+            "the runtime role is not powerless by the same standard the \
+             migration step applies. A deployment would refuse to start; this \
+             suite must not pass.",
+        );
+
     let row = sqlx::query(
         "SELECT rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolcanlogin
            FROM pg_roles WHERE rolname = $1",
@@ -344,7 +384,7 @@ async fn app_role_pool(pool: &PgPool) -> PgPool {
     let options: PgConnectOptions = (*pool.connect_options())
         .clone()
         .username(APP_ROLE)
-        .password(APP_PROBE_PASSWORD);
+        .password(&app_probe_password());
 
     let probe = PgPoolOptions::new()
         .max_connections(1)
@@ -436,6 +476,46 @@ async fn boot_as_the_runtime_role_refuses_a_schema_that_is_behind(pool: PgPool) 
     probe.close().await;
 }
 
+/// PROVED IN REVIEW (I3): the boot branch is chosen by
+/// `has_schema_privilege(current_user,'public','CREATE')`, so a runtime role
+/// that LATER acquires CREATE silently flips to the OWNER branch. On a database
+/// already at head `MIGRATOR.run` has nothing to do, so it succeeds — and the
+/// API serves as a role that can now create and own tables, with nothing
+/// reporting it. `FORCE ROW LEVEL SECURITY` filters an owner rather than
+/// exempting it, so that is a second, undesigned access path.
+///
+/// A `PUBLIC` grant is the reachable way in, and not an exotic one: it is the
+/// default on any database created before PostgreSQL 15 (see
+/// `migration_034_repairs_a_public_create_grant_instead_of_failing`).
+#[sqlx::test]
+async fn boot_as_the_runtime_role_refuses_when_a_public_grant_hands_it_create(pool: PgPool) {
+    // Built BEFORE the grant: `app_role_pool` asserts the role has no CREATE,
+    // which is the premise this test then breaks on purpose.
+    let probe = app_role_pool(&pool).await;
+
+    sqlx::raw_sql("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        .execute(&pool)
+        .await
+        .expect("the pre-PG15 default, granted here after boot detection was set up");
+
+    let err = ensure_pg_migrations(&probe)
+        .await
+        .expect_err(
+            "the runtime role acquired CREATE and boot took the OWNER branch \
+             without a word. The process would serve as a role that can create \
+             and own tables.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("REVOKE CREATE ON SCHEMA public FROM PUBLIC"),
+        "the refusal must give the operator the statement that repairs it. \
+         Got: {err}"
+    );
+
+    probe.close().await;
+}
+
 /// POSITIVE CONTROL, over the awkward path `ensure_pg_migrations` was written
 /// for: a database whose tables exist but whose `_sqlx_migrations` does not,
 /// because someone applied the schema by hand with `psql` and then redeployed.
@@ -482,6 +562,100 @@ async fn boot_as_the_owner_bootstraps_tracking_when_the_schema_predates_sqlx(poo
     );
 }
 
+/// Number of `pg_default_acl` rows in schema `public` naming the runtime role.
+/// This is 034's fingerprint: nothing else in the migration set issues
+/// `ALTER DEFAULT PRIVILEGES`, and `pg_default_acl` was MEASURED empty at the
+/// parent commit. Two rows (tables, sequences) means 034 executed; zero means
+/// it did not, whatever `_sqlx_migrations` claims.
+async fn runtime_role_default_acls(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_default_acl d
+           JOIN pg_namespace n ON n.oid = d.defaclnamespace
+          WHERE n.nspname = 'public'
+            AND array_to_string(d.defaclacl, ',') LIKE '%' || $1 || '=%'",
+    )
+    .bind(APP_ROLE)
+    .fetch_one(pool)
+    .await
+    .expect("default-privilege probe")
+}
+
+/// THE UPGRADE PATH FOR EVERY EXISTING DEPLOYMENT.
+///
+/// The bootstrap branch of `apply_as_owner` exists for a database whose schema
+/// was applied by hand with `psql` and which therefore has no
+/// `_sqlx_migrations`. It marked EVERY embedded migration applied and then ran
+/// `MIGRATOR.run`, which consequently found nothing pending — so on a database
+/// whose hand-applied schema predates 034, the one migration that grants the
+/// runtime role anything was recorded as applied WITHOUT EVER RUNNING.
+///
+/// MEASURED on `postgres:16` against a database at 001–033 (scratch DB
+/// `mr7_pre034`): `pg_default_acl = 0`,
+/// `has_table_privilege(secureprompt_app,'_sqlx_migrations','SELECT') = f`,
+/// and `--migrate-only` **exits 0**. The API then dies on the bare `42501`
+/// this whole change exists to replace — and the obvious operator reaction,
+/// pointing DATABASE_URL back at the owner, lands the deployment in exactly
+/// the superuser-serving state the split exists to leave.
+///
+/// So the assertion is not "the tracking table has 34 rows" (that is what the
+/// defect produced); it is that the migration's EFFECTS are present, and that
+/// the runtime role can then actually boot.
+#[sqlx::test]
+async fn the_tracking_bootstrap_does_not_claim_a_migration_it_never_ran(pool: PgPool) {
+    // Rewind this database to the state a pre-034 hand-applied schema is in:
+    // tables present, 034's grants and default privileges absent, no sqlx
+    // tracking table.
+    sqlx::raw_sql(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public
+             REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM secureprompt_app;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA public
+             REVOKE USAGE, SELECT ON SEQUENCES FROM secureprompt_app;
+         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM secureprompt_app;
+         DROP TABLE _sqlx_migrations;",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate a schema hand-applied before 034 existed");
+
+    assert_eq!(
+        runtime_role_default_acls(&pool).await,
+        0,
+        "premise: 034's effects must start absent, or this test measures nothing"
+    );
+
+    ensure_pg_migrations(&pool)
+        .await
+        .expect("boot as the owner must bring a pre-034 database up to head");
+
+    assert!(
+        runtime_role_default_acls(&pool).await > 0,
+        "the bootstrap recorded 034 as applied without running it: \
+         pg_default_acl is still empty. Every table a later migration creates \
+         will be unreachable by {APP_ROLE}, and the migration step reports \
+         success while having prepared nothing."
+    );
+
+    let tracking_readable: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1, '_sqlx_migrations', 'SELECT')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("tracking-table privilege probe");
+    assert!(
+        tracking_readable,
+        "{APP_ROLE} cannot SELECT from _sqlx_migrations, which is the FIRST \
+         thing the runtime branch of boot reads. The migration step exited 0 \
+         and the API cannot start."
+    );
+
+    // The end of the story, not a proxy for it: the serving role boots.
+    let probe = app_role_pool(&pool).await;
+    ensure_pg_migrations(&probe)
+        .await
+        .expect("the runtime role must be able to boot after the migration step reported success");
+    probe.close().await;
+}
+
 /// The same database, the other role. An existing deployment that has just
 /// been pointed at the runtime URL, before its migration step has ever run,
 /// must be told so — not handed `permission denied for schema public`, and
@@ -507,6 +681,148 @@ async fn boot_as_the_runtime_role_refuses_a_schema_with_no_tracking_table(pool: 
     );
 
     probe.close().await;
+}
+
+// ===========================================================================
+// Migration 034 itself, re-run against databases it was not written on.
+// ===========================================================================
+
+/// The SQL text of one embedded migration.
+///
+/// Running the migration's own bytes is the only way to test it: by the time
+/// `#[sqlx::test]` hands over a pool, 034 is already applied and will never be
+/// pending again. 034's header commits to being idempotent — "safe on a fresh
+/// database and on one that has been running since 001" — so re-running it is
+/// also exactly what the runbook tells an operator to do when grants drift.
+fn migration_sql(version: i64) -> String {
+    MIGRATOR
+        .iter()
+        .find(|m| m.version == version)
+        .unwrap_or_else(|| panic!("migration {version} is not in the embedded set"))
+        .sql
+        .to_string()
+}
+
+/// PROVED IN REVIEW: 034 took the whole deployment down on any database where
+/// `CREATE ON SCHEMA public` is granted to `PUBLIC`.
+///
+/// `REVOKE CREATE ON SCHEMA public FROM secureprompt_app` does **nothing**
+/// against a grant held by `PUBLIC`. Section 5 then sees
+/// `has_schema_privilege = true` and raises, so `--migrate-only` exits
+/// non-zero, the compose `db-migrate` service never reaches
+/// `service_completed_successfully`, and neither `api` nor `worker` starts.
+///
+/// `PUBLIC` holding `CREATE` on `public` is the default for every database
+/// created before PostgreSQL 15, survives `pg_upgrade` (which preserves schema
+/// ACLs — only a NEWLY initdb'd PG15+ cluster drops it), and is what an
+/// operator gets from the very common `GRANT ALL ON SCHEMA public TO PUBLIC`.
+/// A full outage on upgrade, on a database that was working a minute earlier.
+#[sqlx::test]
+async fn migration_034_repairs_a_public_create_grant_instead_of_failing(pool: PgPool) {
+    sqlx::raw_sql("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        .execute(&pool)
+        .await
+        .expect("the pre-PG15 default, and a common operator incantation");
+
+    let can_create_before: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("schema privilege probe");
+    assert!(
+        can_create_before,
+        "premise: the PUBLIC grant must reach {APP_ROLE}, or this test measures \
+         nothing"
+    );
+
+    sqlx::raw_sql(&migration_sql(34))
+        .execute(&pool)
+        .await
+        .expect(
+            "034 must survive a PUBLIC grant. Failing here is a total outage: \
+             --migrate-only exits non-zero, db-migrate never completes, and \
+             nothing starts.",
+        );
+
+    let can_create_after: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(APP_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("schema privilege probe");
+    assert!(
+        !can_create_after,
+        "034 reported success while {APP_ROLE} can still create — and therefore \
+         own — tables in schema public. An owner is filtered by FORCE ROW LEVEL \
+         SECURITY rather than exempt from it, so this is a second, undesigned \
+         access path that the migration claims to have closed."
+    );
+}
+
+/// PROVED IN REVIEW: 034's own closing assertion — the ONLY one that runs on
+/// the two supported paths where `--migrate-only` is not what applied the
+/// schema (`sqlx migrate run`, and any database already at head where 034 is
+/// no longer pending) — passed while `secureprompt_app` was a member of a
+/// BYPASSRLS role. `migrations.rs` claimed the Rust assertion was "in the same
+/// shape as ... the closing block of 034"; only the Rust one asked
+/// `pg_auth_members`.
+///
+/// NOINHERIT is what makes this invisible to the attribute checks: it means
+/// the privileges are not AUTOMATIC, not that they are unreachable. `SET ROLE`
+/// reaches them over an ordinary connection with no password, so a BYPASSRLS
+/// role the runtime role is a member of is BYPASSRLS, one statement away.
+///
+/// The whole probe runs inside a transaction that is ROLLED BACK: `pg_authid`
+/// and `pg_auth_members` are cluster-global, and every other test in this file
+/// depends on `secureprompt_app`'s real state. Uncommitted catalog rows are
+/// invisible to them.
+#[sqlx::test]
+async fn migration_034_refuses_a_runtime_role_that_can_reach_bypassrls(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("probe transaction");
+
+    sqlx::raw_sql(
+        "CREATE ROLE sp_034_bypass_probe NOLOGIN BYPASSRLS;
+         GRANT sp_034_bypass_probe TO secureprompt_app;",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("grant the runtime role membership of a BYPASSRLS role");
+
+    // PREMISE: every attribute-based check still calls the role harmless, so
+    // only a membership check can catch this.
+    let looks_harmless: bool = sqlx::query_scalar(
+        "SELECT NOT (rolsuper OR rolbypassrls)
+            AND NOT has_schema_privilege($1, 'public', 'CREATE')
+           FROM pg_roles WHERE rolname = $1",
+    )
+    .bind(APP_ROLE)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("attribute probe");
+    assert!(
+        looks_harmless,
+        "premise: the attribute checks must NOT already flag {APP_ROLE}, or \
+         this test is not measuring the membership hole"
+    );
+
+    let outcome = sqlx::raw_sql(&migration_sql(34)).execute(&mut *tx).await;
+
+    tx.rollback().await.expect("undo the cluster-global grant");
+
+    let err = outcome
+        .expect_err(
+            "034 reported success while secureprompt_app was one SET ROLE from \
+             BYPASSRLS. This is the only powerless-assertion that runs on a \
+             `sqlx migrate run` deployment or on a database already at head.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("sp_034_bypass_probe"),
+        "the refusal must name the role that is reachable, or an operator \
+         cannot find it. Got: {err}"
+    );
 }
 
 // ===========================================================================
@@ -602,6 +918,137 @@ async fn the_migration_step_succeeds_as_the_owner(pool: PgPool) {
     secureprompt_api::db::migrations::run_migration_step(&pool, None)
         .await
         .expect("the migration step must succeed as the owner role");
+}
+
+/// PROVED IN REVIEW, AND RENDERED: the Helm chart puts the `--migrate-only`
+/// initContainer on the api Deployment **and** the worker Deployment, so every
+/// `helm install`/`helm upgrade` starts at least two of these concurrently
+/// (five at `api.replicaCount=3` / `worker.replicaCount=2` — measured by
+/// `helm template`). Compose has the same shape whenever anything restarts the
+/// one-shot while another is mid-flight.
+///
+/// `MIGRATOR.run` takes a Postgres advisory lock (sqlx 0.8.6 sets
+/// `locking: true` by default), but it RELEASES it before returning — and
+/// `set_role_password` runs after that. `ALTER ROLE ... PASSWORD` rewrites one
+/// row of the cluster-global `pg_authid`, and concurrent writers get
+/// `XX000 tuple concurrently updated`. MEASURED in review: 6 of 8 concurrent
+/// `ALTER ROLE` statements failed.
+///
+/// The consequence is not cosmetic. An initContainer exiting non-zero is
+/// `Init:Error`/`CrashLoopBackOff`, and `helm upgrade --wait`/`--atomic` (or
+/// any Argo/Flux health gate) sees a failed rollout and can roll the release
+/// back — on the security-critical path.
+///
+/// The password used is the one this suite already puts on the role, so this
+/// test writes the same value every other test here relies on.
+#[sqlx::test]
+async fn concurrent_migration_steps_all_succeed(pool: PgPool) {
+    const CONCURRENCY: usize = 8;
+
+    // `#[sqlx::test]`'s own pool is too small to hold this many in flight.
+    let options: PgConnectOptions = (*pool.connect_options()).clone();
+    let racing = PgPoolOptions::new()
+        .max_connections(CONCURRENCY as u32)
+        .connect_with(options)
+        .await
+        .expect("pool wide enough to run the migration step concurrently");
+
+    // `join_all` rather than `tokio::spawn`: sqlx's `Acquire`/`Executor` impls
+    // for `&mut PgConnection` are not higher-ranked, so the migration step's
+    // future cannot be proved `Send` and will not spawn (sqlx#2941). Joining
+    // them on one task is concurrency enough — every one of these blocks on
+    // network I/O, so the ALTER ROLEs still overlap at the server, which is
+    // where the race is. MEASURED before the fix: 4 of 8 failed.
+    let password = app_probe_password();
+    let steps = (0..CONCURRENCY).map(|_| {
+        let step_pool = racing.clone();
+        let password = password.clone();
+        async move {
+            secureprompt_api::db::migrations::run_migration_step(&step_pool, Some(&password)).await
+        }
+    });
+
+    let failures: Vec<String> = futures_util::future::join_all(steps)
+        .await
+        .into_iter()
+        .filter_map(|outcome| outcome.err().map(|e| e.to_string()))
+        .collect();
+
+    racing.close().await;
+
+    assert!(
+        failures.is_empty(),
+        "{} of {CONCURRENCY} concurrent migration steps failed. Every one of \
+         them is an initContainer exiting non-zero on a rollout that was \
+         supposed to be idempotent. Failures: {failures:#?}",
+        failures.len()
+    );
+}
+
+/// PROVED IN REVIEW: nothing reached the powerless assertion THROUGH
+/// `run_migration_step`. A full reference sweep found three call sites — one
+/// that fails earlier on the CREATE check, one that passes with or without the
+/// assertion, and one calling `assert_role_is_powerless` directly — so the line
+/// could be deleted from the migration step with all thirteen tests green. The
+/// deployment gate was pinned by nothing.
+///
+/// It could not be tested through `run_migration_step` because that function
+/// hard-coded `RUNTIME_ROLE`, which is cluster-global: a test that made
+/// `secureprompt_app` a member of a BYPASSRLS role would break every other test
+/// in this file. `run_migration_step_for_role` takes the role as a parameter,
+/// so the assertion is reachable against a throwaway.
+///
+/// MUTATION-PROVED: deleting `assert_role_is_powerless_on` from
+/// `locked_migration_step` turns THIS test red and leaves the other seventeen
+/// green — which is exactly the review's finding, now the other way round.
+#[sqlx::test]
+async fn the_migration_step_refuses_a_runtime_role_that_can_reach_bypassrls(pool: PgPool) {
+    sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             CREATE ROLE sp_step_probe LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                 NOINHERIT NOBYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         DO $$
+         BEGIN
+             CREATE ROLE sp_step_grantor NOLOGIN BYPASSRLS;
+         EXCEPTION WHEN duplicate_object THEN NULL; WHEN unique_violation THEN NULL;
+         END $$;
+         GRANT sp_step_grantor TO sp_step_probe;",
+    )
+    .execute(&pool)
+    .await
+    .expect("probe roles");
+
+    // PREMISE: the step is connected as the OWNER, so it gets past the
+    // authority check and actually runs. Otherwise it would refuse for an
+    // unrelated reason and prove nothing.
+    let outcome =
+        secureprompt_api::db::migrations::run_migration_step_for_role(&pool, "sp_step_probe", None)
+            .await;
+
+    sqlx::raw_sql(
+        "REVOKE sp_step_grantor FROM sp_step_probe;
+         DROP ROLE IF EXISTS sp_step_grantor;
+         DROP ROLE IF EXISTS sp_step_probe;",
+    )
+    .execute(&pool)
+    .await
+    .ok();
+
+    let err = outcome
+        .expect_err(
+            "the migration step completed while its runtime role was one SET \
+             ROLE from BYPASSRLS. --migrate-only would exit 0 and the \
+             deployment would serve with every RLS policy inert.",
+        )
+        .to_string();
+
+    assert!(
+        err.contains("sp_step_grantor"),
+        "the refusal must name the reachable role. Got: {err}"
+    );
 }
 
 /// A role can be powerless on paper and not in practice.

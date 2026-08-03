@@ -6,7 +6,7 @@
 //! connected role is NOT allowed to change the schema — cannot be exercised
 //! any other way.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 /// Embedded sqlx migrations (all .sql files in `secureprompt-api/migrations/`).
 /// Sorted by the leading numeric prefix in each filename. The path is relative
@@ -29,9 +29,14 @@ pub enum SchemaAuthority {
 
 /// Ask the server which of the two roles this connection is holding.
 pub async fn schema_authority(pool: &PgPool) -> anyhow::Result<SchemaAuthority> {
+    let mut conn = pool.acquire().await?;
+    schema_authority_on(&mut conn).await
+}
+
+async fn schema_authority_on(conn: &mut PgConnection) -> anyhow::Result<SchemaAuthority> {
     let can_create: bool =
         sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     Ok(if can_create {
@@ -81,17 +86,48 @@ pub async fn schema_authority(pool: &PgPool) -> anyhow::Result<SchemaAuthority> 
 ///    manually via `psql`, then redeployed): the tables are already there, but
 ///    `_sqlx_migrations` is missing, so a naive `MIGRATOR.run` would try to
 ///    recreate `workspaces` and fail. We detect this and bootstrap the tracking
-///    table by marking every embedded migration as already applied.
+///    table — but only for migrations whose effects we do not have a cheaper
+///    way of checking. See `BOOTSTRAP_WITNESSES`.
 pub async fn ensure_pg_migrations(pool: &PgPool) -> anyhow::Result<()> {
-    match schema_authority(pool).await? {
-        SchemaAuthority::Owner => apply_as_owner(pool).await,
+    let mut conn = pool.acquire().await?;
+    match schema_authority_on(&mut conn).await? {
+        SchemaAuthority::Owner => {
+            // MISDETECTION, not a fallthrough. The branch is chosen by CREATE
+            // on schema public, and a PUBLIC grant hands that to every role
+            // (proved reachable: it is the default on any database created
+            // before PostgreSQL 15). Without this, the serving role would take
+            // the owner branch, find nothing pending, and serve as a role that
+            // can create and own tables — with nothing reporting it.
+            let who: String = sqlx::query_scalar("SELECT current_user::text")
+                .fetch_one(&mut *conn)
+                .await?;
+            if who == RUNTIME_ROLE {
+                anyhow::bail!(
+                    "connected as the runtime role `{who}`, but it has CREATE on \
+                     schema public — so it can create, and therefore own, tables, \
+                     and an owner is filtered by FORCE ROW LEVEL SECURITY rather \
+                     than exempt from it. The usual cause is `CREATE ON SCHEMA \
+                     public` granted to PUBLIC. Fix it with `REVOKE CREATE ON \
+                     SCHEMA public FROM PUBLIC;` and re-run the migration step."
+                );
+            }
+            apply_as_owner(&mut conn).await
+        }
         SchemaAuthority::Runtime => {
             tracing::info!(
                 "connected role has no CREATE on schema public — not applying \
                  migrations. This is the expected shape under the DB role \
                  split; the owner role applies them in a separate step."
             );
-            verify_schema_at_head(pool).await
+            verify_schema_at_head(&mut conn).await?;
+            // The powerless assertion runs HERE too, not only in the migration
+            // step. Its own doc-comment justified itself as "the last thing that
+            // runs before a deployment starts serving" and as catching "a role
+            // that acquired SUPERUSER or BYPASSRLS after 034 was applied" — both
+            // claims are about boot, and it had no boot call site. A GRANT
+            // applied between the migration step and a later pod restart was
+            // never re-checked. Three catalog reads.
+            assert_role_is_powerless_on(&mut conn, RUNTIME_ROLE).await
         }
     }
 }
@@ -103,10 +139,10 @@ pub async fn ensure_pg_migrations(pool: &PgPool) -> anyhow::Result<()> {
 /// `MIGRATOR.run` already refuses in the owner branch — that is the migration
 /// step's error to report, and duplicating it here would be a second place to
 /// keep true for no extra protection.
-async fn verify_schema_at_head(pool: &PgPool) -> anyhow::Result<()> {
+async fn verify_schema_at_head(conn: &mut PgConnection) -> anyhow::Result<()> {
     let tracking_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     if !tracking_exists {
@@ -120,7 +156,7 @@ async fn verify_schema_at_head(pool: &PgPool) -> anyhow::Result<()> {
 
     let applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
 
     let missing: Vec<String> = MIGRATOR
@@ -147,15 +183,62 @@ async fn verify_schema_at_head(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `Owner` branch. Byte-identical to what boot has always done.
-async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
+/// Migrations the tracking-table bootstrap is NOT allowed to take on faith,
+/// paired with a query that answers "did this migration's effect actually
+/// land?".
+///
+/// # Why this list exists
+///
+/// The bootstrap runs on a database whose `_sqlx_migrations` is missing because
+/// the schema was applied by hand with `psql`. It cannot know WHICH migrations
+/// that hand-application covered; the presence of `workspaces` only proves 001.
+/// Marking the whole set applied is therefore a guess, and MEASURED on
+/// `postgres:16` it is a guess that breaks the deployment: on a database
+/// hand-applied at 001–033, marking 034 applied means the one migration that
+/// grants the runtime role anything never runs. `pg_default_acl` stays empty,
+/// `secureprompt_app` cannot even `SELECT` from `_sqlx_migrations`, and
+/// `--migrate-only` exits **0** on a database it did not prepare. The API then
+/// dies at boot on the bare `permission denied` this module exists to replace.
+///
+/// A migration listed here is left OUT of the blanket insert when its witness
+/// answers false, so `MIGRATOR.run` applies it immediately afterwards. That is
+/// only safe for a migration that is idempotent by construction — which is why
+/// this is an explicit, reviewed list and not a heuristic over the whole set.
+///
+/// 034 qualifies: it issues `GRANT`, `ALTER DEFAULT PRIVILEGES` and `REVOKE`,
+/// creates no object, moves no data, and its header commits to being re-runnable
+/// as the documented repair for drifted grants. Its witness is `pg_default_acl`,
+/// which is 034's fingerprint — nothing else in the set issues
+/// `ALTER DEFAULT PRIVILEGES`, and the catalog was MEASURED empty at the commit
+/// before it.
+///
+/// The residual gap is deliberate and named: a database hand-applied at, say,
+/// 020 still has 021–033 marked applied without running. Those migrations
+/// create tables, so re-running them is not safe, and no witness can make it
+/// so — the bootstrap warns instead.
+const BOOTSTRAP_WITNESSES: &[(i64, &str)] = &[(
+    34,
+    "SELECT EXISTS (
+         SELECT 1
+           FROM pg_default_acl d
+           JOIN pg_namespace n ON n.oid = d.defaclnamespace
+          WHERE n.nspname = 'public'
+            AND array_to_string(d.defaclacl, ',') LIKE '%secureprompt_app=%')",
+)];
+
+/// The `Owner` branch.
+///
+/// Takes a single connection rather than the pool because `run_migration_step`
+/// holds a session-level advisory lock on it for the whole step — see
+/// `MIGRATION_STEP_LOCK_KEY`.
+async fn apply_as_owner(conn: &mut PgConnection) -> anyhow::Result<()> {
     let workspaces_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public.workspaces') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     let tracking_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     if workspaces_exists && !tracking_exists {
@@ -172,9 +255,32 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
                 execution_time  BIGINT NOT NULL
             )",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
+
+        // Ask, for every migration we have a witness for, whether it really ran.
+        // Anything that answers "no" is left out of the insert below so that
+        // `MIGRATOR.run` applies it for real.
+        let mut unwitnessed: Vec<i64> = Vec::new();
+        for (version, witness) in BOOTSTRAP_WITNESSES {
+            let effect_present: bool = sqlx::query_scalar(witness).fetch_one(&mut *conn).await?;
+            if !effect_present {
+                unwitnessed.push(*version);
+            }
+        }
+        if !unwitnessed.is_empty() {
+            tracing::warn!(
+                versions = ?unwitnessed,
+                "these migrations have left no trace in this database, so the \
+                 bootstrap will NOT record them as applied — they are about to \
+                 be run for real"
+            );
+        }
+
         for m in MIGRATOR.iter() {
+            if unwitnessed.contains(&m.version) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES ($1, $2, TRUE, $3, 0) ON CONFLICT (version) DO NOTHING",
@@ -182,12 +288,20 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
             .bind(m.version)
             .bind(m.description.as_ref())
             .bind(&m.checksum[..])
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
+
+        tracing::warn!(
+            "the schema this database already carried is being taken on trust \
+             for every migration not listed above. If it was hand-applied part \
+             way through the set, the migrations after that point are now \
+             recorded as applied without having run — verify against \
+             secureprompt-api/migrations/ before serving."
+        );
     }
 
-    MIGRATOR.run(pool).await?;
+    MIGRATOR.run(&mut *conn).await?;
     tracing::info!(
         applied = MIGRATOR.iter().count(),
         "Postgres migrations up to date"
@@ -201,49 +315,126 @@ async fn apply_as_owner(pool: &PgPool) -> anyhow::Result<()> {
 /// the worker.
 pub const RUNTIME_ROLE: &str = "secureprompt_app";
 
+/// The advisory-lock key `run_migration_step` serialises on.
+///
+/// # Why the step needs its own lock
+///
+/// `MIGRATOR.run` takes an advisory lock of its own (sqlx 0.8.6 sets
+/// `locking: true` by default) — and RELEASES it before returning. Everything
+/// the migration step does afterwards, `ALTER ROLE ... PASSWORD` above all,
+/// therefore ran unserialised.
+///
+/// That is not theoretical. `helm template` at chart defaults renders a
+/// `--migrate-only` initContainer on BOTH the api and the worker Deployment —
+/// two concurrent migration steps on every `helm install`/`helm upgrade`, five
+/// at `api.replicaCount=3` / `worker.replicaCount=2`. `ALTER ROLE` rewrites one
+/// row of the cluster-global `pg_authid`, and concurrent writers get
+/// `XX000 tuple concurrently updated`. MEASURED on postgres:16: **4 of 8**
+/// concurrent migration steps failed that way. Each failure is an initContainer
+/// exiting non-zero, which `helm upgrade --wait`/`--atomic` and any Argo/Flux
+/// health gate read as a failed rollout — on the security-critical path.
+///
+/// # Scope, stated honestly
+///
+/// Postgres advisory locks are scoped to a DATABASE, while `pg_authid` is
+/// cluster-global. Two SecurePrompt deployments in two databases of one cluster
+/// could therefore still collide on the same role — but they would also be
+/// fighting over one role's password, which is a misconfiguration this lock is
+/// not the right place to paper over. Within one database, which is every
+/// supported topology, this serialises the step completely.
+///
+/// The value is arbitrary but must never collide with sqlx's own key, which is
+/// derived from the database name via `crc32`, so it is always positive and
+/// below 2^32. This one is far above that.
+pub const MIGRATION_STEP_LOCK_KEY: i64 = 0x5350_4442_5F53_5445;
+
 /// Set a role's login password.
 ///
-/// `ALTER ROLE ... PASSWORD` accepts no bind parameter, so the statement has to
-/// be built as text. It is built BY THE SERVER — `format('%I', $1)` for the
-/// identifier and `format('%L', $2)` for the literal — rather than by string
-/// concatenation here, so a password containing a quote is quoted correctly
-/// instead of ending the literal. The resulting statement is never logged: it
-/// contains the credential.
+/// # Why the statement is built server-side
 ///
-/// This exists because there is nowhere else the runtime password can come
-/// from. `001_init.sql` creates the role with a fixed placeholder, and a
-/// migration cannot read a deployment's environment.
+/// `ALTER ROLE ... PASSWORD` accepts no bind parameter, so the statement has to
+/// be built as text. Both the identifier and the literal are quoted BY THE
+/// SERVER (`format('%I', ...)` / `format('%L', ...)`) rather than concatenated
+/// here, so a password containing a quote is quoted correctly instead of ending
+/// the literal.
+///
+/// # Why the password is passed through `set_config` and not interpolated
+///
+/// The earlier version built the whole `ALTER ROLE ... PASSWORD 'literal'` text
+/// server-side and then executed THAT text, and the comment claimed it was
+/// "never logged: it contains the credential". That was true only of this
+/// process's own `tracing` output. MEASURED on postgres:16 with the routine
+/// audit setting `log_statement = 'ddl'`:
+///
+/// ```text
+/// LOG:  statement: ALTER ROLE mr7_race_probe WITH LOGIN PASSWORD 'super_secret_value_12345';
+/// ```
+///
+/// The password is now handed over as a bind parameter to `set_config(...,
+/// true)` inside a transaction and read back with `current_setting`, which is
+/// the technique `scripts/db/setup-app-role.sh` already used. The DDL text
+/// Postgres logs contains `current_setting('sp.pw')`, not the credential;
+/// `local = true` drops the setting at commit so it does not linger on a
+/// pooled connection.
 pub async fn set_role_password(pool: &PgPool, role: &str, password: &str) -> anyhow::Result<()> {
-    let statement: String = sqlx::query_scalar(
-        "SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', $1::text, $2::text)",
-    )
-    .bind(role)
-    .bind(password)
-    .fetch_one(pool)
-    .await?;
+    let mut conn = pool.acquire().await?;
+    set_role_password_on(&mut conn, role, password).await
+}
 
-    // MEASURED on postgres:16 — the failure worth naming. A CREATEROLE role may
-    // alter only roles it CREATED (it gets ADMIN OPTION on those implicitly):
+async fn set_role_password_on(
+    conn: &mut PgConnection,
+    role: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    use sqlx::Connection as _;
+
+    let mut tx = conn.begin().await?;
+
+    sqlx::query("SELECT set_config('sp.role', $1, true), set_config('sp.pw', $2, true)")
+        .bind(role)
+        .bind(password)
+        .execute(&mut *tx)
+        .await?;
+
+    // MEASURED on postgres:16 — the two failures worth naming.
     //
-    //   creator creates a role, then alters it   -> ALTER ROLE
-    //   creator alters a role it did not create  -> 42501 permission denied
-    //     "the current user must have the CREATEROLE attribute and the ADMIN
-    //      option on the role"
-    //
-    // So this succeeds when the migration role is a superuser, or when it is
-    // the role that ran 001_init.sql on a fresh cluster and thus created
-    // `secureprompt_app`. It fails on managed Postgres where an administrator
-    // created the role separately — a deployment shape, not a bug, and the raw
-    // message does not tell the operator which of the two to fix.
-    sqlx::raw_sql(&statement).execute(pool).await.map_err(|e| {
-        anyhow::anyhow!(
-            "could not set the password on role `{role}`: {e}. In Postgres 16 a \
-             CREATEROLE role may only alter roles it created. Either run this \
-             step as a superuser, or provision the role out of band with \
-             scripts/db/setup-app-role.sh and leave SECUREPROMPT_APP_DB_PASSWORD \
-             unset so this step does not try."
-        )
-    })?;
+    // 42501: a CREATEROLE role may alter only roles it CREATED (it gets ADMIN
+    //   OPTION on those implicitly). So this succeeds when the migration role is
+    //   a superuser, or when it is the role that ran 001_init.sql on a fresh
+    //   cluster and thus created `secureprompt_app`. It fails on managed
+    //   Postgres where an administrator created the role separately — a
+    //   deployment shape, not a bug.
+    // XX000 `tuple concurrently updated`: two migration steps altering the same
+    //   cluster-global role at once. `run_migration_step` serialises on
+    //   MIGRATION_STEP_LOCK_KEY so this cannot happen within one database;
+    //   reaching it means two databases share the role.
+    let outcome = sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L',
+                            current_setting('sp.role'), current_setting('sp.pw'));
+         END $$;",
+    )
+    .execute(&mut *tx)
+    .await;
+
+    if let Err(e) = outcome {
+        let detail = if e.to_string().contains("tuple concurrently updated") {
+            "Two migration steps altered this cluster-global role at the same \
+             time. Within one database the step serialises on an advisory lock, \
+             so this means two databases on this cluster share the role."
+        } else {
+            "In Postgres 16 a CREATEROLE role may only alter roles it created. \
+             Either run this step as a superuser, or provision the role out of \
+             band with scripts/db/setup-app-role.sh and leave \
+             SECUREPROMPT_APP_DB_PASSWORD unset so this step does not try."
+        };
+        return Err(anyhow::anyhow!(
+            "could not set the password on role `{role}`: {e}. {detail}"
+        ));
+    }
+
+    tx.commit().await?;
 
     tracing::info!(role, "runtime role password set");
     Ok(())
@@ -257,9 +448,27 @@ pub async fn set_role_password(pool: &PgPool, role: &str, password: &str) -> any
 /// and the first sign of trouble would be the API refusing to boot against a
 /// schema this step was supposed to have prepared.
 pub async fn run_migration_step(pool: &PgPool, app_password: Option<&str>) -> anyhow::Result<()> {
-    if schema_authority(pool).await? != SchemaAuthority::Owner {
+    run_migration_step_for_role(pool, RUNTIME_ROLE, app_password).await
+}
+
+/// `run_migration_step` with the runtime role named explicitly.
+///
+/// Exists so the step's own guarantees can be tested against a throwaway role.
+/// `RUNTIME_ROLE` is cluster-global and every other test in `db_role_split`
+/// depends on its state, so a test that made `secureprompt_app` a member of a
+/// BYPASSRLS role — the only way to reach the powerless assertion THROUGH this
+/// function — would break the suite around it. With the role as a parameter the
+/// assertion is reachable, and deleting it from here turns a test red.
+pub async fn run_migration_step_for_role(
+    pool: &PgPool,
+    runtime_role: &str,
+    app_password: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+
+    if schema_authority_on(&mut conn).await? != SchemaAuthority::Owner {
         let who: String = sqlx::query_scalar("SELECT current_user::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
         anyhow::bail!(
             "--migrate-only is connected as `{who}`, which has no CREATE on \
@@ -268,19 +477,51 @@ pub async fn run_migration_step(pool: &PgPool, app_password: Option<&str>) -> an
         );
     }
 
-    apply_as_owner(pool).await?;
+    // EVERYTHING below runs under one advisory lock, held on THIS connection,
+    // which is also the connection the work is done on — so a caller cannot
+    // deadlock itself by holding a lock connection while waiting for a second
+    // one out of an exhausted pool. See MIGRATION_STEP_LOCK_KEY.
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_STEP_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
 
-    if let Some(password) = app_password {
-        set_role_password(pool, RUNTIME_ROLE, password).await?;
+    let outcome = locked_migration_step(&mut conn, runtime_role, app_password).await;
+
+    // Released explicitly rather than left to session teardown: this connection
+    // goes back to a pool and may be reused, and a session-level advisory lock
+    // outlives the transaction that took it.
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_STEP_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(error = %e, "could not release the migration-step advisory lock");
     }
 
-    assert_runtime_role_is_powerless(pool).await?;
+    outcome
+}
+
+async fn locked_migration_step(
+    conn: &mut PgConnection,
+    runtime_role: &str,
+    app_password: Option<&str>,
+) -> anyhow::Result<()> {
+    apply_as_owner(&mut *conn).await?;
+
+    if let Some(password) = app_password {
+        set_role_password_on(&mut *conn, runtime_role, password).await?;
+    }
+
+    assert_role_is_powerless_on(&mut *conn, runtime_role).await?;
     Ok(())
 }
 
 /// The mandated powerless-assertion, in the same shape as
-/// `scripts/ci/create-nonsuperuser-role.sh` and the closing block of
-/// `034_app_role_runtime_grants.sql`.
+/// `scripts/ci/create-nonsuperuser-role.sh`, `scripts/db/setup-app-role.sh` and
+/// the closing block of `034_app_role_runtime_grants.sql` — all four ask the
+/// same three questions, including the membership one, and
+/// `scripts/ci/check-powerless-assertions-agree.sh` fails if one of them stops.
 ///
 /// Repeated here rather than left to the migration because this is the last
 /// thing that runs before a deployment starts serving, and because 034 only
@@ -296,12 +537,9 @@ pub async fn assert_runtime_role_is_powerless(pool: &PgPool) -> anyhow::Result<(
 ///
 /// 1. `rolsuper OR rolbypassrls` — the obvious one. Either exempts the role
 ///    from row-level security outright.
-/// 2. `has_schema_privilege(..., 'CREATE')` — a role that can create can own,
-///    and `FORCE ROW LEVEL SECURITY` filters an owner rather than exempting it,
-///    so ownership is a second undesigned access path.
-/// 3. **Role membership.** MEASURED while exercising
+/// 2. **Role membership.** MEASURED while exercising
 ///    `scripts/db/setup-app-role.sh`: granting `secureprompt_app` membership of
-///    a role holding `CREATE ON SCHEMA public` leaves question 2 answering
+///    a role holding `CREATE ON SCHEMA public` leaves question 3 answering
 ///    **false**, because the runtime role is NOINHERIT and does not pick the
 ///    privilege up automatically. Both attribute checks call it powerless.
 ///
@@ -310,11 +548,27 @@ pub async fn assert_runtime_role_is_powerless(pool: &PgPool) -> anyhow::Result<(
 ///    BYPASSRLS role the runtime role is a member of is BYPASSRLS, one
 ///    statement away. Membership is the escape hatch neither attribute
 ///    reports, so it is asked about directly.
+/// 3. `has_schema_privilege(..., 'CREATE')` — a role that can create can own,
+///    and `FORCE ROW LEVEL SECURITY` filters an owner rather than exempting it,
+///    so ownership is a second undesigned access path.
+///
+/// Asked in that order on purpose. A membership-conferred privilege is
+/// invisible to question 3, so if 3 fired first its message would have to guess
+/// at the cause — which is exactly how 034's error came to blame membership for
+/// the one thing membership provably cannot cause.
 pub async fn assert_role_is_powerless(pool: &PgPool, role: &str) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    assert_role_is_powerless_on(&mut conn, role).await
+}
+
+pub async fn assert_role_is_powerless_on(
+    conn: &mut PgConnection,
+    role: &str,
+) -> anyhow::Result<()> {
     let privileged: Option<bool> =
         sqlx::query_scalar("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = $1")
             .bind(role)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
 
     match privileged {
@@ -330,19 +584,6 @@ pub async fn assert_role_is_powerless(pool: &PgPool, role: &str) -> anyhow::Resu
         Some(false) => {}
     }
 
-    let can_create: bool =
-        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
-            .bind(role)
-            .fetch_one(pool)
-            .await?;
-    if can_create {
-        anyhow::bail!(
-            "role `{role}` has CREATE on schema public. It can create — and \
-             therefore own — a table, and an owner is filtered by FORCE ROW \
-             LEVEL SECURITY rather than exempt from it."
-        );
-    }
-
     let memberships: Vec<String> = sqlx::query_scalar(
         "SELECT grantee.rolname::text
            FROM pg_auth_members m
@@ -352,7 +593,7 @@ pub async fn assert_role_is_powerless(pool: &PgPool, role: &str) -> anyhow::Resu
           ORDER BY grantee.rolname",
     )
     .bind(role)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     if !memberships.is_empty() {
@@ -360,14 +601,44 @@ pub async fn assert_role_is_powerless(pool: &PgPool, role: &str) -> anyhow::Resu
             "role `{role}` is a member of: {}. NOINHERIT does not close this — \
              `SET ROLE` reaches those privileges from an ordinary connection, so \
              whatever they hold, the runtime role effectively holds. Revoke the \
-             membership.",
+             membership: REVOKE <role> FROM {role};",
             memberships.join(", ")
+        );
+    }
+
+    let can_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+            .bind(role)
+            .fetch_one(&mut *conn)
+            .await?;
+    if can_create {
+        // Name the grantee rather than guess at it. Membership has already been
+        // ruled out above, so the grant is a direct one or one held by PUBLIC.
+        let grantees: Option<String> = sqlx::query_scalar(
+            "SELECT string_agg(DISTINCT
+                        CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                             ELSE pg_get_userbyid(a.grantee) END, ', ')
+               FROM pg_namespace n,
+                    aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+              WHERE n.nspname = 'public'
+                AND a.privilege_type = 'CREATE'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+
+        anyhow::bail!(
+            "role `{role}` has CREATE on schema public. It can create — and \
+             therefore own — a table, and an owner is filtered by FORCE ROW \
+             LEVEL SECURITY rather than exempt from it. CREATE on schema public \
+             is held by: {}. (PUBLIC reaches every role, and is the default on \
+             any database created before PostgreSQL 15.)",
+            grantees.unwrap_or_else(|| "(nothing in pg_namespace.nspacl)".into())
         );
     }
 
     tracing::info!(
         role,
-        "runtime role verified NOSUPERUSER, NOBYPASSRLS, no CREATE on public, no role memberships"
+        "runtime role verified NOSUPERUSER, NOBYPASSRLS, no role memberships, no CREATE on public"
     );
     Ok(())
 }

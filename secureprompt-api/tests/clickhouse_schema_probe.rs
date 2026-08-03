@@ -260,6 +260,76 @@ async fn probe_flags_a_missing_table() {
     );
 }
 
+/// MR1 review I8 — the half `probe_flags_a_stale_schema_and_passes_a_complete_one`
+/// structurally cannot cover.
+///
+/// That test's "complete" arm builds its table FROM `REQUEST_EVENTS_COLUMNS`
+/// and then asserts nothing is missing, so `missing` is empty by construction
+/// and the arm is a constant compared against itself. It is still a useful
+/// positive control for the stale arm — a probe that flagged unconditionally
+/// would redden it — but it says nothing about whether the constant is
+/// FAITHFUL.
+///
+/// Half of that fidelity question is now answered at compile time:
+/// `REQUEST_EVENTS_COLUMNS` is `<RequestEventRow as Row>::COLUMN_NAMES`, so it
+/// cannot drift from what the writer serialises. This test answers the other
+/// half, which no derive can: whether `clickhouse/migrations/*` has caught up
+/// with the struct. Add a field to `RequestEventRow` and forget the ALTER, and
+/// production inserts start failing schema validation on every event — S2 in
+/// the MR1 review, the API-ahead-of-worker rollout — while every unit test
+/// stays green.
+///
+/// Run against the LIVE, migrated `CLICKHOUSE_DB`, deliberately: a scratch
+/// database created from the constant would reproduce the same tautology.
+///
+/// Premise first: the table must exist and report a non-empty column list, so
+/// "no column is missing" cannot be true because `DESCRIBE` returned nothing.
+///
+/// Falsifier (verified): add a field to `RequestEventRow` without a matching
+/// ClickHouse migration and this reddens naming that column. It reddens the
+/// same way when the deployment's ClickHouse is behind the code, which is the
+/// production condition it is standing in for.
+#[tokio::test]
+async fn probe_expectation_matches_the_migrated_schema() {
+    let database = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "sp_analytics".to_owned());
+
+    let described = query_in(
+        &database,
+        "SELECT name FROM system.columns \
+         WHERE database = currentDatabase() AND table = 'request_events'",
+    )
+    .await;
+    let live: Vec<&str> = described
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    assert!(
+        !live.is_empty(),
+        "premise: `{database}.request_events` has no columns — the analytics \
+         migrations have not run against {}, so this test would pass by \
+         describing nothing. Start the worker or apply \
+         `secureprompt-api/clickhouse/migrations/*`.",
+        ch_url()
+    );
+
+    let missing: Vec<&&str> = REQUEST_EVENTS_COLUMNS
+        .iter()
+        .filter(|column| !live.contains(column))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "`RequestEventRow` serialises {missing:?}, which `{database}.request_events` \
+         does not have. Either a field was added to the struct without a \
+         matching `clickhouse/migrations/*` ALTER — in which case every \
+         analytics insert in production fails schema validation and the whole \
+         event is abandoned — or this deployment's ClickHouse is behind the \
+         code. Live columns: {live:?}"
+    );
+}
+
 fn sample_event() -> RequestEvent {
     RequestEvent::new(
         RequestId::new(),

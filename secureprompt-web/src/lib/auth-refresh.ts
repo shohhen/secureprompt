@@ -67,11 +67,24 @@ export interface ClientSessionFields {
  * even the user's actual browser session, should have stopped working.
  *
  * The refresh token still has to live somewhere the SERVER can reach it:
- * it stays only in the encrypted NextAuth JWT cookie (the `AppJWT` this
- * function takes as input) and is read exclusively by
+ * after sign-in it is held in the encrypted NextAuth JWT cookie (the
+ * `AppJWT` this function takes as input) and is read exclusively by
  * `refreshAccessTokenIfNeeded` inside the server-side `jwt` callback
  * (`src/lib/auth.ts`), which never runs in the browser. Silent refresh
  * keeps working; it just never surfaces the token used to do it.
+ *
+ * SCOPE, corrected (MR1 review I9): "if it ever reached client-side JS"
+ * above describes the risk this function removes, not a property the whole
+ * login flow has. It reaches client-side JS exactly once, during sign-in:
+ * `twofa-api.ts::loginStep1` is a browser `fetch` that reads
+ * `body.refresh_token`, and the `"use client"` login form hands it to
+ * `signIn("credentials", …)`. What this function guarantees is that the
+ * exposure does not EXTEND across the session — which is the difference
+ * between "an XSS during one form submission" and "any XSS, at any point,
+ * for as long as the user is signed in". Removing the remaining single-turn
+ * exposure means moving the `/v1/auth/token` exchange server-side; see the
+ * note in `src/types/next-auth.d.ts` and
+ * `tests/unit/refresh-token-transits-the-browser-at-login.test.ts`.
  */
 export function buildClientSessionFields(token: AppJWT): ClientSessionFields {
   return {

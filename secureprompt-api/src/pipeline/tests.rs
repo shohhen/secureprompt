@@ -642,12 +642,32 @@ mod fail_closed_audit_redaction_tests {
     /// clamped — one fewer redaction than the old re-scanning path produced,
     /// and the safe direction.
     ///
-    /// BOTH halves of the bounds check are exercised deliberately. The first
-    /// version of this test only covered `s < start`; a mutation that clamped
-    /// `e` to `end` left it green, because the span it used was already
-    /// rejected by the start check. A test that exercises one half of a
-    /// condition while claiming to cover both is the vacuity pattern this
-    /// project keeps hitting.
+    /// # What each case can and cannot falsify (MR1 review I14)
+    ///
+    /// This doc used to claim "BOTH halves of the bounds check are exercised
+    /// deliberately", and that was false in a way worth writing down rather
+    /// than quietly repairing, because the reason generalises.
+    ///
+    /// `e > end` is NOT independently falsifiable BY DELETION, and no fixture
+    /// can make it so. Work the arithmetic: for the output to change when
+    /// `|| e > end` is removed, `content.get(local_start..local_end)` must
+    /// return `Some`, which needs `e - start <= content.len() = end - start`,
+    /// i.e. `e <= end` — the case the guard was going to reject anyway. The
+    /// `bytes_match` belt-and-braces check below it subsumes plain deletion.
+    /// Cases (a) and (b) below therefore hold the BEHAVIOUR (both shapes are
+    /// dropped) but neither reddens on that mutation, and claiming otherwise
+    /// is what this comment previously did.
+    ///
+    /// What `e > end` IS falsifiable against is the mutation someone would
+    /// actually write: CLAMPING `e` to `end` instead of dropping. That is
+    /// case (c), and it is the only one that discriminates — it hands the
+    /// clamp a span whose clamped form matches its recorded value, so the
+    /// mutant redacts where the real code refuses. Verified: with
+    /// `let (local_start, local_end) = (s - start, e.min(end) - start);`
+    /// case (c) returns `{{Person_1}}` instead of `alpha`.
+    ///
+    /// Keeping (a) and (b) is deliberate — they pin the two real-world
+    /// straddle shapes — but they are labelled with what they prove.
     #[test]
     fn a_detection_straddling_the_boundary_is_dropped() {
         // (a) starts BEFORE the audited message: rejected by `s < start`.
@@ -679,6 +699,24 @@ mod fail_closed_audit_redaction_tests {
             redact_last_user_message_with(&with_reply, &[runs_over]),
             "alpha",
             "a span overrunning the audited message must be dropped, not clamped"
+        );
+
+        // (c) THE DISCRIMINATING CASE. Starts inside, overruns the end, and
+        // its recorded value is exactly what the CLAMPED span would cover —
+        // so `bytes_match` would accept it and the only thing standing
+        // between this input and a redaction is `e > end` rejecting first.
+        // Cases (a) and (b) cannot tell a clamp from a drop; this one can.
+        let clamp_bait = Detection {
+            class: "PERSON".to_owned(),
+            confidence: 0.9,
+            span: Some((0, 7)), // "alpha\nb" — two bytes past the message
+            value: "alpha".to_owned(), // ...but the value is the clamped form
+        };
+        assert_eq!(
+            redact_last_user_message_with(&with_reply, &[clamp_bait]),
+            "alpha",
+            "clamping `e` to `end` would redact this span instead of dropping \
+             it — `e > end` has to reject before `bytes_match` gets a chance"
         );
     }
 

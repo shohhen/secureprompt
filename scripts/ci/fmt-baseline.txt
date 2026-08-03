@@ -7,7 +7,6 @@
 secureprompt-api/src/analytics/dashboard_reader.rs
 secureprompt-api/src/app_state.rs
 secureprompt-api/src/auth/totp.rs
-secureprompt-api/src/db/api_key_repo.rs
 secureprompt-api/src/db/license_repo.rs
 secureprompt-api/src/db/provider_repo.rs
 secureprompt-api/src/db/secure_mode_repo.rs
@@ -41,7 +40,6 @@ secureprompt-api/src/ml_sidecar/client.rs
 secureprompt-api/src/observability/metrics.rs
 secureprompt-api/src/pipeline/service.rs
 secureprompt-api/src/pipeline/tests.rs
-secureprompt-api/src/policy/tests.rs
 secureprompt-api/src/providers/credential_test.rs
 secureprompt-api/src/providers/mod.rs
 secureprompt-api/src/providers/openai_compat.rs

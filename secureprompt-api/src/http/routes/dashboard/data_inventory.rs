@@ -104,8 +104,10 @@ use crate::{
 /// * [`PLAIN_BY_DESIGN`] is ALWAYS declared — there is no count that could
 ///   produce it. It claims nothing beyond "stored as written", which is why
 ///   declaring it is honest.
-/// * [`EMPTY`] is also declared once, for `request_content_captures` when the
+/// * [`UNKNOWN`] is declared once, for `request_content_captures` when the
 ///   store did not answer: nothing was inspected, so no verdict is claimed.
+///   This used to be [`EMPTY`], which is a CLAIM — "nothing was stored" — and
+///   the one request that cannot support it is the one where nothing was read.
 /// * Two classes declare a PROTECTIVE verdict, and both carry their reason in
 ///   the response rather than only here: `users` is [`MIXED`] whenever the
 ///   workspace has a member, because the table holds an Argon2id hash, a
@@ -137,7 +139,17 @@ mod at_rest {
     /// Nothing stored for this workspace, so there is nothing to verify.
     /// Deliberately NOT reported as `ciphertext`: an empty class proves
     /// nothing about the write path.
+    ///
+    /// This is a MEASUREMENT — the count ran and came back zero. When the
+    /// count did not run, say [`UNKNOWN`] instead.
     pub const EMPTY: &str = "empty";
+    /// The store did not answer, so nothing on disk was inspected and NO
+    /// verdict is claimed — not even the negative one.
+    ///
+    /// Separate from [`EMPTY`] on purpose, and for the same reason
+    /// `row_count: null` is separate from `row_count: 0`: an outage must not
+    /// be able to publish "this workspace stores no un-redacted content".
+    pub const UNKNOWN: &str = "unknown";
 }
 
 /// Values [`Encryption::basis`] can contain — what a claim actually rests on.
@@ -1005,13 +1017,20 @@ async fn get_data_inventory(
                 Some(CIPHERTEXT_SHAPE_CLAIM),
             )
         } else {
+            // NOT `EMPTY`. `EMPTY` says "nothing was stored", and this is the
+            // one branch that cannot know: the count did not run. Reporting
+            // it as empty let a ClickHouse outage attest that the only store
+            // holding un-redacted request content holds nothing.
             Encryption {
-                at_rest: at_rest::EMPTY,
+                at_rest: at_rest::UNKNOWN,
                 basis: vec![basis::WRITE_PATH],
                 verification: None,
                 note: Some(
                     "the store did not answer, so the bytes on disk were not \
-                     inspected and no encryption verdict is claimed"
+                     inspected and no encryption verdict is claimed. This is \
+                     NOT a statement that the class is empty: whether anything \
+                     is stored is unknown on this response — see \
+                     `row_count_status`."
                         .to_owned(),
                 ),
             }
@@ -2297,8 +2316,12 @@ async fn get_data_inventory(
             "`at_rest` is COMPUTED from `verification` wherever a `verification` block is \
              present, and the rule is: `ciphertext` = every payload checked matched the \
              envelope, `plaintext` = none did, `mixed` = some did, `hashed` = one-way by \
-             construction and every value matched, `empty` = nothing was stored so nothing \
-             was verified. `plaintext_by_design` carries no `verification` and claims \
+             construction and every value matched, `empty` = the check RAN and there was \
+             nothing stored to verify. `unknown` is not any of those: it means the store \
+             did not answer, so nothing was inspected and no verdict — not even `empty` — \
+             is claimed; it pairs with `row_count_status: unavailable` and is the `at_rest` \
+             half of caveat 3's rule that a measured zero and an unread store are never \
+             conflated. `plaintext_by_design` carries no `verification` and claims \
              nothing beyond `stored as written`. THREE CLASSES ARE EXCEPTIONS and their \
              verdict is DECLARED rather than computed — this caveat used to say `never \
              declared per class`, which was false: (1) `users` reports `mixed` \

@@ -30,8 +30,18 @@
 //! [`SecureModeRepository::get`] resolves "no row" to
 //! [`SecureModeRow::default`], and that default is `enabled: false`. An
 //! unarmed read would not merely hide this table; it would switch redaction
-//! OFF for a workspace that switched it on, and the request path would carry
-//! on with policy-only behaviour having logged nothing.
+//! OFF for a workspace that switched it on.
+//!
+//! CORRECTION (MR5 C1 / MR6 F3). This header used to end "…and the request
+//! path would carry on with policy-only behaviour having logged nothing",
+//! which implied the read-back was the whole fix. It was not: the read-back
+//! only turns a silent zero into an `Err`, and the sole caller
+//! ([`crate::pipeline::service`]) resolved every `Err` back to
+//! [`SecureModeRow::default`] — the same `enabled: false`, at HTTP 200, with
+//! a `warn!` line as the only difference. The compensating control was inert
+//! on the one path that matters. The caller now REFUSES the request (503) on
+//! any error from [`SecureModeRepository::get`]; the read-back is what gives
+//! it something to refuse on, rather than the fix by itself.
 
 use chrono::{DateTime, Utc};
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
@@ -86,7 +96,15 @@ impl SecureModeRepository {
     /// every row and this SELECT returns nothing, which `map_or_else` below
     /// resolves to `enabled: false` — redaction off, silently, for a workspace
     /// that turned it on. The read-back inside `begin_scoped` converts that
-    /// silence into an error the caller can log.
+    /// silence into an error.
+    ///
+    /// That error is LOAD-BEARING and must not be swallowed. The doc here used
+    /// to say the read-back produced "an error the caller can log", and the
+    /// caller duly logged it and carried on with `enabled: false` — i.e. with
+    /// the outcome the read-back was added to prevent. `pipeline::service`
+    /// now refuses the request (503) on any `Err` from this method; see the
+    /// comment at its call site for why that costs no availability the
+    /// request path had.
     ///
     /// # Errors
     /// `ApiError::Database` on SQL failure, `ApiError::Internal` when the

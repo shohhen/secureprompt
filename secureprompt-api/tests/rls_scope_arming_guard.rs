@@ -61,6 +61,12 @@
 //! fragments, and it cannot tell a read-back that is on the success path from
 //! one behind a branch that never runs. It is a supplement to
 //! `begin_scoped`'s runtime check, not a replacement.
+//!
+//! It USED to be defeatable by one comment as well: `arms` ignored comment
+//! lines and `verifies` did not, so a `//` line naming `current_setting(…)`
+//! anywhere in the window satisfied the invariant with the read-back deleted.
+//! Both halves now apply the same filter, and the "PROSE CANNOT VERIFY" case
+//! in [`the_detector_actually_detects`] is what keeps it that way.
 //! [`the_detector_actually_detects`] is the positive control that keeps the
 //! scanner itself honest — without it, a scan that matched nothing would make
 //! this gate green and silent, which is the exact failure mode it exists to
@@ -141,7 +147,19 @@ fn scan(source: &str, file: &str) -> Vec<UnverifiedArming> {
     // ONLY helper in this workspace whose contract is "the GUC reads back as
     // this value or you get an error" — `db::scope::scope_is_armed` and the
     // worker's private copies of it.
+    //
+    // COMMENTS ARE EXCLUDED, on the same rule and for a stronger reason than
+    // `arms` excludes them. A comment that names the read-back does not
+    // perform one, and these files explain the pattern at length — so without
+    // this filter the guard was defeated by a single `//` line inside the
+    // window. That was measured: read-back deleted -> RED; one comment naming
+    // it added -> GREEN. `the_detector_actually_detects`'s "PROSE CANNOT
+    // VERIFY" case is what keeps it deleted.
     let verifies = |line: &str| {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') {
+            return false;
+        }
         (line.contains("current_setting") && line.contains(SCOPE_GUC))
             || line.contains("scope_is_armed")
     };
@@ -313,6 +331,36 @@ fn the_detector_actually_detects() {
     assert!(
         scan(prose, "synthetic.rs").is_empty(),
         "a comment naming set_config('app.current_workspace_id') is prose, not an arming"
+    );
+
+    // FLAGGED, and the reason `verifies` filters comments the way `arms`
+    // already does. PROSE CANNOT VERIFY.
+    //
+    // MEASURED, not imagined: a reviewer deleted the real
+    // `scope_is_armed(tx, workspace_id).await` from `db::scope::arm_scope` —
+    // the gate went RED, naming `db/scope.rs:107` — then added exactly the one
+    // `//` line below inside the window, and the gate went GREEN. The single
+    // compensating control the whole 033 sweep is justified by was gone and
+    // the guard that exists to prove it is present said nothing. A guard that
+    // a comment can switch off is not a guard.
+    //
+    // This is the same asymmetry, one level up, that the gate itself measures:
+    // naming a check is not performing one.
+    let commented_away = r#"
+        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+            .bind(workspace_id.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+        // NOTE: the value is verified by reading
+        // current_setting('app.current_workspace_id', true) — see scope_is_armed.
+        Ok(())
+    "#;
+    assert_eq!(
+        scan(commented_away, "synthetic.rs").len(),
+        1,
+        "an arming whose only verification is a COMMENT naming \
+         current_setting/scope_is_armed must still be flagged"
     );
 
     // NEGATIVE CONTROL 4 — DISTANCE. A read-back far below the arming does not

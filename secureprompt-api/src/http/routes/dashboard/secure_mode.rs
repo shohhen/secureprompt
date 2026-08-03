@@ -466,9 +466,15 @@ mod tokenize_detection_tests {
     /// detection redacts only the inner fragment and forwards the rest of the
     /// entity — a partial leak that is worse than either layer alone, and one
     /// that only appeared once this endpoint gained a regex layer.
+    ///
+    /// The fixture says `pasport` because MR1 review I4 gave
+    /// `Matcher::UzbekPassport` a document-level context gate: without a
+    /// passport word somewhere in the text the regex layer stays quiet, the
+    /// "short regex span INSIDE a longer ML span" premise disappears, and
+    /// this test would keep passing while covering nothing.
     #[test]
     fn ml_span_containing_a_regex_span_is_fully_redacted() {
-        let text = "Manzil: Toshkent shahri, AA1234567 blok, 5-uy";
+        let text = "Manzil: Toshkent shahri, pasport AA1234567 blok, 5-uy";
         let address_start = text.find("Toshkent").expect("fixture");
         let address = &text[address_start..];
 
@@ -496,9 +502,16 @@ mod tokenize_detection_tests {
     /// Round-2 review: the end-to-end form of the containment regression.
     /// An ML span that covers one regex detection but only PART of another
     /// must not leave the tail of the second one in the output.
+    ///
+    /// The fixture says `pasport` for the same reason as the test above: the
+    /// I4 context gate means an unlabelled `AA1234567` produces no regex
+    /// detection, and this test's ML span only PARTLY covers the STIR, so
+    /// `subsumes_all_overlapping` drops it — leaving the passport covered by
+    /// nothing and the assertion at the bottom failing for a reason that has
+    /// nothing to do with what the test is named for.
     #[test]
     fn no_byte_of_a_regex_identifier_survives_a_partly_covering_ml_span() {
-        let text = "Manzil: Toshkent, AA1234567 blok, STIR 300111222 raqami";
+        let text = "Manzil: Toshkent, pasport AA1234567 blok, STIR 300111222 raqami";
         let address_start = text.find("Toshkent").expect("fixture");
         // Deliberately ends mid-STIR: covers the passport in full and the
         // STIR only partly.

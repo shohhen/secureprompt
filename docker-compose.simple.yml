@@ -28,10 +28,16 @@ services:
       context: .
       dockerfile: secureprompt-api/Dockerfile
     command: ["--migrate-only"]
-    restart: on-failure
+    # BOUNDED. This profile has no healthcheck, so `db-migrate` retries instead
+    # of waiting on a condition — but an unbounded `on-failure` turns a genuine
+    # failure (a wrong SECUREPROMPT_APP_DB_PASSWORD, a CREATE-on-public grant
+    # the migration role cannot revoke) into a silent infinite loop while `api`
+    # waits on `service_completed_successfully` with no timeout and nothing
+    # surfaced. Five attempts, then stop and show the exit code.
+    restart: on-failure:5
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
-      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}
+      SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
     depends_on:
       - postgres
 
@@ -41,7 +47,7 @@ services:
       dockerfile: secureprompt-api/Dockerfile
     environment:
       # RUNTIME role: NOSUPERUSER, NOBYPASSRLS, owns nothing.
-      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:-secureprompt}@postgres:5432/secureprompt
+      DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: debug
       # WS2-3. This profile deliberately ships NO ML sidecar, so the gateway

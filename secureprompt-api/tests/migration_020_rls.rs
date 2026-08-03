@@ -486,6 +486,14 @@ async fn migration_020_leaves_an_unrelated_rule_alone(pool: PgPool) {
 /// Idempotent, and specifically: no duplicate entries. Re-running a migration
 /// is normal (`sqlx migrate run` on a restored backup, a re-applied
 /// deployment), and a duplicated class array is a UI defect at best.
+///
+/// PREMISE: the FIRST run must have back-filled. Without it this test is a
+/// constant compared against itself — the exact shape this file exists to
+/// catch, one level up. Replace 020's whole `DO $$ … END $$` body with
+/// `SELECT 1;` and `once == twice == LEGACY_NINE`, whose nine entries are
+/// distinct, so both the equality and the no-duplicates assertion pass for a
+/// migration that did nothing. A silent no-op under RLS is the headline
+/// defect of this suite, and this was the one test that survived it.
 #[sqlx::test]
 async fn migration_020_is_idempotent_under_a_non_superuser_role(pool: PgPool) {
     let rule = seed_rule(&pool, "Idempotent Co", "Redact common PII", LEGACY_NINE).await;
@@ -496,6 +504,18 @@ async fn migration_020_is_idempotent_under_a_non_superuser_role(pool: PgPool) {
         .await
         .expect("first run");
     let once = classes_of(&pool, rule).await;
+    assert!(
+        once.contains(&"PINFL".to_owned()),
+        "premise: the first run must actually have back-filled, or `once` is \
+         just the seeded array and everything below compares it with itself. \
+         020 reached no row: {once:?}"
+    );
+    assert!(
+        once.len() > 9,
+        "premise: the seed carries nine classes and the back-fill adds to \
+         them, so a first run that changed anything leaves more than nine: \
+         {once:?}"
+    );
     sqlx::raw_sql(MIGRATION_020)
         .execute(&mut conn)
         .await

@@ -209,6 +209,16 @@ static-checks:
     - bash scripts/ci/check-no-dangerous-html.sh
     # AUTH-07: .env.example carries CHANGEME sentinels, never a real secret.
     - bash scripts/ci/check-env-hygiene.sh
+    # MR1 I1. check-env-hygiene.sh guards .env.example; this guards the compose
+    # files, where the actual defect was — a `${VAR:-...}` fallback meant the
+    # boot gate never saw a placeholder because the var was never unset.
+    - bash scripts/ci/check-compose-secret-fallbacks.sh
+    # MR7 I1: no runbook may route an upgrade through `init-env.sh --force`,
+    # which rotates the AES key for stored provider credentials.
+    - bash scripts/ci/check-upgrade-path-is-nondestructive.sh
+    # MR7 C4: all four "the runtime role is powerless" assertions must ask
+    # about role membership, not just role attributes.
+    - bash scripts/ci/check-powerless-assertions-agree.sh
     # Every mart consumed by the dashboard is declared as a dbt exposure.
     - node scripts/ci/check-mart-exposures.mjs
     - |
@@ -226,6 +236,35 @@ static-checks:
         echo "Use upstream images instead."; exit 1
       fi
       echo "OK: no bitnami/ image references found."
+
+# ---------------------------------------------------------------------------
+# helm-render — MR7 C1/I2/M3. RENDER the chart and assert the properties the DB
+# role split rests on.
+#
+# Three of the six Criticals in the MR7 review were found by rendering, not by
+# reading: nothing in this pipeline had ever run `helm template`. `helm lint`
+# exists only in the manual `deploy` job, and lint does not look at container
+# fields at all, so "the owner credential reaches no serving container" was
+# asserted in prose and checked by nobody.
+#
+# alpine/helm ships helm as the entrypoint; `entrypoint: [""]` gets a shell,
+# and bash is a 2 MB apk away.
+# ---------------------------------------------------------------------------
+helm-render:
+  stage: lint
+  image:
+    name: alpine/helm:3.16.2
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache bash >/dev/null
+  script:
+    - bash scripts/ci/check-helm-migration-initcontainer.sh
+    # MR1 C4. The reviewer first recorded the sidecar-token wiring as SOUND —
+    # `grep` found the env var in all four templates — and withdrew it after
+    # rendering: two of the four sat inside an `if .Values.license.enabled`
+    # guard whose chart default is false. Same lesson as the check above, so
+    # it runs in the same job.
+    - bash scripts/ci/check-helm-sidecar-token.sh
 
 # ===========================================================================
 # Stage: test
@@ -532,6 +571,96 @@ test:rls-nonsuperuser:
     # 6 / 0 and 3 / 0 under BOTH roles.
     - cargo test -p secureprompt-api --test rls_missing_predicate -- --test-threads=4 --nocapture
     - cargo test -p secureprompt-api --test tenancy_predicate_guard -- --test-threads=4 --nocapture
+
+# ---------------------------------------------------------------------------
+# MR1 review I17 / WS6-1-FU6 — the Python sidecar's own tests, in the pipeline
+# that actually runs.
+#
+# WHAT THE REVIEW SAID, AND WHERE IT WAS ACTUALLY WRONG
+#
+# I17 reported that `.github/workflows/ci.yml`'s `ml-sidecar` job ran a
+# hand-listed five-file set which omitted `test_sidecar_route_auth.py` — the
+# 349-line centrepiece of WS1-5 — plus `test_internal_model_key.py`,
+# `test_secure_endpoints.py` and `test_scan_async.py`.
+#
+# The omission is real. The location is not: `.github/workflows/` no longer
+# exists. WS6-1 moved all four workflows to `.github/workflows-retired/` and
+# consolidated CI here, and that directory's README records that they had
+# never run at all — there is no GitHub remote, only
+# `git@gitlab.com:secureprompt/secure-prompt.git`. So the true state at the
+# tip is worse than reported: it was not that four sidecar suites were left
+# off a list, it is that THIS pipeline had no Python stage whatsoever, and
+# every sidecar test — including the five that were listed — ran nowhere.
+# `workflows-retired/README` books it as follow-up WS6-1-FU6.
+#
+# WHAT RUNS, AND WHY THIS LIST
+#
+# The five the retired job named, plus the four I17 names, plus the two model
+# key-loading suites (`test_keyloader`, `test_weight_crypto`) — the sidecar
+# half of the model-IP boundary `test_internal_model_key.py` guards from the
+# HTTP side. All eleven need no model download; `ML_SKIP_MODEL_LOAD` covers
+# the rest.
+#
+# It is a list rather than a bare `pytest tests/`, and that is a deliberate
+# trade, not laziness: the directory also holds the datagen and NER-regression
+# suites, several of which load real checkpoints or corpora that are not in
+# the image. A job that is red for a missing 5 GB checkpoint teaches everyone
+# to ignore the stage beside it — the exact failure `.github/workflows-retired/README`
+# documents four times over. WIDEN THIS LIST as suites are confirmed to run
+# without model weights; that is the same ratchet `fmt` and `clippy` use.
+#
+# VERIFICATION. The eleven files were run together locally at this commit
+# against Python 3.12 with the repo's requirements installed:
+# 57 passed, 2 skipped. The install steps below are ported verbatim from the
+# retired workflow's `ml-sidecar` job rather than reinvented, because that is
+# the closest thing to evidence that this dependency set resolves. The FIRST
+# pipeline run of this job must be watched: no runner was available to prove
+# `pip install` succeeds inside `python:3.11-slim`.
+#
+# NO SERVICES. Every test here is in-process: FastAPI's `TestClient` against
+# the real ASGI app with heavy dependencies stubbed. Nothing touches Postgres,
+# Redis, ClickHouse or Qdrant.
+# ---------------------------------------------------------------------------
+test:ml-sidecar:
+  image: "python:3.11-slim"
+  stage: test
+  variables:
+    # `app.main` raises at IMPORT when this is unset (WS1-5's fail-closed boot
+    # gate), and `tests/conftest.py` sets a default with `os.environ.setdefault`
+    # so collection-time imports survive. The auth suites override it per test
+    # via monkeypatch + a fresh `app.main` import, so a value here cannot hide
+    # an auth defect — see that conftest's comment.
+    ML_SKIP_MODEL_LOAD: "true"
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  cache:
+    key:
+      files:
+        - secureprompt-ml/requirements.txt
+    paths:
+      - .cache/pip
+  script:
+    - cd secureprompt-ml
+    - |
+      # CPU torch FIRST, from PyTorch's own index: the default PyPI wheel
+      # pulls the CUDA runtime (~2 GB) that this job can never use.
+      python -m pip install --upgrade pip
+      python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      python -m pip install -r requirements.txt
+    - |
+      python -m pytest \
+        tests/test_sidecar_route_auth.py \
+        tests/test_internal_model_key.py \
+        tests/test_secure_endpoints.py \
+        tests/test_scan_async.py \
+        tests/test_keyloader.py \
+        tests/test_weight_crypto.py \
+        tests/test_batching.py \
+        tests/test_compliance_map.py \
+        tests/test_onnx_flag.py \
+        tests/test_ready.py \
+        tests/test_stateless.py \
+        -v --tb=short
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.

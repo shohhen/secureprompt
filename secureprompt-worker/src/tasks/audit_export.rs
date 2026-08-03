@@ -99,6 +99,14 @@ pub const MAX_EXPORT_ROWS: u64 = 500_000;
 
 // ── Status vocabulary ─────────────────────────────────────────────────────
 
+/// The status a freshly created export row carries. The worker NEVER writes
+/// it — the API's create handler does, from its own `STATUS_QUEUED` in
+/// `http/routes/dashboard/audit_export.rs`. This copy exists so the tests can
+/// seed the state the worker picks up from, and `#[cfg(test)]` says so:
+/// without it the constant is dead on the binary target and shows up under the
+/// clippy gate's `-A dead_code`, filed there as a "test-support helper".
+/// Marking it is how that stays true instead of being excused.
+#[cfg(test)]
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_COMPLETE: &str = "complete";
@@ -663,6 +671,16 @@ const SCOPE_NOT_ARMED: &str =
 /// thing that makes the tables readable and writable at all under a
 /// non-superuser role.
 ///
+/// **It is not the tenancy filter, and this module must not lean on it as one.**
+/// Migration 025's own header says the SQL predicate "is still the filter" and
+/// the policy is defence in depth; the compose role is a SUPERUSER and bypasses
+/// every policy unconditionally. So every statement below ALSO carries an
+/// explicit `workspace_id` predicate. That was true of `mark_running`,
+/// `mark_failed` and both writes in [`persist`] from the start, and false of
+/// exactly one statement — `persist`'s page wipe, which named `export_id`
+/// alone until `the_page_wipe_does_not_cross_a_workspace_boundary` was written
+/// to fail on it.
+///
 /// The read-back is the part that is new with the control plane, and it is not
 /// belt-and-braces. On the WRITE path a missing GUC is loud: the INSERT is
 /// rejected and the export fails. On the READ path it is SILENT — the query
@@ -756,8 +774,17 @@ async fn persist(
 
     // Re-running a task (the queue is at-least-once) must not append a second
     // set of pages beside the first.
-    sqlx::query("DELETE FROM audit_export_pages WHERE export_id = $1")
+    //
+    // `AND workspace_id = $2` is not redundant with the `export_id` key. The
+    // RLS policy on this table is defence in depth, not the filter (migration
+    // 025 says so, and the compose role is a SUPERUSER that bypasses it), so
+    // without the predicate the only thing confining this DELETE to one tenant
+    // is that the API happens to write an envelope and a payload that agree.
+    // `the_page_wipe_does_not_cross_a_workspace_boundary` fails when it is
+    // removed.
+    sqlx::query("DELETE FROM audit_export_pages WHERE export_id = $1 AND workspace_id = $2")
         .bind(req.export_id)
+        .bind(req.workspace_id)
         .execute(&mut *tx)
         .await?;
 

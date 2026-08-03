@@ -594,21 +594,53 @@ impl PipelineService {
         //   * `strict`:     block on any detection (override allow/redact → deny)
         //   * `standard`:   respect the toggles below
         // Block toggles only matter at level=standard; permissive/strict
-        // imply their own behavior. Failure to read the row is non-fatal —
-        // we log and continue with policy-only behavior.
+        // imply their own behavior.
+        //
+        // MR5 C1 / MR6 F3 — a failed read REFUSES the request (503). It used
+        // to resolve to `SecureModeRow::default()`, and that default is
+        // `enabled: false`, which is the OFF position of this workspace's
+        // redaction control: injection gate skipped, `block_on_pii_detection`
+        // never applied, `redact_pii_in_responses` off, `strict`/`permissive`
+        // ignored — at HTTP 200, with one `warn!` line. On a redaction
+        // gateway that is the product not doing its job, quietly.
+        //
+        // Why fail closed rather than trade it for availability: the
+        // `evaluate(...).await?` immediately above reads `policy_rules` from
+        // the SAME pool and propagates its error. A Postgres outage has
+        // therefore ALREADY failed this request one statement earlier, so the
+        // fallback bought no availability at all — it only converted the
+        // security control into a silent no-op for the narrower class of
+        // errors that reach this line and not that one (a dropped/renamed
+        // table, a permission change, and the
+        // `ApiError::Internal(SCOPE_NOT_ARMED)` that migration 031's
+        // read-back exists to raise, which under the DB role-split is
+        // deterministic rather than transient).
+        //
+        // NOT the same shape as the raw-capture fallback ~150 lines above,
+        // despite the identical code. There, `CaptureDecision::default()` is
+        // `enabled: false` = "do not retain plaintext", so defaulting IS
+        // failing closed. Here, `default()` is "do not protect". Same shape,
+        // opposite safety direction; that is why only one of the two may
+        // swallow its error.
+        //
+        // `ServiceUnavailable` (503) rather than `Internal` (500) because the
+        // condition is retryable and the caller should treat it as such.
         let secure_mode = SecureModeRepository::new(self.state.db.clone())
             .get(auth.workspace_id)
             .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(
+            .map_err(|err| {
+                tracing::error!(
+                    alert = "secure_mode_read_failed",
                     workspace_id = %auth.workspace_id,
+                    %request_id,
                     error = %err,
-                    "secure_mode read failed; falling back to policy-only behavior"
+                    "secure_mode read failed; refusing the request rather than \
+                     serving it with the redaction control off"
                 );
-                let mut row = SecureModeRow::default();
-                row.workspace_id = auth.workspace_id.0;
-                row
-            });
+                ApiError::ServiceUnavailable(
+                    "secure mode configuration unavailable; request refused".to_owned(),
+                )
+            })?;
         if secure_mode.enabled {
             let injection_outcome = self
                 .state

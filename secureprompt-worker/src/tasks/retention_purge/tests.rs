@@ -43,12 +43,35 @@ async fn ch_query(sql: &str) -> String {
         .await
         .expect("ClickHouse must be reachable — see the task env (CLICKHOUSE_URL)");
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    // NOT `unwrap_or_default()`, which is what this was and which contradicts
+    // the sentence above it. A failed body read produced `""`, and `""` is a
+    // quietly-passing answer to every caller here: `capture_exists` compares
+    // `"" != "0"` and reports the row SURVIVED, satisfying a survival
+    // assertion for a query that never returned. Fails loudly instead.
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|e| panic!("clickhouse response body could not be read: {e}\nsql: {sql}"));
     assert!(
         status.is_success(),
         "clickhouse query failed ({status}): {text}\nsql: {sql}"
     );
     text.trim().to_owned()
+}
+
+/// [`ch_query`] for a query whose ANSWER is read, as opposed to DDL and
+/// INSERTs, which legitimately return an empty body.
+///
+/// The distinction is the point. `capture_exists` used to be
+/// `ch_query(...) != "0"`, so any answer that was not literally `0` — the
+/// empty string included — reported that the row SURVIVED. That is the wrong
+/// direction for a purge test: a query that failed to produce a value
+/// satisfied the survival assertion.
+async fn ch_count(sql: &str) -> u64 {
+    let text = ch_query(sql).await;
+    text.parse::<u64>().unwrap_or_else(|e| {
+        panic!("clickhouse did not answer with a count ({e}): {text:?}\nsql: {sql}")
+    })
 }
 
 /// Apply ClickHouse migration 007 the same way the worker does at startup.
@@ -208,6 +231,67 @@ async fn purge_deletes_expired_vault_entries_and_spares_live_ones(
     Ok(())
 }
 
+/// The token-vault purge runs on an UNARMED connection, and this fails the
+/// day that stops being safe.
+///
+/// `purge_token_vault` issues `DELETE FROM token_vault_entries WHERE
+/// expires_at <= $1` on the pool directly — no `set_config
+/// ('app.current_workspace_id')`, no `begin_armed`. That is correct today and
+/// deliberate: the scope is global (`workspace_id: None` on the audit record),
+/// so there is no single workspace to arm it to, and `token_vault_entries`
+/// carries no row-level security. Verified on the live schema:
+/// `pg_class.relrowsecurity` is false for this table and true for
+/// `retention_purge_audit`, `raw_capture_audit`, `audit_export_pages` and
+/// `session_revocation_audit`.
+///
+/// The hazard is drift, and it is silent. Arm RLS on this table — the exact
+/// repair migrations 020 and 035 exist to perform, one table over — and the
+/// DELETE matches zero rows on an unarmed connection. Every retention test
+/// keeps passing, because `#[sqlx::test]` connects as a BYPASSRLS superuser
+/// and cannot observe the policy at all. The purge would report `ok`,
+/// `rows_deleted: 0`, forever.
+///
+/// So the drift itself is what this asserts. If you arm RLS here, this test
+/// fails and points at the statement that has to change with it.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn the_token_vault_purge_has_no_row_level_security_to_be_blocked_by(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (enabled, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+         WHERE relname = 'token_vault_entries'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        !enabled && !forced,
+        "`token_vault_entries` has gained row-level security (enabled={enabled}, \
+         forced={forced}). `purge_token_vault` deletes from it on an UNARMED \
+         pool connection, so under a policy keyed on \
+         `app.current_workspace_id` it now silently deletes NOTHING — and no \
+         test in this suite can see that, because #[sqlx::test] connects as \
+         BYPASSRLS. Arm the purge transaction (see `begin_armed`) or make the \
+         policy admit the worker role, then update this test."
+    );
+
+    // POSITIVE CONTROL on the probe: a table that IS armed must read back as
+    // armed, or the assertion above is satisfied by a query that returns
+    // false for everything.
+    let (audit_enabled, audit_forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+         WHERE relname = 'retention_purge_audit'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        audit_enabled && audit_forced,
+        "positive control: `retention_purge_audit` is armed by migration 030, \
+         and this probe does not see it (enabled={audit_enabled}, \
+         forced={audit_forced}) — so the absence asserted above proves nothing"
+    );
+    Ok(())
+}
+
 /// A purge run over a store with nothing to delete must still succeed, must
 /// delete nothing, and must still leave an audit row.
 ///
@@ -308,11 +392,32 @@ async fn purge_emits_a_proof_of_purge_record_with_counts_and_ranges(
         newest > oldest,
         "the recorded window must span the two deleted rows, got {oldest} .. {newest}"
     );
+    // `newest <= cutoff` used to stand here. The DELETE selects
+    // `WHERE expires_at <= $1` and `newest` is `MAX(expires_at)` over exactly
+    // those rows, so it is true by the statement — a tautology, not a check.
+    // What is NOT implied is that the two instants are the two SEEDED ones:
+    // the fixture puts them 48 hours apart (-50 h and -2 h), so the recorded
+    // window must be 48 hours wide. Replace `MAX(expires_at)` with the cutoff
+    // itself and the old assertion still passes while this one does not.
     let cutoff: DateTime<Utc> = row.get("cutoff");
-    assert!(
-        newest <= cutoff,
-        "everything deleted must be at or before the recorded cutoff; \
-         newest={newest} cutoff={cutoff}"
+    assert_eq!(
+        (newest - oldest).num_hours(),
+        48,
+        "the recorded window must be the one the fixture seeded (-50 h to \
+         -2 h). oldest={oldest} newest={newest} cutoff={cutoff}"
+    );
+
+    // And the row that had NOT expired must still be there. Nothing above
+    // says so: `rows_deleted == 2` counts what the statement removed, and
+    // `rows_remaining_past_cutoff == 0` only looks at rows already past the
+    // cutoff — a purge that took the +23 h row as well satisfies both.
+    let survivors: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_vault_entries")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        survivors, 1,
+        "the entry expiring 23 hours from now must survive a purge whose \
+         cutoff is now"
     );
     Ok(())
 }
@@ -345,11 +450,11 @@ async fn capture_count(workspace_id: Uuid) -> i64 {
 }
 
 async fn capture_exists(request_id: Uuid) -> bool {
-    ch_query(&format!(
+    ch_count(&format!(
         "SELECT count() FROM request_content_captures WHERE request_id = '{request_id}'"
     ))
     .await
-        != "0"
+        > 0
 }
 
 /// THE CASE WS3-2 DEFERRED HERE.

@@ -28,6 +28,21 @@ ingress:
 # ----------------------------------------------------------------------------
 # Application services
 # ----------------------------------------------------------------------------
+# WS1-P0 DB ROLE SPLIT — the schema-migration initContainer
+# (secureprompt.dbMigrateInitContainer in _helpers.tpl). It runs the API image
+# with `--migrate-only` and exits before anything listens; it is the only place
+# the OWNER database credential is mounted.
+#
+# Its own pullPolicy, because api.image.pullPolicy is IfNotPresent and the
+# 0.1.x tags are mutable: a node-cached PRE-SPLIT api image has no argument
+# parsing at all, so `--migrate-only` is ignored, the full API main runs, and
+# the pod sits in Init:CrashLoopBackOff forever.
+# scripts/ci/check-helm-migration-initcontainer.sh rejects IfNotPresent here in
+# every render mode.
+migration:
+  image:
+    pullPolicy: Always
+
 api:
   image:
     repository: secureprompt/api

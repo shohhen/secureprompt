@@ -1,12 +1,42 @@
-//! Phase 5 / Plan 05-06 — Cross-tenant RLS matrix test (VALIDATION 5-08-01 / T-05-05).
+//! Phase 5 / Plan 05-06 — Cross-tenant **IDOR** matrix (VALIDATION 5-08-01 /
+//! T-05-05).
 //!
 //! Iterates over every dashboard endpoint that accepts a workspace-scoped
 //! parameter. For each endpoint, issues the request using a JWT minted for
 //! workspace A while targeting workspace B. Asserts that every response is
 //! either HTTP 403 Forbidden or returns an empty result set (no data leakage).
 //!
-//! The test is data-driven via an `EndpointCase` manifest so new endpoints
-//! can be added by appending a row — no new test function required.
+//! The test is data-driven via a `Case` manifest so new endpoints can be added
+//! by appending a row — no new test function required.
+//!
+//! # What this file proves, and what it does NOT (MR1 review I5)
+//!
+//! It proves **application** tenancy: the handler-level IDOR guards, and the
+//! `WHERE workspace_id = ?` predicates in the ClickHouse readers underneath
+//! them. It does **not** prove Postgres row-level security, and the earlier
+//! header — "Cross-tenant RLS matrix test" — claimed otherwise.
+//!
+//! `#[sqlx::test]` connects as the role `DATABASE_URL` names, which for the
+//! compose stack is `POSTGRES_USER` — a superuser, and a superuser bypasses
+//! RLS including `FORCE`. Nothing here sets `app.current_workspace_id` on the
+//! connection the app reads through, and nothing does `SET LOCAL ROLE`.
+//! Deleting the whole `CREATE POLICY workspace_isolation` block from
+//! `001_init.sql` reddens no assertion in this file. That premise is not left
+//! as prose — `the_matrix_role_bypasses_rls` below asserts it on the wire, so
+//! the day it stops being true this note fails instead of quietly rotting.
+//!
+//! RLS itself is covered, and covered properly, by the suites that build a
+//! non-`BYPASSRLS` connection on purpose: `tests/rls_unscoped_read_is_invisible.rs`,
+//! `tests/rls_scope_readback.rs`, `tests/rls_repo_scope.rs`,
+//! `tests/rls_missing_predicate.rs`, `tests/db_role_split.rs` and the
+//! `tests/migration_*_rls.rs` family.
+//!
+//! The MODULE is named `cross_tenant_idor` (see `dashboard/mod.rs`) so the
+//! test IDs cargo prints say what is actually being proved. The FILE keeps its
+//! path deliberately: several dated plan and audit documents cite
+//! `tests/dashboard/rls_matrix.rs` by name, and a path that no longer resolves
+//! is worse for the next auditor than a path whose contents say plainly, in
+//! the first screen, what they are.
 
 use axum::{
     body::{to_bytes, Body},
@@ -123,7 +153,7 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "ClickHouse unreachable at {} — the RLS matrix cannot prove \
+                "ClickHouse unreachable at {} — the IDOR matrix cannot prove \
                  isolation without seeded cross-tenant data and must not be \
                  skipped: {e}",
                 clickhouse_url()
@@ -136,6 +166,56 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
         status.is_success(),
         "ClickHouse canary insert failed ({status}): {body}"
     );
+}
+
+/// Seed one `policy_events` row for `workspace_id` carrying `canary` as the
+/// rule NAME.
+///
+/// MR1 review I7: two of the four `NoCanary` cases —
+/// `/v1/analytics/policy-violations` and `/v1/analytics/latency-pctiles` —
+/// asserted the absence of a canary the endpoint could not have returned.
+/// The only canary was a `request_events` row, and `query_policy_violations`
+/// reads `mart_policy_violations` and falls back to `policy_events`; neither
+/// touches `request_events` and both were empty. `body.contains(canary)` was
+/// therefore false unconditionally, and removing `WHERE workspace_id = ?` from
+/// `dashboard_reader.rs` left both cases green.
+///
+/// `rule_name` is the carrier because `PolicyViolationsRow` serialises it, so
+/// a row belonging to another tenant is visible in the response body — which
+/// is the only thing the matrix's classifier can see.
+async fn seed_policy_event(workspace_id: Uuid, canary: &str) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.policy_events \
+             (request_id, workspace_id, rule_id, rule_name, action, dry_run, created_at) \
+             VALUES ('{rid}', '{ws}', '{rule}', '{canary}', 'redact', false, now())",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            rule = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding policy_events",
+    )
+    .await;
+}
+
+/// Seed one `latency_samples` row for `workspace_id` carrying `canary` as the
+/// MODEL name — the `latency-pctiles` half of I7, same reasoning as
+/// `seed_policy_event`. `LatencyPctilesRow` serialises `model`, and
+/// `query_latency_pctiles` falls back to `latency_samples`.
+async fn seed_latency_sample(workspace_id: Uuid, canary: &str) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.latency_samples \
+             (request_id, workspace_id, model, latency_ms, created_at) \
+             VALUES ('{rid}', '{ws}', '{canary}', 120, now())",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding latency_samples",
+    )
+    .await;
 }
 
 /// POST a statement to the test `ClickHouse`, failing loudly with the server's
@@ -333,18 +413,21 @@ fn matrix_cases() -> Vec<Case> {
             body_fn: None,
             expect: Expect::ForbiddenOrEmpty,
         },
-        Case {
-            method: "GET",
-            path_template: "/v1/providers?workspace_id={B}",
-            body_fn: None,
-            expect: Expect::ForbiddenOrEmpty,
-        },
-        Case {
-            method: "GET",
-            path_template: "/v1/policy-rules?workspace_id={B}",
-            body_fn: None,
-            expect: Expect::ForbiddenOrEmpty,
-        },
+        // `/v1/providers?workspace_id={B}` and `/v1/policy-rules?workspace_id={B}`
+        // used to sit here and were REMOVED by MR1 review I6. Neither handler
+        // takes a `workspace_id` query parameter — `list_providers` and
+        // `list_rules` are `(State, Extension<JwtAuthContext>)` and axum
+        // discards the query string — so there was no production line whose
+        // deletion could redden them, which directly contradicts
+        // `Expect::ForbiddenOrEmpty`'s doc ("the guard should reject before
+        // any query runs"). They were fixtures named for a code path that
+        // does not exist.
+        //
+        // The property those endpoints DO have — a supplied `workspace_id`
+        // must not change the answer, and must never surface another tenant's
+        // rows — is real and was untested. It is now
+        // `providers_and_policy_rules_ignore_a_workspace_id_parameter` below,
+        // where it can be falsified by a production line.
         Case {
             method: "GET",
             path_template: "/v1/workspaces/{B}/budgets",
@@ -361,6 +444,11 @@ fn matrix_cases() -> Vec<Case> {
 
     // ---- Omitted workspace_id: the guard never fires -----------------------
     // These are the cases that catch a query missing its tenancy predicate.
+    // All four of them, since MR1 review I7: the canary is now seeded into
+    // `policy_events` and `latency_samples` as well as `request_events`, so
+    // `policy-violations` and `latency-pctiles` can finally see the row whose
+    // absence they assert. Before that, this comment was true only of
+    // `usage-daily` and `cost-by-model`.
     for path in [
         "/v1/analytics/usage-daily",
         "/v1/analytics/cost-by-model",
@@ -488,6 +576,38 @@ fn classify(status: StatusCode, body: &Value, expect: Expect, canary: &str) -> V
 
 // ---------- Test -------------------------------------------------------------
 
+/// The header's scope claim, asserted rather than asserted-in-prose.
+///
+/// MR1 review I5 found this file named and documented as an *RLS* matrix when
+/// every connection it uses bypasses RLS entirely. A comment saying so would
+/// be the same species of defect as the one being fixed — a claim about the
+/// runtime that nothing checks — so the claim is a test.
+///
+/// If this ever reddens, `#[sqlx::test]`'s role stopped bypassing RLS, the
+/// matrix's verdicts became partly attributable to `workspace_isolation`, and
+/// the header above has to be rewritten before the results mean what they say.
+/// Redden it deliberately by pointing `DATABASE_URL` at a non-superuser role.
+#[sqlx::test]
+async fn the_matrix_role_bypasses_rls(pool: PgPool) -> sqlx::Result<()> {
+    let (role, is_super, bypasses): (String, bool, bool) = sqlx::query_as(
+        "SELECT current_user::text, rolsuper, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    assert!(
+        is_super || bypasses,
+        "the matrix now runs as `{role}` (rolsuper={is_super}, \
+         rolbypassrls={bypasses}), which does NOT bypass row-level security. \
+         Every verdict in this file is now partly attributable to \
+         `workspace_isolation` rather than to the handler guards it is written \
+         to test — rewrite this file's header before trusting a green run."
+    );
+
+    Ok(())
+}
+
 /// VALIDATION 5-08-01 / T-05-05 — cross-tenant matrix.
 ///
 /// Every dashboard endpoint must return 403 or empty when accessed with
@@ -498,8 +618,36 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
 
     // Give workspace B something worth stealing, tagged uniquely per run so a
     // sighting can never be coincidental.
+    //
+    // THREE tables, not one (MR1 review I7). The canary used to be a
+    // `request_events` row only, and `policy-violations` / `latency-pctiles`
+    // read `policy_events` / `latency_samples` — so their `NoCanary` cases
+    // asserted the absence of something the endpoint structurally could not
+    // return, and stayed green with `WHERE workspace_id = ?` deleted from
+    // `dashboard_reader.rs`.
     let canary = format!("rls-canary-{}", Uuid::new_v4().simple());
     seed_canary(seeded.workspace_b, &canary).await;
+    seed_policy_event(seeded.workspace_b, &canary).await;
+    seed_latency_sample(seeded.workspace_b, &canary).await;
+
+    // And give workspace A — the CALLER — its own rows in the same three
+    // tables (MR1 review I6).
+    //
+    // Only B was seeded before, so for every endpoint that already scopes by
+    // `ctx.workspace_id` the `ForbiddenOrEmpty` verdict was reachable two
+    // ways: 403 from the IDOR guard, or `200 []` because the caller's own
+    // workspace was empty. Deleting all four guards at
+    // `analytics.rs:80-88,…` and the one at `requests.rs:238-244` left the
+    // matrix green — measured. With A seeded, guard deletion returns A's own
+    // rows for a request that named B, `rows_of` sees a non-empty array, and
+    // the verdict is `Leak`.
+    //
+    // A's marker is deliberately NOT the canary: a canary sighting is a leak
+    // by definition in `classify`, and A seeing its own data is correct.
+    let own = format!("rls-own-{}", Uuid::new_v4().simple());
+    seed_canary(seeded.workspace_a, &own).await;
+    seed_policy_event(seeded.workspace_a, &own).await;
+    seed_latency_sample(seeded.workspace_a, &own).await;
 
     // Build Redis pool (needed by AppState even if not seeding budget data).
     let _redis_pool = RedisConfig::from_url(redis_url())
@@ -558,6 +706,108 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
         inconclusive.len(),
         inconclusive.join("\n")
     );
+
+    Ok(())
+}
+
+/// MR1 review I6(c) — what the two deleted matrix rows should have been.
+///
+/// The matrix carried `/v1/providers?workspace_id={B}` and
+/// `/v1/policy-rules?workspace_id={B}` as `Expect::ForbiddenOrEmpty`, whose
+/// doc says "the guard should reject before any query runs". Neither handler
+/// has such a guard, or could: `list_providers` (`providers.rs`) and
+/// `list_rules` (`policy_rules.rs`) are `(State, Extension<JwtAuthContext>)`,
+/// so axum parses no query string and there is nothing to compare. No
+/// production line's deletion reddened those rows. They are gone.
+///
+/// The property these endpoints really have is worth pinning and was not
+/// pinned anywhere: the workspace comes from the JWT only, so supplying
+/// `workspace_id={B}` must change nothing — the caller still gets their own
+/// rows, and never B's. That is the same guarantee the deleted rows were
+/// gesturing at, expressed so a production line can falsify it.
+///
+/// Three defences against a vacuous pass:
+///
+/// 1. **Premise / positive control** — A's own provider and rule MUST appear.
+///    An empty or errored response fails here rather than passing the
+///    tenancy assertion by returning nothing.
+/// 2. **B is really seeded** — B's rows go in under B's own armed scope, so
+///    "B is absent" cannot be true merely because B has nothing.
+/// 3. **Both spellings** — with and without the parameter. If a future change
+///    starts honouring `workspace_id`, the parameterised call returns B's
+///    rows and the tenancy assertion catches it.
+///
+/// Falsifier (verified): delete `WHERE workspace_id = $1` from
+/// `provider_repo::list_providers` or `policy_repo::list_rules` — the two
+/// queries whose comments say "this WHERE, not `begin_scoped`, is the real
+/// isolation boundary. Do not remove." Both reddened.
+#[sqlx::test]
+async fn providers_and_policy_rules_ignore_a_workspace_id_parameter(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let seeded = fixtures::seed_two_workspaces(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    let provider_a = format!("provider-own-{run}");
+    let provider_b = format!("provider-other-{run}");
+    let rule_a = format!("rule-own-{run}");
+    let rule_b = format!("rule-other-{run}");
+
+    // Written from inside each workspace's own armed scope, the way
+    // `seed_two_workspaces` writes `api_keys`: one scope names exactly one
+    // tenant, so the two tenants cannot share a transaction.
+    for (workspace_id, provider, rule) in [
+        (seeded.workspace_a, &provider_a, &rule_a),
+        (seeded.workspace_b, &provider_b, &rule_b),
+    ] {
+        let mut tx = fixtures::scoped(&pool, workspace_id).await;
+        sqlx::query(
+            "INSERT INTO providers (id, workspace_id, name, provider_type)
+             VALUES ($1, $2, $3, 'openai')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id)
+        .bind(provider)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO policy_rules (id, workspace_id, name, action)
+             VALUES ($1, $2, $3, 'redact')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id)
+        .bind(rule)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, seeded.workspace_a, seeded.admin_a, "admin");
+    let (_state, router) = build_app(pool);
+
+    for (endpoint, own, other) in [
+        ("/v1/providers", &provider_a, &provider_b),
+        ("/v1/policy-rules", &rule_a, &rule_b),
+    ] {
+        for path in [
+            endpoint.to_owned(),
+            format!("{endpoint}?workspace_id={}", seeded.workspace_b),
+        ] {
+            let (status, body) = send_raw(&router, "GET", &path, None, &token_a).await;
+            assert_eq!(status, StatusCode::OK, "{path} failed: {body}");
+
+            let rendered = body.to_string();
+            assert!(
+                rendered.contains(own.as_str()),
+                "positive control: workspace A's own row '{own}' is missing \
+                 from {path}, so the absence of B's row proves nothing: {body}"
+            );
+            assert!(
+                !rendered.contains(other.as_str()),
+                "workspace B's row '{other}' reached workspace A via {path}: {body}"
+            );
+        }
+    }
 
     Ok(())
 }

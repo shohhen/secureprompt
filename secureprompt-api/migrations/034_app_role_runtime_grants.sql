@@ -52,6 +52,23 @@
 --
 -- IDEMPOTENT. Safe on a fresh database and on one that has been running since
 -- 001. It transfers no ownership and moves no data.
+--
+-- IF YOU ALREADY RAN AN EARLIER VERSION OF THIS FILE (unmerged branch only)
+-- ------------------------------------------------------------------------
+-- MR7 review changed this file: sections 4b and 5 were wrong in ways that took
+-- a deployment down (a PUBLIC grant made section 5 raise) or falsely reassured
+-- one (section 5 passed while the runtime role was a member of a BYPASSRLS
+-- role). The fix had to be HERE and not in a later migration, because a fresh
+-- install fails AT 034 — it never reaches 035.
+--
+-- That changes the checksum, so a database that applied the old bytes reports
+--     migration 34 was previously applied but has been modified
+-- Because this file is idempotent, the repair is to forget the old row and let
+-- it re-run:
+--     DELETE FROM _sqlx_migrations WHERE version = 34;
+--     secureprompt-api --migrate-only     # with the OWNER DATABASE_URL
+-- This applies only to databases used while this branch was in review; 034 has
+-- never been released.
 
 -- ---------------------------------------------------------------------------
 -- 1. The role must exist, and must be powerless.
@@ -136,6 +153,63 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 REVOKE CREATE ON SCHEMA public FROM secureprompt_app;
 
 -- ---------------------------------------------------------------------------
+-- 4b. And the same privilege held by PUBLIC, which the REVOKE above cannot
+--     reach.
+--
+-- MEASURED on postgres:16.14: with `GRANT CREATE ON SCHEMA public TO PUBLIC`
+-- in place, `REVOKE CREATE ... FROM secureprompt_app` is a NO-OP — it removes
+-- a grant the role does not individually hold — and the assertion below then
+-- raised, taking the whole deployment down: `--migrate-only` exits non-zero,
+-- compose's `db-migrate` never reaches `service_completed_successfully`, and
+-- neither `api` nor `worker` starts.
+--
+-- This is not an exotic state. `PUBLIC` holding `CREATE` on `public` is the
+-- DEFAULT for every database created before PostgreSQL 15; `pg_upgrade`
+-- preserves schema ACLs, so only a newly `initdb`'d PG15+ cluster drops it.
+-- It is also what an operator gets from `GRANT ALL ON SCHEMA public TO PUBLIC`.
+-- The chart and compose pin postgres:16, but a database restored from an older
+-- cluster carries the old ACL.
+--
+-- Conditional rather than unconditional because REVOKE requires ownership of
+-- the schema (or grant option), which the migration role is not guaranteed to
+-- have on managed Postgres. On a database that does not need the repair, the
+-- statement is never attempted and no privilege is required.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    public_holds_create BOOLEAN;
+BEGIN
+    -- grantee 0 is the pseudo-role PUBLIC. COALESCE onto acldefault() because
+    -- a NULL nspacl means "the built-in default", which for a schema created
+    -- before PG15 still includes the PUBLIC grant.
+    SELECT EXISTS (
+        SELECT 1
+          FROM pg_namespace n,
+               aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+         WHERE n.nspname = 'public'
+           AND a.grantee = 0
+           AND a.privilege_type = 'CREATE')
+      INTO public_holds_create;
+
+    IF public_holds_create THEN
+        BEGIN
+            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+            RAISE NOTICE
+                '034: revoked CREATE ON SCHEMA public from PUBLIC (the '
+                'pre-PostgreSQL-15 default). Any role that was relying on that '
+                'grant to create objects in schema public must now be granted '
+                'CREATE explicitly.';
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+                'CREATE ON SCHEMA public is granted to PUBLIC, which gives it '
+                'to secureprompt_app, and this migration role cannot revoke it '
+                '(it does not own schema public). Fix it as the schema owner '
+                'or a superuser: REVOKE CREATE ON SCHEMA public FROM PUBLIC;';
+        END;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- 5. The powerless-assertion, in the same shape as
 --    scripts/ci/create-nonsuperuser-role.sh.
 --
@@ -147,8 +221,10 @@ REVOKE CREATE ON SCHEMA public FROM secureprompt_app;
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-    privileged BOOLEAN;
-    can_create BOOLEAN;
+    privileged  BOOLEAN;
+    can_create  BOOLEAN;
+    grantees    TEXT;
+    memberships TEXT;
 BEGIN
     SELECT rolsuper OR rolbypassrls
       INTO privileged
@@ -162,13 +238,64 @@ BEGIN
             'Refusing to complete the migration.';
     END IF;
 
+    -- ROLE MEMBERSHIP. Asked before the CREATE check, and asked at all,
+    -- because a role can be powerless on paper and not in practice: granting
+    -- secureprompt_app membership of a role that holds CREATE ON SCHEMA public
+    -- — or BYPASSRLS — leaves BOTH attribute checks above and the
+    -- has_schema_privilege check below answering harmless, because this role is
+    -- NOINHERIT and does not pick the privilege up automatically. MEASURED.
+    --
+    -- NOINHERIT only means the privileges are not AUTOMATIC. `SET ROLE` reaches
+    -- them over an ordinary connection, with no password. So a BYPASSRLS role
+    -- secureprompt_app is a member of is BYPASSRLS, one statement away, and
+    -- every RLS policy in this schema is inert at runtime with nothing
+    -- reporting it.
+    --
+    -- This is the assertion that runs on the paths --migrate-only does not
+    -- cover: `sqlx migrate run`, and any database already at head where this
+    -- file is no longer pending. It has to be complete on its own.
+    SELECT string_agg(grantee.rolname, ', ' ORDER BY grantee.rolname)
+      INTO memberships
+      FROM pg_auth_members m
+      JOIN pg_roles member  ON member.oid  = m.member
+      JOIN pg_roles grantee ON grantee.oid = m.roleid
+     WHERE member.rolname = 'secureprompt_app';
+
+    IF memberships IS NOT NULL THEN
+        RAISE EXCEPTION
+            'secureprompt_app is a member of: %. NOINHERIT does not close this '
+            '— SET ROLE reaches those privileges from an ordinary connection, '
+            'so whatever they hold, the runtime role effectively holds. '
+            'Revoke it: REVOKE <role> FROM secureprompt_app; Refusing to '
+            'complete the migration.', memberships;
+    END IF;
+
     SELECT has_schema_privilege('secureprompt_app', 'public', 'CREATE')
       INTO can_create;
 
     IF can_create THEN
+        -- Name the grantee instead of guessing at it. The previous text here
+        -- said "it is probably a member of a role that holds it", which is the
+        -- ONE cause it provably cannot be: secureprompt_app is NOINHERIT, and
+        -- a NOINHERIT membership makes has_schema_privilege answer FALSE
+        -- (measured). That sent the operator to pg_auth_members, which is
+        -- empty, while the real grantee sat in pg_namespace.nspacl. Membership
+        -- has in any case already been ruled out above.
+        SELECT string_agg(DISTINCT
+                   CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(a.grantee) END, ', ')
+          INTO grantees
+          FROM pg_namespace n,
+               aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) a
+         WHERE n.nspname = 'public'
+           AND a.privilege_type = 'CREATE';
+
         RAISE EXCEPTION
             'secureprompt_app still has CREATE on schema public after the '
-            'REVOKE above — it is probably a member of a role that holds it. '
-            'Refusing to complete the migration.';
+            'REVOKEs above. CREATE on schema public is currently held by: %. '
+            'Revoke it from whichever of those reaches secureprompt_app '
+            '(PUBLIC reaches every role). Refusing to complete the migration.',
+            COALESCE(grantees, '(nothing in pg_namespace.nspacl — the grant is '
+                               'reaching it some other way)');
     END IF;
 END $$;

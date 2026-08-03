@@ -29,8 +29,13 @@ pub mod requests;
 #[path = "settings_tests.rs"]
 pub mod settings;
 
+// MR1 review I5: the file proves application tenancy (handler IDOR guards +
+// query predicates), not Postgres RLS — `#[sqlx::test]` connects as a
+// BYPASSRLS superuser. The module carries the accurate name so the test IDs
+// cargo prints do too; the file keeps its path because dated plan/audit docs
+// cite it. See that file's header for the whole argument.
 #[path = "rls_matrix.rs"]
-pub mod rls;
+pub mod cross_tenant_idor;
 
 #[path = "users_tests.rs"]
 pub mod users;

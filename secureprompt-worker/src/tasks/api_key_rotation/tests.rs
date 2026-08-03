@@ -441,3 +441,153 @@ async fn a_sweep_with_nothing_to_do_revokes_nothing(pool: PgPool) {
         "the in-grace key was revoked by a sweep that had nothing to do"
     );
 }
+
+/// `row_security_active` for one table, as THIS pool's role sees it — role
+/// attributes plus policy presence, which is what actually decides whether the
+/// enumeration below comes back filtered.
+async fn row_security_active(pool: &PgPool, table: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT row_security_active($1)")
+        .bind(format!("public.{table}"))
+        .fetch_one(pool)
+        .await
+}
+
+/// MR6 F2. The sweep that cannot see a single workspace must NOT report
+/// success.
+///
+/// `Outcome::all_ok()` was `self.failures == 0`, which is VACUOUSLY TRUE over
+/// an empty enumeration: `SELECT id FROM workspaces` on a bare pool answers
+/// `Ok(vec![])` the moment `workspaces` is policed, the loop runs zero times,
+/// nothing fails because nothing ran, and `main.rs` records
+/// `record_job("rotation_cleanup", …, ok = true)`. The grace-expired key stays
+/// `status = 'rotating'` with `revoked_at IS NULL` forever: `GET /v1/keys`
+/// shows a dead credential as never-revoked and a re-rotation takes
+/// `ApiKeyRepository::rotate`'s idempotent branch with no audit row.
+///
+/// This is the SAME defect `retention_purge` closed in the same MR, in the
+/// sibling function, with two tests
+/// (`a_capture_sweep_that_cannot_enumerate_workspaces_fails_loudly`,
+/// `a_device_context_scrub_that_cannot_enumerate_workspaces_fails_loudly`)
+/// this file did not have. `run`'s comment claimed "the tests here fail on
+/// `workspaces_swept`" — no such test existed, and `workspaces_swept` was
+/// consulted by no production code at all.
+///
+/// The arming below is the future migration the comment contemplates, applied
+/// for real rather than reasoned about.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_sweep_that_cannot_enumerate_workspaces_fails_loudly(pool: PgPool) -> sqlx::Result<()> {
+    // Asserted BEFORE the arming below, which is the point of the arming.
+    assert_table_is_armed(&pool).await;
+
+    let stale = seed_key(
+        &pool,
+        new_workspace(&pool, "Blind Sweep").await,
+        "Stale",
+        "10 days",
+        86_400,
+    )
+    .await;
+    assert_eq!(
+        key_state(&pool, &stale).await,
+        Some(("rotating".to_owned(), true)),
+        "premise: there must be REAL WORK for this run, or `ok` would be honest"
+    );
+
+    let low = low_privilege_pool(&pool).await;
+
+    // PREMISE/CONTROL: the enumeration works before the table is armed, so the
+    // empty reading afterwards is caused by what this test thinks it is.
+    let visible_before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_before.contains(&stale.workspace_id),
+        "premise: the low-privilege pool must enumerate workspaces BEFORE the \
+         arming, got {visible_before:?}"
+    );
+
+    // The future migration. No policy at all, so ENABLE alone is default-deny
+    // for a non-owner; FORCE covers the case where the connecting role owns
+    // the table.
+    sqlx::raw_sql(
+        "ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&pool)
+    .await?;
+
+    assert!(
+        row_security_active(&low, "workspaces").await?,
+        "premise: arming workspaces did not make row security active for the \
+         low-privilege pool, so the enumeration is not actually filtered"
+    );
+    let visible_after: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        .fetch_all(&low)
+        .await?;
+    assert!(
+        visible_after.is_empty(),
+        "premise: the armed table must hide every workspace from this pool, \
+         got {visible_after:?}"
+    );
+
+    let outcome = run(&low).await;
+
+    // THE POINT. Sweeping zero workspaces because it cannot read them is not
+    // success.
+    assert!(
+        !outcome.all_ok(),
+        "the rotation sweep reported SUCCESS while it could not see a single \
+         workspace. A grace-expired key was present, so this run did nothing \
+         and told the cron it was fine: {outcome:?}"
+    );
+
+    // The consequence that makes the success report a lie, asserted from a
+    // scope that WOULD see the row.
+    assert_eq!(
+        key_state(&pool, &stale).await,
+        Some(("rotating".to_owned(), true)),
+        "premise for the assertion above: the blind sweep must genuinely have \
+         revoked nothing"
+    );
+
+    // The census: "how many did I look at" must be recorded, not inferred
+    // from the absence of failures.
+    assert_eq!(
+        outcome.workspaces_swept, 0,
+        "the blind sweep visited a workspace it could not see: {outcome:?}"
+    );
+    Ok(())
+}
+
+/// POSITIVE CONTROL for the test above. The precondition must not turn every
+/// ordinary run into a failure — an unarmed `workspaces` with real work in it
+/// still reports success.
+///
+/// Without this, "fail when blind" could be implemented as "always fail" and
+/// the test above would still pass.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn a_sweep_that_can_enumerate_workspaces_still_succeeds(pool: PgPool) {
+    assert_table_is_armed(&pool).await;
+
+    let stale = seed_key(
+        &pool,
+        new_workspace(&pool, "Sighted Sweep").await,
+        "Stale",
+        "10 days",
+        86_400,
+    )
+    .await;
+
+    let low = low_privilege_pool(&pool).await;
+    let outcome = run(&low).await;
+
+    assert!(
+        outcome.all_ok(),
+        "an ordinary run over a readable `workspaces` must succeed: {outcome:?}"
+    );
+    assert_eq!(
+        key_state(&pool, &stale).await,
+        Some(("revoked".to_owned(), false)),
+        "the sighted control must actually have done the work: {outcome:?}"
+    );
+}

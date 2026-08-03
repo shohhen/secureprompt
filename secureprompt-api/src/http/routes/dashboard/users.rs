@@ -545,13 +545,32 @@ async fn list_sessions(
 /// everything for this person", and this one answers "end this device", through
 /// the gate `jwt_auth::session_gate` already applies to both.
 ///
-/// # Ordering, which is load-bearing (the same as WS4-3's)
+/// # Ordering, which is load-bearing — and is NOT WS4-3's
 ///
-/// Postgres first — close this chain and write the audit row in one
-/// transaction — then Redis. A Redis failure gives the caller a 500 to retry,
-/// and the operation is idempotent; what has already happened is the durable,
-/// provable half. The other order would let a Postgres failure leave a security
-/// action performed and unrecorded.
+/// Redis first, Postgres second. The jtis come from `find_live_session`, which
+/// has already run, so nothing blocks blacklisting them before the chain is
+/// closed.
+///
+/// The other order — the one this handler shipped with, copied from WS4-3 —
+/// was unrecoverable. `revoke_one_session` COMMITS, so a Redis failure raised
+/// after it left the refresh chain closed and the audit row written *while the
+/// access token stayed servable*; and because `find_live_session` gates on
+/// `bool_or(revoked_at IS NULL AND …)`, the retry that the 500 invites resolves
+/// to `None` and this handler answers 404. The administrator got an error, a
+/// durable trail saying the session ended, a live token, and no lever left to
+/// finish the job. WS4-3's user-wide lever can afford that order because it has
+/// a Redis-independent fallback (`latest_watermark`); this one deliberately
+/// excludes itself from that fallback (the `session_id IS NULL` predicate), so
+/// Redis is its ONLY enforcement for an already-minted access token.
+///
+/// Blacklisting first inverts the residual to the safe direction. If Postgres
+/// then fails, one access token is dead that the trail does not mention — the
+/// caller still gets a 5xx, the refresh chain is still open, and the retry
+/// still resolves the session (nothing set `revoked_at`), re-runs the
+/// idempotent `SET … EX` and commits the audit row. No state is reachable in
+/// which the trail claims a session ended that did not, and none in which the
+/// administrator cannot re-drive the operation.
+/// `a_redis_failure_leaves_the_session_endable_on_retry` pins both halves.
 async fn revoke_one_session(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
@@ -584,6 +603,18 @@ async fn revoke_one_session(
         .await
         .map_err(api_error_response)?;
 
+    // BEFORE the commit — see "# Ordering" above. The blacklist TTL is the one
+    // `revocation_watermark_ttl_secs` already computes and documents: long
+    // enough to outlive every access token that existed when it was written,
+    // short enough that the key does not accumulate forever. `SET … EX` is
+    // idempotent, so a retry after a Postgres failure costs one rewrite.
+    let ttl = sp_redis::revocation_watermark_ttl_secs(state.jwt.access_ttl_secs);
+    for jti in &live.revocable_jtis {
+        sp_redis::blacklist_jti(&state.redis_pool, jti, ttl)
+            .await
+            .map_err(api_error_response)?;
+    }
+
     let outcome = repo
         .revoke_one_session(
             &RevocationRecord {
@@ -599,17 +630,6 @@ async fn revoke_one_session(
         )
         .await
         .map_err(api_error_response)?;
-
-    // The blacklist TTL is the one `revocation_watermark_ttl_secs` already
-    // computes and documents: long enough to outlive every access token that
-    // existed when it was written, short enough that the key does not
-    // accumulate forever.
-    let ttl = sp_redis::revocation_watermark_ttl_secs(state.jwt.access_ttl_secs);
-    for jti in &live.revocable_jtis {
-        sp_redis::blacklist_jti(&state.redis_pool, jti, ttl)
-            .await
-            .map_err(api_error_response)?;
-    }
 
     // NOT `auth_cache.remove(&target.user_id)`. That cache is keyed by USER and
     // evicting it would degrade every session that user holds, which is the

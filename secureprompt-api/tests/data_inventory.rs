@@ -346,6 +346,91 @@ fn artifact<'a>(body: &'a Value, class: &str) -> &'a Value {
         })
 }
 
+/// The verdict the provider-key probe MUST report for the key this process is
+/// actually configured with, derived WITHOUT calling the production probe.
+///
+/// Deliberately a hand-rolled hex decode rather than `hex::decode` +
+/// `ProviderKeyConfig`: if the expectation were computed by the same code that
+/// produces the response, agreement would prove nothing. The two rules are the
+/// ones the module documents — the key must be 64 hex characters, and it must
+/// not be the all-zero fallback `from_env_or_zero` substitutes when
+/// `SECUREPROMPT_PROVIDER_KEY` is unset.
+fn expected_provider_key_verdict() -> (&'static str, String) {
+    let configured = std::env::var("SECUREPROMPT_PROVIDER_KEY").unwrap_or_else(|_| "0".repeat(64));
+    let trimmed = configured.trim();
+    let mut bytes: Vec<u8> = Vec::new();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() % 2 == 0 {
+        for pair in chars.chunks(2) {
+            let hi = pair[0].to_digit(16);
+            let lo = pair[1].to_digit(16);
+            match (hi, lo) {
+                (Some(hi), Some(lo)) => bytes.push((hi * 16 + lo) as u8),
+                _ => {
+                    bytes.clear();
+                    break;
+                }
+            }
+        }
+    }
+    if bytes.len() == 32 && bytes.iter().any(|b| *b != 0) {
+        (
+            "ok",
+            format!(
+                "SECUREPROMPT_PROVIDER_KEY is {} hex characters of non-zero key \
+                 material, so the probe must round-trip and say `ok`",
+                trimmed.len()
+            ),
+        )
+    } else {
+        (
+            "failed",
+            format!(
+                "SECUREPROMPT_PROVIDER_KEY is {} character(s) and decodes to {} \
+                 usable non-zero key byte(s); the module documents both the \
+                 malformed case and the all-zero fallback as FAILURES, not \
+                 warnings",
+                trimmed.len(),
+                bytes.iter().filter(|b| **b != 0).count()
+            ),
+        )
+    }
+}
+
+/// The response's `provider_key_self_test` must AGREE with the key the process
+/// holds.
+///
+/// This replaces `assert!(…provider_key_self_test.is_string())`, which was the
+/// shape it was auditing: `provider_key_self_test` is a required
+/// `&'static str` field, so serde emits a string in every reachable state and
+/// the assertion could not fail. Run once with the real key and once with
+/// `SECUREPROMPT_PROVIDER_KEY` forced to 64 zeros, it was identically green —
+/// the test named for the provider-key probe could not detect the single
+/// defect the probe exists to detect.
+///
+/// Comparing against an independently derived expectation is what makes it a
+/// measurement: a probe replaced by a constant `"ok"` reddens the moment the
+/// configured key is absent, malformed or all-zero, and a probe replaced by a
+/// constant `"failed"` reddens on any well-formed key.
+fn assert_provider_key_probe_is_a_measurement(body: &Value) {
+    let (expected, why) = expected_provider_key_verdict();
+    assert_eq!(
+        body["encryption_basis"]["provider_key_self_test"],
+        Value::String(expected.to_owned()),
+        "the provider-key probe does not agree with the key this process is \
+         configured with, so the basis `providers` names is a label and not a \
+         measurement. {why}. Response: {body}"
+    );
+    let detail = body["encryption_basis"]["provider_key_self_test_detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the probe reports no detail at all: {body}"));
+    assert!(
+        detail.len() > 40,
+        "a `{expected}` verdict with no explanation is not actionable: \
+         {detail:?}"
+    );
+}
+
 /// Every class name the response declares, across BOTH lists. An artifact is
 /// "covered" if it appears in either — enumerable with a count, or declared
 /// un-enumerable with a reason.
@@ -751,11 +836,7 @@ async fn encryption_claims_name_their_basis_and_prove_the_kms_works_now(pool: Pg
         "`providers` must rest on the provider-key probe and NOT on the KMS \
          probe: {provider_basis:?}"
     );
-    assert!(
-        body["encryption_basis"]["provider_key_self_test"].is_string(),
-        "the provider key was never probed, so the basis it names is a label \
-         and not a measurement: {body}"
-    );
+    assert_provider_key_probe_is_a_measurement(&body);
 
     // Positive controls. The loop above passes vacuously over an empty set,
     // and it passed for months of nothing if the only class it ever saw was
@@ -920,9 +1001,16 @@ async fn encryption_verdicts_are_computed_or_named_as_exceptions(pool: PgPool) {
         for entry in body[key].as_array().expect("array") {
             let class = entry["class"].as_str().unwrap_or_default().to_owned();
             let verdict = entry["encryption"]["at_rest"].as_str().unwrap_or_default();
-            // Only PROTECTIVE claims. `plaintext_by_design` and `empty` claim
-            // nothing and need no verification to be honest.
-            if !matches!(verdict, "ciphertext" | "hashed" | "mixed") {
+            // Every verdict that CLAIMS something about the stored bytes.
+            //
+            // This said "`plaintext_by_design` and `empty` claim nothing", and
+            // that was false for `empty`: "nothing was stored" is a claim, and
+            // it is the strongest one in the vocabulary for a class holding
+            // un-redacted content. It was declared without a count on the
+            // ClickHouse-outage path and this skip is what let it through.
+            // `plaintext_by_design` really does claim nothing beyond "stored
+            // as written"; `unknown` claims nothing at all, by construction.
+            if !matches!(verdict, "ciphertext" | "hashed" | "mixed" | "empty") {
                 continue;
             }
             let verification = &entry["encryption"]["verification"];
@@ -1053,11 +1141,7 @@ async fn the_provider_credential_key_is_probed_separately_from_the_kms(pool: PgP
     );
 
     // The substitute claim must be substantiated, not merely renamed.
-    assert!(
-        body["encryption_basis"]["provider_key_self_test"].is_string(),
-        "the response does not report whether the provider credential key \
-         itself works: {body}"
-    );
+    assert_provider_key_probe_is_a_measurement(&body);
     let note = providers["encryption"]["note"].as_str().unwrap_or_default();
     for needle in ["SECUREPROMPT_PROVIDER_KEY", "zero"] {
         assert!(
@@ -1920,6 +2004,110 @@ async fn an_unreachable_store_does_not_echo_the_stores_own_message(pool: PgPool)
         Value::Null,
         "an uncountable class must report null, never a fabricated zero: {failed}"
     );
+}
+
+/// A store that did not answer must not be attested as a store that holds
+/// nothing.
+///
+/// `request_content_captures` is described in this very response as "the only
+/// store in the product that holds un-redacted request content". When
+/// `ClickHouse` was unreachable its `encryption.at_rest` was rendered `empty`,
+/// and the response's own `at_rest` caveat defines `empty` as "nothing was
+/// stored so nothing was verified". So a ClickHouse outage published the
+/// machine-readable verdict "there is no un-redacted content here" over the one
+/// class where that claim matters most, on a request that inspected nothing.
+///
+/// The sibling field already got this right — `row_count` goes `null` with
+/// `row_count_status: unavailable`, and caveat 3 promises "A count of zero
+/// means the query ran and found nothing … The two are never conflated". This
+/// test holds `at_rest` to the same promise.
+///
+/// PREMISE: the outage branch must actually have run — asserted through
+/// `row_count_status`, which is the field that says the count did not happen.
+/// POSITIVE CONTROL: on a HEALTHY store with no capture rows the same class
+/// must still say `empty`, so this is the outage arm being corrected and not
+/// the word being deleted from the vocabulary.
+#[sqlx::test]
+async fn an_unreachable_store_does_not_attest_that_nothing_was_stored(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+    let token = make_jwt(ws, user, "admin");
+
+    // ---- POSITIVE CONTROL: healthy store, genuinely nothing captured ------
+    let healthy = build_app(pool.clone());
+    let (status, healthy_body) = get_inventory(&healthy, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "data-inventory failed: {healthy_body}"
+    );
+    let counted = artifact(&healthy_body, "request_content_captures");
+    assert_eq!(
+        counted["row_count_status"],
+        Value::String("counted".into()),
+        "premise: the capture table must be countable on the healthy app, or \
+         the control below is measuring a broken harness: {counted}"
+    );
+    assert_eq!(
+        counted["encryption"]["at_rest"],
+        Value::String("empty".into()),
+        "positive control: a store that WAS inspected and held nothing must \
+         still report `empty`. If this fails, the outage arm was fixed by \
+         deleting the honest verdict rather than by separating it: {counted}"
+    );
+
+    // ---- The outage: nothing was inspected --------------------------------
+    let broken = build_app_with_ch_db(pool, "sp_no_such_database");
+    let (broken_status, broken_body) = get_inventory(&broken, &token).await;
+    assert_eq!(
+        broken_status,
+        StatusCode::OK,
+        "an unreachable analytics store must still yield an inventory with \
+         stated gaps, not a 500: {broken_body}"
+    );
+
+    let capture = artifact(&broken_body, "request_content_captures");
+    // PREMISE: the outage branch executed on THIS response.
+    assert_eq!(
+        capture["row_count_status"],
+        Value::String("unavailable".into()),
+        "premise failed: the capture count succeeded against a database that \
+         does not exist, so the branch under test never ran: {broken_body}"
+    );
+
+    let verdict = capture["encryption"]["at_rest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("at_rest is not a string: {capture}"));
+    assert_ne!(
+        verdict, "empty",
+        "the store did not answer, and the response attests `at_rest: empty` \
+         over the only class holding un-redacted request content. The same \
+         response defines `empty` as `nothing was stored so nothing was \
+         verified`, which is a claim this request has no evidence for: nothing \
+         was counted, so whether anything is stored is UNKNOWN. Report the \
+         not-inspected case as its own verdict: {capture}"
+    );
+
+    // The verdict must be a word the response itself teaches the reader, not a
+    // new token an auditor has to guess at.
+    let at_rest_caveat = body_caveat_mentioning(&broken_body, "at_rest");
+    assert!(
+        at_rest_caveat.contains(verdict),
+        "`at_rest: {verdict}` is not defined in the response's own `at_rest` \
+         caveat, so a reader has no way to tell it apart from `empty`: \
+         {at_rest_caveat}"
+    );
+}
+
+/// The one caveat that mentions `needle`, or a panic naming what was searched.
+fn body_caveat_mentioning(body: &Value, needle: &str) -> String {
+    body["caveats"]
+        .as_array()
+        .expect("caveats array")
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|c| c.contains(needle))
+        .unwrap_or_else(|| panic!("no caveat explains `{needle}`: {body}"))
+        .to_owned()
 }
 
 /// The analytics counts cover GATEWAY traffic only, and the inventory must say
