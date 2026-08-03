@@ -138,6 +138,95 @@ async fn seed_canary(workspace_id: Uuid, canary: &str) {
     );
 }
 
+/// POST a statement to the test `ClickHouse`, failing loudly with the server's
+/// own error text. Same "never skip" stance as `seed_canary`: an unreachable or
+/// erroring datastore must fail the run, not silently weaken it.
+async fn clickhouse_exec(sql: String, what: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(clickhouse_url())
+        .body(sql)
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "ClickHouse unreachable at {} while {what}: {e}",
+                clickhouse_url()
+            )
+        });
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "ClickHouse {what} failed ({status}): {body}"
+    );
+    body
+}
+
+/// `SELECT count()` over one table, used for premise assertions.
+async fn clickhouse_count(table: &str, predicate: &str) -> u64 {
+    let body = clickhouse_exec(
+        format!(
+            "SELECT count() FROM {db}.{table} WHERE {predicate}",
+            db = clickhouse_db()
+        ),
+        "counting rows",
+    )
+    .await;
+    body.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("count() did not return a number ({body:?}): {e}"))
+}
+
+/// Create `mart_cost_by_model` with its production shape.
+///
+/// Columns and types are transcribed from the two authorities that must agree:
+/// `secureprompt-analytics/models/marts/mart_cost_by_model.sql` (grain and
+/// column list) and `analytics::dashboard_reader::CostByModelRow` (the Rust
+/// types the reader deserializes into — `u64` → `UInt64`, `f64` → `Float64`,
+/// `NaiveDate` → `Date`). Engine, `ORDER BY`, and `PARTITION BY` are copied
+/// from the dbt model's `config()` block.
+async fn create_mart_cost_by_model() {
+    clickhouse_exec(
+        format!(
+            "CREATE TABLE IF NOT EXISTS {db}.mart_cost_by_model \
+             (workspace_id UUID, \
+              model String, \
+              usage_date Date, \
+              daily_cost_usd Float64, \
+              daily_request_count UInt64, \
+              rolling_7d_cost_usd Float64, \
+              rolling_30d_cost_usd Float64) \
+             ENGINE = MergeTree \
+             PARTITION BY toYYYYMM(usage_date) \
+             ORDER BY (workspace_id, model, usage_date)",
+            db = clickhouse_db()
+        ),
+        "creating mart_cost_by_model",
+    )
+    .await;
+}
+
+/// Seed one `mart_cost_by_model` row dated today.
+///
+/// The rolling-window figures are passed in deliberately: the raw fallback
+/// cannot compute them and sets both equal to the daily cost, so a caller that
+/// seeds `rolling != daily` can tell from the response body alone which code
+/// path answered.
+async fn seed_mart_row(ws: Uuid, model: &str, daily: f64, rolling_7d: f64, rolling_30d: f64) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.mart_cost_by_model \
+             (workspace_id, model, usage_date, daily_cost_usd, daily_request_count, \
+              rolling_7d_cost_usd, rolling_30d_cost_usd) \
+             VALUES ('{ws}', '{model}', today(), {daily}, 3, {rolling_7d}, {rolling_30d})",
+            db = clickhouse_db()
+        ),
+        "seeding mart_cost_by_model",
+    )
+    .await;
+}
+
 async fn send_raw(
     router: &Router,
     method: &str,
@@ -288,6 +377,34 @@ fn matrix_cases() -> Vec<Case> {
     cases.push(Case {
         method: "GET",
         path_template: "/v1/requests",
+        body_fn: None,
+        expect: Expect::NoCanary,
+    });
+    // WS3-5. Takes no workspace parameter at all — the workspace comes from
+    // the JWT — so `NoCanary` is the only shape that applies. What this case
+    // actually pins is that the endpoint ANSWERS 2xx for an authenticated
+    // admin: a 403 or 500 lands as `Inconclusive`, which fails the run.
+    //
+    // It cannot pin tenancy: the canary is a model NAME and this endpoint
+    // returns counts, so an unfiltered count query would still show no
+    // canary. `data_inventory_is_workspace_scoped` below carries that half,
+    // exactly as `mart_cost_by_model_is_workspace_scoped` does for the mart.
+    cases.push(Case {
+        method: "GET",
+        path_template: "/v1/data-inventory",
+        body_fn: None,
+        expect: Expect::NoCanary,
+    });
+    // WS3-6. Same shape as data-inventory: no workspace parameter at all, so
+    // `NoCanary` is the only form that applies and what it pins is that an
+    // authenticated admin gets a 2xx (a 403 or 500 lands as `Inconclusive`,
+    // which fails the run). It cannot pin tenancy — the canary is a model NAME
+    // in `request_events` and this endpoint reads `detection_class_counts`,
+    // where the matrix seeds nothing. `leak_report_is_workspace_scoped` below
+    // carries that half.
+    cases.push(Case {
+        method: "GET",
+        path_template: Box::leak(format!("/v1/leak-report?{range}").into_boxed_str()),
         body_fn: None,
         expect: Expect::NoCanary,
     });
@@ -442,5 +559,352 @@ async fn cross_tenant_matrix(pool: PgPool) -> sqlx::Result<()> {
         inconclusive.join("\n")
     );
 
+    Ok(())
+}
+
+/// WS1-2 follow-up — tenancy on the MART ITSELF, not on the raw fallback.
+///
+/// `cross_tenant_matrix` above can only ever exercise the raw `request_events`
+/// fallback: no `mart_cost_by_model` table exists in the test `ClickHouse`, so
+/// `query_cost_by_model` always fails into `is_stale_mart_err` and answers from
+/// `request_events`. The `WHERE workspace_id = ?` that the WS1-2 fix added to
+/// the *mart* query was therefore covered by nothing at all and could have been
+/// deleted without reddening a single test.
+///
+/// This test creates the mart with its production shape, seeds one row for each
+/// of two workspaces, and asserts workspace A never sees workspace B's row —
+/// while proving the answer actually came from the mart.
+///
+/// Three separate defences against a vacuous pass, because a tenancy test that
+/// "passes" on an error, an empty table, or a silent fallback proves nothing:
+///
+/// 1. **Premise** — B's mart row is confirmed present by a direct `count()`
+///    before the request is issued, so "B is absent from the response" cannot
+///    be true merely because B was never seeded.
+/// 2. **Positive control** — A's own row, differing from B's only in
+///    `workspace_id`, MUST come back. The same assertion set on an empty
+///    response would otherwise pass.
+/// 3. **Path proof** — the raw fallback aggregates `request_events` (asserted
+///    to contain neither canary) and sets `rolling_7d = rolling_30d = daily`.
+///    Reading back three DIFFERENT figures is only possible from the mart.
+///
+/// Falsifier (verified, see the WS1 report): delete `workspace_id = ? AND` from
+/// the `mart_cost_by_model` query in `analytics/dashboard_reader.rs` together
+/// with its matching `.bind(ws)` — i.e. revert the WS1-2 fix — and this test
+/// fails with workspace B's canary model present in workspace A's response.
+#[sqlx::test]
+async fn mart_cost_by_model_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    // Fresh UUIDs rather than the fixed `WS_A_UUID`/`WS_B_UUID`: the mart table
+    // is created once and shared by every run against this ClickHouse, and
+    // seeding rows under the matrix's own workspaces would divert
+    // `cross_tenant_matrix`'s cost-by-model case off the fallback it covers.
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    create_mart_cost_by_model().await;
+
+    // Run-unique model names, same reasoning as `seed_canary`: a sighting can
+    // never be a leftover row from an earlier run.
+    let run = Uuid::new_v4().simple().to_string();
+    let model_a = format!("mart-own-{run}");
+    let model_b = format!("mart-other-{run}");
+
+    // daily / 7d / 30d deliberately all different — see "Path proof" above.
+    // Every figure is exactly representable in binary floating point so the
+    // JSON round-trip compares exactly.
+    seed_mart_row(ws_a.workspace_id, &model_a, 1.25, 77.5, 333.75).await;
+    seed_mart_row(ws_b.workspace_id, &model_b, 9.5, 88.25, 444.5).await;
+
+    // ---- Premise assertions, before anything is asserted to be absent ------
+    assert_eq!(
+        clickhouse_count("mart_cost_by_model", &format!("model = '{model_b}'")).await,
+        1,
+        "premise failed: workspace B has no mart row, so 'A cannot see B' \
+         would pass vacuously"
+    );
+    assert_eq!(
+        clickhouse_count("mart_cost_by_model", &format!("model = '{model_a}'")).await,
+        1,
+        "premise failed: workspace A has no mart row, so the positive control \
+         could not distinguish the mart from the fallback"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("model IN ('{model_a}', '{model_b}')")
+        )
+        .await,
+        0,
+        "premise failed: a canary model exists in request_events, so the raw \
+         fallback could also have produced it and the path proof is void"
+    );
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (_state, router) = build_app(pool);
+
+    let path = format!("/v1/analytics/cost-by-model?{}", date_range());
+    let (status, body) = send_raw(&router, "GET", &path, None, &token_a).await;
+    assert_eq!(status, StatusCode::OK, "cost-by-model failed: {body}");
+
+    let rows = body
+        .as_array()
+        .unwrap_or_else(|| panic!("cost-by-model must return a JSON array, got {body}"));
+
+    // ---- Positive control: the permitted row DOES come back ----------------
+    let own = rows
+        .iter()
+        .find(|row| row["model"] == json!(model_a))
+        .unwrap_or_else(|| {
+            panic!(
+                "positive control failed: workspace A's own mart row \
+                 '{model_a}' is missing, so the absence of B's row proves \
+                 nothing. Response: {body}"
+            )
+        });
+
+    // ---- Path proof: this answer came from the mart, not the fallback ------
+    assert_eq!(
+        own["daily_cost_usd"],
+        json!(1.25),
+        "unexpected daily cost in {own}"
+    );
+    assert_eq!(
+        own["rolling_7d_cost_usd"],
+        json!(77.5),
+        "rolling_7d does not match the seeded mart value — the raw fallback \
+         answered (it sets rolling_7d = daily), so the mart's own tenancy \
+         filter is still untested: {own}"
+    );
+    assert_eq!(
+        own["rolling_30d_cost_usd"],
+        json!(333.75),
+        "rolling_30d does not match the seeded mart value — see above: {own}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    assert!(
+        !body.to_string().contains(&model_b),
+        "workspace B's mart row '{model_b}' leaked into workspace A's \
+         cost-by-model response: {body}"
+    );
+
+    Ok(())
+}
+
+/// WS3-5 — tenancy on `GET /v1/data-inventory`.
+///
+/// The matrix case above can only prove this endpoint answers 2xx. It returns
+/// COUNTS, so the canary-substring check that catches every other leak here is
+/// structurally blind to it: an unfiltered `SELECT count()` returns a number
+/// containing no canary and the matrix stays green while the endpoint reports
+/// the whole cluster's row counts to one tenant. That is the same shape as the
+/// `cost-by-model` leak this branch already shipped — a guard that fired only
+/// on a supplied parameter over a query that never filtered — so it gets its
+/// own test rather than a matrix row.
+///
+/// Three defences against a vacuous pass:
+///
+/// 1. **Premise** — both workspaces' row counts are confirmed by direct
+///    `count()` queries against ClickHouse before the request, so "A sees 4"
+///    cannot be true merely because B was never seeded.
+/// 2. **Positive control** — A's own count MUST come back, and it is non-zero
+///    and distinct. An empty or errored response fails here rather than
+///    passing the tenancy assertion by returning nothing.
+/// 3. **Distinguishable totals** — A and B are seeded DIFFERENT, non-zero
+///    counts, so `own == 4` and `own == 4 + 9` are different assertions. A
+///    count query missing its tenancy predicate reports 13.
+///
+/// Falsifier (verified, see the WS3-5 report): replace
+/// `WHERE workspace_id = toUUID('{ws}')` with `WHERE 1 = 1` in
+/// `data_inventory::ch_count` — this test fails with `13 != 4`.
+#[sqlx::test]
+async fn data_inventory_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    // Fresh UUIDs: `request_events` is shared across every run against this
+    // ClickHouse, and seeding under the matrix's fixed workspaces would change
+    // what `cross_tenant_matrix` sees.
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    for _ in 0..4 {
+        seed_canary(ws_a.workspace_id, &format!("inv-own-{run}")).await;
+    }
+    for _ in 0..9 {
+        seed_canary(ws_b.workspace_id, &format!("inv-other-{run}")).await;
+    }
+
+    // ---- Premise assertions, before anything is asserted to be absent ------
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("workspace_id = toUUID('{}')", ws_a.workspace_id)
+        )
+        .await,
+        4,
+        "premise failed: workspace A has no request_events rows, so the \
+         positive control below could not distinguish a live count from a zero"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "request_events",
+            &format!("workspace_id = toUUID('{}')", ws_b.workspace_id)
+        )
+        .await,
+        9,
+        "premise failed: no OTHER tenant's rows exist, so an unfiltered count \
+         would return the same number as a correct one and this test could not \
+         tell them apart"
+    );
+
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (_state, router) = build_app(pool);
+
+    let (status, body) = send_raw(&router, "GET", "/v1/data-inventory", None, &token_a).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let events = body["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`artifacts` must be an array: {body}"))
+        .iter()
+        .find(|entry| entry["class"] == json!("request_events"))
+        .unwrap_or_else(|| panic!("no `request_events` class in the inventory: {body}"));
+
+    // ---- Positive control: the permitted count DOES come back --------------
+    assert_eq!(
+        events["row_count_status"],
+        json!("counted"),
+        "the count did not run, so the tenancy assertion below would pass on \
+         a null: {events}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    assert_eq!(
+        events["row_count"],
+        json!(4),
+        "workspace A must see only its own 4 rows. Seeing 13 means the count \
+         query is missing its tenancy predicate and every tenant's row counts \
+         are being reported to A: {events}"
+    );
+
+    Ok(())
+}
+
+/// Seed one `detection_class_counts` row for `workspace_id`.
+///
+/// Written directly rather than by driving a request through the pipeline:
+/// this file's job is the tenancy predicate, and `tests/leak_report.rs`
+/// already covers the write path end-to-end.
+async fn seed_detection_count(workspace_id: Uuid, model: &str, class: &str, count: u32) {
+    clickhouse_exec(
+        format!(
+            "INSERT INTO {db}.detection_class_counts \
+             (request_id, workspace_id, created_at, model, user_id, api_key_name, \
+              entity_class, entity_count) \
+             VALUES ('{rid}', '{ws}', now(), '{model}', NULL, NULL, '{class}', {count})",
+            db = clickhouse_db(),
+            rid = Uuid::new_v4(),
+            ws = workspace_id,
+        ),
+        "seeding detection_class_counts",
+    )
+    .await;
+}
+
+/// WS3-6 — `GET /v1/leak-report` takes no workspace parameter, so the matrix
+/// above can only prove it answers. This proves it answers with the CALLER'S
+/// data and nobody else's.
+///
+/// The three defences, matching `data_inventory_is_workspace_scoped`:
+///
+/// 1. **Premise** — both workspaces' rows are confirmed by direct `count()`
+///    against ClickHouse first, so "A sees 4" cannot be true merely because B
+///    was never seeded.
+/// 2. **Positive control** — A's own total MUST come back non-zero, and B's
+///    canary model MUST appear in B's OWN report. An empty or errored response
+///    fails there rather than passing the tenancy assertion by returning
+///    nothing.
+/// 3. **Distinguishable totals** — A and B are seeded DIFFERENT, non-zero
+///    counts (4 and 9), so `4` and `13` are different assertions. A query
+///    missing its tenancy predicate reports 13.
+///
+/// Falsifier (VERIFIED, and not where it was first assumed): replace
+/// `workspace_id = ?` with `workspace_id = workspace_id` in
+/// `leak_report::SCOPE`. This test then fails at the POSITIVE CONTROL, not at
+/// the tenancy assertion — B's total comes back as every workspace's rows in a
+/// shared, never-reset ClickHouse, which is far more than 9. The tenancy
+/// assertion is never reached. That is still a correct falsification, and it
+/// is written down rather than guessed because the obvious prediction
+/// (`13 != 4`) is wrong: it would only hold against a database containing
+/// exactly these two tenants.
+#[sqlx::test]
+async fn leak_report_is_workspace_scoped(pool: PgPool) -> sqlx::Result<()> {
+    let ws_a = fixtures::seed_unique_workspace(&pool).await?;
+    let ws_b = fixtures::seed_unique_workspace(&pool).await?;
+
+    let run = Uuid::new_v4().simple().to_string();
+    let model_a = format!("leak-own-{run}");
+    let model_b = format!("leak-other-{run}");
+    seed_detection_count(ws_a.workspace_id, &model_a, "PERSON", 4).await;
+    seed_detection_count(ws_b.workspace_id, &model_b, "PINFL", 9).await;
+
+    // ---- Premise: both tenants really have rows ---------------------------
+    assert_eq!(
+        clickhouse_count(
+            "detection_class_counts",
+            &format!("workspace_id = toUUID('{}')", ws_a.workspace_id)
+        )
+        .await,
+        1,
+        "premise failed: workspace A has no counts row, so the positive \
+         control below could not distinguish a live query from an empty table"
+    );
+    assert_eq!(
+        clickhouse_count(
+            "detection_class_counts",
+            &format!("workspace_id = toUUID('{}')", ws_b.workspace_id)
+        )
+        .await,
+        1,
+        "premise failed: no OTHER tenant's rows exist, so an unfiltered query \
+         would return the same numbers as a correct one"
+    );
+
+    let (_state, router) = build_app(pool);
+    let path = format!("/v1/leak-report?{}", date_range());
+
+    // ---- Positive control: B's canary is visible in B's OWN report ---------
+    let token_b = fixtures::mint_jwt(TEST_JWT_SECRET, ws_b.workspace_id, ws_b.admin_id, "admin");
+    let (status_b, body_b) = send_raw(&router, "GET", &path, None, &token_b).await;
+    assert_eq!(
+        status_b,
+        StatusCode::OK,
+        "leak-report failed for B: {body_b}"
+    );
+    assert_eq!(
+        body_b["totals"]["entities_detected"],
+        json!(9),
+        "positive control: B must see its own 9, or the absence of 9 from A's \
+         report proves nothing: {body_b}"
+    );
+
+    // ---- The tenancy assertion --------------------------------------------
+    let token_a = fixtures::mint_jwt(TEST_JWT_SECRET, ws_a.workspace_id, ws_a.admin_id, "admin");
+    let (status_a, body_a) = send_raw(&router, "GET", &path, None, &token_a).await;
+    assert_eq!(
+        status_a,
+        StatusCode::OK,
+        "leak-report failed for A: {body_a}"
+    );
+    assert_eq!(
+        body_a["totals"]["entities_detected"],
+        json!(4),
+        "workspace A must see only its own 4 entities. Seeing 13 means the \
+         query is missing its tenancy predicate and every tenant's detection \
+         counts are being reported to A: {body_a}"
+    );
+    assert!(
+        !body_a.to_string().contains(&model_b),
+        "another tenant's destination model reached A's leak report: {body_a}"
+    );
     Ok(())
 }

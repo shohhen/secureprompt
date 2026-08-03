@@ -162,9 +162,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 6 / Plan 06-01 — API key rotation cleanup cron (D-17, AUTH-08).
     // Runs daily at 03:00 to move expired-grace-window rotating keys to 'revoked'.
-    let pg_pool_cleanup = sqlx::PgPool::connect(&config.database.url)
+    let pg_pool = sqlx::PgPool::connect(&config.database.url)
         .await
         .context("Worker: failed to connect to Postgres for rotation cleanup")?;
+    let pg_pool_cleanup = pg_pool.clone();
 
     let metrics_rotation = metrics.clone();
     sched.add(
@@ -193,6 +194,38 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .context("Failed to schedule rotation cleanup job")?;
+
+    // WS3-4 — retention.purge, daily at 04:00.
+    //
+    // A CRON, not just the queue handler below, and that is the load-bearing
+    // part: `QUEUE_RETENTION` is declared in
+    // `secureprompt-common/src/tasks.rs` but NOTHING in the repository ever
+    // enqueues to it. Wiring the handler alone would have left the job as
+    // unreachable as the stub it replaced — correct code that never runs.
+    let pg_pool_purge = pg_pool.clone();
+    let ch_purge = ch_client.clone();
+    let metrics_purge = metrics.clone();
+    sched
+        .add(
+            Job::new_async("0 0 4 * * *", move |_uuid, _l| {
+                let pg = pg_pool_purge.clone();
+                let ch = ch_purge.clone();
+                let metrics = metrics_purge.clone();
+                Box::pin(async move {
+                    let started = Instant::now();
+                    let outcome = tasks::retention_purge::run(&pg, &ch).await;
+                    tracing::info!(
+                        run_id = %outcome.run_id,
+                        rows_deleted = outcome.total_deleted(),
+                        "retention purge complete"
+                    );
+                    metrics.record_job("retention_purge", started.elapsed(), outcome.all_ok());
+                })
+            })
+            .context("Failed to create retention purge job")?,
+        )
+        .await
+        .context("Failed to schedule retention purge job")?;
 
     sched.start().await?;
 
@@ -225,6 +258,8 @@ async fn main() -> anyhow::Result<()> {
     let ml_sidecar_token = config.license.internal_token.clone();
 
     let metrics_drain = metrics.clone();
+    let pg_pool_drain = pg_pool.clone();
+    let ch_drain = ch_client.clone();
     tokio::spawn(async move {
         run_queue_drain(
             redis_pool_drain,
@@ -233,13 +268,15 @@ async fn main() -> anyhow::Result<()> {
             ml_sidecar_url,
             ml_sidecar_token,
             metrics_drain,
+            pg_pool_drain,
+            ch_drain,
         )
         .await;
     });
 
     tracing::info!("Task queue drain loop started");
 
-    tracing::info!("secureprompt-worker running; OPTIMIZE FINAL at 02:00 + rotation cleanup at 03:00 daily");
+    tracing::info!("secureprompt-worker running; OPTIMIZE FINAL at 02:00, rotation cleanup at 03:00, retention purge at 04:00 daily");
     tokio::signal::ctrl_c().await?;
     tracing::info!("secureprompt-worker shutting down");
 
@@ -256,6 +293,8 @@ async fn run_queue_drain(
     ml_sidecar_url: String,
     ml_sidecar_token: String,
     metrics: Arc<WorkerMetrics>,
+    pg: sqlx::PgPool,
+    ch: clickhouse::Client,
 ) {
     loop {
         let mut conn = match redis_pool.get().await {
@@ -287,6 +326,8 @@ async fn run_queue_drain(
                         &ml_sidecar_url,
                         &ml_sidecar_token,
                         &metrics,
+                        &pg,
+                        &ch,
                     )
                     .await;
                 }
@@ -312,6 +353,8 @@ async fn dispatch_task(
     ml_sidecar_url: &str,
     ml_sidecar_token: &str,
     metrics: &WorkerMetrics,
+    pg: &sqlx::PgPool,
+    ch: &clickhouse::Client,
 ) {
     use secureprompt_common::tasks::task_types;
 
@@ -332,8 +375,17 @@ async fn dispatch_task(
             metrics.record_task(task_types::AUDIT_EXPORT, "stub");
         }
         task_types::RETENTION_PURGE => {
-            tracing::debug!("retention.purge — no-op stub (Phase 7 implementation)");
-            metrics.record_task(task_types::RETENTION_PURGE, "stub");
+            let outcome = tasks::retention_purge::run(pg, ch).await;
+            let ok = outcome.all_ok();
+            tracing::info!(
+                run_id = %outcome.run_id,
+                rows_deleted = outcome.total_deleted(),
+                "retention.purge complete"
+            );
+            metrics.record_task(
+                task_types::RETENTION_PURGE,
+                if ok { "ok" } else { "error" },
+            );
         }
         task_types::API_KEY_ROTATION_CLEANUP => {
             tracing::debug!("api_key.rotation_cleanup — handled by cron in Plan 06-01");

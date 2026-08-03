@@ -14,9 +14,10 @@ use crate::{
     },
     pipeline::service::{
         ChatStreamItem, GatewayRequest, PipelineExecution, PipelineService, RequestKind,
-        StreamExecution, SIDECAR_DEGRADED_HEADER,
+        StreamExecution, DETECTION_ENGINES_HEADER, SIDECAR_DEGRADED_HEADER,
     },
 };
+use crate::analytics::engines::DetectionEngines;
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -161,9 +162,16 @@ pub async fn chat_completions(
             Ok(StreamExecution {
                 items,
                 degraded_reason,
-            }) => with_sidecar_degraded(
-                with_budget_warning(stream_chat_response_live(items, request.model), budget_gate),
-                degraded_reason,
+                engines,
+            }) => with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(
+                        stream_chat_response_live(items, request.model),
+                        budget_gate,
+                    ),
+                    degraded_reason,
+                ),
+                engines,
             ),
             Err(error) => api_error_response(error),
         };
@@ -176,9 +184,13 @@ pub async fn chat_completions(
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
                 .await;
             let degraded = execution.degraded_reason;
-            with_sidecar_degraded(
-                with_budget_warning(stream_chat_response(execution), budget_gate),
-                degraded,
+            let engines = execution.engines;
+            with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(stream_chat_response(execution), budget_gate),
+                    degraded,
+                ),
+                engines,
             )
         }
         Ok(execution) => {
@@ -200,9 +212,12 @@ pub async fn chat_completions(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_sidecar_degraded(
-                with_budget_warning(body, budget_gate),
-                execution.degraded_reason,
+            with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(body, budget_gate),
+                    execution.degraded_reason,
+                ),
+                execution.engines,
             )
         }
         Err(error) => api_error_response(error),
@@ -281,9 +296,13 @@ pub async fn completions(
             reconcile_workspace_tokens(&state, auth.workspace_id.0, &execution, estimated_input)
                 .await;
             let degraded = execution.degraded_reason;
-            with_sidecar_degraded(
-                with_budget_warning(stream_completion_response(execution), budget_gate),
-                degraded,
+            let engines = execution.engines;
+            with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(stream_completion_response(execution), budget_gate),
+                    degraded,
+                ),
+                engines,
             )
         }
         Ok(execution) => {
@@ -302,9 +321,12 @@ pub async fn completions(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_sidecar_degraded(
-                with_budget_warning(body, budget_gate),
-                execution.degraded_reason,
+            with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(body, budget_gate),
+                    execution.degraded_reason,
+                ),
+                execution.engines,
             )
         }
         Err(error) => api_error_response(error),
@@ -384,9 +406,12 @@ pub async fn embeddings(
                 "usage": usage_json(&execution),
             }))
             .into_response();
-            with_sidecar_degraded(
-                with_budget_warning(body, budget_gate),
-                execution.degraded_reason,
+            with_engines(
+                with_sidecar_degraded(
+                    with_budget_warning(body, budget_gate),
+                    execution.degraded_reason,
+                ),
+                execution.engines,
             )
         }
         Err(error) => api_error_response(error),
@@ -456,6 +481,22 @@ fn with_sidecar_degraded(
             HeaderValue::from_static(reason.as_str()),
         );
     }
+    response
+}
+
+/// WS2-4 — attach `x-secureprompt-engines: floor[,ml|,ml_partial]`.
+///
+/// Unlike `with_sidecar_degraded` this is UNCONDITIONAL: a client should be
+/// able to read the provenance of every answer, not have to infer "the model
+/// ran" from the absence of a header. `HeaderValue::from_static` is what keeps
+/// it a bounded label — `as_header_value` returns a `&'static str`, so there
+/// is no runtime string construction and no way for request data to reach the
+/// header.
+fn with_engines(mut response: Response, engines: DetectionEngines) -> Response {
+    response.headers_mut().insert(
+        DETECTION_ENGINES_HEADER,
+        HeaderValue::from_static(engines.as_header_value()),
+    );
     response
 }
 
@@ -735,6 +776,7 @@ mod response_shape_tests {
         };
         PipelineExecution {
             degraded_reason: None,
+            engines: crate::analytics::engines::DetectionEngines::FloorAndMl,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: model.to_owned(),
@@ -769,6 +811,7 @@ mod response_shape_tests {
         };
         PipelineExecution {
             degraded_reason: None,
+            engines: crate::analytics::engines::DetectionEngines::FloorAndMl,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: model.to_owned(),

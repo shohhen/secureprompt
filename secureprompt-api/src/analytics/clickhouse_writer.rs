@@ -1,5 +1,8 @@
 use crate::{
-    analytics::events::{LatencySampleRow, PolicyEventRow, RequestEvent, RequestEventRow, TokenUsageRow},
+    analytics::events::{
+        DetectionClassCountRow, LatencySampleRow, PolicyEventRow, RequestContentCaptureRow,
+        RequestEvent, RequestEventRow, TokenUsageRow,
+    },
     observability::metrics::MetricsRegistry,
 };
 use clickhouse::{Client, Row};
@@ -34,6 +37,7 @@ pub const REQUEST_EVENTS_COLUMNS: &[&str] = &[
     "raw_prompt",
     "raw_response",
     "floor_only",
+    "engines",
 ];
 
 #[derive(Row, Deserialize)]
@@ -211,6 +215,33 @@ impl AnalyticsHandle {
                 .with_max_rows(BATCH_MAX_ROWS)
                 .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
 
+            // WS3-1 / WS3-2 — captured raw content, encrypted, opt-in only.
+            // A separate inserter (and a separate table) so its retention TTL
+            // is independent of `request_events`' fixed 90-day row TTL, and
+            // so purging a workspace's captured content never touches the
+            // table the cost/latency dashboards read.
+            let mut cap_inserter = ch_client
+                .inserter::<RequestContentCaptureRow>("request_content_captures")
+                .with_timeouts(
+                    Some(Duration::from_secs(INSERT_TIMEOUT_SECS)),
+                    Some(Duration::from_secs(INSERT_SEND_TIMEOUT_SECS)),
+                )
+                .with_max_rows(BATCH_MAX_ROWS)
+                .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
+
+            // WS3-6 — per-class detection counts, the leak report's source.
+            // A separate inserter because it is the only table with more than
+            // one row per request; a failure here must not cost the analytics
+            // row, and vice versa.
+            let mut cnt_inserter = ch_client
+                .inserter::<DetectionClassCountRow>("detection_class_counts")
+                .with_timeouts(
+                    Some(Duration::from_secs(INSERT_TIMEOUT_SECS)),
+                    Some(Duration::from_secs(INSERT_SEND_TIMEOUT_SECS)),
+                )
+                .with_max_rows(BATCH_MAX_ROWS)
+                .with_period(Some(Duration::from_secs(BATCH_PERIOD_SECS)));
+
             let mut tok_inserter = ch_client
                 .inserter::<TokenUsageRow>("token_usage")
                 .with_timeouts(
@@ -316,6 +347,38 @@ impl AnalyticsHandle {
                     }
                 }
 
+                // WS3-1 / WS3-2 — `from_event` returns `None` unless the
+                // workspace opted in, so this is a no-op on every default
+                // install and no empty row is written.
+                if let Some(cap_row) = RequestContentCaptureRow::from_event(&event, now) {
+                    if let Err(e) = cap_inserter.write(&cap_row).await {
+                        // Deliberately NOT `continue`: losing captured content
+                        // must not also lose the policy/latency/usage rows for
+                        // this request. Capture is the optional extra; the
+                        // analytics record is the load-bearing part.
+                        tracing::error!(
+                            error = %e,
+                            "request_content_captures write error; dropping the capture"
+                        );
+                        metrics_task.record_clickhouse_insert_failure();
+                    }
+                }
+
+                // WS3-6 — one row per class detected on this request. Returns
+                // an EMPTY vec when nothing was detected, so a clean request
+                // writes nothing here. Deliberately NOT `continue` on error,
+                // for the same reason as the capture row above: losing the
+                // leak-report source must not also lose the audit row.
+                for cnt_row in DetectionClassCountRow::from_event(&event, now) {
+                    if let Err(e) = cnt_inserter.write(&cnt_row).await {
+                        tracing::error!(
+                            error = %e,
+                            "detection_class_counts write error; dropping the count row"
+                        );
+                        metrics_task.record_clickhouse_insert_failure();
+                    }
+                }
+
                 for pe in &event.policy_events {
                     let pol_row = PolicyEventRow::from_policy_event(
                         pe,
@@ -380,6 +443,17 @@ impl AnalyticsHandle {
                     tracing::error!(error = %e, "latency_samples inserter commit error");
                     metrics_task.record_clickhouse_insert_failure();
                 }
+                if let Err(e) = cap_inserter.commit().await {
+                    tracing::error!(
+                        error = %e,
+                        "request_content_captures inserter commit error"
+                    );
+                    metrics_task.record_clickhouse_insert_failure();
+                }
+                if let Err(e) = cnt_inserter.commit().await {
+                    tracing::error!(error = %e, "detection_class_counts inserter commit error");
+                    metrics_task.record_clickhouse_insert_failure();
+                }
                 if let Err(e) = tok_inserter.commit().await {
                     tracing::error!(error = %e, "token_usage inserter commit error");
                     metrics_task.record_clickhouse_insert_failure();
@@ -389,6 +463,8 @@ impl AnalyticsHandle {
             let _ = req_inserter.end().await;
             let _ = pol_inserter.end().await;
             let _ = lat_inserter.end().await;
+            let _ = cap_inserter.end().await;
+            let _ = cnt_inserter.end().await;
             let _ = tok_inserter.end().await;
         });
 

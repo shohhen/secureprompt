@@ -267,3 +267,149 @@ fn idor_guard_absent_param_is_allowed() {
 
     assert!(!is_idor, "absent workspace_id param must pass IDOR check");
 }
+
+// ── WS2-4: detection provenance on the audit detail endpoint ────────────────
+
+/// Seed one `request_events` row with an explicit `engines` array and return
+/// its id. Raw SQL rather than the writer, so the READ path is what is under
+/// test and a write-path bug cannot make this pass by coincidence.
+async fn seed_request_event_with_engines(workspace_id: uuid::Uuid, engines: &str) -> uuid::Uuid {
+    use super::analytics::{clickhouse_db, clickhouse_url};
+
+    // Idempotent: the reader SELECTs `engines`, so the column has to exist
+    // before this runs. Applying the real migration file rather than restating
+    // its DDL keeps this from drifting from what the worker applies.
+    let migration: String = include_str!("../../clickhouse/migrations/009_detection_engines.sql")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let request_id = uuid::Uuid::new_v4();
+    let insert = format!(
+        "INSERT INTO {db}.request_events \
+         (request_id, workspace_id, provider, model, final_action, cost_usd, \
+          estimated_usage, created_at, engines) \
+         VALUES ('{request_id}', '{workspace_id}', 'anthropic', 'claude-3-haiku', \
+                 'allow', 0.0, false, now(), {engines})",
+        db = clickhouse_db(),
+    );
+    for sql in migration
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .chain(std::iter::once(insert.as_str()))
+    {
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "{}/?database={}",
+                clickhouse_url(),
+                clickhouse_db()
+            ))
+            .body(sql.to_owned())
+            .send()
+            .await
+            .expect("ClickHouse must be reachable — this test must not be skipped");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "clickhouse failed ({status}): {body}\nsql: {sql}"
+        );
+    }
+    request_id
+}
+
+/// WS2-4 acceptance, read side: `GET /v1/requests/:id` states which engines
+/// produced coverage, and states DIFFERENT things for rows that were scanned
+/// differently.
+///
+/// THE DISCRIMINATING PAIR is the whole test. A handler that hard-coded
+/// `["floor"]`, or that dropped the column and returned `[]`, would satisfy
+/// "the response has an `engines` field" — so two rows seeded with different
+/// arrays must come back different.
+///
+/// POSITIVE CONTROL: the `["floor","ml"]` row, which must round-trip a value
+/// the floor-only row does not have.
+///
+/// WORKSPACE SCOPING is asserted in the same test because this is a new read
+/// path over a multi-tenant table: a third row is seeded in ANOTHER workspace
+/// and must 404, and the filter that does it is in the query's WHERE clause
+/// (`requests.rs`), not only in a caller-side guard.
+#[sqlx::test]
+async fn request_detail_reports_which_engines_scanned_the_prompt(pool: sqlx::PgPool) {
+    use super::analytics::{build_app, make_jwt};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    let workspace = Uuid::new_v4();
+    let other_workspace = Uuid::new_v4();
+
+    let ml_id = seed_request_event_with_engines(workspace, "['floor','ml']").await;
+    let floor_id = seed_request_event_with_engines(workspace, "['floor']").await;
+    let partial_id = seed_request_event_with_engines(workspace, "['floor','ml_partial']").await;
+    let foreign_id = seed_request_event_with_engines(other_workspace, "['floor','ml']").await;
+
+    let token = make_jwt(workspace, "admin");
+    let (_state, app) = build_app(pool);
+
+    let fetch = |id: Uuid| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let request = Request::builder()
+                .uri(format!("/v1/requests/{id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request builds");
+            let response = app.oneshot(request).await.expect("router responds");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body reads");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+    };
+
+    let (status, ml) = fetch(ml_id).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "premise: the seeded row is readable"
+    );
+    let (_, floor) = fetch(floor_id).await;
+    let (_, partial) = fetch(partial_id).await;
+
+    assert_eq!(
+        ml["engines"],
+        serde_json::json!(["floor", "ml"]),
+        "a request the model fully scanned must say so"
+    );
+    assert_eq!(
+        floor["engines"],
+        serde_json::json!(["floor"]),
+        "a request the model never saw must not claim the model ran"
+    );
+    assert_eq!(
+        partial["engines"],
+        serde_json::json!(["floor", "ml_partial"]),
+        "partial coverage must be distinguishable from both"
+    );
+    assert_ne!(ml["engines"], floor["engines"]);
+    assert_ne!(ml["engines"], partial["engines"]);
+
+    // Workspace scoping. The premise for this absence is the three OK
+    // responses above: the endpoint demonstrably CAN return a row, so a 404
+    // here is tenancy filtering and not a broken handler.
+    let (status, _) = fetch(foreign_id).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another workspace's audit row must not be readable through this endpoint"
+    );
+}

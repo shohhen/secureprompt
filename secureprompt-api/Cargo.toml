@@ -2,6 +2,8 @@
 name = "secureprompt-api"
 version = "0.1.0"
 edition = "2021"
+# See the [[bench]] section: benches/corpus.rs is a shared module, not a target.
+autobenches = false
 
 [lib]
 name = "secureprompt_api"
@@ -50,6 +52,7 @@ gcp_auth = { workspace = true }
 totp-rs = { workspace = true }
 sp-license = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+regex = "1"
 
 [lints]
 workspace = true
@@ -57,3 +60,19 @@ workspace = true
 [dev-dependencies]
 sqlx = { workspace = true }
 rand = "0.8"
+# WS2-5 — latency budget for the deterministic floor.
+#
+# `default-features = false` drops `plotters`/`rayon`/`html_reports`, which
+# exist to render gnuplot-style report pages nobody reads in CI and which cost
+# a large chunk of the dependency build. `cargo_bench_support` is the one
+# feature that is not optional: without it `cargo bench` refuses to run the
+# harness at all.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# `benches/corpus.rs` is a MODULE shared by the bench and by
+# `tests/detection_floor_budget.rs`, not a bench target of its own. Without
+# this, cargo auto-discovers it as a second bench, tries to run it with the
+# libtest harness, and fails.
+[[bench]]
+name = "detection_floor"
+harness = false

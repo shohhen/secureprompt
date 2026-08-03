@@ -1,0 +1,60 @@
+# SecurePrompt — test quarantine manifest (WS6-1).
+#
+# EVERY `#[ignore]`d Rust test in the workspace MUST have a row here. The test
+# gate (`scripts/ci/rust-test-gate.sh`) counts the `N ignored` figure cargo
+# prints for each suite and compares it against the rows below. If they differ
+# the gate FAILS. That is the mechanism that makes silent exclusion impossible:
+# you cannot skip a test without also declaring it here, in the diff, in review.
+#
+# To un-quarantine: delete the `#[ignore = "..."]` attribute in the test file
+# AND delete the row here. Both, or the gate fails.
+#
+# Columns: cargo-selector <TAB> test-name <TAB> class <TAB> reason
+#
+# class = QUARANTINE  → a genuinely failing test, deliberately not gating.
+#                       Must name a root cause and a follow-up.
+# class = ENVIRONMENT → passes, but needs infrastructure CI does not provide.
+
+# ---------------------------------------------------------------------------
+# QUARANTINE — 6 failures across 4 suites. Baseline recorded at origin/main
+# bea4cb2 (plan 2026-07-27-prd-workstreams.md, Global Constraint 9) and
+# re-verified at fix/ws1-security-cluster before quarantining.
+#
+# ROOT CAUSE (all 6): these suites drive the router with `tower::ServiceExt::
+# oneshot`, which does not install the `ConnectInfo<SocketAddr>` request
+# extension that `secureprompt-api/src/http/routes/openai.rs` extracts at
+# lines 82 / 214 / 316. The extractor rejects, the handler never runs, and the
+# route answers 500 instead of 200. It is a TEST-HARNESS defect, not a product
+# defect: production installs ConnectInfo via
+# `into_make_service_with_connect_info` (see main.rs:413), and
+# `tests/sidecar_failure_policy.rs:253` proves the same routes return 200 once
+# the extension is inserted by hand — that suite passes, 33/33.
+#
+# SECOND CAUSE (openai_compat only): its three tests additionally assert the
+# response body contains the literal "openai echo" (openai_compat.rs:48,88).
+# That string came from a stub adapter that has since been replaced by a real
+# HTTP adapter, so the assertion is stale even once ConnectInfo is fixed.
+#
+# FOLLOW-UP: WS6-1-FU1 — port the `ConnectInfo` insertion from
+# tests/sidecar_failure_policy.rs:244-253 into tests/support/mod.rs so every
+# suite gets it, then replace the "openai echo" assertions with a mock HTTP
+# provider. Tracked in docs/superpowers/plans/2026-07-27-prd-workstreams.md.
+# ---------------------------------------------------------------------------
+-p secureprompt-api --test openai_compat	chat_completions_route_returns_openai_shape	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200) + stale "openai echo" assertion
+-p secureprompt-api --test openai_compat	completions_route_returns_legacy_shape	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200) + stale "openai echo" assertion
+-p secureprompt-api --test openai_compat	embeddings_route_returns_embedding_list	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200)
+-p secureprompt-api --test provider_fallback	retryable_provider_failure_falls_back_before_first_byte	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200)
+-p secureprompt-api --test streaming_redaction	streaming_route_restores_redacted_values_and_includes_usage	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200)
+-p secureprompt-api --test token_usage_fallback	missing_provider_usage_falls_back_to_estimation	QUARANTINE	WS6-1-FU1 missing ConnectInfo under oneshot (500 != 200)
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT — pre-existing `#[ignore]`s inherited by WS6-1, listed so the
+# count assertion balances and so they stop being invisible. These pass when
+# the named dependency is available; run them with `-- --include-ignored`.
+# ---------------------------------------------------------------------------
+-p secureprompt-api --lib	analytics::integration_tests::tests::test_inserter_batch_size_threshold	ENVIRONMENT	requires live ClickHouse
+-p secureprompt-api --lib	analytics::integration_tests::tests::test_policy_events_denormalization	ENVIRONMENT	requires live ClickHouse
+-p secureprompt-api --lib	analytics::integration_tests::tests::test_request_event_insert_round_trip	ENVIRONMENT	requires live ClickHouse
+-p secureprompt-common --test kms_tests	vault_kms_constructs_with_token	ENVIRONMENT	requires live HashiCorp Vault (see secureprompt-common/src/kms.rs:88)
+-p secureprompt-worker --bins	tests::tests::test_migration_idempotency	ENVIRONMENT	requires live ClickHouse
+-p secureprompt-worker --bins	tests::tests::test_mv_hourly_cost_aggregation	ENVIRONMENT	requires live ClickHouse

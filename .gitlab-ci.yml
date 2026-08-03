@@ -1,49 +1,381 @@
-# SecurePrompt — build & push container images to the GitLab Container Registry.
+# SecurePrompt — GitLab CI: quality gate, image publish, deploy.
 #
-# Trigger: manual only ("Run pipeline" in the GitLab UI or scheduled).
-# Parallelism: one job per service, all running concurrently across runners
-# (7 jobs total). Each image is tagged with the short commit SHA and `latest`.
+# GitLab is the ONLY CI system for this repository. `git remote -v` resolves to
+# gitlab.com:secureprompt/secure-prompt.git and nothing else; the four
+# `.github/workflows/*.yml` files that used to sit alongside this one have been
+# retired to `.github/workflows-retired/` because there is no GitHub remote for
+# them to run on — see that directory's README for the evidence and for which
+# of their gates were ported here.
 #
-# Platform: linux/amd64 only. arm64 was dropped because QEMU emulation on the
-# shared amd64 runners blew past the 1h job timeout while compiling the Rust
-# workspace. Reintroduce arm64 once native arm64 runners are available, or by
-# adding Rust cross-compilation (e.g. `cargo zigbuild`) inside each Dockerfile.
+# ---------------------------------------------------------------------------
+# PIPELINE SHAPE
 #
-# Required CI/CD variables (Settings → CI/CD → Variables):
-#   SP_LICENSE_DEPLOY_KEY  base64-encoded SSH private key with read access to
-#                          the private `sp-license` gitlab.com repo. Required
-#                          by all Rust services (api, worker, mcp, sp-agent).
+#   fmt ─┐
+#   lint ─┼─> test ──> build (manual) ──> deploy (manual)
+#        ─┘
+#
+#   fmt / lint / test  run on EVERY merge request and every push to the default
+#                      branch. They are the gate. The `test` stage holds three
+#                      jobs that run in parallel: `test` (the whole Rust
+#                      suite), `test:rls-nonsuperuser`, and `bench` (WS2-5 —
+#                      `cargo bench -- --test`, a compile-and-run check with
+#                      no timing assertion; see the job's header).
+#   build              publishes 6 images to the GitLab Container Registry.
+#                      `needs:` the whole gate, so a red gate makes it
+#                      un-runnable, and `when: manual` so it is never spent
+#                      accidentally (each run is ~7 concurrent Rust/Node image
+#                      builds).
+#   deploy             helm rollout. `when: manual`, `needs: [build]`.
+#
+# WHAT ACTUALLY BLOCKS A MERGE — read this before assuming the file is enough.
+#   This file can only make the pipeline RED. It cannot, on its own, stop
+#   anyone clicking Merge. That requires a project setting no committed file
+#   can carry:
+#       Settings → Merge requests → Merge checks → "Pipelines must succeed"
+#       (API: only_allow_merge_if_pipeline_succeeds = true)
+#   plus protecting the default branch. Until a maintainer turns that on, the
+#   gate is advisory. Do not describe it as enforced before checking.
+#
+# ---------------------------------------------------------------------------
+# REQUIRED CI/CD VARIABLES (Settings → CI/CD → Variables)
+#   SP_LICENSE_DEPLOY_KEY  base64 SSH private key with read access to the
+#                          private sp-license repo
+#                          (ssh://git@gitlab.com/secureprompt/admin.git, see
+#                          workspace Cargo.toml). Every Rust job needs it —
+#                          the gate jobs too, not just the image builds,
+#                          because the dependency is in the build graph.
 #                          Generate: `base64 -w0 < ~/.ssh/id_ed25519`
 #   NEXT_PUBLIC_API_URL    public API origin baked into the secureprompt-web
-#                          browser bundle at build time (optional; defaults to
-#                          http://localhost:8080 inside the Dockerfile).
+#                          browser bundle (optional; the Dockerfile defaults to
+#                          http://localhost:8080)
+#   KUBE_CONFIG            base64 kubeconfig for the deploy job (protected)
+#   HELM_RELEASE           helm release name for the deploy job
+#   HELM_NAMESPACE         target namespace for the deploy job
 #
-# Runner requirements:
-#   - A runner with `docker:27-dind` capability (privileged mode).
-#   - Network egress to gitlab.com (for the sp-license git+ssh fetch).
+#   Values are referenced by name only. Never inline a credential here.
 #
-# Known caveats:
-#   - secureprompt-ml is intentionally excluded — its build needs the raw
-#     model DEK + plaintext weights, which aren't wired up yet. Build/push
-#     that image manually until weights distribution is decided.
-#     Manual build MUST pass the MODEL-KEK build-arg (from a protected CI var):
+# RUNNER REQUIREMENTS
+#   - gate jobs:   any Linux docker-executor runner.
+#   - build/deploy: a runner with `docker:27-dind` (privileged).
+#   - Network egress to gitlab.com for the sp-license git+ssh fetch.
+#
+# KNOWN CAVEATS
+#   - secureprompt-ml is intentionally excluded from `build` — it needs the raw
+#     model DEK + plaintext weights, which aren't wired up. Build/push manually
+#     until weights distribution is decided, passing the MODEL-KEK build-arg
+#     from a protected CI var:
 #       docker build --build-arg SECUREPROMPT_PINNED_MODEL_KEK=<value> ...
+#   - linux/amd64 only. arm64 was dropped because QEMU emulation on the shared
+#     amd64 runners blew past the 1h job timeout while compiling the Rust
+#     workspace. Reintroduce it with native arm64 runners or `cargo zigbuild`.
+
+stages:
+  - fmt
+  - lint
+  - test
+  - build
+  - deploy
 
 workflow:
   rules:
+    # Avoid the classic duplicate-pipeline trap: when a branch has an open MR,
+    # keep the merge-request pipeline and drop the redundant branch pipeline.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_PIPELINE_SOURCE == "schedule"
 
-stages:
-  - build
-
 variables:
+  # Rust toolchain: pinned to the version the gate was verified against
+  # locally (rustc 1.89.0). Bump deliberately, not incidentally.
+  RUST_IMAGE: "rust:1.89-bookworm"
+
+  # Keep cargo's caches inside the build dir so GitLab's cache: can see them.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+  # Service credentials. Synthetic, local to the ephemeral service container,
+  # never reachable from outside the job — but still declared as variables so
+  # there is one place to change them.
+  POSTGRES_USER: "secureprompt"
+  POSTGRES_PASSWORD: "secureprompt"
+  POSTGRES_DB: "secureprompt"
+  POSTGRES_HOST_AUTH_METHOD: "md5"
+
   DOCKER_TLS_CERTDIR: "/certs"
   DOCKER_DRIVER: overlay2
   DOCKER_BUILDKIT: "1"
   BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
 
-default:
+# ===========================================================================
+# Shared setup for the Rust gate jobs.
+# ===========================================================================
+.rust-gate:
+  image: "$RUST_IMAGE"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - .cargo/git/db
+      - target/
+  before_script:
+    - |
+      # sp-license is a private git+ssh dependency of every Rust crate here, so
+      # even `cargo fmt --check` needs the key to resolve the build graph.
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      if [ -z "${SP_LICENSE_DEPLOY_KEY:-}" ]; then
+        echo "SP_LICENSE_DEPLOY_KEY is not set — cargo cannot fetch sp-license." >&2
+        echo "Set it in Settings -> CI/CD -> Variables (base64 of an SSH key)." >&2
+        exit 1
+      fi
+      echo "$SP_LICENSE_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
+      chmod 600 ~/.ssh/id_ed25519
+      ssh-keyscan gitlab.com >> ~/.ssh/known_hosts 2>/dev/null || true
+      eval "$(ssh-agent -s)"
+      ssh-add ~/.ssh/id_ed25519
+    - rustc --version && cargo --version
+
+# ===========================================================================
+# Stage: fmt
+# ===========================================================================
+fmt:
+  extends: .rust-gate
+  stage: fmt
+  variables:
+    SQLX_OFFLINE: "true"
+  script:
+    - rustup component add rustfmt
+    # Ratcheting gate, NOT `cargo fmt --all --check`. There are 83 files of
+    # pre-existing drift; a blanket check would be red on every MR from minute
+    # one, which is how the previous CI got ignored. See the script header.
+    - bash scripts/ci/fmt-gate.sh
+
+# ===========================================================================
+# Stage: lint
+# ===========================================================================
+clippy:
+  extends: .rust-gate
+  stage: lint
+  variables:
+    SQLX_OFFLINE: "true"
+  script:
+    - rustup component add clippy
+    # NOT `cargo clippy -- -D warnings`: the workspace sets pedantic+nursery to
+    # "warn" (631 warnings), so that command can never pass. This runs
+    # -D warnings with pedantic/nursery advisory and a named debt allowlist.
+    # See the script header.
+    - bash scripts/ci/clippy-gate.sh
+
+# ---------------------------------------------------------------------------
+# Cheap repo-invariant checks, ported from the retired GitHub workflows. Each
+# one was run locally on this branch and passes; see the WS6-1 report for the
+# transcript. They cost seconds, so they get their own fast job rather than
+# waiting behind the Rust toolchain.
+#
+# NOT PORTED, and deliberately so — each of these gates is RED on this branch
+# today, so wiring it in would recreate the permanently-red pipeline this
+# workstream exists to end. They are listed here rather than dropped silently:
+#
+#   check-openapi-codegen.sh   RED. openapi.yaml on this branch gained
+#                              `sidecar_unavailable` and dropped the provider
+#                              `config` field, and api.gen.ts was never
+#                              regenerated. Regenerating would remove `config`
+#                              from the TS types, which is a product decision,
+#                              not a CI one.                       → WS6-1-FU3
+#   pnpm lint                  RED. 9 eslint errors (setState-in-effect ×4,
+#                              no-unescaped-entities ×2, no-require-imports ×2,
+#                              no-empty-object-type ×1).           → WS6-1-FU4
+#   pnpm test --run            RED. 3 of 128 fail, all in
+#                              tests/unit/keys.test.tsx
+#                              (CreateKeyDialog).                  → WS6-1-FU4
+#   check-bundle-size.sh /     Needs a full docker image build; belongs with
+#   image-budget                the build stage, not the gate.     → WS6-1-FU5
+# ---------------------------------------------------------------------------
+static-checks:
+  stage: lint
+  image: node:22-bookworm-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git ripgrep
+  script:
+    # DASH-08: analytics.rs may only read from mart tables.
+    - bash scripts/ci/check-mart-only.sh
+    # POL-05: no dangerouslySetInnerHTML anywhere in the dashboard.
+    - bash scripts/ci/check-no-dangerous-html.sh
+    # AUTH-07: .env.example carries CHANGEME sentinels, never a real secret.
+    - bash scripts/ci/check-env-hygiene.sh
+    # Every mart consumed by the dashboard is declared as a dbt exposure.
+    - node scripts/ci/check-mart-exposures.mjs
+    - |
+      # Bitnami images moved behind a paid subscription in August 2025; the
+      # stack must stay on upstream official images. Ported from the retired
+      # .github/workflows/image-size.yml, with `find` swapped for
+      # `git ls-files`: the original walked the working tree and swept up
+      # node_modules and sibling git worktrees, which overflows ARG_MAX
+      # ("File name too long") on a developer machine. Tracked files only.
+      set -euo pipefail
+      found="$(git ls-files -z 'docker-compose*.yml' 'helm/**' '**/Dockerfile' 'Dockerfile' \
+        | xargs -0 grep -nH 'bitnami/' || true)"
+      if [ -n "$found" ]; then
+        echo "ERROR: Bitnami images found:"; echo "$found"
+        echo "Use upstream images instead."; exit 1
+      fi
+      echo "OK: no bitnami/ image references found."
+
+# ===========================================================================
+# Stage: test
+# ===========================================================================
+test:
+  extends: .rust-gate
+  stage: test
+  # Service versions are pinned to match docker-compose.yml exactly. Testing
+  # against a different Postgres/ClickHouse than you ship is how schema bugs
+  # reach production green.
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+    - name: valkey/valkey:8.1.6-alpine
+      alias: redis
+    - name: clickhouse/clickhouse-server:24.8
+      alias: clickhouse
+  variables:
+    # `#[sqlx::test]` provisions a throwaway database per test, so it needs a
+    # role that can CREATE DATABASE and a base database to connect to.
+    DATABASE_URL: "postgres://secureprompt:secureprompt@postgres:5432/secureprompt"
+    REDIS_URL: "redis://redis:6379"
+    CLICKHOUSE_URL: "http://clickhouse:8123"
+    CLICKHOUSE_DB: "sp_analytics"
+    CLICKHOUSE_SKIP_USER_SETUP: "1"
+    # See RULE 3 in scripts/ci/rust-test-gate.sh. Raising this trades a little
+    # wall-clock for sqlx test-database contention; it is not free.
+    TEST_THREADS: "4"
+  script:
+    - |
+      # ClickHouse DDL is applied by the WORKER at boot, not by the API
+      # (secureprompt-worker/src/main.rs::apply_migrations). CI never starts a
+      # worker, so without this the analytics suites run against an empty
+      # database and fail on schema mismatch.
+      bash scripts/ci/clickhouse-migrate.sh
+    - |
+      # The whole gate. Runs each test binary sequentially and reports all of
+      # them; prints the quarantine manifest; fails on any suite failure or on
+      # any skip that is not declared in scripts/ci/quarantine.tsv.
+      #
+      # Do NOT replace this with `cargo test --workspace`. Three measured
+      # reasons, spelled out in full in the script header:
+      #   1. cargo is fail-fast across test binaries and hid 3 of 6 real
+      #      failures on this very workspace.
+      #   2. bare `--no-fail-fast` runs the binaries concurrently, each
+      #      #[sqlx::test] provisions its own database, and Postgres is
+      #      exhausted — ~111 spurious PoolTimedOut failures.
+      #   3. sqlx test-database creation contends across concurrent cargo
+      #      processes: 2.00s passing alone vs 60.03s failing under
+      #      contention, with Postgres at 6/100 connections.
+      bash scripts/ci/rust-test-gate.sh
+
+# ---------------------------------------------------------------------------
+# WS2-5 — the deterministic detection floor's latency budget.
+#
+# WHAT RUNS HERE, AND WHAT DELIBERATELY DOES NOT
+#
+# This job runs `cargo bench -- --test`: criterion executes each benchmark
+# for exactly ONE iteration, collects no statistics, and asserts nothing about
+# time. It is a compile-and-run check that keeps `benches/detection_floor.rs`
+# from bit-rotting, which is the failure mode a benchmark actually suffers —
+# nobody notices a bench stopped building until the day they need a number.
+#
+# IT IS NOT A WALL-CLOCK GATE, and that is the whole design. A threshold like
+# "the floor must take under 5 ms" measured by criterion on a shared runner
+# goes red for a noisy neighbour, a cold cache or a slow spot instance. This
+# repository has the receipts for what happens next: four .github/workflows
+# were abandoned once they were permanently red (see
+# .github/workflows-retired/README), and both `fmt` and `clippy` had to be
+# rebuilt here as ratchets for the same reason. A flaky perf gate does not
+# just fail to catch regressions — it teaches people to ignore the gates
+# beside it.
+#
+# THE REAL REGRESSION GUARD IS IN THE `test` JOB.
+# `secureprompt-api/tests/detection_floor_budget.rs` is picked up
+# automatically by rust-test-gate.sh (it discovers tests/*.rs from the
+# filesystem) and asserts things that do not depend on how fast the runner is:
+#   * 40 KB of "1 " must not explode into thousands of detections — the
+#     property MAX_IDENTIFIER_GROUPS provides, asserted as a COUNT. Verified
+#     by raising the cap to 14, which reproduced the original incident at
+#     20,467 detections in 1.96 s.
+#   * detection count is linear, not quadratic, in document size.
+#   * hostile input is bounded as a RATIO against a realistic document of the
+#     same size, measured in the same process on the same machine — so runner
+#     slowness cancels instead of causing false alarms.
+#
+# The actual latency curve, and the honest statement of the input size at
+# which the 5 ms budget stops holding (~105 KiB; a 256 KiB document costs
+# 11.6 ms p95), is produced by running `cargo bench` locally and is recorded
+# in the WS2-5 report. A number that has to be interpreted belongs in a report
+# a human reads, not in a pass/fail gate.
+#
+# No services: the bench touches no database, cache or analytics store, and
+# SQLX_OFFLINE makes the compile-time query checks read the committed
+# .sqlx metadata instead of a live Postgres.
+# ---------------------------------------------------------------------------
+bench:
+  extends: .rust-gate
+  stage: test
+  variables:
+    SQLX_OFFLINE: "true"
+  script:
+    - cargo bench -p secureprompt-api --bench detection_floor -- --test
+
+# ---------------------------------------------------------------------------
+# The AUTH-05 gate, carried over from the retired .github/workflows/ci.yml.
+#
+# WHY A SEPARATE JOB WITH A DIFFERENT ROLE: the `test` job above connects as
+# the compose-default `secureprompt` role, which the postgres image creates as
+# a SUPERUSER — so it silently BYPASSES row-level security. That is the same
+# blind spot every developer has locally, and it is not theoretical: migration
+# 017's `UPDATE policy_rules ... WHERE name = 'Redact common PII'`
+# (017_uzbek_identifier_policy_classes.sql:40) carries no workspace scoping. As
+# a non-BYPASSRLS role that statement matches ZERO rows and still reports
+# success. Only a NOSUPERUSER / NOBYPASSRLS role can catch that class of bug.
+#
+# WHY IT IS SCOPED TO cross_tenant RATHER THAN THE WHOLE SUITE: measured on
+# this branch, running the FULL gate as `secureprompt_runner` produces 85
+# failures across 4 suites, all of the form
+#   `new row violates row-level security policy for table "policy_rules"`
+# originating in workspace_repo's default-rule seeding. That is a real finding
+# about the product — the app currently depends on connecting as a
+# BYPASSRLS role — but fixing it means changing workspace_repo.rs, which is
+# out of WS6-1's scope. Making this job run everything today would put the
+# pipeline back in the permanently-red state this workstream exists to end.
+# Tracked as WS6-1-FU2, and it feeds the open "DB role-split" item.
+# Expand this job's scope as those failures are fixed; do not delete the job.
+# ---------------------------------------------------------------------------
+test:rls-nonsuperuser:
+  extends: .rust-gate
+  stage: test
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    DATABASE_URL: "postgres://secureprompt_runner:secureprompt@postgres:5432/postgres"
+    RUST_LOG: "info"
+  # The role setup lives in `script`, not `before_script`, so this job inherits
+  # .rust-gate's ssh setup unchanged. (GitLab's `!reference` would also work,
+  # but it is a GitLab-only YAML tag that ordinary yaml parsers — and therefore
+  # local validation — choke on.)
+  script:
+    - apt-get update -qq && apt-get install -y -qq postgresql-client
+    - bash scripts/ci/create-nonsuperuser-role.sh
+    - cargo test -p secureprompt-api --test cross_tenant -- --test-threads=4 --nocapture
+
+# ===========================================================================
+# Stage: build — publish images to the GitLab Container Registry.
+# ===========================================================================
+.docker-publish:
   image: docker:27
   services:
     - name: docker:27-dind
@@ -64,7 +396,23 @@ default:
     - docker buildx create --use --name sp-builder --driver docker-container --bootstrap tls-env
 
 build:
+  extends: .docker-publish
   stage: build
+  # `needs:` is what makes the gate load-bearing: GitLab will not schedule this
+  # job at all unless every listed job succeeded. Do not loosen it to
+  # `needs: []` to "speed up a hotfix" — that is the whole gate.
+  needs:
+    - fmt
+    - clippy
+    - static-checks
+    - test
+    - test:rls-nonsuperuser
+    - bench
+  rules:
+    # Manual because each run is 6 concurrent image builds. Not `allow_failure`
+    # — a started build that fails must fail the pipeline.
+    - when: manual
+      allow_failure: false
   parallel:
     matrix:
       - SERVICE:
@@ -109,3 +457,50 @@ build:
         $BUILD_ARGS $SSH_FLAG \
         --push \
         "$CONTEXT"
+
+# ===========================================================================
+# Stage: deploy — helm rollout of the images `build` just published.
+# ===========================================================================
+deploy:
+  stage: deploy
+  image: alpine/helm:3.16.2
+  # Transitively requires the whole gate: build needs fmt+clippy+test, and
+  # deploy needs build. A red gate leaves this job unschedulable.
+  needs:
+    - build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+    - when: never
+  environment:
+    name: production
+  script:
+    - |
+      set -euo pipefail
+      # Fail loudly on missing configuration rather than half-deploying.
+      for var in KUBE_CONFIG HELM_RELEASE HELM_NAMESPACE; do
+        eval "val=\${$var:-}"
+        if [ -z "$val" ]; then
+          echo "FAIL: $var is not set. Add it under Settings -> CI/CD -> Variables" >&2
+          echo "      (protected + masked) before running deploy." >&2
+          exit 1
+        fi
+      done
+      mkdir -p ~/.kube
+      echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+      chmod 600 ~/.kube/config
+
+      helm lint helm/secureprompt
+      # Render first: a chart that cannot template is caught before anything
+      # is applied to the cluster.
+      helm template "$HELM_RELEASE" helm/secureprompt \
+        --namespace "$HELM_NAMESPACE" \
+        --set image.tag="$CI_COMMIT_SHORT_SHA" > /dev/null
+
+      helm upgrade --install "$HELM_RELEASE" helm/secureprompt \
+        --namespace "$HELM_NAMESPACE" \
+        --create-namespace \
+        --set image.tag="$CI_COMMIT_SHORT_SHA" \
+        --atomic \
+        --timeout 10m

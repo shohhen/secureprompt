@@ -492,6 +492,148 @@ async fn policy_priority_conflict(pool: PgPool) {
     assert_eq!(body["code"].as_str().unwrap_or(""), "priority_conflict");
 }
 
+/// FIX 4 (WS1-6b), save-time half — an invalid `content_regex` must be
+/// rejected with a 4xx that names the field.
+///
+/// `validate_conditions` is unit-tested in `policy/failclosed_tests.rs`;
+/// these tests exist for a different reason — to prove it is actually WIRED
+/// into the handlers. A unit test on the validator passes just as happily
+/// when nobody calls it.
+#[sqlx::test]
+async fn policy_create_rejects_invalid_content_regex(pool: PgPool) {
+    let seeds = seed_two_workspaces(&pool).await.unwrap();
+    let (_, router) = build_app(pool);
+    let admin_token = mint_jwt(seeds.workspace_a, seeds.admin_a, "admin");
+
+    let (status, body) = post_json(
+        &router,
+        "/v1/policy-rules",
+        json!({
+            "name": "bad-regex",
+            "priority": 11,
+            "conditions": [{"field": "content_regex", "op": "matches", "value": "([unclosed"}],
+            "action": "deny"
+        }),
+        &admin_token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an invalid regex must not be storable: {body}"
+    );
+    assert!(
+        body.to_string().contains("content_regex"),
+        "the 4xx must name the offending field: {body}"
+    );
+}
+
+/// POSITIVE CONTROL: the same request shape with a VALID pattern is created
+/// normally. Without this, a handler that rejected every `content_regex`
+/// rule outright would pass the test above.
+#[sqlx::test]
+async fn policy_create_accepts_valid_content_regex(pool: PgPool) {
+    let seeds = seed_two_workspaces(&pool).await.unwrap();
+    let (_, router) = build_app(pool);
+    let admin_token = mint_jwt(seeds.workspace_a, seeds.admin_a, "admin");
+
+    let (status, body) = post_json(
+        &router,
+        "/v1/policy-rules",
+        json!({
+            "name": "good-regex",
+            "priority": 12,
+            "conditions": [{"field": "content_regex", "op": "matches", "value": "^sk-[A-Za-z0-9]{32}$"}],
+            "action": "deny"
+        }),
+        &admin_token,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "valid regex must save: {body}");
+}
+
+/// FIX 2 (WS1-8), save-time half — a rule with two `detection_class`
+/// conditions can never match any single detection, so it would sit in the
+/// database looking enforced while enforcing nothing.
+#[sqlx::test]
+async fn policy_create_rejects_two_detection_class_conditions(pool: PgPool) {
+    let seeds = seed_two_workspaces(&pool).await.unwrap();
+    let (_, router) = build_app(pool);
+    let admin_token = mint_jwt(seeds.workspace_a, seeds.admin_a, "admin");
+
+    let (status, body) = post_json(
+        &router,
+        "/v1/policy-rules",
+        json!({
+            "name": "unsatisfiable",
+            "priority": 13,
+            "conditions": [
+                {"field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS"},
+                {"field": "detection_class", "op": "eq", "value": "PERSON"}
+            ],
+            "action": "redact"
+        }),
+        &admin_token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unsatisfiable rule must not be storable: {body}"
+    );
+    assert!(
+        body.to_string().contains("detection_class"),
+        "the 4xx must name the offending field: {body}"
+    );
+}
+
+/// The PUT handler must validate too — otherwise an operator can create a
+/// clean rule and then edit it into an unenforceable one.
+#[sqlx::test]
+async fn policy_update_rejects_invalid_content_regex(pool: PgPool) {
+    let seeds = seed_two_workspaces(&pool).await.unwrap();
+    let (_, router) = build_app(pool);
+    let admin_token = mint_jwt(seeds.workspace_a, seeds.admin_a, "admin");
+
+    let (status, created) = post_json(
+        &router,
+        "/v1/policy-rules",
+        json!({"name": "editable", "priority": 14, "action": "deny"}),
+        &admin_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "precondition: {created}");
+    let rule_id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = put_json(
+        &router,
+        &format!("/v1/policy-rules/{rule_id}"),
+        json!({
+            "name": "editable",
+            "priority": 14,
+            "conditions": [{"field": "content_regex", "op": "matches", "value": "([unclosed"}],
+            "action": "deny",
+            "enabled": true,
+            "dry_run": false
+        }),
+        &admin_token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "PUT must validate conditions too: {body}"
+    );
+    assert!(
+        body.to_string().contains("content_regex"),
+        "the 4xx must name the offending field: {body}"
+    );
+}
+
 /// Viewer POST → 403.
 #[sqlx::test]
 async fn policy_role_gate(pool: PgPool) {

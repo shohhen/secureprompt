@@ -87,18 +87,31 @@ impl ScratchDb {
     /// succeeding. (Found exactly that way: `healthy_schema_leaves_the_gauge_clear`
     /// reported 4 failures for 4 events against an otherwise perfect table.)
     async fn create_request_events_like_production(&self) {
-        // Apply ClickHouse migration 006 first: the source table needs
-        // `floor_only` or the clone inherits a stale schema. Idempotent, and
-        // read from the migration file so it cannot drift.
-        const MIGRATION: &str = include_str!("../clickhouse/migrations/006_floor_only.sql");
-        let sql: String = MIGRATION
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for statement in sql.split(';') {
-            if !statement.trim().is_empty() {
-                exec_in("sp_analytics", statement.trim()).await;
+        // Apply the column-adding migrations to the SOURCE first: the clone
+        // below is `CREATE TABLE ... AS sp_analytics.request_events`, so a
+        // source that has not been migrated hands every scratch database a
+        // stale schema and the "complete table" leg of the probe test would
+        // assert against a table that is genuinely missing a column.
+        // Idempotent (`IF NOT EXISTS`), and read from the migration files so
+        // they cannot drift from what the worker applies at startup.
+        //
+        // ADD A LINE HERE whenever a migration adds a `request_events`
+        // column. Forgetting reddens `healthy_schema_leaves_the_gauge_clear`
+        // rather than failing silently, which is the intended failure mode.
+        const MIGRATIONS: &[&str] = &[
+            include_str!("../clickhouse/migrations/006_floor_only.sql"),
+            include_str!("../clickhouse/migrations/009_detection_engines.sql"),
+        ];
+        for migration in MIGRATIONS {
+            let sql: String = migration
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for statement in sql.split(';') {
+                if !statement.trim().is_empty() {
+                    exec_in("sp_analytics", statement.trim()).await;
+                }
             }
         }
         for table in [

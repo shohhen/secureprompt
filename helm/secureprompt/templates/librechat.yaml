@@ -125,6 +125,14 @@ spec:
               value: "http://{{ $fullName }}-api"
             - name: SECUREPROMPT_ML_URL
               value: "http://{{ $fullName }}-ml:8080"
+            # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.
+            # MUST equal the secret the -ml deployment consumes, or every
+            # file-scan request 500s (secureprompt-scan.js throws when unset).
+            - name: ML_SIDECAR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: ml-sidecar-internal-token
             - name: SECUREPROMPT_SCAN_FILES_ENABLED
               value: {{ .Values.librechat.scanFilesEnabled | quote }}
             - name: ALLOW_REGISTRATION

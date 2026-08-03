@@ -32,23 +32,152 @@ use crate::db::user_repo::UserRow;
 /// redacted the email and forwarded the PINFL. Migration
 /// `017_uzbek_identifier_policy_classes.sql` back-fills workspaces that were
 /// already seeded with the narrower list.
+///
+/// FIX-WAVE: the same omission applied to EVERY CREDENTIAL CLASS. The list
+/// carried 15 entries while `detection/registry.rs` emits 37, and not one of
+/// the 15 was a credential — so a prompt containing an email AND a bearer
+/// token redacted the email and shipped the token, because populating
+/// `redaction_map` also suppressed the secure-mode catch-all. Five review
+/// rounds of credential-detection work therefore delivered nothing on the
+/// real chat path. Every credential class the registry emits is now listed,
+/// back-filled by `019_credential_policy_classes.sql`.
+///
+/// Two entries were also DEAD NAMES matching nothing the registry ever
+/// emits: `GCP_KEY` (registry emits `google_api_key` and
+/// `gcp_service_account_email`) and `AZURE_KEY` (registry emits
+/// `azure_storage_connection_string`). Both are replaced by the real
+/// spellings below. Migration 019 leaves the dead strings in place in
+/// existing rows — they match nothing, so removing them is churn, and the
+/// superset guard the back-fill relies on is keyed on them.
+///
+/// `IBAN` sits alongside `IBAN_CODE` on purpose. Both spellings are live:
+/// the Rust regex floor emits `iban`, which `normalize_class` only
+/// upper-cases, while the Python sidecar's `_map_label` emits Presidio's
+/// `IBAN_CODE`. Listing only the Presidio spelling left the floor's own IBAN
+/// detections unprotected whenever the sidecar was down or the class came
+/// from regex alone. The same reasoning applied to `SSN` / `US_SSN` until
+/// both were demoted to `OPT_IN_ONLY_CLASSES` below — which is why BOTH had
+/// to go: leaving either one in would have made the demotion cosmetic.
+///
+/// KEEP THIS IN SYNC WITH THE REGISTRY. It is checked by
+/// `default_policy_classes_cover_every_registry_class` below, which fails
+/// the build when a new detector class is added without a decision here.
+/// A rot in this list is no longer a silent leak either — `fail_closed` in
+/// `policy/engine.rs` makes a firing `redact` rule cover every detection in
+/// the request — but the explicit list is what protects deployments that
+/// have turned `SECUREPROMPT_REDACT_WHEN_NO_RULES` off.
+///
+/// A class may be ABSENT from this list only if `OPT_IN_ONLY_CLASSES` names
+/// it. That is enforced, not merely intended: see
+/// `the_exclusion_list_does_not_excuse_an_accidental_omission`.
 pub const DEFAULT_POLICY_CLASSES: &[&str] = &[
+    // ── People / contact PII (ML sidecar + floor) ──────────────────────
     "PERSON",
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
+    // ── Financial identifiers ──────────────────────────────────────────
     "CREDIT_CARD",
-    "US_SSN",
+    // `US_SSN` / `SSN` are deliberately NOT here — see OPT_IN_ONLY_CLASSES.
     "IBAN_CODE",
-    "AWS_ACCESS_KEY",
-    "GCP_KEY",
-    "AZURE_KEY",
+    "IBAN",
+    // ── Uzbek / CIS identifiers (WS2-1) ────────────────────────────────
     "PINFL",
     "STIR",
     "MFO",
     "PASSPORT_NUMBER",
     "UZCARD",
     "HUMO",
+    // ── Cloud provider keys ────────────────────────────────────────────
+    "AWS_ACCESS_KEY",
+    "GOOGLE_API_KEY",
+    "GCP_SERVICE_ACCOUNT_EMAIL",
+    "AZURE_STORAGE_CONNECTION_STRING",
+    // ── Vendor API keys ────────────────────────────────────────────────
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_PUBLISHABLE_KEY",
+    // ── Source-control tokens ──────────────────────────────────────────
+    "GITHUB_PAT",
+    "GITHUB_FINE_GRAINED_PAT",
+    "GITHUB_OAUTH_TOKEN",
+    "GITHUB_REFRESH_TOKEN",
+    // ── Slack tokens ───────────────────────────────────────────────────
+    "SLACK_BOT_TOKEN",
+    "SLACK_USER_TOKEN",
+    "SLACK_APP_TOKEN",
+    // ── Private keys ───────────────────────────────────────────────────
+    "PRIVATE_KEY_PEM",
+    "RSA_PRIVATE_KEY",
+    "OPENSSH_PRIVATE_KEY",
+    // ── Connection strings / URIs ──────────────────────────────────────
+    "POSTGRESQL_URI",
+    "MONGODB_URI",
+    "WEBHOOK_URL",
+    // ── Generic credentials ────────────────────────────────────────────
+    "BEARER_TOKEN",
+    "BASIC_AUTH_HEADER",
+    "PASSWORD_ASSIGNMENT",
+    "OAUTH_CLIENT_SECRET",
+    "API_TOKEN_GENERIC",
+    "JWT",
 ];
+
+/// Detector classes that are deliberately NOT seeded into a new workspace's
+/// "Redact common PII" rule — available, but OFF until an admin turns them
+/// on. This is the one and only sanctioned way for a class to be missing
+/// from `DEFAULT_POLICY_CLASSES`.
+///
+/// It exists because the drift guards must keep failing for an ACCIDENTAL
+/// omission (that is the defect they were written for: the list carried 15
+/// entries while the registry emitted 37, and not one of the 15 was a
+/// credential) while still permitting a DELIBERATE one. Absence alone cannot
+/// distinguish the two; a name on this list is the difference.
+///
+/// The guards that consult it live in `policy/failclosed_tests.rs`:
+/// `default_policy_classes_cover_every_registry_class` (registry drift),
+/// `opt_in_only_classes_contains_no_dead_names` (this list's own rot), and
+/// `migration_020_backfills_default_policy_classes_plus_the_opt_ins`
+/// (Rust ↔ SQL drift).
+///
+/// ── Why `SSN` / `US_SSN` (owner decision, 2026-07-30) ──────────────────
+/// SecurePrompt is an Uzbekistan-market product; the US Social Security
+/// Number is not a supported default class.
+///
+///   * `SOCIAL_SECURITY_NUMBER` appears ZERO times across every active
+///     dataset under `data/**` — v5, v7, `v7_corpus_v2`/v3, `v7_hardened`,
+///     `v8_corpus`, `spy_ruz`, `aug_*`. Its only occurrences are in the abandoned
+///     v4 corpus under `docs/backup_v4/`, where the generator hallucinated a
+///     Cyrillic "ССН" into Uzbek HR documents. The deployed v8 model has no
+///     training support for it, and the label survives only as a dead entry
+///     in `_V2_RAW_LABELS` (`secureprompt-ml/app/detection/xlmr_ner.py:129`).
+///   * `compliance.py:9` maps `US_SSN → [GDPR, HIPAA]`; HIPAA is US
+///     healthcare law and does not apply to this market.
+///
+/// DEMOTED, NOT DELETED. `Matcher::Ssn` and its `DetectorSpec` stay, so the
+/// class is still DETECTED — it is only no longer redacted by the seeded
+/// default. An admin re-enables it by adding the class to that rule in the
+/// policy UI; `demoting_ssn_is_reversible_from_the_policy_ui` executes that
+/// path rather than asserting it.
+///
+/// BOTH SPELLINGS ARE LISTED because both are live: the Rust floor emits
+/// `ssn` (upper-cased to `SSN` by `merge::normalize_class`) and the Python
+/// sidecar emits Presidio's `US_SSN`. Demoting one and not the other would
+/// have been cosmetic.
+///
+/// THE PREREQUISITE, since the ordering is load-bearing: until `fa880be`
+/// moved the bare-nine-digit backstop from `Matcher::Ssn` onto `stir`, `ssn`
+/// was the ONLY detector that redacted an UNLABELLED Uzbek tax number —
+/// `Matcher::Stir` is keyword-gated and needs a nearby `ИНН`/`STIR` label.
+/// Demoting the class before that commit would have turned a mislabel into
+/// a real leak. `a_bare_nine_digit_stir_survives_the_demotion` asserts the
+/// no-leak property on redacted output.
+///
+/// Existing workspaces are reconciled by
+/// `024_demote_ssn_to_opt_in.sql`, which strips both spellings from rules
+/// that still exactly match the seeded default and leaves customised rules
+/// alone.
+pub const OPT_IN_ONLY_CLASSES: &[&str] = &["SSN", "US_SSN"];
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceRow {

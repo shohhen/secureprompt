@@ -245,6 +245,7 @@ mod pipeline_contract_tests {
         // Build a representative PipelineExecution and verify fields exist
         let exec = PipelineExecution {
             degraded_reason: None,
+            engines: crate::analytics::engines::DetectionEngines::FloorAndMl,
             request_id: RequestId::new(),
             provider_name: "openai".to_owned(),
             model: "gpt-4o".to_owned(),

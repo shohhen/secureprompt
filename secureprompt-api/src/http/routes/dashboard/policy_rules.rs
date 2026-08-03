@@ -54,6 +54,76 @@ fn validate_action(action: &str) -> Result<(), ApiError> {
     }
 }
 
+/// Reject rule shapes the engine cannot honour, at SAVE time, rather than
+/// letting them sit in the database looking enforced.
+///
+/// `conditions` arrives as an unvalidated `serde_json::Value` from any API
+/// client, so anything not rejected here is something `policy/engine.rs` has
+/// to survive at request time. Two shapes are rejected:
+///
+///   * an invalid `content_regex` pattern (WS1-6b). The field was evaluated
+///     with `str::contains` until this fix wave, so `^sk-[A-Za-z0-9]{32}$`
+///     was accepted and silently matched nothing. Now that it compiles as a
+///     real regex, an operator who mistypes one must be told at save time
+///     rather than discovering it from a breach.
+///
+///   * two or more `detection_class` conditions on one rule (WS1-8). A
+///     detection has exactly one class, and `rule_matches` requires a
+///     SINGLE detection to satisfy every detection-scoped condition, so
+///     such a rule can never fire. The operator almost certainly means OR;
+///     `detection_class in [...]` is that, as ONE condition. Rejecting is
+///     better than silently reinterpreting, because guessing OR would turn
+///     an `allow` rule that currently protects the request by not firing
+///     into one that waves it through.
+///
+/// Deliberately NOT exhaustive: unknown field names still pass, because
+/// `matches_condition` returns `false` for them and the fail-closed net in
+/// `pipeline/service.rs` covers the request. Tightening that into a
+/// whitelist would break any workspace already storing extra metadata on a
+/// condition object, which is a compatibility decision, not a security one.
+pub(crate) fn validate_conditions(conditions: &Value) -> Result<(), ApiError> {
+    let Some(array) = conditions.as_array() else {
+        // A non-array `conditions` makes `rule_matches` return `true`
+        // (match everything) — odd, but pre-existing and not a leak.
+        return Ok(());
+    };
+
+    let mut detection_class_conditions = 0usize;
+
+    for condition in array {
+        let field = condition.get("field").and_then(Value::as_str);
+
+        if field == Some("detection_class") {
+            detection_class_conditions += 1;
+        }
+
+        if field == Some("content_regex") {
+            if let Some(pattern) = condition.get("value").and_then(Value::as_str) {
+                if let Err(error) = regex::Regex::new(pattern) {
+                    // `regex`'s Display is multi-line and includes a caret
+                    // diagram; flatten it so it survives a JSON error body.
+                    let detail = error.to_string().replace('\n', " ");
+                    return Err(ApiError::BadRequest(format!(
+                        "condition field `content_regex` is not a valid regular expression: {detail}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if detection_class_conditions > 1 {
+        return Err(ApiError::BadRequest(format!(
+            "a rule may have at most one `detection_class` condition, found \
+             {detection_class_conditions}. A detection has exactly one class, so a rule \
+             requiring two of them can never match anything. Combine the \
+             classes into a single condition: \
+             {{\"field\": \"detection_class\", \"op\": \"in\", \"value\": [...]}}"
+        )));
+    }
+
+    Ok(())
+}
+
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -159,12 +229,15 @@ async fn create_rule(
         return Err(priority_conflict_response());
     }
 
+    let conditions = body.conditions.unwrap_or(Value::Array(vec![]));
+    validate_conditions(&conditions).map_err(api_error_response)?;
+
     let row = repo
         .create_rule(
             ctx.workspace_id,
             &body.name,
             body.priority,
-            body.conditions.unwrap_or(Value::Array(vec![])),
+            conditions,
             &body.action,
             body.action_params.unwrap_or(Value::Object(Default::default())),
             body.enabled.unwrap_or(true),
@@ -199,13 +272,16 @@ async fn update_rule(
         return Err(priority_conflict_response());
     }
 
+    let conditions = body.conditions.unwrap_or(Value::Array(vec![]));
+    validate_conditions(&conditions).map_err(api_error_response)?;
+
     let row = repo
         .update_rule(
             ctx.workspace_id,
             rule_id,
             &body.name,
             body.priority,
-            body.conditions.unwrap_or(Value::Array(vec![])),
+            conditions,
             &body.action,
             body.action_params.unwrap_or(Value::Object(Default::default())),
             body.enabled.unwrap_or(true),

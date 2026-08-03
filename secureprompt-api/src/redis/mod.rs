@@ -10,7 +10,7 @@ use deadpool_redis::{
     redis::{cmd, RedisError},
     Config, Pool, Runtime,
 };
-use secureprompt_common::errors::ApiError;
+use secureprompt_common::{errors::ApiError, kms::KmsBackend};
 
 /// Build a `deadpool-redis` pool from the on-prem Redis URL.
 ///
@@ -72,21 +72,62 @@ pub async fn blacklist_jti(pool: &Pool, jti: &str, ttl_secs: u64) -> Result<(), 
 /// The ref (a UUID) travels in the message as an opaque `[[sp:v=…]]` marker — the
 /// PII itself never touches LibreChat's DB.
 ///
+/// # WS3 review — the map is ciphertext in Redis
+///
+/// The values in that map are the un-redacted PII the caller asked
+/// SecurePrompt to protect: it is the SAME DATA CLASS as
+/// `token_vault_entries.mapping`, which migration 022 replaced with
+/// `mapping_ciphertext` for exactly this reason. WS3-3 encrypted that vault
+/// and left this one writing raw JSON, so the file-scan path still put
+/// customer PII in the clear into a store whose only protection was a 6h TTL.
+///
+/// It now goes through the same [`KmsBackend`] that
+/// [`crate::analytics::capture::seal`] and
+/// [`crate::db::token_vault_repo::TokenVaultRepository`] use, with the same
+/// two rules:
+///
+/// 1. **Encrypt-or-fail.** A KMS outage makes this return an error, which
+///    fails the stash request. It never degrades to writing the originals in
+///    the clear.
+/// 2. **No plaintext read path** — see [`load_file_vault`].
+///
 /// # Errors
-/// Returns `ApiError::Internal` on Redis connection or `SET … EX` failure.
+/// Returns `ApiError::Internal` when the KMS refuses, when it returns
+/// non-UTF-8 ciphertext, or on Redis connection / `SET … EX` failure.
 pub async fn stash_file_vault(
     pool: &Pool,
+    kms: &dyn KmsBackend,
     vault_ref: &str,
     map_json: &str,
     ttl_secs: u64,
 ) -> Result<(), ApiError> {
+    // Encrypt BEFORE touching Redis, so a KMS failure leaves no key at all
+    // rather than a key awaiting a repair that never comes.
+    let ciphertext = kms.encrypt(map_json.as_bytes()).await.map_err(|error| {
+        tracing::error!(
+            alert = "file_vault_encrypt_failed",
+            error = %error,
+            "KMS encrypt failed; refusing the stash rather than storing the \
+             file-scan originals in the clear"
+        );
+        ApiError::Internal(format!("file vault encrypt: {error}"))
+    })?;
+    let ciphertext = String::from_utf8(ciphertext).map_err(|error| {
+        tracing::error!(
+            alert = "file_vault_encrypt_failed",
+            error = %error,
+            "KMS returned non-UTF-8 ciphertext; refusing the stash"
+        );
+        ApiError::Internal("file vault encrypt: ciphertext not UTF-8".to_owned())
+    })?;
+
     let mut conn = pool
         .get()
         .await
         .map_err(|error| ApiError::Internal(format!("redis checkout failed: {error}")))?;
     cmd("SET")
         .arg(format!("filevault:{vault_ref}"))
-        .arg(map_json)
+        .arg(ciphertext)
         .arg("EX")
         .arg(ttl_secs)
         .query_async::<()>(&mut conn)
@@ -98,14 +139,39 @@ pub async fn stash_file_vault(
 /// Load a stashed file-scan token map JSON by ref. Returns `None` on any error
 /// or if the ref has expired — the pipeline degrades to leaving the `{{Type_N}}`
 /// tokens unrestored rather than failing the request.
-pub async fn load_file_vault(pool: &Pool, vault_ref: &str) -> Option<String> {
+///
+/// There is deliberately NO "if it does not decrypt, assume it is the old
+/// plaintext JSON" fallback, mirroring `token_vault_repo`. Such a fallback
+/// would re-admit the plaintext format forever and give an attacker who can
+/// write to Redis a way to inject a map that never passes the KMS. The cost
+/// is bounded to the stashes written before the upgrade: they stop restoring
+/// and age out within `FILE_VAULT_TTL_SECS` (6h).
+pub async fn load_file_vault(pool: &Pool, kms: &dyn KmsBackend, vault_ref: &str) -> Option<String> {
     let mut conn = pool.get().await.ok()?;
-    cmd("GET")
+    let stored: Option<String> = cmd("GET")
         .arg(format!("filevault:{vault_ref}"))
         .query_async::<Option<String>>(&mut conn)
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let stored = stored?;
+
+    match kms.decrypt(stored.as_bytes()).await {
+        Ok(plaintext) => String::from_utf8(plaintext).ok(),
+        Err(error) => {
+            // Logged rather than swallowed: a rotated key or a pre-upgrade
+            // plaintext stash both land here, and both are worth seeing as
+            // "restoration is silently off" instead of being inferred from a
+            // reply full of `{{Person_1}}`.
+            tracing::warn!(
+                alert = "file_vault_decrypt_failed",
+                error = %error,
+                "stashed file vault could not be decrypted; leaving its \
+                 placeholders unrestored"
+            );
+            None
+        }
+    }
 }
 
 /// Atomically increment a counter by `delta` and return the new value.
