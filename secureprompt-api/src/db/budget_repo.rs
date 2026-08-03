@@ -12,8 +12,14 @@
 use chrono::{DateTime, Utc};
 use secureprompt_common::errors::ApiError;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+use crate::db::admin_audit_repo::{
+    self, changed_field, AdminActor, AdminAuditAction, AdminAuditEntry,
+};
+use crate::db::scope::begin_scoped;
 
 /// The three enforcement modes for a workspace budget.
 ///
@@ -122,19 +128,39 @@ impl BudgetRepository {
         }))
     }
 
-    /// Upsert the budget configuration for `workspace_id`.
+    /// Upsert the budget configuration for `workspace_id`, and audit what
+    /// moved (P1A).
     ///
     /// On conflict (duplicate `workspace_id`), replaces the existing row.
     ///
+    /// # Why the "before" is read inside this transaction
+    ///
+    /// The audit row's whole content is the DIFF, so it has to be taken from
+    /// the state the write is actually replacing. Reading it in the handler
+    /// and passing it in would leave a window in which a concurrent PUT lands
+    /// between the read and the write, and the record would then describe a
+    /// change that never happened. The SELECT below is in the same transaction
+    /// as the upsert and the audit row.
+    ///
+    /// # When nothing moved, nothing is recorded
+    ///
+    /// A dashboard that re-saves the form on every page view would otherwise
+    /// bury the real changes under identical rows. Same rule as a repeated
+    /// `POST /v1/keys/{id}/rotate` inside its grace window, and it is stated in
+    /// `CONTROL_COVERAGE` so an auditor reads this section as CHANGES rather
+    /// than as form submissions.
+    ///
     /// # Errors
-    /// Returns `ApiError::BadRequest` when a limit value is negative.
-    /// Returns `ApiError::Database` on SQL failure.
+    /// Returns `ApiError::BadRequest` when a limit value is negative,
+    /// `ApiError::Database` on SQL failure, and `ApiError::Internal` when the
+    /// tenancy scope does not arm.
     pub async fn upsert(
         &self,
         workspace_id: Uuid,
         daily: Option<i64>,
         monthly: Option<i64>,
         behavior: BudgetBehavior,
+        actor: &AdminActor,
     ) -> Result<WorkspaceBudgetRow, ApiError> {
         // Validate: limits must be non-negative when provided.
         if daily.is_some_and(|d| d < 0) {
@@ -148,17 +174,32 @@ impl BudgetRepository {
             ));
         }
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        // `begin_scoped` rather than a bare `begin` + `set_config`: it sets the
+        // GUC and READS IT BACK, so a transaction whose scope did not take
+        // fails loudly instead of writing under an unarmed policy.
+        let mut tx = begin_scoped(&self.pool, workspace_id).await?;
 
-        sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
-            .bind(workspace_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Database(e.to_string()))?;
+        let before = sqlx::query(
+            "SELECT daily_token_limit, monthly_token_limit, behavior
+             FROM workspace_budgets
+             WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // NULL rather than a zero or a default when the workspace had no
+        // budget at all: "no limit configured" and "a limit of zero" are
+        // different starting points and the record must distinguish them.
+        let (before_daily, before_monthly, before_behavior): (Value, Value, Value) =
+            before.map_or((Value::Null, Value::Null, Value::Null), |row| {
+                (
+                    json!(row.get::<Option<i64>, _>("daily_token_limit")),
+                    json!(row.get::<Option<i64>, _>("monthly_token_limit")),
+                    json!(row.get::<String, _>("behavior")),
+                )
+            });
 
         let row = sqlx::query(
             "INSERT INTO workspace_budgets
@@ -178,6 +219,35 @@ impl BudgetRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let mut changed = serde_json::Map::new();
+        changed_field(
+            &mut changed,
+            "daily_token_limit",
+            &before_daily,
+            &json!(daily),
+        );
+        changed_field(
+            &mut changed,
+            "monthly_token_limit",
+            &before_monthly,
+            &json!(monthly),
+        );
+        changed_field(
+            &mut changed,
+            "behavior",
+            &before_behavior,
+            &json!(behavior.as_db_str()),
+        );
+        if !changed.is_empty() {
+            admin_audit_repo::write(
+                &mut tx,
+                actor,
+                &AdminAuditEntry::on_object(AdminAuditAction::BudgetUpdated, workspace_id, None)
+                    .with_detail(json!({ "changed": Value::Object(changed) })),
+            )
+            .await?;
+        }
 
         tx.commit()
             .await

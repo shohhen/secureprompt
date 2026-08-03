@@ -222,6 +222,10 @@ async fn session_revocation_write_cannot_close_another_workspaces_refresh_rows(
             actor_role: "admin",
             target: &target,
             revoked_before_unix: 1_800_000_000,
+            // WS4-3's user-wide lever. FU4's narrow one sets `Some(session_id)`
+            // and is covered by
+            // `dashboard::session_listing::sessions_cannot_be_read_or_ended_across_workspaces`.
+            session_id: None,
         })
         .await
         .expect("revoke must succeed");

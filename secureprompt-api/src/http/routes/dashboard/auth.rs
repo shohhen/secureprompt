@@ -14,6 +14,7 @@
 //!   * Refresh tokens are single-use; replay triggers
 //!     `revoke_all_for_user` (threat T-05-03).
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::{
     body::Body,
     extract::{Extension, State},
@@ -23,7 +24,6 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
@@ -35,10 +35,12 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
-        refresh_token_repo::RotationOutcome,
+        admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry},
+        refresh_token_repo::{NewSessionRow, RotationOutcome},
         user_repo::{self, UserRepository},
     },
     http::middleware::jwt_auth::{self, Claims, JwtAuthContext, UserRole},
+    http::routes::dashboard::device::DeviceContext,
     redis as sp_redis,
 };
 
@@ -193,14 +195,40 @@ pub async fn token(
         Err(err) => return api_error_to_response(err),
     };
 
-    match decide_2fa(role, creds.totp_confirmed_at.is_some()) {
+    let decision = decide_2fa(role, creds.totp_confirmed_at.is_some());
+
+    // P1A — the login is recorded BEFORE anything is issued. "Who logged in,
+    // and when" is the first question of every access review and had no answer
+    // at all. See `record_login` for why this refuses the login when it fails.
+    if let Err(err) = record_login(
+        &state,
+        creds.id,
+        creds.workspace_id,
+        &creds.email,
+        &creds.role,
+        LoginMethod::Password,
+        decision,
+    )
+    .await
+    {
+        return api_error_to_response(err);
+    }
+
+    match decision {
         TwoFaDecision::Access => {
             // Routed through `TokenOr2fa::Access` (not `issue_token_pair`
             // directly) so the 200 body is provably the same
             // `(StatusCode::OK, JsonResponse(TokenResponse))` shape as the
             // 202 branches below share a type with — see `TokenOr2fa`.
-            match build_token_pair_body(&state, creds.id, creds.workspace_id, &creds.role, &creds.email)
-                .await
+            match build_token_pair_body(
+                &state,
+                creds.id,
+                creds.workspace_id,
+                &creds.role,
+                &creds.email,
+                &DeviceContext::from_headers(&headers),
+            )
+            .await
             {
                 Ok(body) => TokenOr2fa::Access(body).into_response(),
                 Err(err) => api_error_to_response(err),
@@ -269,6 +297,114 @@ pub(crate) const fn decide_2fa(role: UserRole, totp_confirmed: bool) -> TwoFaDec
     }
 }
 
+// ---------- The login audit record (P1A) ----------
+
+/// How the FIRST factor was proven.
+///
+/// `pub(crate)` so `oidc_callback`'s tail can label its own sign-ins: an
+/// identity the deployment accepted from an external provider is not the same
+/// evidence as a password this product verified itself, and an auditor
+/// reviewing access after an IdP compromise needs to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginMethod {
+    Password,
+    Oidc,
+}
+
+impl LoginMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Oidc => "oidc",
+        }
+    }
+}
+
+/// What `detail.outcome` says a verified first factor led to.
+///
+/// Derived from [`TwoFaDecision`] rather than passed in, so the recorded
+/// outcome cannot disagree with the branch actually taken.
+const fn login_outcome(decision: TwoFaDecision) -> &'static str {
+    match decision {
+        TwoFaDecision::Access => "session_issued",
+        TwoFaDecision::Challenge => "second_factor_required",
+        TwoFaDecision::Enroll => "enrolment_required",
+    }
+}
+
+/// Write `auth.login_succeeded` for a principal whose first factor verified.
+///
+/// # Why this is recorded for outcomes that issue no session
+///
+/// A login stopped at the 2FA gate is a real event — somebody had the correct
+/// password — and it is one an investigator specifically looks for. Recording
+/// it as a completed login would be a lie; recording nothing would lose the
+/// fact. `detail.outcome` carries the distinction.
+///
+/// # Why it is written BEFORE the session is issued, and what that costs
+///
+/// Every other audited action commits in the same transaction as the thing it
+/// records. A login cannot: the session write belongs to FU4's refresh-token
+/// chain and the two 202 branches write nothing at all. So the ordering carries
+/// the guarantee instead, in the direction that matters — NO SESSION IS EVER
+/// ISSUED WITHOUT A LOGIN RECORD, because the record commits first and a
+/// failure here returns before any token is minted.
+///
+/// The residual is the other direction, and it is stated rather than hidden: if
+/// `build_token_pair_body` fails AFTER this row commits (Redis or Postgres
+/// unavailable during refresh-token persistence), the trail holds a row saying
+/// `session_issued` for a login that produced no session. That is
+/// over-reporting a login the credentials really did pass, which is the safe
+/// direction; under-reporting would be an authentication that happened with
+/// nothing saying so.
+///
+/// # The availability consequence, stated
+///
+/// This refuses the login when the audit write fails, following FU5's rule
+/// that a control whose trail can fail independently of the control is a
+/// control with a silent mode. The cost is larger here than anywhere else FU5
+/// applied it: with `admin_audit` unwritable, NOBODY CAN LOG IN TO THE
+/// DASHBOARD. That is deliberate — a product sold on its audit trail must not
+/// quietly authenticate people it cannot account for — but it means a
+/// Postgres incident is a total dashboard outage rather than a degraded one.
+/// The data plane (`/v1/chat/completions` under an API key) is unaffected.
+///
+/// # Errors
+/// Returns `ApiError::Database` when the write fails and `ApiError::Internal`
+/// when the tenancy scope does not arm.
+pub(crate) async fn record_login(
+    state: &AppState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    email: &str,
+    role: &str,
+    method: LoginMethod,
+    decision: TwoFaDecision,
+) -> Result<(), ApiError> {
+    let actor = AdminActor {
+        workspace_id,
+        user_id: Some(user_id),
+        email: Some(email.to_owned()),
+        role: Some(role.to_owned()),
+    };
+    // NOTHING ABOUT THE REQUEST GOES IN. Not the address, not the User-Agent,
+    // and not FU4's `{browser} on {os}` reduction of it: FU4 stores the device
+    // on the SESSION row and ERASES it when that session ends, and this table
+    // is never purged, so a copy here would undo that erasure permanently.
+    let entry =
+        AdminAuditEntry::on_own_account(AdminAuditAction::LoginSucceeded, user_id, email, role)
+            .with_detail(json!({
+                "method": method.as_str(),
+                "outcome": login_outcome(decision),
+            }));
+
+    let mut tx = crate::db::scope::begin_scoped(&state.db, workspace_id).await?;
+    admin_audit_repo::write(&mut tx, &actor, &entry).await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))
+}
+
 /// `POST /v1/auth/token` response shape (2FA, Task 5). `Access` carries the
 /// pre-existing `TokenResponse` unchanged — serializing it here is byte-
 /// identical to the old `(StatusCode::OK, JsonResponse(TokenResponse))`
@@ -309,18 +445,22 @@ impl IntoResponse for TokenOr2fa {
 }
 
 /// `POST /v1/auth/refresh` — rotate a refresh token atomically.
-pub async fn refresh(
-    State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> Response {
+pub async fn refresh(State(state): State<AppState>, Json(body): Json<RefreshRequest>) -> Response {
     // Generate the successor raw token up front so `rotate` can hash it.
     let new_raw = random_refresh_token();
     let now = Utc::now();
     let new_expires_at = now + Duration::seconds(state.jwt.refresh_ttl_secs as i64);
 
+    // FU4 — the access-token id is minted BEFORE the rotation, not after, so
+    // the successor row can record the jti this request is actually going to
+    // return. Minting it afterwards (as this handler did) would leave the row
+    // describing a token that was never issued, and a later narrow revocation
+    // would blacklist a jti nobody holds while the real one kept working.
+    let new_jti = Uuid::new_v4().to_string();
+
     let outcome = match state
         .refresh_tokens
-        .rotate(&body.refresh_token, &new_raw, new_expires_at)
+        .rotate(&body.refresh_token, &new_raw, &new_jti, new_expires_at)
         .await
     {
         Ok(outcome) => outcome,
@@ -341,16 +481,16 @@ pub async fn refresh(
                 Err(err) => return api_error_to_response(err),
             };
 
-            // Mint fresh access token; refresh token already inserted by rotate.
+            // Mint fresh access token; refresh token already inserted by rotate,
+            // carrying `new_jti` — the same value this token is signed with.
             let access_exp = now + Duration::seconds(state.jwt.access_ttl_secs as i64);
-            let jti = Uuid::new_v4().to_string();
             let access_claims = Claims {
                 sub: user_id,
                 ws: workspace_id,
                 role: creds.role.clone(),
                 iat: now.timestamp(),
                 exp: access_exp.timestamp(),
-                jti,
+                jti: new_jti,
                 purpose: None,
             };
             let access_token = match encode_access(&state, &access_claims) {
@@ -377,7 +517,15 @@ pub async fn refresh(
             let _ = state.refresh_tokens.revoke_all_for_user(user_id).await;
             generic_401(None)
         }
-        RotationOutcome::NotFound | RotationOutcome::Expired => generic_401(None),
+        // FU4 — `Revoked` is deliberately NOT routed through the
+        // `revoke_all_for_user` branch above. A device whose single session an
+        // administrator just ended retries its refresh exactly once; reading
+        // that as a stolen token would terminate every OTHER session that
+        // person holds, which is the behaviour the narrow lever exists to
+        // avoid. See `RotationOutcome::Revoked`.
+        RotationOutcome::NotFound | RotationOutcome::Expired | RotationOutcome::Revoked => {
+            generic_401(None)
+        }
     }
 }
 
@@ -501,7 +649,16 @@ pub async fn register(
     // gets a 500 with no token. They can recover by calling `POST /v1/auth/token`
     // with their email/password. This is rare (only fires on Redis or DB
     // failure during refresh-token persistence) and acceptable for MVP.
-    match build_token_pair_body(&state, user.id, ws.id, "owner", &user.email).await {
+    match build_token_pair_body(
+        &state,
+        user.id,
+        ws.id,
+        "owner",
+        &user.email,
+        &DeviceContext::from_headers(&headers),
+    )
+    .await
+    {
         Ok(body) => (StatusCode::CREATED, JsonResponse(body)).into_response(),
         Err(err) => api_error_to_response(err),
     }
@@ -518,6 +675,7 @@ pub(crate) async fn build_token_pair_body(
     workspace_id: Uuid,
     role: &str,
     email: &str,
+    device: &DeviceContext,
 ) -> Result<TokenResponse, ApiError> {
     let now = Utc::now();
     let access_exp = now + Duration::seconds(state.jwt.access_ttl_secs as i64);
@@ -529,15 +687,27 @@ pub(crate) async fn build_token_pair_body(
         role: role.to_owned(),
         iat: now.timestamp(),
         exp: access_exp.timestamp(),
-        jti,
+        jti: jti.clone(),
         purpose: None,
     };
     let access_token = encode_access(state, &access_claims)?;
 
+    // FU4 — this IS the session record. A fresh `session_id` names the rotation
+    // chain that starts here; the device is recorded on this row and on no
+    // other. Still one INSERT, on the statement that was already here.
     let refresh_raw = random_refresh_token();
     state
         .refresh_tokens
-        .insert(user_id, workspace_id, &refresh_raw, refresh_exp)
+        .insert(&NewSessionRow {
+            user_id,
+            workspace_id,
+            raw_token: &refresh_raw,
+            expires_at: refresh_exp,
+            session_id: Uuid::new_v4(),
+            access_jti: &jti,
+            client_ip: device.client_ip.as_deref(),
+            client_descriptor: device.client_descriptor.as_deref(),
+        })
         .await?;
 
     Ok(TokenResponse {
@@ -560,8 +730,9 @@ pub(crate) async fn issue_token_pair(
     workspace_id: Uuid,
     role: &str,
     email: &str,
+    device: &DeviceContext,
 ) -> Response {
-    match build_token_pair_body(state, user_id, workspace_id, role, email).await {
+    match build_token_pair_body(state, user_id, workspace_id, role, email, device).await {
         Ok(body) => (StatusCode::OK, JsonResponse(body)).into_response(),
         Err(err) => api_error_to_response(err),
     }
@@ -689,13 +860,11 @@ async fn fetch_user_by_id(
     pool: &sqlx::PgPool,
     user_id: Uuid,
 ) -> Result<Option<UserIdentity>, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, workspace_id, email, role FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| ApiError::Database(error.to_string()))?;
+    let row = sqlx::query("SELECT id, workspace_id, email, role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| ApiError::Database(error.to_string()))?;
     Ok(row.map(|record| UserIdentity {
         _id: sqlx::Row::get(&record, "id"),
         _workspace_id: WorkspaceId(sqlx::Row::get(&record, "workspace_id")),

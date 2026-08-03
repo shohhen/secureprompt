@@ -16,9 +16,11 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::{AdminActor, AdminAuditAction, AdminAuditEntry},
     db::license_repo,
     http::{
         api_error_response,
@@ -27,7 +29,7 @@ use crate::{
     },
     license::{
         effective_vendor_pubkey, load_and_verify_token, parse_vendor_key,
-        resolve_active_token, LicenseStatus,
+        resolve_active_token, LicenseSnapshot, LicenseStatus,
     },
 };
 use ed25519_dalek::VerifyingKey;
@@ -75,15 +77,22 @@ async fn resolve_source(state: &AppState) -> &'static str {
     }
 }
 
-/// Build the status response from the current `LicenseState` + DB source.
-async fn build_response(state: &AppState) -> LicenseStatusResponse {
-    let snap = state.license.snapshot();
-    let status_str = match state.license.effective_status() {
+/// The stable string form of a verdict, for both the API response and the
+/// audit row — one function so the two cannot describe the same license
+/// differently.
+const fn status_str(status: LicenseStatus) -> &'static str {
+    match status {
         LicenseStatus::Valid => "Valid",
         LicenseStatus::Grace => "Grace",
         LicenseStatus::Unlicensed => "Unlicensed",
         LicenseStatus::Revoked => "Revoked",
-    };
+    }
+}
+
+/// Build the status response from the current `LicenseState` + DB source.
+async fn build_response(state: &AppState) -> LicenseStatusResponse {
+    let snap = state.license.snapshot();
+    let status_str = status_str(state.license.effective_status());
     let source = resolve_source(state).await;
     LicenseStatusResponse {
         customer_name: snap.customer_name,
@@ -157,15 +166,60 @@ async fn activate_license(
         api_error_response(ApiError::BadRequest("invalid license signature".into()))
     })?;
 
-    // Persist the token.
-    license_repo::upsert(&state.db, body.token.trim(), Some(ctx.user_id))
-        .await
-        .map_err(|e| api_error_response(ApiError::Database(e.to_string())))?;
-
-    // Live-swap the license snapshot.
+    // The verdict is computed BEFORE the write, not after, because the audit
+    // row has to be built from it and the row has to be in the same
+    // transaction as the token it describes. `load_and_verify_token` is pure —
+    // signature check, clock comparison, no I/O — so evaluating it early
+    // changes nothing about what it returns.
     let now = chrono::Utc::now().timestamp();
     let snapshot = load_and_verify_token(body.token.trim(), &vk, now);
     let new_lic_id = snapshot.lic_id.clone();
+
+    // What the deployment was running under before this paste. "Replaced the
+    // license" and "licensed a deployment that had none" are different events.
+    let source_before = resolve_source(&state).await;
+
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+    let entry = AdminAuditEntry::on_named_object(
+        AdminAuditAction::LicenseActivated,
+        // The vendor's `lic_id`, which is what a revocation is a verdict
+        // about, and the only identifier that survives a later replacement.
+        // `None` when the token did not verify as a live license — the row
+        // then still records that somebody activated something and what the
+        // gateway concluded about it.
+        new_lic_id.clone(),
+    )
+    .with_detail(json!({
+        "status": status_str(snapshot.status),
+        "expires_at": snapshot.expires_at,
+        // The COUNT, not the list: a feature list is vendor-controlled text of
+        // unbounded length, and how many were granted is the auditable shape.
+        "feature_count": snapshot.features.len(),
+        "source_before": source_before,
+        "source_after": "db",
+    }));
+
+    // Persist the token AND the record of who installed it, together. THE
+    // TOKEN ITSELF IS NEVER IN `entry`: it is a bearer entitlement, it is
+    // stored in `license_activation` (a declared artifact with its own
+    // lifecycle), and `admin_audit` is never purged.
+    license_repo::upsert_audited(
+        &state.db,
+        body.token.trim(),
+        Some(ctx.user_id),
+        &actor,
+        &entry,
+    )
+    .await
+    .map_err(api_error_response)?;
+
+    // Live-swap the license snapshot.
     state.license.set(snapshot);
 
     // WS4-4 — a revocation is a verdict about one `lic_id`. Installing a
@@ -198,19 +252,49 @@ async fn delete_license(
 ) -> Result<Json<LicenseStatusResponse>, axum::response::Response> {
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
-    license_repo::clear(&state.db)
-        .await
-        .map_err(|e| api_error_response(ApiError::Database(e.to_string())))?;
-
-    // Re-resolve and live-swap.
-    let token = resolve_active_token(&state.db, &state.config.license.license_token).await;
+    // What removing the row will leave behind, worked out BEFORE the delete so
+    // it can go in the audit row that shares the delete's transaction. The
+    // fallback is the ENV token by definition — `resolve_active_token` prefers
+    // the DB row, and after this delete there is none — so this needs no read.
     let now = chrono::Utc::now().timestamp();
-    let snapshot = {
-        let vk_b64 = effective_vendor_pubkey(&state.config.license.pubkey_b64);
-        match parse_vendor_key(&vk_b64) {
-            Some(vk) => load_and_verify_token(&token, &vk, now),
-            None => crate::license::LicenseSnapshot::unlicensed(),
-        }
+    let env_token = state.config.license.license_token.clone();
+    let source_after = if env_token.is_empty() { "none" } else { "env" };
+    let vk_b64 = effective_vendor_pubkey(&state.config.license.pubkey_b64);
+    let snapshot_after = match parse_vendor_key(&vk_b64) {
+        Some(vk) => load_and_verify_token(&env_token, &vk, now),
+        None => LicenseSnapshot::unlicensed(),
+    };
+
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+    let entry = AdminAuditEntry::on_named_object(
+        AdminAuditAction::LicenseCleared,
+        // The id of the license being REMOVED, captured while it is still the
+        // active one. Afterwards there is nothing left to name it.
+        state.license.snapshot().lic_id,
+    )
+    .with_detail(json!({
+        "status_after": status_str(snapshot_after.status),
+        "source_after": source_after,
+    }));
+
+    license_repo::clear_audited(&state.db, &actor, &entry)
+        .await
+        .map_err(api_error_response)?;
+
+    // Re-resolve and live-swap. The re-read is kept rather than reusing
+    // `snapshot_after`: it is the same value by construction, and going back
+    // to `resolve_active_token` means the applied state comes from the
+    // database as it now is rather than from this handler's prediction of it.
+    let token = resolve_active_token(&state.db, &state.config.license.license_token).await;
+    let snapshot = match parse_vendor_key(&vk_b64) {
+        Some(vk) => load_and_verify_token(&token, &vk, now),
+        None => LicenseSnapshot::unlicensed(),
     };
     state.license.set(snapshot);
 

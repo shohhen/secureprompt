@@ -2091,6 +2091,115 @@ async fn retention_days_without_an_enforcement_mechanism_is_never_reported(pool:
     );
 }
 
+/// FU4 — session device context is PERSONAL DATA in a table the inventory
+/// already declares as `credential_material` with no retention at all. Folding
+/// it into that entry would hide two facts an auditor needs: that
+/// `refresh_tokens` now holds IP addresses, and that those addresses (unlike
+/// the rows around them) ARE erased on a schedule.
+///
+/// So it is its own class, with its own retention and its own count. This test
+/// exists because the alternative — saying nothing, on the grounds that no new
+/// table was created — is exactly the omission
+/// `every_table_the_product_creates_appears_in_the_inventory` cannot catch: it
+/// derives its expected set from `CREATE TABLE`, and FU4 issued none.
+///
+/// Falsifier: delete the `session_device_context` entry from the handler.
+#[sqlx::test]
+async fn session_device_context_is_declared_with_the_purge_that_erases_it(pool: PgPool) {
+    let (ws, user) = seed_workspace(&pool).await;
+
+    // Two sessions, one with device context and one without, so the count
+    // below is a real count and not a table total.
+    for (session, ip, descriptor) in [
+        (Uuid::new_v4(), Some("203.0.113.7"), Some("Chrome on macOS")),
+        (Uuid::new_v4(), None, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO refresh_tokens
+                 (id, user_id, workspace_id, token_hash, expires_at, created_at,
+                  session_id, access_jti, client_ip, client_descriptor)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 hour', NOW(), $5, $6, $7, $8)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user)
+        .bind(ws)
+        .bind(Uuid::new_v4().simple().to_string())
+        .bind(session)
+        .bind(Uuid::new_v4().to_string())
+        .bind(ip)
+        .bind(descriptor)
+        .execute(&pool)
+        .await
+        .expect("seed session");
+    }
+
+    let app = build_app(pool);
+    let (status, body) = get_inventory(&app, &make_jwt(ws, user, "admin")).await;
+    assert_eq!(status, StatusCode::OK, "data-inventory failed: {body}");
+
+    let class = artifact(&body, "session_device_context");
+
+    // It counts the rows that actually hold the data, not the table.
+    assert_eq!(
+        class["row_count"],
+        Value::from(1),
+        "the count must be of rows CARRYING device context — one of the two \
+         sessions seeded above has none: {class}"
+    );
+
+    // The two facts that make this different from `refresh_tokens`.
+    assert_eq!(
+        class["sensitivity"], "personal_data",
+        "an IP address is personal data, whatever table it sits in: {class}"
+    );
+    assert_eq!(
+        class["retention"]["mechanism"], "worker_purge",
+        "device context IS erased on a schedule, unlike the rows around it. \
+         Reporting `none` here would understate what the product does; \
+         reporting a mechanism that does not exist would overstate it: {class}"
+    );
+    assert!(
+        !class["retention"]["mechanism_detail"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "the mechanism needs a description, not just a name: {class}"
+    );
+
+    // PREMISE + FALSIFIER for the retention claim. A mechanism name in JSON is
+    // a promise; this asserts the code that keeps it exists and names this
+    // table. WS3-5's own `refresh_tokens` entry justifies its `none` with
+    // exactly this kind of grep, and the claim is only as good as the check.
+    const PURGE_SOURCE: &str =
+        include_str!("../../secureprompt-worker/src/tasks/retention_purge.rs");
+    assert!(
+        PURGE_SOURCE.contains("UPDATE refresh_tokens"),
+        "the inventory claims `worker_purge` erases session device context, and \
+         nothing in retention_purge.rs writes to refresh_tokens. Either the \
+         claim is false or the purge was removed."
+    );
+    assert!(
+        PURGE_SOURCE.contains("client_ip = NULL") && PURGE_SOURCE.contains("client_descriptor"),
+        "the purge must clear BOTH device columns; clearing one leaves the \
+         other retained indefinitely while the inventory says otherwise."
+    );
+
+    // CONTROL THAT MUST DIFFER: `refresh_tokens` itself still reports no
+    // retention, because nothing deletes those ROWS and saying otherwise would
+    // be the false assurance
+    // `retention_days_without_an_enforcement_mechanism_is_never_reported`
+    // exists to prevent. The two classes must not have been collapsed.
+    let rows = artifact(&body, "refresh_tokens");
+    assert_eq!(
+        rows["retention"]["mechanism"],
+        Value::String("none".into()),
+        "the ROWS are still never deleted — only the device context on them is \
+         erased. Reporting a mechanism for the row class would claim a deletion \
+         that does not happen: {rows}"
+    );
+    assert_eq!(rows["row_count"], Value::from(2), "control: {rows}");
+}
+
 // ── 5. What the endpoint cannot say ───────────────────────────────────────
 
 /// The Redis file vault carries no workspace id in its key, so it can neither

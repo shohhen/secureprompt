@@ -3,6 +3,8 @@ use secureprompt_common::{errors::ApiError, types::WorkspaceId};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+
 #[derive(Debug, Clone)]
 pub struct PolicyRuleRow {
     pub id: Uuid,
@@ -152,6 +154,7 @@ impl PolicyRepository {
         action_params: serde_json::Value,
         enabled: bool,
         dry_run: bool,
+        actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
         let mut tx = self
             .pool
@@ -185,6 +188,29 @@ impl PolicyRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
+        let rule_id: Uuid = row.get("id");
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::PolicyRuleCreated,
+                rule_id,
+                Some(name.to_owned()),
+            )
+            .with_detail(serde_json::json!({
+                "priority": priority,
+                // `rule_action` and not `action`: the audit row's own `action`
+                // column already means "what the administrator did", and a
+                // second `action` meaning "what the rule does" inside `detail`
+                // would be read wrong by everyone exactly once.
+                "rule_action": action,
+                "enabled": enabled,
+                "dry_run": dry_run,
+                "conditions_present": !matches!(&conditions, serde_json::Value::Array(a) if a.is_empty()),
+            })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -210,6 +236,7 @@ impl PolicyRepository {
         action_params: serde_json::Value,
         enabled: bool,
         dry_run: bool,
+        actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
         let mut tx = self
             .pool
@@ -222,6 +249,20 @@ impl PolicyRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // The BEFORE half of the audit diff, locked so nothing moves between
+        // this read and the UPDATE below. Once the UPDATE runs these values are
+        // unrecoverable, and a diff is the whole content of an edit record.
+        let before = sqlx::query(
+            "SELECT name, priority, conditions, action, action_params, enabled, dry_run
+             FROM policy_rules WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+        )
+        .bind(rule_id)
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
 
         let row = sqlx::query(
             "UPDATE policy_rules
@@ -245,6 +286,60 @@ impl PolicyRepository {
         .map_err(|e| ApiError::Database(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
 
+        let mut changed = serde_json::Map::new();
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "name",
+            &serde_json::json!(before.get::<String, _>("name")),
+            &serde_json::json!(name),
+        );
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "priority",
+            &serde_json::json!(before.get::<i32, _>("priority")),
+            &serde_json::json!(priority),
+        );
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "rule_action",
+            &serde_json::json!(before.get::<String, _>("action")),
+            &serde_json::json!(action),
+        );
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "enabled",
+            &serde_json::json!(before.get::<bool, _>("enabled")),
+            &serde_json::json!(enabled),
+        );
+        admin_audit_repo::changed_field(
+            &mut changed,
+            "dry_run",
+            &serde_json::json!(before.get::<bool, _>("dry_run")),
+            &serde_json::json!(dry_run),
+        );
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::PolicyRuleUpdated,
+                rule_id,
+                Some(name.to_owned()),
+            )
+            .with_detail(serde_json::json!({
+                "changed": serde_json::Value::Object(changed),
+                // `conditions` and `action_params` are unbounded
+                // administrator-authored JSON — a match pattern can contain
+                // anything, including the personal data this product exists to
+                // keep out of places it should not be. WHETHER they moved is
+                // recorded; their contents are not. See migration 028.
+                "conditions_changed":
+                    before.get::<serde_json::Value, _>("conditions") != conditions,
+                "action_params_changed":
+                    before.get::<serde_json::Value, _>("action_params") != action_params,
+            })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -260,6 +355,7 @@ impl PolicyRepository {
         &self,
         workspace_id: WorkspaceId,
         rule_id: Uuid,
+        actor: &AdminActor,
     ) -> Result<(), ApiError> {
         let mut tx = self
             .pool
@@ -273,24 +369,45 @@ impl PolicyRepository {
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        let result = sqlx::query(
-            "DELETE FROM policy_rules WHERE id = $1 AND workspace_id = $2",
+        // RETURNING the descriptive columns: after this commits, the audit
+        // row is the only surviving description of the rule that was removed.
+        let deleted = sqlx::query(
+            "DELETE FROM policy_rules WHERE id = $1 AND workspace_id = $2
+             RETURNING name, priority, action, enabled, dry_run",
         )
         .bind(rule_id)
         .bind(workspace_id.0)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        let Some(deleted) = deleted else {
+            return Err(ApiError::NotFound(format!(
+                "policy rule {rule_id} not found"
+            )));
+        };
+
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::PolicyRuleDeleted,
+                rule_id,
+                Some(deleted.get::<String, _>("name")),
+            )
+            .with_detail(serde_json::json!({
+                "priority": deleted.get::<i32, _>("priority"),
+                "rule_action": deleted.get::<String, _>("action"),
+                "enabled": deleted.get::<bool, _>("enabled"),
+                "dry_run": deleted.get::<bool, _>("dry_run"),
+            })),
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound(format!(
-                "policy rule {rule_id} not found"
-            )));
-        }
         Ok(())
     }
 
@@ -298,11 +415,20 @@ impl PolicyRepository {
     ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the rule does not exist.
+    /// FU5: writes a `policy_rule.enabled_changed` audit row in the same
+    /// transaction, carrying the direction the control moved.
+    ///
+    /// A call that sets the flag to the value it already held IS recorded, with
+    /// `before` equal to `after`. That is an administrator re-asserting the
+    /// setting, which happened, and a trail that silently drops it would answer
+    /// "nobody touched this rule" to a question about an afternoon when
+    /// somebody did.
     pub async fn set_enabled(
         &self,
         workspace_id: WorkspaceId,
         rule_id: Uuid,
         enabled: bool,
+        actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
         let mut tx = self
             .pool
@@ -315,6 +441,19 @@ impl PolicyRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // The prior value, locked, because `UPDATE ... RETURNING` yields the
+        // NEW one and "it is now false" does not say which way it moved.
+        let before = sqlx::query(
+            "SELECT enabled FROM policy_rules WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+        )
+        .bind(rule_id)
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
+        let was: bool = before.get("enabled");
 
         let row = sqlx::query(
             "UPDATE policy_rules SET enabled=$3, updated_at=NOW()
@@ -330,6 +469,18 @@ impl PolicyRepository {
         .map_err(|e| ApiError::Database(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
 
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::PolicyRuleEnabledChanged,
+                rule_id,
+                Some(row.get::<String, _>("name")),
+            )
+            .with_detail(serde_json::json!({ "before": was, "after": enabled })),
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
@@ -341,11 +492,20 @@ impl PolicyRepository {
     ///
     /// # Errors
     /// Returns `ApiError::NotFound` when the rule does not exist.
+    /// FU5: writes a `policy_rule.dry_run_changed` audit row in the same
+    /// transaction, carrying the direction the control moved.
+    ///
+    /// A call that sets the flag to the value it already held IS recorded, with
+    /// `before` equal to `after`. That is an administrator re-asserting the
+    /// setting, which happened, and a trail that silently drops it would answer
+    /// "nobody touched this rule" to a question about an afternoon when
+    /// somebody did.
     pub async fn set_dry_run(
         &self,
         workspace_id: WorkspaceId,
         rule_id: Uuid,
         dry_run: bool,
+        actor: &AdminActor,
     ) -> Result<PolicyRuleRow, ApiError> {
         let mut tx = self
             .pool
@@ -358,6 +518,19 @@ impl PolicyRepository {
             .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        // The prior value, locked, because `UPDATE ... RETURNING` yields the
+        // NEW one and "it is now false" does not say which way it moved.
+        let before = sqlx::query(
+            "SELECT dry_run FROM policy_rules WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+        )
+        .bind(rule_id)
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
+        let was: bool = before.get("dry_run");
 
         let row = sqlx::query(
             "UPDATE policy_rules SET dry_run=$3, updated_at=NOW()
@@ -372,6 +545,18 @@ impl PolicyRepository {
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("policy rule {rule_id} not found")))?;
+
+        admin_audit_repo::write(
+            &mut tx,
+            actor,
+            &AdminAuditEntry::on_object(
+                AdminAuditAction::PolicyRuleDryRunChanged,
+                rule_id,
+                Some(row.get::<String, _>("name")),
+            )
+            .with_detail(serde_json::json!({ "before": was, "after": dry_run })),
+        )
+        .await?;
 
         tx.commit()
             .await

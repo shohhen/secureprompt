@@ -11,6 +11,9 @@ pub mod auth;
 pub mod budgets;
 // WS3-5 — `GET /v1/data-inventory`, the transparency/attestation endpoint.
 pub mod data_inventory;
+// FU4 — the closed vocabulary a session listing may say about a device, and
+// the parsers that keep two attacker-controlled headers out of the database.
+pub mod device;
 // Plan 05-04 namespaces.
 pub mod keys;
 // WS3-6 — `GET /v1/leak-report`, the shadow-mode pilot report, and the RU/UZ

@@ -34,6 +34,7 @@ use crate::{
     http::routes::dashboard::auth::{
         decide_2fa, encode_purpose_token, issue_token_pair, TokenOr2fa, TwoFaDecision,
     },
+    http::routes::dashboard::device::DeviceContext,
     redis as sp_redis,
 };
 use secureprompt_common::errors::ApiError;
@@ -161,6 +162,7 @@ pub async fn oidc_authorize(State(state): State<AppState>) -> Response {
 /// 6. Issues SecurePrompt JWT pair via `issue_token_pair` (same as credentials flow).
 pub async fn oidc_callback(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
     let (client_id, client_secret, issuer_url, redirect_uri) = match read_oidc_env() {
@@ -174,24 +176,24 @@ pub async fn oidc_callback(
     };
 
     // Consume PKCE verifier from Redis (GETDEL — prevents replay attack).
-    let verifier_secret =
-        match sp_redis::consume_oidc_state(&state.redis_pool, &params.state).await {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    JsonResponse(json!({
-                        "error": {
-                            "code": "invalid_state",
-                            "message": "Invalid or expired OAuth state parameter",
-                            "type": "secureprompt_error"
-                        }
-                    })),
-                )
-                    .into_response()
-            }
-            Err(e) => return api_error_to_response(e),
-        };
+    let verifier_secret = match sp_redis::consume_oidc_state(&state.redis_pool, &params.state).await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({
+                    "error": {
+                        "code": "invalid_state",
+                        "message": "Invalid or expired OAuth state parameter",
+                        "type": "secureprompt_error"
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => return api_error_to_response(e),
+    };
 
     let pkce_verifier = PkceCodeVerifier::new(verifier_secret);
 
@@ -267,7 +269,7 @@ pub async fn oidc_callback(
     // `token()` (password login) enforces for Owner/Admin. Delegate to the
     // same decision `token()` uses instead of inlining it, both to keep
     // this function short and so the two login paths cannot drift apart.
-    issue_token_or_2fa_response(&state, &row).await
+    issue_token_or_2fa_response(&state, &row, &DeviceContext::from_headers(&headers)).await
 }
 
 /// Shared tail of `oidc_callback`: apply the exact same 2FA decision
@@ -275,19 +277,56 @@ pub async fn oidc_callback(
 /// `decide_2fa`/`TokenOr2fa`/`encode_purpose_token` machinery — so an
 /// OIDC-authenticated Owner/Admin cannot skip 2FA by using this path
 /// instead of `/v1/auth/token`.
-async fn issue_token_or_2fa_response(
+/// `pub` rather than private so an integration test can drive it directly.
+/// `oidc_callback` cannot be exercised without a live identity provider —
+/// discovery, code exchange and a userinfo fetch all happen before this point —
+/// and this is the whole of the callback that decides what an OIDC sign-in
+/// does, so testing it here is testing the OIDC path with only the network
+/// hops omitted.
+pub async fn issue_token_or_2fa_response(
     state: &AppState,
     row: &crate::db::user_repo::UserCredentials,
+    device: &DeviceContext,
 ) -> Response {
     let role = match UserRole::from_db_str(&row.role) {
         Ok(role) => role,
         Err(err) => return api_error_to_response(err),
     };
 
-    match decide_2fa(role, row.totp_confirmed_at.is_some()) {
+    let decision = decide_2fa(role, row.totp_confirmed_at.is_some());
+
+    // P1A — the same record the password path writes, labelled `oidc`. One
+    // shared function rather than a second copy, for the same reason
+    // `decide_2fa` is shared: two divergent copies of a login rule is how the
+    // 2FA bypass this function exists to fix happened in the first place.
+    // Written BEFORE anything is issued — see `auth::record_login` for the
+    // guarantee that buys and for the availability cost it carries.
+    if let Err(err) = crate::http::routes::dashboard::auth::record_login(
+        state,
+        row.id,
+        row.workspace_id,
+        &row.email,
+        &row.role,
+        crate::http::routes::dashboard::auth::LoginMethod::Oidc,
+        decision,
+    )
+    .await
+    {
+        return api_error_to_response(err);
+    }
+
+    match decision {
         TwoFaDecision::Access => {
             // Unchanged — same envelope as the credentials flow.
-            issue_token_pair(state, row.id, row.workspace_id, &row.role, &row.email).await
+            issue_token_pair(
+                state,
+                row.id,
+                row.workspace_id,
+                &row.role,
+                &row.email,
+                device,
+            )
+            .await
         }
         TwoFaDecision::Challenge => {
             match encode_purpose_token(state, row.id, row.workspace_id, "2fa_challenge", 300) {
@@ -401,19 +440,37 @@ mod tests {
 
     #[test]
     fn build_oauth_client_rejects_invalid_auth_url() {
-        let result = build_oauth_client("id", "secret", "not-a-url", "https://token.example.com/token", "https://redirect.example.com/cb");
+        let result = build_oauth_client(
+            "id",
+            "secret",
+            "not-a-url",
+            "https://token.example.com/token",
+            "https://redirect.example.com/cb",
+        );
         assert!(result.is_err(), "Expected Err for invalid auth_url");
     }
 
     #[test]
     fn build_oauth_client_rejects_invalid_token_url() {
-        let result = build_oauth_client("id", "secret", "https://auth.example.com/auth", "not-a-url", "https://redirect.example.com/cb");
+        let result = build_oauth_client(
+            "id",
+            "secret",
+            "https://auth.example.com/auth",
+            "not-a-url",
+            "https://redirect.example.com/cb",
+        );
         assert!(result.is_err(), "Expected Err for invalid token_url");
     }
 
     #[test]
     fn build_oauth_client_rejects_invalid_redirect_uri() {
-        let result = build_oauth_client("id", "secret", "https://auth.example.com/auth", "https://token.example.com/token", "not-a-url");
+        let result = build_oauth_client(
+            "id",
+            "secret",
+            "https://auth.example.com/auth",
+            "https://token.example.com/token",
+            "not-a-url",
+        );
         assert!(result.is_err(), "Expected Err for invalid redirect_uri");
     }
 
@@ -426,6 +483,9 @@ mod tests {
             "https://idp.example.com/token",
             "https://app.example.com/callback",
         );
-        assert!(result.is_ok(), "Expected Ok for valid URLs, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Expected Ok for valid URLs, got: {result:?}"
+        );
     }
 }

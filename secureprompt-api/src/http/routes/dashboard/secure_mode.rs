@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     db::{
+        admin_audit_repo::AdminActor,
         raw_capture_repo::{RawCaptureRepository, RawCaptureSettings},
         secure_mode_repo::SecureModeRepository,
         sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
@@ -272,6 +273,20 @@ async fn put_secure_mode(
     // that direction fails safe: the sidecar policy keeps its previous, more
     // conservative-or-equal value rather than being loosened by a request
     // that then errored.
+    // P1A — the acting administrator, resolved once for both controls. Two
+    // audit rows can come out of this one PUT and they must name the same
+    // person: secure mode and the sidecar-failure policy are separate controls
+    // answering separate auditor questions ("was redaction on?" and "what did
+    // this gateway do when the redactor was down?"), and one combined row
+    // would make the second unanswerable.
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+
     let repo = SecureModeRepository::new(state.db.clone());
     let row = repo
         .upsert(
@@ -281,13 +296,19 @@ async fn put_secure_mode(
             body.block_on_pii_detection,
             body.block_on_injection_detection,
             body.redact_pii_in_responses,
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
 
     let sidecar_unavailable = match body.sidecar_unavailable.as_deref() {
         Some(value) => sidecar_repo
-            .upsert(ctx.workspace_id, SidecarUnavailablePolicy::from_db(value))
+            .upsert(
+                ctx.workspace_id,
+                SidecarUnavailablePolicy::from_db(value),
+                deployment_default,
+                &actor,
+            )
             .await
             .map_err(api_error_response)?,
         None => sidecar_repo

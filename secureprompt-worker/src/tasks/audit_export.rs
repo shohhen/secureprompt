@@ -73,6 +73,7 @@ use secureprompt_common::{
     tasks::TaskEnvelope,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
@@ -303,6 +304,7 @@ pub const CONTROL_TIME_COLUMNS: &[(&str, &str)] = &[
     ("raw_capture_audit", "created_at"),
     ("retention_purge_audit", "completed_at"),
     ("session_revocation_audit", "created_at"),
+    ("admin_audit", "created_at"),
 ];
 
 /// The total order the control plane is exported in.
@@ -437,6 +439,71 @@ async fn fetch_control_rows(
                 "revoked_before_unix": record.get::<i64, _>("revoked_before_unix"),
                 "refresh_tokens_revoked": record.get::<i64, _>("refresh_tokens_revoked"),
             }),
+        });
+    }
+
+    // FU5 — `admin_audit`, the one source that is not per-action.
+    //
+    // THIS IS THE WHOLE POINT OF THE SINGLE-TABLE DESIGN, so it is worth being
+    // explicit about what is NOT here: there is no `match` on the action, no
+    // per-action `detail` construction and no `WHERE action IN (...)`. The
+    // stored `action` becomes `event_type` VERBATIM and the stored `detail`
+    // is carried through with the object identity merged in. A thirteenth
+    // audited action therefore reaches an auditor with no change to this
+    // function — there is no list here to forget to extend, which is what makes
+    // "a new action cannot silently miss the export" structural rather than a
+    // habit. `tests.rs::every_audited_action_reaches_the_signed_export` reads
+    // the vocabulary out of migration 028's CHECK constraint and proves it.
+    for record in sqlx::query(
+        "SELECT id, action, actor_user_id, actor_email, actor_role, target_type, \
+                target_id, target_label, target_user_id, target_email, target_role, \
+                detail, created_at \
+         FROM admin_audit \
+         WHERE workspace_id = $1 AND created_at >= $2 AND created_at < $3",
+    )
+    .bind(req.workspace_id)
+    .bind(req.from)
+    .bind(req.to)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        // The object's identity travels in `detail` rather than in new
+        // top-level columns: `CONTROL_COLUMNS` is the shared shape for all four
+        // sources, and widening it for one source would change every row of the
+        // other three and break the format for a reason none of them share.
+        let mut detail = record.get::<Value, _>("detail");
+        if let Value::Object(map) = &mut detail {
+            map.insert(
+                "target_type".to_owned(),
+                Value::String(record.get::<String, _>("target_type")),
+            );
+            map.insert(
+                "target_id".to_owned(),
+                record
+                    .get::<Option<Uuid>, _>("target_id")
+                    .map_or(Value::Null, |id| Value::String(id.to_string())),
+            );
+            map.insert(
+                "target_label".to_owned(),
+                record
+                    .get::<Option<String>, _>("target_label")
+                    .map_or(Value::Null, Value::String),
+            );
+        }
+
+        rows.push(ControlRow {
+            event_id: record.get("id"),
+            workspace_id: req.workspace_id,
+            occurred_at: record.get("created_at"),
+            event_type: record.get::<String, _>("action"),
+            source_table: "admin_audit".to_owned(),
+            actor_user_id: record.get("actor_user_id"),
+            actor_email: record.get("actor_email"),
+            actor_role: record.get("actor_role"),
+            target_user_id: record.get("target_user_id"),
+            target_email: record.get("target_email"),
+            target_role: record.get("target_role"),
+            detail,
         });
     }
 

@@ -1723,3 +1723,147 @@ async fn the_scope_guard_refuses_a_transaction_that_was_not_scoped(
     low.close().await;
     Ok(())
 }
+
+// ── FU5: the whole administrative vocabulary must reach the artifact ──────
+
+/// The action vocabulary, read from the DATABASE rather than restated here.
+///
+/// Migration 028's `admin_audit_action_known` CHECK is the closed list of
+/// actions that may be stored, so deriving the test's expectations from it
+/// means a newly audited action joins this test automatically. Restating the
+/// list in Rust would produce exactly the drift FU5 exists to prevent: a new
+/// action shipping while the test that proves actions reach auditors still
+/// checked the old set and stayed green.
+async fn audited_actions(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'admin_audit_action_known'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let mut out = Vec::new();
+    let mut rest = def.as_str();
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else { break };
+        out.push(after[..close].to_owned());
+        rest = &after[close + 1..];
+    }
+    Ok(out)
+}
+
+/// **The structural guarantee, executed.** Every action the product is capable
+/// of auditing reaches the signed export.
+///
+/// This is the test that makes "a future action cannot silently miss the
+/// export" true rather than intended. It does not enumerate actions; it asks
+/// the database which actions exist and requires ALL of them in the artifact.
+/// Adding a thirteenth action to migration 028 extends this test's expectation
+/// on the next run without anybody remembering to.
+///
+/// It fails today: the exporter reads three control-plane tables and
+/// `admin_audit` is not one of them.
+#[sqlx::test(migrations = "../secureprompt-api/migrations")]
+async fn every_audited_action_reaches_the_signed_export(pool: PgPool) -> sqlx::Result<()> {
+    let workspace_id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    seed_workspace(&pool, workspace_id).await?;
+    seed_workspace(&pool, other).await?;
+
+    let actions = audited_actions(&pool).await?;
+    // PREMISE: there is a vocabulary to check. An empty list would make every
+    // loop below iterate zero times and pass without proving anything.
+    assert!(
+        actions.len() >= 12,
+        "premise: migration 028 must declare the audited actions, found {}",
+        actions.len()
+    );
+
+    let (from, _) = window();
+    for (i, action) in actions.iter().enumerate() {
+        // One row per action for this tenant, and one for the other tenant, so
+        // the tenancy assertion below has something real to exclude.
+        for (ws, label) in [
+            (workspace_id, "mine"),
+            (other, "another tenant's — must never appear"),
+        ] {
+            sqlx::query(
+                "INSERT INTO admin_audit \
+                 (id, workspace_id, action, actor_user_id, actor_email, actor_role, \
+                  target_type, target_id, target_label, detail, created_at) \
+                 VALUES ($1, $2, $3, $4, 'synthetic-admin@example.invalid', 'admin', \
+                         'synthetic', $5, $6, '{\"synthetic\": true}'::jsonb, $7)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(ws)
+            .bind(action)
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(label)
+            .bind(from + chrono::Duration::minutes(i64::try_from(i).unwrap_or(0)))
+            .execute(&pool)
+            .await?;
+        }
+    }
+
+    let export_id = Uuid::new_v4();
+    seed_export_row(&pool, export_id, workspace_id, "jsonl", 5_000).await?;
+    let outcome = run_with(
+        &pool,
+        &ch_client(),
+        &envelope(export_id, workspace_id, "jsonl", 5_000),
+        Ok(test_key()),
+        MAX_EXPORT_ROWS,
+        Utc::now(),
+    )
+    .await;
+    let stored = load_export(&pool, export_id).await?;
+    assert!(
+        outcome.ok(),
+        "the export must complete; error: {:?}",
+        stored.error
+    );
+
+    let manifest: Value = serde_json::from_str(
+        stored
+            .manifest_json
+            .as_deref()
+            .expect("a complete export has a manifest"),
+    )
+    .expect("manifest is json");
+    let pages = load_pages(&pool, export_id).await?;
+    let exported = section_objects(&manifest, &pages, SECTION_CONTROL_PLANE);
+
+    let carried: Vec<&str> = exported
+        .iter()
+        .filter(|o| o["source_table"].as_str() == Some("admin_audit"))
+        .filter_map(|o| o["event_type"].as_str())
+        .collect();
+
+    for action in &actions {
+        assert!(
+            carried.iter().any(|e| e == action),
+            "`{action}` is an action this product audits and it is NOT in the \
+             signed export. An auditor holding this artifact would read its \
+             absence as the action never having happened. Carried: {carried:?}"
+        );
+    }
+
+    // The source must be NAMED, so the claim is re-derivable against the live
+    // database — the reason `source_table` exists on a control row at all.
+    assert!(
+        secureprompt_common::audit_export::CONTROL_SOURCE_TABLES.contains(&"admin_audit"),
+        "the manifest's source list must name `admin_audit`, or an auditor \
+         cannot tell which relation these rows were read from"
+    );
+
+    // And no other tenant's administrative history, at any depth in the bytes.
+    let all = String::from_utf8_lossy(&pages.concat()).into_owned();
+    assert!(
+        !all.contains("another tenant's"),
+        "another tenant's administrative actions reached this export"
+    );
+
+    Ok(())
+}

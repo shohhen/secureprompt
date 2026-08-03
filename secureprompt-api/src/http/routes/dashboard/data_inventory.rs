@@ -296,6 +296,27 @@ impl Retention {
             mechanism_detail: detail.to_owned(),
         }
     }
+
+    /// A class with a REAL enforcement mechanism whose window is not a number
+    /// of days.
+    ///
+    /// FU4 needed this and neither existing constructor could tell the truth
+    /// for it: `none` would deny an erasure that happens, and `days(n, …)`
+    /// would invent a fixed window where the boundary is an event — the
+    /// session ending — whose distance from now depends on when the person
+    /// last used it. `days: None` with a named mechanism is the shape the
+    /// `days` field's own documentation already anticipates, and the shape
+    /// `retention_days_without_an_enforcement_mechanism_is_never_reported`
+    /// admits: it forbids a NUMBER without a mechanism, not a mechanism
+    /// without a number.
+    fn bounded_by(window: &str, mechanism: &'static str, detail: &str) -> Self {
+        Self {
+            days: None,
+            window: window.to_owned(),
+            mechanism,
+            mechanism_detail: detail.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -742,6 +763,9 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1) AS c_refresh_tokens,
            (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1
               AND token_hash ~ '^[0-9a-f]+$' AND length(token_hash) = 64) AS v_refresh_tokens,
+           (SELECT count(*) FROM refresh_tokens WHERE workspace_id = $1
+              AND (client_ip IS NOT NULL OR client_descriptor IS NOT NULL))
+             AS c_session_device_context,
            (SELECT count(*) FROM workspace_budgets WHERE workspace_id = $1) AS c_workspace_budgets,
            (SELECT count(*) FROM token_vault_entries WHERE workspace_id = $1) AS c_token_vault_entries,
            (SELECT count(*) FROM token_vault_entries WHERE workspace_id = $1
@@ -760,7 +784,8 @@ async fn postgres_counts(pool: &sqlx::PgPool, ws: Uuid) -> Result<PgCounts, ApiE
            (SELECT count(*) FROM audit_exports WHERE workspace_id = $1) AS c_audit_exports,
            (SELECT count(*) FROM audit_export_pages WHERE workspace_id = $1) AS c_audit_export_pages,
            (SELECT count(*) FROM session_revocation_audit WHERE workspace_id = $1)
-             AS c_session_revocation_audit",
+             AS c_session_revocation_audit,
+           (SELECT count(*) FROM admin_audit WHERE workspace_id = $1) AS c_admin_audit",
         cred_sealed = pg_sealed("encrypted_credential"),
         vault_sealed = pg_sealed("mapping_ciphertext"),
     );
@@ -1349,9 +1374,53 @@ async fn get_data_inventory(
         retention: Retention::none(
             "NOTHING DELETES THESE ROWS. `expires_at` and `revoked_at` are honoured at READ \
              time, so an expired or rotated token stops working — but the row itself is kept \
-             forever, one per refresh per user, and `retention.purge` does not cover this \
-             table. Reported as `none` deliberately: `expires_at` is a validity check, not a \
-             deletion, and presenting it as a retention window would be a false assurance.",
+             forever, one per refresh per user, and `retention.purge` does not delete from \
+             this table. Reported as `none` deliberately: `expires_at` is a validity check, \
+             not a deletion, and presenting it as a retention window would be a false \
+             assurance. The `session_device_context` class below covers the FU4 columns on \
+             these same rows, which ARE erased on a schedule — the rows are not.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
+    // FU4. Declared SEPARATELY from `refresh_tokens` rather than folded into
+    // it, because the two differ on both axes an auditor reads: sensitivity
+    // (credential material vs. personal data) and retention (never vs. erased
+    // when the session ends). One entry could only have told one of those two
+    // truths.
+    artifacts.push(ArtifactClass {
+        class: "session_device_context".to_owned(),
+        store: "postgres",
+        location: "refresh_tokens.client_ip + refresh_tokens.client_descriptor".to_owned(),
+        description: "The device that opened each session: the IP address as seen at sign-in, \
+                      and a coarse client descriptor. Recorded once per session, on the \
+                      sign-in row only — never re-recorded when the token rotates.",
+        sensitivity: "personal_data",
+        // Rows CARRYING device context, not rows in the table. The two differ,
+        // and the smaller number is the one that describes this class.
+        row_count: Some(pg.n("c_session_device_context")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Stored in the clear, and bounded rather than verbatim. The raw `User-Agent` is \
+             NOT kept: it is reduced to `{browser} on {os}` drawn from a closed vocabulary, so \
+             no byte of that header reaches this column and the version/build detail that \
+             makes a User-Agent a fingerprint is discarded. `client_ip` is written only when \
+             the value parses as an IP address, and is re-rendered from the parse. CHECK \
+             constraints on the table bound both independently of the code.",
+        ),
+        retention: Retention::bounded_by(
+            "until the session ends, then the next purge run",
+            mechanism::WORKER_PURGE,
+            "`retention.purge`, scope `refresh_tokens.device_context`, daily at 04:00. It \
+             SCRUBS these two columns to NULL on every session with no live refresh row \
+             left — it does not delete the row, because a deleted row would make a replayed \
+             refresh token indistinguishable from one that never existed and would silently \
+             disable replay detection. The upper bound on how long an address is held is \
+             therefore the refresh-token lifetime (default 30 days) from the session's last \
+             use, plus up to 24h until the next run. The decision is made per rotation CHAIN, \
+             not per row.",
         ),
         governed_by: None,
         enabled: None,
@@ -1562,6 +1631,73 @@ async fn get_data_inventory(
              far back it reaches. A COPY of these rows therefore also lives in \
              `audit_export_pages` for every window that has been exported, and an \
              erasure request must reach that table too.",
+        ),
+        governed_by: None,
+        enabled: None,
+    });
+
+    // FU5 — migration 028. Every audited administrative action in this
+    // workspace, in one table.
+    artifacts.push(ArtifactClass {
+        class: "admin_audit".to_owned(),
+        store: "postgres",
+        location: "admin_audit".to_owned(),
+        description: "Append-only record of the audited administrative actions: API \
+                      key create/revoke/rotate, provider credential create/update/delete, \
+                      policy rule create/update/delete and enabled/dry-run toggles, \
+                      user creation (FU5), and 2FA enrolment/confirmation/reset, license \
+                      activation and removal, budget / secure-mode / sidecar-failure \
+                      settings changes, successful dashboard and OIDC logins, and \
+                      second-factor verification (P1A). Each row says who acted, on \
+                      which object, what \
+                      changed and when. Written in the SAME transaction as the action it \
+                      records, so the action and its record commit together or neither \
+                      does — with two named exceptions whose action has no transaction \
+                      to join: `auth.login_succeeded` and `auth.second_factor_verified` \
+                      commit BEFORE the session they precede, so no session is issued \
+                      without a record of the login that opened it. NOT a complete \
+                      record of administrative activity: a FAILED login writes nothing, \
+                      deliberately — an attempt against an unknown email has no \
+                      workspace to be recorded under, and auditing only the resolvable \
+                      failures would make row-absence mean `no such account`. Public \
+                      signup, token refresh, logout, API-key reassignment and provider \
+                      model changes are also unaudited. Their absence here is not \
+                      evidence they did not happen.",
+        sensitivity: "audit_trail",
+        row_count: Some(pg.n("c_admin_audit")),
+        row_count_status: "counted",
+        row_count_detail: None,
+        encryption: Encryption::plain(
+            "Identifiers, the acting administrator's email and role as they read at the \
+             time, the acted-on object's own name, and a JSONB `detail` of bounded \
+             action-specific facts (a priority, an enabled flag, a provider type, a \
+             grace-window instant, and before/after pairs for the fields that moved). \
+             NO SECRET IS STORED: not an API key or any prefix of one, not a provider \
+             credential in plaintext or ciphertext, not a password or its hash, not a \
+             TOTP secret, a 2FA backup code or the signed license token — \
+             `tests/admin_audit.rs` dumps every column of \
+             every row to text and searches it. DELIBERATELY ABSENT for the reason \
+             `session_revocation_audit` gives: IP address, User-Agent and any free-text \
+             reason. That holds for the LOGIN rows too, which are the only ones whose \
+             request carries those headers, and it holds for the reduced \
+             `{browser} on {os}` descriptor a session row stores as well: that \
+             descriptor is ERASED when the session ends, and this table is never purged, \
+             so a copy here would undo the erasure permanently. \
+             The object's NAME is the one administrator-supplied string admitted, \
+             because without it a deleted object's audit row names only a UUID that \
+             resolves to nothing; it is truncated to 200 characters and the database \
+             REFUSES anything longer.",
+        ),
+        retention: Retention::none(
+            "Append-only and never purged, by design, like `raw_capture_audit`, \
+             `retention_purge_audit` and `session_revocation_audit`. `retention.purge` \
+             does not cover this table and is not intended to — an audit trail with a \
+             retention window is an audit trail with a deadline. Everything written here \
+             is kept forever, which is why what may enter is bounded so tightly. These \
+             rows ARE carried by `audit.export` as part of the `control_plane_events` \
+             section, so a COPY of them also lives in `audit_export_pages` for every \
+             window that has been exported, and an erasure request must reach that table \
+             too.",
         ),
         governed_by: None,
         enabled: None,

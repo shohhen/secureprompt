@@ -28,7 +28,11 @@
 //! sake.
 
 use secureprompt_common::{errors::ApiError, types::WorkspaceId};
+use serde_json::json;
 use sqlx::{PgPool, Row};
+
+use crate::db::admin_audit_repo::{self, AdminActor, AdminAuditAction, AdminAuditEntry};
+use crate::db::scope::begin_scoped;
 
 /// What to do when the ML sidecar produced no coverage for a request.
 ///
@@ -134,15 +138,50 @@ impl SidecarPolicyRepository {
         Ok(self.get(workspace_id).await?.unwrap_or(deployment_default))
     }
 
-    /// Upsert the workspace's policy.
+    /// Upsert the workspace's policy, and audit the move (P1A).
+    ///
+    /// This is the control that decides whether a prompt the PII detector never
+    /// saw is forwarded upstream anyway. `degrade_with_alert` is the setting a
+    /// customer will be asked about after a leak, and until now nothing
+    /// recorded who chose it or when.
+    ///
+    /// `deployment_default` is needed to state the BEFORE honestly: a workspace
+    /// with no row is not "unset", it is running the deployment's default, and
+    /// an audit row saying `before: null` would misdescribe the control that
+    /// was actually in force. That is the same distinction
+    /// [`Self::get_effective`] exists to make.
+    ///
+    /// Writes NO row when the effective policy does not move — re-submitting
+    /// the same value is not a change to a security control. See
+    /// `CONTROL_COVERAGE`.
     ///
     /// # Errors
-    /// Returns `ApiError::Database` when the write fails.
+    /// Returns `ApiError::Database` when the write fails and
+    /// `ApiError::Internal` when the tenancy scope does not arm.
     pub async fn upsert(
         &self,
         workspace_id: WorkspaceId,
         policy: SidecarUnavailablePolicy,
+        deployment_default: SidecarUnavailablePolicy,
+        actor: &AdminActor,
     ) -> Result<SidecarUnavailablePolicy, ApiError> {
+        // `admin_audit` is under FORCE RLS even though this table is not, so
+        // the transaction has to be scoped for the audit INSERT to be accepted.
+        let mut tx = begin_scoped(&self.pool, workspace_id.0).await?;
+
+        let before = sqlx::query(
+            "SELECT sidecar_unavailable
+             FROM workspace_sidecar_policy
+             WHERE workspace_id = $1",
+        )
+        .bind(workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Database(e.to_string()))?
+        .map_or(deployment_default, |r| {
+            SidecarUnavailablePolicy::from_db(&r.get::<String, _>("sidecar_unavailable"))
+        });
+
         let row = sqlx::query(
             "INSERT INTO workspace_sidecar_policy (workspace_id, sidecar_unavailable, updated_at)
              VALUES ($1, $2, NOW())
@@ -153,12 +192,32 @@ impl SidecarPolicyRepository {
         )
         .bind(workspace_id.0)
         .bind(policy.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
-        Ok(SidecarUnavailablePolicy::from_db(
-            &row.get::<String, _>("sidecar_unavailable"),
-        ))
+        let after = SidecarUnavailablePolicy::from_db(&row.get::<String, _>("sidecar_unavailable"));
+        if before != after {
+            admin_audit_repo::write(
+                &mut tx,
+                actor,
+                &AdminAuditEntry::on_object(
+                    AdminAuditAction::SidecarPolicyUpdated,
+                    workspace_id.0,
+                    None,
+                )
+                .with_detail(json!({
+                    "before": before.as_str(),
+                    "after": after.as_str(),
+                })),
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Database(e.to_string()))?;
+
+        Ok(after)
     }
 }

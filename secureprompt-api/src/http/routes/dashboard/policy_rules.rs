@@ -30,6 +30,7 @@ use secureprompt_common::tasks::{task_types, TaskEnvelope, QUEUE_POLICY_INDEX};
 
 use crate::{
     app_state::AppState,
+    db::admin_audit_repo::AdminActor,
     db::policy_repo::PolicyRepository,
     http::{
         api_error_response,
@@ -219,6 +220,13 @@ async fn create_rule(
     validate_action(&body.action).map_err(api_error_response)?;
 
     let repo = PolicyRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
 
     // Priority uniqueness check.
     if repo
@@ -242,6 +250,7 @@ async fn create_rule(
             body.action_params.unwrap_or(Value::Object(Default::default())),
             body.enabled.unwrap_or(true),
             body.dry_run.unwrap_or(false),
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
@@ -262,6 +271,13 @@ async fn update_rule(
     validate_action(&body.action).map_err(api_error_response)?;
 
     let repo = PolicyRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
 
     // Priority uniqueness check (exclude self).
     if repo
@@ -286,6 +302,7 @@ async fn update_rule(
             body.action_params.unwrap_or(Value::Object(Default::default())),
             body.enabled.unwrap_or(true),
             body.dry_run.unwrap_or(false),
+            &actor,
         )
         .await
         .map_err(api_error_response)?;
@@ -304,7 +321,14 @@ async fn delete_rule(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = PolicyRepository::new(state.db.clone());
-    repo.delete_rule(ctx.workspace_id, rule_id)
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
+    repo.delete_rule(ctx.workspace_id, rule_id, &actor)
         .await
         .map_err(api_error_response)?;
 
@@ -321,8 +345,15 @@ async fn toggle_enabled(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = PolicyRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let row = repo
-        .set_enabled(ctx.workspace_id, rule_id, body.value)
+        .set_enabled(ctx.workspace_id, rule_id, body.value, &actor)
         .await
         .map_err(api_error_response)?;
 
@@ -339,8 +370,15 @@ async fn toggle_dry_run(
     require_role(&ctx, UserRole::Admin).map_err(api_error_response)?;
 
     let repo = PolicyRepository::new(state.db.clone());
+    let actor = AdminActor::resolve(
+        &state.db,
+        ctx.workspace_id.0,
+        ctx.user_id,
+        ctx.role.as_db_str(),
+    )
+    .await;
     let row = repo
-        .set_dry_run(ctx.workspace_id, rule_id, body.value)
+        .set_dry_run(ctx.workspace_id, rule_id, body.value, &actor)
         .await
         .map_err(api_error_response)?;
 
