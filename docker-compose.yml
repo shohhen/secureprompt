@@ -64,12 +64,23 @@ services:
       # at 0.70 because extracted text is normalized before detection.
       GLINER_THRESHOLD: ${GLINER_THRESHOLD:-0.70}
       QDRANT_URL: http://qdrant:6333
-      # Shared secret the gateway uses to relay the license's WRAPPED model key
-      # to POST /internal/model-key. The sidecar's compiled .so unwraps it.
-      # MUST match the api service's value below.
-      # The image sets SECUREPROMPT_MODEL_KEY_REQUIRED=true, so the sidecar
-      # stays 503 until the gateway relays the wrapped key with this token.
-      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
+      # Shared secret every ML-sidecar caller (api, worker, web, librechat)
+      # must send as `Authorization: Bearer <value>` on every route except
+      # /health, /ready, /metrics (WS1-5) — also used to relay the license's
+      # WRAPPED model key to POST /internal/model-key. MUST match the value
+      # given to every other service below.
+      #
+      # No insecure default on purpose (WS1-5 fix-round): this used to
+      # default to the published placeholder `dev-sidecar-token-change-me`,
+      # which silently defeated the sidecar's own fail-closed boot gate (a
+      # value anyone can read in this repo is not a secret). The sidecar now
+      # ALSO rejects that literal placeholder even if it is set explicitly
+      # (see secureprompt-ml/app/config.py's PLACEHOLDER_SECRETS), but
+      # dropping the default here means `docker compose up` fails loudly —
+      # container restarts, unhealthy — instead of quietly booting on a
+      # public value. Set a real secret in `.env` (e.g. `openssl rand -hex
+      # 32`) before starting the stack.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
     # No ports: mapping — api already binds host 8080; gateway calls via Docker DNS only.
     # Healthcheck probes /health (liveness), NOT /ready. /ready only returns 200
     # AFTER the gateway pushes the model key — but the api `depends_on` this
@@ -162,7 +173,10 @@ services:
       SECUREPROMPT_LICENSE_PUBKEY: ${SECUREPROMPT_LICENSE_PUBKEY:-}
       SECUREPROMPT_ATTEST_KEK: ${SECUREPROMPT_ATTEST_KEK:-}
       SECUREPROMPT_LICENSE_TOKEN: ${SECUREPROMPT_LICENSE_TOKEN:-}
-      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:-dev-sidecar-token-change-me}
+      # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.
+      # MUST equal the secureprompt-ml service's value above — see that
+      # comment for why there is no insecure default here.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
       # sp-admin license server. Enables the online revocation poller (fail-CLOSED
       # only on a confirmed `revoked`; soft-fail/last-known on any other outcome)
       # and the attestation heartbeat uploader. Base URL must point at the JSON
@@ -197,6 +211,10 @@ services:
       CLICKHOUSE_MIGRATIONS_DIR: /clickhouse/migrations
       QDRANT_URL: http://qdrant:6333
       ML_SIDECAR_URL: http://secureprompt-ml:8080
+      # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.
+      # MUST equal the secureprompt-ml service's value above — see that
+      # comment for why there is no insecure default here.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
     depends_on:
       postgres:
         condition: service_healthy
@@ -219,6 +237,10 @@ services:
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme-dev-only}
       API_URL: http://api:8080
       ML_SIDECAR_URL: http://secureprompt-ml:8080
+      # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.
+      # MUST equal the secureprompt-ml service's value above — see that
+      # comment for why there is no insecure default here.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
     ports:
       - "3003:3000"
     depends_on:
@@ -332,6 +354,12 @@ services:
       # SP: over the docker bridge network. Phase 2 will replace this with a
       # SP: SP-side proxy at /v1/scan-file that does API-key auth + audit.
       SECUREPROMPT_ML_URL: http://secureprompt-ml:8080
+      # WS1-5: the fork's secureprompt-scan.js sends this as
+      # Authorization: Bearer <value> when it calls the ML sidecar's
+      # /v1/scan-file(/async) directly. MUST equal the secureprompt-ml
+      # service's value above — see that comment for why there is no
+      # insecure default here.
+      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
       SECUREPROMPT_SCAN_FILES_ENABLED: ${SECUREPROMPT_SCAN_FILES_ENABLED:-true}
       ALLOW_REGISTRATION: "false"
       ALLOW_EMAIL_LOGIN: "true"

@@ -55,6 +55,7 @@ fn test_config() -> AppConfig {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig::default(),
     }
 }
@@ -294,4 +295,143 @@ async fn put_secure_mode_rejects_invalid_level(pool: PgPool) {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── WS2-3: sidecar_unavailable ────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn get_secure_mode_reports_block_as_the_sidecar_default(pool: PgPool) {
+    let ws_id = seed_workspace(&pool).await;
+    let token = make_jwt(ws_id, "admin");
+    let app = build_app(pool);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["sidecar_unavailable"], "block",
+        "a workspace that has never chosen must read back as fail-closed"
+    );
+}
+
+#[sqlx::test]
+async fn put_secure_mode_can_switch_to_degrade_with_alert(pool: PgPool) {
+    let ws_id = seed_workspace(&pool).await;
+    let token = make_jwt(ws_id, "admin");
+    let app = build_app(pool);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"sidecar_unavailable": "degrade_with_alert"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["sidecar_unavailable"], "degrade_with_alert");
+
+    // Persisted, not just echoed.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["sidecar_unavailable"], "degrade_with_alert");
+}
+
+/// A PUT that does not mention `sidecar_unavailable` must leave it alone —
+/// otherwise toggling an unrelated secure-mode switch would silently
+/// re-open a workspace that had chosen to fail closed (or vice versa).
+#[sqlx::test]
+async fn put_secure_mode_preserves_sidecar_policy_when_unset(pool: PgPool) {
+    let ws_id = seed_workspace(&pool).await;
+    let token = make_jwt(ws_id, "admin");
+    let app = build_app(pool);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"sidecar_unavailable": "degrade_with_alert"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"enabled": true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(
+        body["sidecar_unavailable"], "degrade_with_alert",
+        "an unrelated PUT must not reset the sidecar policy"
+    );
+}
+
+#[sqlx::test]
+async fn put_secure_mode_rejects_unknown_sidecar_policy(pool: PgPool) {
+    let ws_id = seed_workspace(&pool).await;
+    let token = make_jwt(ws_id, "admin");
+    let app = build_app(pool);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/secure-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"sidecar_unavailable": "degrade"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a near-miss value must be rejected, not silently coerced"
+    );
 }

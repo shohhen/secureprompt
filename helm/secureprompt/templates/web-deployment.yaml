@@ -42,6 +42,13 @@ spec:
               value: "http://{{ include "secureprompt.fullname" . }}-api"
             - name: ML_SIDECAR_URL
               value: "http://{{ include "secureprompt.fullname" . }}-ml:8080"
+            # WS1-5: sent as Authorization: Bearer <value> to the ML sidecar.
+            # MUST equal the secret the -ml deployment consumes.
+            - name: ML_SIDECAR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secureprompt.fullname" . }}-secrets
+                  key: ml-sidecar-internal-token
           readinessProbe:
             httpGet:
               path: /api/health

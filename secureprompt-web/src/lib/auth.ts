@@ -17,6 +17,7 @@ import Credentials from "next-auth/providers/credentials";
 import type { AppRole } from "@/types/next-auth";
 import {
   refreshAccessTokenIfNeeded,
+  buildClientSessionFields,
   type AppJWT,
   type FetchImpl,
 } from "./auth-refresh";
@@ -228,13 +229,16 @@ export const authConfig: NextAuthConfig = {
         id: appToken.user?.id ?? "",
         email: appToken.user?.email ?? session.user?.email ?? "",
       };
-      session.workspaceId = appToken.workspaceId;
-      session.role = appToken.role;
-      session.accessToken = appToken.accessToken;
-      session.refreshToken = appToken.refreshToken;
-      session.accessExpiresAt = appToken.accessExpiresAt;
-      session.refreshExpiresAt = appToken.refreshExpiresAt;
-      session.error = appToken.error;
+      // SECURITY (WS1-9): buildClientSessionFields() deliberately omits
+      // refreshToken — do not add `session.refreshToken = ...` back here.
+      // See its doc comment in auth-refresh.ts for why.
+      const clientFields = buildClientSessionFields(appToken);
+      session.workspaceId = clientFields.workspaceId;
+      session.role = clientFields.role;
+      session.accessToken = clientFields.accessToken;
+      session.accessExpiresAt = clientFields.accessExpiresAt;
+      session.refreshExpiresAt = clientFields.refreshExpiresAt;
+      session.error = clientFields.error;
       return session;
     },
   },

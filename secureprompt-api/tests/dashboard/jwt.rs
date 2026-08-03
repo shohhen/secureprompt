@@ -113,6 +113,7 @@ fn build_state(pool: PgPool) -> AppState {
         public_signup_enabled: false,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig::default(),
     };
     let ml_sidecar = Arc::new(MlSidecarClient::new(String::new(), 100));

@@ -1,3 +1,280 @@
+/// WS2-1 round-1 review: the flagship claim, verified through the POLICY
+/// path rather than by calling `apply_redaction` directly.
+///
+/// A new workspace is seeded with a `detection_class in DEFAULT_POLICY_CLASSES`
+/// redact rule (`db/workspace_repo.rs`). That makes `rules_evaluated == 1`,
+/// which suppresses the `redact_when_no_rules` safety net in
+/// `pipeline/service.rs`, and `policy/engine.rs` then redacts only the
+/// detections `matching_detections` returns. `matching_detections` falls back
+/// to "all detections" ONLY when the class filter matches nothing — so a
+/// prompt mixing a covered class (an email) with an uncovered one (a PINFL)
+/// redacts the email and forwards the PINFL. Detecting an identifier is not
+/// the same as redacting it, and only a test through `evaluate` can tell the
+/// difference.
+#[cfg(test)]
+mod default_policy_path_tests {
+    use crate::db::{PolicyRepository, WorkspaceRepository};
+    use crate::detection::{detect_content, merge::merge_detections};
+    use crate::policy::engine::{evaluate, PolicyEvaluationInput};
+    use secureprompt_common::types::{RequestId, TokenVault, WorkspaceId};
+    use sqlx::PgPool;
+    use std::collections::HashMap;
+
+    /// A realistic requisites prompt. The email is load-bearing: without a
+    /// detection whose class IS in the seeded list, `matching_detections`
+    /// would fall back to redacting everything and hide the bug.
+    const REQUISITES_PROMPT: &str = "Ali Aliev, ali@example.com, \
+         PINFL 50101901234567, STIR 300111222, МФО 00014, \
+         pasport AA1234567, karta 8600 1234 5678 9012";
+
+    async fn redact_through_policy(pool: &PgPool, content: &str) -> String {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner("Policy Path Co", "policy-path@example.com", &hash)
+            .await
+            .expect("workspace + seeded rule must be created");
+
+        // Empty ML vector — the whole point is that the deterministic floor
+        // survives with the sidecar absent.
+        let detections = merge_detections(detect_content(content), vec![]);
+        assert!(
+            !detections.is_empty(),
+            "precondition: the floor must detect something"
+        );
+
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace.id),
+                provider_name: "none",
+                model: "none",
+                content,
+                detections: &detections,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "the seeded rule must be the one and only rule — if this is 0 the \
+             redact_when_no_rules safety net would mask the bug under test"
+        );
+        assert_eq!(outcome.result.final_action, "redact");
+        outcome.content
+    }
+
+    #[sqlx::test]
+    async fn seeded_default_rule_redacts_uzbek_identifiers(pool: PgPool) {
+        let redacted = redact_through_policy(&pool, REQUISITES_PROMPT).await;
+
+        for leaked in [
+            "50101901234567",
+            "300111222",
+            "00014",
+            "AA1234567",
+            "8600 1234 5678 9012",
+        ] {
+            assert!(
+                !redacted.contains(leaked),
+                "{leaked} was detected but forwarded unredacted by the default \
+                 policy: {redacted:?}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn seeded_default_rule_still_redacts_the_pre_existing_classes(pool: PgPool) {
+        // Regression guard: widening the class list must not drop anything.
+        let redacted = redact_through_policy(&pool, REQUISITES_PROMPT).await;
+        assert!(
+            !redacted.contains("ali@example.com"),
+            "email regressed: {redacted:?}"
+        );
+    }
+}
+
+/// WS2-1 round-1 review: migration `017` back-fills workspaces that were
+/// already seeded with the pre-Uzbek class list.
+///
+/// `#[sqlx::test]` runs every migration before the test body, so the seeded
+/// rule a test creates is already new-shaped. To prove the migration itself
+/// does anything, these tests write a LEGACY-shaped rule and then execute the
+/// migration file's own SQL against it.
+#[cfg(test)]
+mod migration_backfill_tests {
+    use crate::db::WorkspaceRepository;
+    use sqlx::{PgPool, Row};
+    use uuid::Uuid;
+
+    const MIGRATION_SQL: &str =
+        include_str!("../../migrations/017_uzbek_identifier_policy_classes.sql");
+
+    const LEGACY_CLASSES: &str = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY"]"#;
+
+    /// Create a workspace, delete its (already-migrated) seeded rule, and
+    /// insert one shaped exactly as it looked before this change.
+    async fn seed_legacy_rule(pool: &PgPool, name: &str, classes: &str) -> Uuid {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Legacy Co",
+                &format!("legacy-{}@example.com", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let rule_id = Uuid::new_v4();
+        let conditions: serde_json::Value = serde_json::from_str(&format!(
+            r#"[{{"field":"detection_class","op":"in","value":{classes}}}]"#
+        ))
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, $3, 100, $4, 'redact', '{}'::jsonb, true, false, NOW(), NOW())",
+        )
+        .bind(rule_id)
+        .bind(workspace.id)
+        .bind(name)
+        .bind(&conditions)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        rule_id
+    }
+
+    async fn classes_of(pool: &PgPool, rule_id: Uuid) -> Vec<String> {
+        let row = sqlx::query("SELECT conditions FROM policy_rules WHERE id = $1")
+            .bind(rule_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let conditions: serde_json::Value = row.get("conditions");
+        conditions[0]["value"]
+            .as_array()
+            .expect("value array")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    #[sqlx::test]
+    async fn backfills_a_legacy_seeded_rule(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", LEGACY_CLASSES).await;
+        assert!(!classes_of(&pool, rule_id)
+            .await
+            .contains(&"PINFL".to_owned()));
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        for expected in ["PINFL", "STIR", "MFO", "PASSPORT_NUMBER", "UZCARD", "HUMO"] {
+            assert!(
+                classes.contains(&expected.to_owned()),
+                "{expected} missing after back-fill: {classes:?}"
+            );
+        }
+        // Nothing may be dropped.
+        assert!(classes.contains(&"PERSON".to_owned()), "{classes:?}");
+        assert!(classes.contains(&"CREDIT_CARD".to_owned()), "{classes:?}");
+    }
+
+    #[sqlx::test]
+    async fn backfill_is_idempotent(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", LEGACY_CLASSES).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let once = classes_of(&pool, rule_id).await;
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        let twice = classes_of(&pool, rule_id).await;
+
+        assert_eq!(once, twice, "re-running the migration must not duplicate");
+    }
+
+    #[sqlx::test]
+    async fn does_not_touch_a_rule_an_admin_narrowed(pool: PgPool) {
+        // An admin who removed CREDIT_CARD meant it. Widening their rule
+        // behind their back would be a policy change we were never asked to
+        // make; these workspaces are the documented operator action.
+        let narrowed = r#"["PERSON","EMAIL_ADDRESS"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", narrowed).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            classes_of(&pool, rule_id).await,
+            vec!["PERSON".to_owned(), "EMAIL_ADDRESS".to_owned()],
+            "a narrowed rule must be left exactly as the admin left it"
+        );
+    }
+
+    #[sqlx::test]
+    async fn backfills_a_rule_an_admin_widened(pool: PgPool) {
+        // Superset of the defaults — the admin added to the seed rather than
+        // replacing it, so the back-fill still applies.
+        let widened = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY","LOCATION"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", widened).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        assert!(classes.contains(&"PINFL".to_owned()), "{classes:?}");
+        assert!(
+            classes.contains(&"LOCATION".to_owned()),
+            "the admin's own addition must survive: {classes:?}"
+        );
+    }
+
+    /// Round-2 review: an admin who had already added one of the new classes
+    /// by hand must not end up with a duplicate entry.
+    #[sqlx::test]
+    async fn backfill_does_not_duplicate_a_class_the_admin_already_added(pool: PgPool) {
+        let with_stir = r#"["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","CREDIT_CARD","US_SSN","IBAN_CODE","AWS_ACCESS_KEY","GCP_KEY","AZURE_KEY","STIR"]"#;
+        let rule_id = seed_legacy_rule(&pool, "Redact common PII", with_stir).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let classes = classes_of(&pool, rule_id).await;
+        assert_eq!(
+            classes.iter().filter(|c| *c == "STIR").count(),
+            1,
+            "STIR must appear exactly once: {classes:?}"
+        );
+        assert!(classes.contains(&"PINFL".to_owned()), "{classes:?}");
+        assert!(classes.contains(&"HUMO".to_owned()), "{classes:?}");
+    }
+
+    #[sqlx::test]
+    async fn does_not_touch_an_unrelated_rule(pool: PgPool) {
+        let rule_id = seed_legacy_rule(&pool, "Block secrets", LEGACY_CLASSES).await;
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        assert!(
+            !classes_of(&pool, rule_id)
+                .await
+                .contains(&"PINFL".to_owned()),
+            "only the seeded 'Redact common PII' rule may be back-filled"
+        );
+    }
+}
+
 /// Tests for the policy engine: rule ordering, condition evaluation, dry-run semantics.
 ///
 /// These tests verify:
@@ -116,14 +393,58 @@ mod condition_tests {
         );
     }
 
+    /// WS1-8 fix-round-1 review, MINOR 3: this used to assert
+    /// `json!([]).as_array().is_empty()` — a fact about `serde_json`, not
+    /// about this crate's `rule_matches`, and the only test covering the
+    /// empty-conditions case. `rule_matches` is now `pub(crate)` (made so
+    /// for the WS1-8 compound-condition tests), which unblocks calling the
+    /// real function here instead. Checked both with and without
+    /// detections present, since the empty-conditions short-circuit
+    /// (`detection_conditions.is_empty() || ...`) and the vacuous-`.all()`
+    /// path it replaces behave differently depending on which is present.
     #[test]
     fn empty_conditions_matches_all_requests() {
-        // A rule with empty conditions array matches every request (AND of zero = true)
-        // This is verified by the rule_matches logic: conditions.is_empty() -> true
+        use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+        use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+
         let rule = make_rule(10, serde_json::json!([]), "flag", false);
-        // Empty conditions JSON array means "match all"
-        let conditions = rule.conditions.as_array().unwrap();
-        assert!(conditions.is_empty(), "Empty conditions array must match all");
+
+        let no_detections: Vec<Detection> = Vec::new();
+        assert!(
+            rule_matches(
+                &rule,
+                &PolicyEvaluationInput {
+                    request_id: RequestId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    provider_name: "test-provider",
+                    model: "test-model",
+                    content: "irrelevant — the rule has no conditions to check",
+                    detections: &no_detections,
+                }
+            ),
+            "empty conditions must match even when there are no detections"
+        );
+
+        let some_detections = vec![Detection {
+            class: "EMAIL_ADDRESS".to_owned(),
+            confidence: 0.42,
+            span: None,
+            value: "synthetic-value".to_owned(),
+        }];
+        assert!(
+            rule_matches(
+                &rule,
+                &PolicyEvaluationInput {
+                    request_id: RequestId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    provider_name: "test-provider",
+                    model: "test-model",
+                    content: "irrelevant — the rule has no conditions to check",
+                    detections: &some_detections,
+                }
+            ),
+            "empty conditions must match regardless of which detections are present"
+        );
     }
 
     #[test]
@@ -201,6 +522,271 @@ mod condition_tests {
 
         assert_eq!(final_action, "allow", "allow rule must be final action");
         assert!(!denied, "allow rule must not set denied");
+    }
+}
+
+/// WS1-8: a compound condition (multiple conditions combined with AND on the same rule)
+/// must be satisfied by a SINGLE detection, not by different detections each
+/// covering one condition. Unlike `condition_tests` above (which simulates
+/// engine logic inline because the helpers were private), these tests call
+/// the real `rule_matches` directly — `rule_matches` was made
+/// `pub(crate)` for exactly this purpose, so the bug is exercised through
+/// production code, not a re-implementation of it.
+#[cfg(test)]
+mod compound_condition_tests {
+    use crate::db::PolicyRuleRow;
+    use crate::policy::engine::{rule_matches, PolicyEvaluationInput};
+    use chrono::Utc;
+    use secureprompt_common::types::{Detection, RequestId, WorkspaceId};
+    use uuid::Uuid;
+
+    fn compound_rule(conditions: serde_json::Value) -> PolicyRuleRow {
+        PolicyRuleRow {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "compound-test-rule".to_owned(),
+            priority: 100,
+            conditions,
+            action: "redact".to_owned(),
+            action_params: serde_json::json!({}),
+            enabled: true,
+            dry_run: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn detection(class: &str, confidence: f32) -> Detection {
+        Detection {
+            class: class.to_owned(),
+            confidence,
+            span: None,
+            value: "synthetic-value".to_owned(),
+        }
+    }
+
+    fn eval_input(detections: &[Detection]) -> PolicyEvaluationInput<'_> {
+        PolicyEvaluationInput {
+            request_id: RequestId::new(),
+            workspace_id: WorkspaceId::new(),
+            provider_name: "test-provider",
+            model: "test-model",
+            content: "irrelevant content — no content_regex condition in these rules",
+            detections,
+        }
+    }
+
+    /// The exact defect from the brief: a rule reading
+    /// `detection_class == EMAIL_ADDRESS AND confidence_gte >= 0.9` must
+    /// match only when ONE detection is both an `EMAIL_ADDRESS` and >= 0.9
+    /// confidence. Here the class is satisfied by one detection and the
+    /// confidence threshold by a completely different one — the rule must
+    /// NOT fire.
+    #[test]
+    fn compound_condition_does_not_match_when_two_different_detections_split_the_conditions() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]));
+
+        let detections = vec![
+            detection("EMAIL_ADDRESS", 0.5), // satisfies class only
+            detection("PHONE_NUMBER", 0.95), // satisfies confidence only
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            !rule_matches(&rule, &input),
+            "rule must NOT match when the class test and the confidence test \
+             are satisfied by two different detections rather than one"
+        );
+    }
+
+    /// Same rule, but one detection now satisfies both conditions at once —
+    /// this is the case the rule is actually meant to catch, and it must
+    /// still fire. Paired with the test above as a positive control: same
+    /// rule shape, different detection composition, opposite expected
+    /// outcome.
+    #[test]
+    fn compound_condition_matches_when_one_detection_satisfies_both() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]));
+
+        let detections = vec![
+            detection("EMAIL_ADDRESS", 0.95), // satisfies both at once
+            detection("PHONE_NUMBER", 0.5),   // unrelated, must be ignored
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            rule_matches(&rule, &input),
+            "rule must match when a single detection satisfies every \
+             condition in the rule"
+        );
+    }
+
+    /// Regression guard mirroring the workspace default rule seeded by
+    /// `db/workspace_repo.rs` (`detection_class in [...]`, a single
+    /// condition). A single detection-scoped condition is trivially
+    /// "per-detection" already — it must keep matching via ANY qualifying
+    /// detection, exactly as before this task.
+    #[test]
+    fn single_detection_class_in_condition_still_matches_via_any_qualifying_detection() {
+        let rule = compound_rule(serde_json::json!([
+            { "field": "detection_class", "op": "in", "value": ["EMAIL_ADDRESS", "PERSON"] }
+        ]));
+
+        let detections = vec![
+            detection("PINFL", 0.99),         // not in the list
+            detection("EMAIL_ADDRESS", 0.10), // in the list; no confidence condition present
+        ];
+        let input = eval_input(&detections);
+
+        assert!(
+            rule_matches(&rule, &input),
+            "a lone detection_class-in condition must still match via any \
+             qualifying detection"
+        );
+    }
+}
+
+/// WS1-8 fix-round-1 review, IMPORTANT 1: pins the second-order effect of
+/// the fix through the real `evaluate()` path (not just `rule_matches`
+/// directly). See `task-5-report.md` for the operator-facing writeup.
+///
+/// Pre-fix: a compound rule (`detection_class == X AND confidence_gte >=
+/// Y`) that fired only because the class test and the confidence test were
+/// satisfied by two DIFFERENT detections (the bug WS1-8 fixes) still
+/// reached `matching_detections`. There, `class_filters = [X]` and
+/// `confidence_gte = Y` are checked against EACH detection individually —
+/// neither detection satisfied both at once, so the filtered set came back
+/// empty, which hit the `detections.to_vec()` fallback at the bottom of
+/// `matching_detections`. Pre-fix, that fallback redacted EVERY detection
+/// in the request, including ones with nothing to do with the rule's
+/// condition. Over-redaction, not a leak.
+///
+/// Post-fix: the rule correctly does not fire, so it redacts NOTHING. If
+/// this compound rule were a workspace's only enabled rule (as it is here),
+/// upgrading silently converts "redacts too much" into "redacts nothing"
+/// for that workspace. `redact_when_no_rules` (`pipeline/service.rs:546`)
+/// cannot rescue it — that gate only engages when `rules_evaluated == 0`
+/// (`engine.rs:43`), and here `rules_evaluated == 1`. The new behaviour is
+/// correct for what the rule's condition actually says — but it is a real,
+/// silent coverage change for any existing workspace whose only rule looks
+/// like this, and is worth a release note.
+#[cfg(test)]
+mod second_order_effect_tests {
+    use crate::db::{PolicyRepository, WorkspaceRepository};
+    use crate::policy::engine::{evaluate, PolicyEvaluationInput};
+    use secureprompt_common::types::{Detection, RequestId, TokenVault, WorkspaceId};
+    use sqlx::PgPool;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[sqlx::test]
+    async fn compound_rule_matched_via_split_detections_now_redacts_nothing_instead_of_everything(
+        pool: PgPool,
+    ) {
+        let hash = crate::db::user_repo::hash_password("pw-for-test-only").unwrap();
+        let (workspace, _) = WorkspaceRepository::new(pool.clone())
+            .create_with_owner(
+                "Second Order Co",
+                &format!("second-order-{}@example.com", Uuid::new_v4()),
+                &hash,
+            )
+            .await
+            .expect("workspace must be created");
+
+        // Replace the seeded default rule with ONLY the compound rule
+        // under test, so there is exactly one enabled rule and the whole
+        // effect is observable in `outcome` without another rule's action
+        // interfering.
+        sqlx::query("DELETE FROM policy_rules WHERE workspace_id = $1")
+            .bind(workspace.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let conditions = serde_json::json!([
+            { "field": "detection_class", "op": "eq", "value": "EMAIL_ADDRESS" },
+            { "field": "confidence_gte", "op": "gte", "value": 0.9 }
+        ]);
+        sqlx::query(
+            "INSERT INTO policy_rules
+                (id, workspace_id, name, priority, conditions, action, action_params,
+                 enabled, dry_run, created_at, updated_at)
+             VALUES ($1, $2, 'High-confidence email rule', 100, $3, 'redact', '{}'::jsonb,
+                     true, false, NOW(), NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace.id)
+        .bind(&conditions)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let content = "Contact ali@example.com or +998901234567 for details";
+        let email = "ali@example.com";
+        let phone = "+998901234567";
+        let email_start = content.find(email).unwrap();
+        let phone_start = content.find(phone).unwrap();
+
+        // SPLIT: the email detection satisfies the class test but not the
+        // confidence test; the phone detection satisfies the confidence
+        // test but is the wrong class. No single detection satisfies both.
+        let detections = vec![
+            Detection {
+                class: "EMAIL_ADDRESS".to_owned(),
+                confidence: 0.5,
+                span: Some((email_start, email_start + email.len())),
+                value: email.to_owned(),
+            },
+            Detection {
+                class: "PHONE_NUMBER".to_owned(),
+                confidence: 0.95,
+                span: Some((phone_start, phone_start + phone.len())),
+                value: phone.to_owned(),
+            },
+        ];
+
+        let mut vault = TokenVault::default();
+        let mut redaction_map: HashMap<String, String> = HashMap::new();
+        let outcome = evaluate(
+            &PolicyRepository::new(pool.clone()),
+            PolicyEvaluationInput {
+                request_id: RequestId::new(),
+                workspace_id: WorkspaceId(workspace.id),
+                provider_name: "none",
+                model: "none",
+                content,
+                detections: &detections,
+            },
+            &mut vault,
+            &mut redaction_map,
+        )
+        .await
+        .expect("policy evaluation must succeed");
+
+        assert_eq!(
+            outcome.rules_evaluated, 1,
+            "the compound rule must be the only enabled rule for this to be observable"
+        );
+        assert_eq!(
+            outcome.result.final_action, "allow",
+            "the compound rule must not fire — its class test and its \
+             confidence test are satisfied by two different detections, \
+             not one"
+        );
+        assert_eq!(
+            outcome.content, content,
+            "post-fix, a rule that does not fire must redact NOTHING — \
+             pre-fix, this same request was redacted in full (both the \
+             email AND the phone number) via matching_detections' \
+             empty-filter fallback, even though neither detection alone \
+             satisfied the rule's condition"
+        );
     }
 }
 

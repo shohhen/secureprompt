@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         public_signup_enabled: AppConfig::public_signup_enabled_from_env(),
         chat_debug_mode: AppConfig::chat_debug_mode_from_env(),
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
+        sidecar_unavailable_default: AppConfig::sidecar_unavailable_default_from_env(),
         license: LicenseConfig::from_env(),
     };
 
@@ -144,7 +145,15 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5000);
-    let ml_sidecar = Arc::new(MlSidecarClient::new(ml_sidecar_url, ml_sidecar_timeout_ms));
+    // WS1-5: every ML-sidecar route except /health, /ready, /metrics now
+    // requires this bearer token (secureprompt-ml/app/main.py's
+    // `_require_internal_token` dependency). Same env var
+    // (`ML_SIDECAR_INTERNAL_TOKEN`) the sidecar itself reads, already
+    // surfaced here via `LicenseConfig::internal_token`.
+    let ml_sidecar = Arc::new(
+        MlSidecarClient::new(ml_sidecar_url, ml_sidecar_timeout_ms)
+            .with_token(config.license.internal_token.clone()),
+    );
 
     // Log whether keys are pinned at build time (boolean only — never log the key value).
     tracing::info!(

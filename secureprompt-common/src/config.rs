@@ -139,6 +139,22 @@ pub struct AppConfig {
     /// `true` — the safe behavior.
     #[serde(default = "default_redact_when_no_rules")]
     pub redact_when_no_rules: bool,
+    /// WS2-3 — deployment-level default for a workspace's
+    /// `sidecar_unavailable` policy: what to do when the ML sidecar produces
+    /// no detection coverage for a request. One of `block` (fail closed,
+    /// 503) or `degrade_with_alert` (answer on the deterministic detection
+    /// floor, loudly). A workspace row in `workspace_sidecar_policy`
+    /// overrides this; this is what applies when the workspace has never
+    /// chosen.
+    ///
+    /// Populated from `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT`. Defaults to
+    /// `block` — the fail-closed posture. It exists because `block` is only a
+    /// safe default if there is a reachable off-switch: a deployment with no
+    /// ML sidecar at all (the `docker-compose.simple.yml` profile) would
+    /// otherwise 503 every gateway request with no recourse except an
+    /// admin-JWT `PUT /v1/secure-mode` per workspace.
+    #[serde(default = "default_sidecar_unavailable")]
+    pub sidecar_unavailable_default: String,
     /// Plan 3 — gateway license verification (fail-open). Loaded from env;
     /// not serde-deserialized because the public key must not come from a
     /// config file.
@@ -148,6 +164,10 @@ pub struct AppConfig {
 
 fn default_redact_when_no_rules() -> bool {
     true
+}
+
+fn default_sidecar_unavailable() -> String {
+    "block".to_owned()
 }
 
 impl AppConfig {
@@ -185,6 +205,32 @@ impl AppConfig {
         {
             Some(v) if matches!(v.as_str(), "0" | "false" | "no") => false,
             _ => true,
+        }
+    }
+
+    /// Parse `SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT` from the environment.
+    ///
+    /// Only the exact value `degrade_with_alert` opts a deployment out of
+    /// fail-closed. Anything else — unset, misspelled, empty — yields
+    /// `block`, because a PII gateway must not fail open because someone
+    /// fat-fingered an env var.
+    #[must_use]
+    pub fn sidecar_unavailable_default_from_env() -> String {
+        match std::env::var("SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("degrade_with_alert") => "degrade_with_alert".to_owned(),
+            Some(other) if !other.is_empty() && other != "block" => {
+                tracing::warn!(
+                    value = %other,
+                    "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT is not a recognised value; \
+                     falling back to 'block'"
+                );
+                "block".to_owned()
+            }
+            _ => "block".to_owned(),
         }
     }
 }
@@ -275,6 +321,47 @@ pub struct JwtConfig {
     pub refresh_ttl_secs: u64,
 }
 
+/// Sentinel values shipped in `.env.example` and comparable templates.
+///
+/// WS1-3: booting with one of these means the deployment is running on a
+/// secret that is public knowledge — `.env.example` sets
+/// `SECUREPROMPT_JWT_SECRET=CHANGEME`, and an operator who copies it to
+/// `.env` and forgets to edit gets a gateway whose tokens anyone can forge.
+/// Compared case-insensitively after trimming.
+const PLACEHOLDER_SECRETS: &[&str] = &[
+    "changeme",
+    "change_me",
+    "change-me",
+    "changethis",
+    "change_this",
+    "change-this",
+    "secret",
+    "password",
+    "placeholder",
+    "todo",
+    "xxx",
+    "your-secret-here",
+    "your_secret_here",
+    "replaceme",
+    "replace_me",
+];
+
+/// Reject a known-placeholder secret, naming the variable so the operator can
+/// act on the message without reading source.
+///
+/// # Errors
+/// Returns a human-readable error when `value` is a known placeholder.
+fn reject_placeholder_secret(var: &str, value: &str) -> Result<(), String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if PLACEHOLDER_SECRETS.contains(&normalized.as_str()) {
+        return Err(format!(
+            "{var} is set to the placeholder value {value:?} — refusing to boot. \
+             Generate a real secret (for example `openssl rand -hex 32`) and set {var}."
+        ));
+    }
+    Ok(())
+}
+
 impl JwtConfig {
     pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
     pub const DEFAULT_REFRESH_TTL_SECS: u64 = 2_592_000;
@@ -292,7 +379,11 @@ impl JwtConfig {
         if secret.trim().is_empty() {
             return Err("SECUREPROMPT_JWT_SECRET must not be empty".into());
         }
+        reject_placeholder_secret("SECUREPROMPT_JWT_SECRET", &secret)?;
         if let Ok(provider_key) = std::env::var("SECUREPROMPT_PROVIDER_KEY") {
+            if !provider_key.is_empty() {
+                reject_placeholder_secret("SECUREPROMPT_PROVIDER_KEY", &provider_key)?;
+            }
             if !provider_key.is_empty() && provider_key == secret {
                 return Err(
                     "SECUREPROMPT_JWT_SECRET must differ from SECUREPROMPT_PROVIDER_KEY".into(),
@@ -322,8 +413,16 @@ mod tests {
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// Recover from poisoning rather than propagating it. These tests mutate
+    /// process-global env vars, so the guard exists only for mutual exclusion
+    /// — it protects no invariant that a panicking test could corrupt.
+    /// Unwrapping here turned a single genuine failure into six, hiding which
+    /// test actually broke.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+        ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn clear_jwt_env() {
@@ -350,6 +449,69 @@ mod tests {
         let result = JwtConfig::from_env();
         clear_jwt_env();
         assert!(result.is_err(), "aliased keys must error");
+    }
+
+    // ── WS1-3: refuse to boot on known-default secrets ───────────────────────
+
+    #[test]
+    fn rejects_placeholder_jwt_secret_naming_the_variable() {
+        let _g = env_lock();
+        for placeholder in [
+            "CHANGEME",
+            "changeme",
+            "ChangeMe",
+            "  CHANGEME  ",
+            "change_me",
+            "CHANGE_ME",
+            "changethis",
+            "secret",
+            "password",
+            "your-secret-here",
+        ] {
+            clear_jwt_env();
+            std::env::set_var("SECUREPROMPT_JWT_SECRET", placeholder);
+            let result = JwtConfig::from_env();
+            clear_jwt_env();
+
+            let err = result.expect_err(&format!(
+                "placeholder secret {placeholder:?} must be rejected at boot"
+            ));
+            assert!(
+                err.contains("SECUREPROMPT_JWT_SECRET"),
+                "error must name the offending variable so the operator can fix \
+                 it; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_placeholder_provider_key_naming_the_variable() {
+        let _g = env_lock();
+        clear_jwt_env();
+        std::env::set_var("SECUREPROMPT_JWT_SECRET", "a-genuinely-distinct-secret");
+        std::env::set_var("SECUREPROMPT_PROVIDER_KEY", "CHANGEME");
+        let result = JwtConfig::from_env();
+        clear_jwt_env();
+
+        let err = result.expect_err("placeholder provider key must be rejected");
+        assert!(
+            err.contains("SECUREPROMPT_PROVIDER_KEY"),
+            "error must name the offending variable; got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_real_secret() {
+        let _g = env_lock();
+        clear_jwt_env();
+        // Guards against an over-broad placeholder rule rejecting real values.
+        std::env::set_var(
+            "SECUREPROMPT_JWT_SECRET",
+            "7f3c1b9a4e2d8f06b5a1c7e93d4082fa61bc5d0e9a3f7148",
+        );
+        let result = JwtConfig::from_env();
+        clear_jwt_env();
+        assert!(result.is_ok(), "a real secret must boot: {result:?}");
     }
 
     #[test]
@@ -433,5 +595,52 @@ mod tests {
         assert_eq!(cfg.license_token, "");
 
         clear_license_env();
+    }
+}
+
+#[cfg(test)]
+mod sidecar_unavailable_default_tests {
+    use super::AppConfig;
+
+    /// WS2-3 — the deployment-level escape hatch must open for exactly one
+    /// spelling and stay shut for everything else. A PII gateway must not
+    /// fail open because an operator mistyped an env var.
+    ///
+    /// Single test, sequential asserts on purpose: these mutate process-wide
+    /// environment, so splitting them into separate `#[test]`s would let the
+    /// harness run them concurrently and race.
+    #[test]
+    fn only_the_exact_opt_out_value_disables_fail_closed() {
+        const VAR: &str = "SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT";
+
+        std::env::remove_var(VAR);
+        assert_eq!(
+            AppConfig::sidecar_unavailable_default_from_env(),
+            "block",
+            "unset must fail closed"
+        );
+
+        for opt_out in ["degrade_with_alert", "  Degrade_With_Alert  "] {
+            std::env::set_var(VAR, opt_out);
+            assert_eq!(
+                AppConfig::sidecar_unavailable_default_from_env(),
+                "degrade_with_alert",
+                "{opt_out:?} must opt out (trimmed, case-insensitive)"
+            );
+        }
+
+        // Near-misses, a plausible typo, and an unrelated value.
+        for bad in ["degrade", "DEGRADE_WITH_ALERTS", "true", "", "   ", "off"] {
+            std::env::set_var(VAR, bad);
+            assert_eq!(
+                AppConfig::sidecar_unavailable_default_from_env(),
+                "block",
+                "{bad:?} must NOT open the gate"
+            );
+        }
+
+        std::env::set_var(VAR, "block");
+        assert_eq!(AppConfig::sidecar_unavailable_default_from_env(), "block");
+        std::env::remove_var(VAR);
     }
 }

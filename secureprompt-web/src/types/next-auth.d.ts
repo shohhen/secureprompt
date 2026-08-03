@@ -23,7 +23,12 @@ export interface AppSessionShape {
   workspaceId: string;
   role: AppRole;
   accessToken: string;
-  refreshToken: string;
+  // NO refreshToken here (WS1-9): this shape is the CLIENT-VISIBLE session
+  // (`useSession()` / `getSession()` / `auth()`'s return value) — anything
+  // on it is readable by client-side JavaScript. The refresh token is
+  // long-lived; it must never leave the server. It lives only in the
+  // encrypted JWT cookie (see the `User`/`JWT` augmentations below and
+  // `buildClientSessionFields` in `src/lib/auth-refresh.ts`).
   accessExpiresAt: number; // unix seconds
   refreshExpiresAt: number; // unix seconds
   error?: "RefreshAccessTokenError";

@@ -1,6 +1,9 @@
 pub mod middleware;
 pub mod model_router;
 pub mod routes;
+/// WS2-4 — `sidecar_unavailable` enforcement for the routes that answer the
+/// caller directly instead of forwarding to a provider.
+pub mod sidecar_coverage;
 pub mod streaming;
 
 use crate::app_state::AppState;

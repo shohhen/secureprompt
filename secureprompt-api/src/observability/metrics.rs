@@ -144,6 +144,15 @@ pub struct MetricsRegistry {
     requests_total: AtomicU64,
     request_failures_total: AtomicU64,
     analytics_dropped_total: AtomicU64,
+    /// `secureprompt_analytics_consumed_total` — events taken off the
+    /// analytics channel by the writer task, counted the moment `recv()`
+    /// yields one and BEFORE any ClickHouse work.
+    ///
+    /// Pairs with `analytics_dropped_total`: dropped/(dropped+consumed) is the
+    /// analytics loss rate. It is also the only externally visible proof that
+    /// the writer's receive loop is running at all, which is what the startup
+    /// schema probe must not be allowed to delay.
+    analytics_consumed_total: AtomicU64,
     analytics_failures_total: AtomicU64,
     clickhouse_insert_failures_total: AtomicU64,
     clickhouse_insert_retries_total: AtomicU64,
@@ -181,6 +190,25 @@ pub struct MetricsRegistry {
     /// bounded label — one of `block`/`redact`/`flag`/`warn` — never a
     /// free-text rule name or id.
     policy_violations: Mutex<Vec<(String, u64)>>,
+
+    // ── WS2-3 ─ ML sidecar coverage loss ────────────────────────────────
+    /// Counter `secureprompt_sidecar_unavailable_total{reason,action}`.
+    /// `reason` is a bounded `SidecarOutage` label
+    /// (`unconfigured`/`disabled`/`circuit_open`/`all_calls_failed`) and
+    /// `action` is the workspace policy that was applied
+    /// (`block`/`degrade_with_alert`). This is the alert signal for a
+    /// gateway running with no ML detection coverage.
+    sidecar_unavailable: Mutex<Vec<(String, String, u64)>>,
+    /// GAUGE `secureprompt_clickhouse_schema_mismatch` — 1 when the live
+    /// `request_events` table is missing columns the writer serialises (the
+    /// worker's ClickHouse migrations have not run, and every analytics event
+    /// is being dropped), 0 otherwise.
+    ///
+    /// A gauge, not a counter, because it describes a STATE that can heal:
+    /// the startup probe sets it, and the first insert that actually lands
+    /// clears it. As a monotonic counter the alert would keep firing after
+    /// the worker migrated and inserts recovered, until an API restart.
+    clickhouse_schema_mismatch: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -189,6 +217,18 @@ impl MetricsRegistry {
         if !success {
             self.request_failures_total.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// One event taken off the channel by the writer task.
+    pub fn record_analytics_consumed(&self) {
+        self.analytics_consumed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Events consumed so far. Read by `tests/clickhouse_schema_probe.rs`.
+    #[must_use]
+    pub fn analytics_consumed_count(&self) -> u64 {
+        self.analytics_consumed_total.load(Ordering::Relaxed)
     }
 
     pub fn record_analytics_drop(&self) {
@@ -434,6 +474,87 @@ impl MetricsRegistry {
         }
     }
 
+    /// Flag that the live ClickHouse schema is behind the writer.
+    pub fn record_clickhouse_schema_mismatch(&self) {
+        self.clickhouse_schema_mismatch.store(1, Ordering::Relaxed);
+    }
+
+    /// Clear the flag — called when an insert actually lands, which proves
+    /// the schema is now compatible.
+    pub fn clear_clickhouse_schema_mismatch(&self) {
+        self.clickhouse_schema_mismatch.store(0, Ordering::Relaxed);
+    }
+
+    /// Number of events dropped because the analytics channel was full.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs` to prove the writer keeps
+    /// draining while ClickHouse is unresponsive; exported as
+    /// `secureprompt_analytics_dropped_total`.
+    #[must_use]
+    pub fn analytics_dropped_count(&self) -> u64 {
+        self.analytics_dropped_total.load(Ordering::Relaxed)
+    }
+
+    /// ClickHouse insert failures so far.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs` to assert the premise that
+    /// writes really are failing before concluding anything about WHY.
+    #[must_use]
+    pub fn clickhouse_insert_failure_count(&self) -> u64 {
+        self.clickhouse_insert_failures_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// 1 when the schema is known-stale, 0 otherwise.
+    ///
+    /// Read by `tests/clickhouse_schema_probe.rs`; the gauge is also exported
+    /// through `render_prometheus` as
+    /// `secureprompt_clickhouse_schema_mismatch`.
+    #[must_use]
+    pub fn clickhouse_schema_mismatch_count(&self) -> u64 {
+        self.clickhouse_schema_mismatch.load(Ordering::Relaxed)
+    }
+
+    /// WS2-3 — record one request for which the ML sidecar produced no
+    /// detection coverage. Both labels are bounded: `reason` is
+    /// [`crate::ml_sidecar::types::SidecarOutage::as_str`], `action` is the
+    /// workspace's `sidecar_unavailable` policy. Never a workspace id.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    pub fn record_sidecar_unavailable(&self, reason: &str, action: &str) {
+        let mut guard = self
+            .sidecar_unavailable
+            .lock()
+            .expect("sidecar_unavailable mutex");
+        if let Some(row) = guard
+            .iter_mut()
+            .find(|(r, a, _)| r == reason && a == action)
+        {
+            row.2 += 1;
+        } else {
+            guard.push((reason.to_owned(), action.to_owned(), 1));
+        }
+    }
+
+    /// Return the sidecar-coverage-loss count for a `(reason, action)` pair.
+    ///
+    /// Used by tests to assert the counter was touched.
+    ///
+    /// # Panics
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn sidecar_unavailable_count(&self, reason: &str, action: &str) -> u64 {
+        let guard = self
+            .sidecar_unavailable
+            .lock()
+            .expect("sidecar_unavailable mutex");
+        guard
+            .iter()
+            .find(|(r, a, _)| r == reason && a == action)
+            .map_or(0, |(_, _, count)| *count)
+    }
+
     /// Return the policy-violation count for a given `action`.
     ///
     /// Used by tests to assert the counter was touched.
@@ -468,6 +589,8 @@ impl MetricsRegistry {
                 "secureprompt_request_failures_total {}\n",
                 "# TYPE secureprompt_analytics_dropped_total counter\n",
                 "secureprompt_analytics_dropped_total {}\n",
+                "# TYPE secureprompt_analytics_consumed_total counter\n",
+                "secureprompt_analytics_consumed_total {}\n",
                 "# TYPE secureprompt_analytics_failures_total counter\n",
                 "secureprompt_analytics_failures_total {}\n",
                 "# TYPE secureprompt_clickhouse_insert_failures_total counter\n",
@@ -478,6 +601,7 @@ impl MetricsRegistry {
             self.requests_total.load(Ordering::Relaxed),
             self.request_failures_total.load(Ordering::Relaxed),
             self.analytics_dropped_total.load(Ordering::Relaxed),
+            self.analytics_consumed_total.load(Ordering::Relaxed),
             self.analytics_failures_total.load(Ordering::Relaxed),
             self.clickhouse_insert_failures_total.load(Ordering::Relaxed),
             self.clickhouse_insert_retries_total.load(Ordering::Relaxed),
@@ -601,6 +725,30 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "secureprompt_policy_violations_total{{action=\"{action}\"}} {value}"
+                    );
+                }
+            }
+        }
+
+        out.push_str("# TYPE secureprompt_clickhouse_schema_mismatch gauge\n");
+        let _ = writeln!(
+            out,
+            "secureprompt_clickhouse_schema_mismatch {}",
+            self.clickhouse_schema_mismatch.load(Ordering::Relaxed)
+        );
+
+        // WS2-3 — ML sidecar coverage-loss counter.
+        {
+            let guard = self
+                .sidecar_unavailable
+                .lock()
+                .expect("sidecar_unavailable mutex");
+            if !guard.is_empty() {
+                out.push_str("# TYPE secureprompt_sidecar_unavailable_total counter\n");
+                for (reason, action, value) in guard.iter() {
+                    let _ = writeln!(
+                        out,
+                        "secureprompt_sidecar_unavailable_total{{reason=\"{reason}\",action=\"{action}\"}} {value}"
                     );
                 }
             }

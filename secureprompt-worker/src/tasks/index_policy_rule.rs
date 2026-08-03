@@ -25,8 +25,9 @@ pub async fn handle_index_policy_rule(
     ml_client: &reqwest::Client,
     qdrant: &qdrant_client::Qdrant,
     ml_sidecar_url: &str,
+    ml_sidecar_token: &str,
 ) -> bool {
-    match index_policy_rule(task, ml_client, qdrant, ml_sidecar_url).await {
+    match index_policy_rule(task, ml_client, qdrant, ml_sidecar_url, ml_sidecar_token).await {
         Ok(()) => true,
         Err(e) => {
             tracing::error!(
@@ -45,6 +46,7 @@ async fn index_policy_rule(
     ml_client: &reqwest::Client,
     qdrant: &qdrant_client::Qdrant,
     ml_sidecar_url: &str,
+    ml_sidecar_token: &str,
 ) -> Result<()> {
     let rule_id = task
         .payload
@@ -71,10 +73,14 @@ async fn index_policy_rule(
         "indexing policy rule"
     );
 
-    // Step 1: Embed via ML sidecar.
+    // Step 1: Embed via ML sidecar. WS1-5 fix-round: /embed now requires
+    // Authorization: Bearer <ML_SIDECAR_INTERNAL_TOKEN> — the same shared
+    // secret the sidecar's other authenticated callers (gateway, dashboard
+    // proxy) send.
     let embed_url = format!("{ml_sidecar_url}/embed");
     let embed_resp = ml_client
         .post(&embed_url)
+        .header("Authorization", format!("Bearer {ml_sidecar_token}"))
         .json(&serde_json::json!({"text": condition_text}))
         .send()
         .await
@@ -116,4 +122,89 @@ async fn index_policy_rule(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secureprompt_common::tasks::TaskEnvelope;
+    use serde_json::json;
+
+    /// A `qdrant_client::Qdrant` handle that never actually connects — the
+    /// gRPC channel is lazy, so building one against an address nothing
+    /// listens on is safe as long as the test never reaches the upsert step.
+    fn dummy_qdrant() -> qdrant_client::Qdrant {
+        qdrant_client::Qdrant::from_url("http://127.0.0.1:1")
+            .build()
+            .expect("qdrant client build is lazy — no connection attempted here")
+    }
+
+    // --- WS1-5 fix-round: the ML sidecar now requires
+    // `Authorization: Bearer <ML_SIDECAR_INTERNAL_TOKEN>` on /embed too.
+    // Raw-TCP capture (same idiom as secureprompt-api's ml_sidecar::client
+    // tests) so we assert on the literal bytes on the wire. The mock server
+    // replies 500, so `index_policy_rule` errors out at
+    // `.error_for_status()` — before ever touching the dummy Qdrant client. ---
+
+    #[tokio::test]
+    async fn test_index_policy_rule_attaches_authorization_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = b"{\"detail\":\"forced error for header-capture test\"}";
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+            request
+        });
+
+        let ml_client = reqwest::Client::new();
+        let qdrant = dummy_qdrant();
+        let task = TaskEnvelope::new(
+            "index_policy_rule",
+            json!({"rule_id": Uuid::new_v4().to_string(), "condition_text": "hello"}),
+            Uuid::new_v4(),
+        );
+        let ml_sidecar_url = format!("http://{addr}");
+
+        let result = index_policy_rule(
+            &task,
+            &ml_client,
+            &qdrant,
+            &ml_sidecar_url,
+            "worker-shared-secret-xyz",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "mock server returns 500, so this must error before ever touching Qdrant"
+        );
+
+        let request = server
+            .join()
+            .expect("mock server thread panicked")
+            .to_lowercase();
+        assert!(
+            request.contains("authorization: bearer worker-shared-secret-xyz"),
+            "index_policy_rule must send the Authorization header; got request:\n{request}"
+        );
+        // Positive control: prove the capture mechanism itself is live by
+        // asserting a DIFFERENT, always-present header — otherwise a broken
+        // capture (e.g. reading 0 bytes) would make the assertion above
+        // vacuously pass.
+        assert!(
+            request.contains("content-type: application/json"),
+            "capture mechanism must see real request headers; got:\n{request}"
+        );
+    }
 }

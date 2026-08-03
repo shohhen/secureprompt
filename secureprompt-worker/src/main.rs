@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         // gateway request path, but AppConfig is shared so the field has
         // to be set. Defer to the env var so worker + API agree.
         redact_when_no_rules: AppConfig::redact_when_no_rules_from_env(),
+        sidecar_unavailable_default: AppConfig::sidecar_unavailable_default_from_env(),
         // The worker never verifies licenses (no gateway request path), so the
         // empty/disabled default is correct here — no pubkey/token reads matter.
         license: LicenseConfig::default(),
@@ -216,10 +217,24 @@ async fn main() -> anyhow::Result<()> {
     let ml_sidecar_url = std::env::var("ML_SIDECAR_URL")
         .unwrap_or_else(|_| "http://secureprompt-ml:8080".into());
     let ml_http = reqwest::Client::new();
+    // WS1-5 fix-round: /embed now requires Authorization: Bearer
+    // <ML_SIDECAR_INTERNAL_TOKEN>. `config.license` already loads that value
+    // from the same env var via `LicenseConfig::from_env()` (the worker
+    // never verifies licenses, but internal_token is unconditionally
+    // populated regardless).
+    let ml_sidecar_token = config.license.internal_token.clone();
 
     let metrics_drain = metrics.clone();
     tokio::spawn(async move {
-        run_queue_drain(redis_pool_drain, qdrant, ml_http, ml_sidecar_url, metrics_drain).await;
+        run_queue_drain(
+            redis_pool_drain,
+            qdrant,
+            ml_http,
+            ml_sidecar_url,
+            ml_sidecar_token,
+            metrics_drain,
+        )
+        .await;
     });
 
     tracing::info!("Task queue drain loop started");
@@ -239,6 +254,7 @@ async fn run_queue_drain(
     qdrant: std::sync::Arc<qdrant_client::Qdrant>,
     ml_client: reqwest::Client,
     ml_sidecar_url: String,
+    ml_sidecar_token: String,
     metrics: Arc<WorkerMetrics>,
 ) {
     loop {
@@ -264,7 +280,15 @@ async fn run_queue_drain(
         if let Some((_queue_name, json)) = result {
             match serde_json::from_str::<TaskEnvelope>(&json) {
                 Ok(task) => {
-                    dispatch_task(task, &qdrant, &ml_client, &ml_sidecar_url, &metrics).await;
+                    dispatch_task(
+                        task,
+                        &qdrant,
+                        &ml_client,
+                        &ml_sidecar_url,
+                        &ml_sidecar_token,
+                        &metrics,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -286,6 +310,7 @@ async fn dispatch_task(
     qdrant: &qdrant_client::Qdrant,
     ml_client: &reqwest::Client,
     ml_sidecar_url: &str,
+    ml_sidecar_token: &str,
     metrics: &WorkerMetrics,
 ) {
     use secureprompt_common::tasks::task_types;
@@ -320,6 +345,7 @@ async fn dispatch_task(
                 ml_client,
                 qdrant,
                 ml_sidecar_url,
+                ml_sidecar_token,
             )
             .await;
             metrics.record_task(

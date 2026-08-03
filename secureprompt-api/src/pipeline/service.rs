@@ -2,12 +2,14 @@ use crate::{
     analytics::events::RequestEvent,
     app_state::AppState,
     db::secure_mode_repo::{SecureModeRepository, SecureModeRow},
+    db::sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
     detection::{detect_content, merge::merge_detections},
     http::{
         middleware::{api_key_auth::AuthContext, rate_limit::adjust_workspace_tokens},
         model_router::{ModelTarget, ResolvedModel},
         streaming::{placeholder_safe_chunks, settled_prefix_len, PlaceholderStreamer},
     },
+    ml_sidecar::types::{CoverageLoss, SidecarCoverage},
     observability::tracing::{log_request_finish, log_request_start},
     policy::engine::{evaluate, PolicyEvaluationInput, PolicyEvaluationOutcome},
     providers::{
@@ -31,6 +33,90 @@ pub enum RequestKind {
     Chat,
     Completion,
     Embedding,
+}
+
+/// WS2-3 — what the workspace's `sidecar_unavailable` policy says to do about
+/// one `detect_if_available` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarGate {
+    /// The sidecar covered the input; carry on normally.
+    Proceed,
+    /// Fail closed — the prompt must not reach the provider.
+    Block(CoverageLoss),
+    /// Proceed on the deterministic floor, loudly: alert + response header +
+    /// `floor_only = true` on the analytics row.
+    Degrade(CoverageLoss),
+}
+
+/// WS2-3 — the single decision point for "the ML sidecar produced no
+/// coverage".
+///
+/// Kept as a free function over plain values (no `AppState`, no database, no
+/// HTTP) so the full cross-product of coverage × policy is unit-testable.
+///
+/// Classification is delegated to [`CoverageLoss::from_coverage`] — the one
+/// exhaustive match over `SidecarCoverage` in the codebase — so this function
+/// only decides policy, and a new coverage variant cannot reach here
+/// unclassified.
+#[must_use]
+pub fn sidecar_gate(coverage: &SidecarCoverage, policy: SidecarUnavailablePolicy) -> SidecarGate {
+    match CoverageLoss::from_coverage(coverage) {
+        None => SidecarGate::Proceed,
+        Some(loss) => match policy {
+            SidecarUnavailablePolicy::Block => SidecarGate::Block(loss),
+            SidecarUnavailablePolicy::DegradeWithAlert => SidecarGate::Degrade(loss),
+        },
+    }
+}
+
+/// Response header set on any request that was answered with deterministic-
+/// floor detection only, because the ML sidecar produced no coverage and the
+/// workspace policy is `degrade_with_alert`. Value is the bounded
+/// [`SidecarOutage::as_str`] reason so a client can tell a never-deployed
+/// sidecar apart from one that just fell over.
+pub const SIDECAR_DEGRADED_HEADER: &str = "x-secureprompt-sidecar-degraded";
+
+/// Metric/log `action` label for a prompt-side outage in a workspace whose
+/// policy is `block`: the request was rejected before reaching the provider.
+const ACTION_BLOCK: &str = "block";
+/// Prompt-side outage in a `degrade_with_alert` workspace: the request was
+/// answered on the deterministic floor.
+const ACTION_DEGRADE: &str = "degrade_with_alert";
+/// Coverage lost on the RESPONSE side, after the upstream call. Deliberately
+/// distinct from [`ACTION_DEGRADE`]: it does NOT mean the workspace chose to
+/// degrade. `block` cannot be honoured this late — the prompt is already
+/// forwarded and, on the streaming path, the SSE status line is already
+/// committed — so the request is marked and alerted instead. An operator
+/// seeing this label is looking at a sidecar that died mid-request, not at a
+/// workspace configuration.
+const ACTION_DEGRADE_RESPONSE_SIDE: &str = "degrade_response_side";
+
+/// Emit the operator-facing alert for a sidecar outage.
+///
+/// "Alert" here means the two things this deployment can actually route: a
+/// `tracing::error!` carrying a stable `alert=` key for log-based alerting,
+/// and a Prometheus counter (`secureprompt_sidecar_unavailable_total`) that
+/// `monitoring/prometheus/alerts.yml` fires `MLSidecarCoverageLost` on. Both
+/// labels are bounded — outage reason and one of the three `ACTION_*`
+/// constants above, never workspace ids or free text.
+fn alert_sidecar_unavailable(
+    state: &AppState,
+    request_id: RequestId,
+    workspace_id: secureprompt_common::types::WorkspaceId,
+    reason: CoverageLoss,
+    action: &'static str,
+) {
+    tracing::error!(
+        alert = "ml_sidecar_coverage_lost",
+        %request_id,
+        %workspace_id,
+        reason = reason.as_str(),
+        action,
+        "ML sidecar produced no detection coverage for this request"
+    );
+    state
+        .metrics
+        .record_sidecar_unavailable(reason.as_str(), action);
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +145,25 @@ pub struct PipelineExecution {
     pub stream_chunks: Vec<String>,
     pub finish_reason: Option<String>,
     pub pipeline_output: PipelineOutput,
+    /// WS2-3 — `Some(reason)` when this request was answered with
+    /// deterministic-floor detection only because the ML sidecar produced no
+    /// coverage. Drives the `x-secureprompt-sidecar-degraded` response header
+    /// and mirrors the analytics row's `floor_only`.
+    pub degraded_reason: Option<CoverageLoss>,
+}
+
+/// WS2-3 — return value of [`PipelineService::execute_stream`].
+///
+/// The streaming path answers with an SSE response whose status line and
+/// headers are committed before the first token, so the degradation flag has
+/// to travel out-of-band alongside the stream rather than inside it.
+pub struct StreamExecution {
+    pub items: Pin<Box<dyn Stream<Item = ChatStreamItem> + Send>>,
+    /// Same meaning as [`PipelineExecution::degraded_reason`], determined at
+    /// `prepare` time. A sidecar that dies mid-stream cannot retroactively
+    /// add a header; that case still alerts and still marks the analytics
+    /// row (see the response-side scrub in `execute_stream`).
+    pub degraded_reason: Option<CoverageLoss>,
 }
 
 /// One item emitted by the streaming pipeline path (`execute_stream`).
@@ -107,12 +212,107 @@ struct Prepared {
     /// (which still times only the upstream call, for `latency_ms` /
     /// `event.latency_ms` — unchanged by this).
     start: Instant,
+    /// WS2-3 — `Some(reason)` when the ML sidecar produced no coverage for
+    /// this prompt and the workspace's `sidecar_unavailable` policy is
+    /// `degrade_with_alert`, so the request proceeded on the deterministic
+    /// Rust floor alone. `None` under normal operation; a `block` workspace
+    /// never reaches here (`prepare` returns 503 instead).
+    degraded_reason: Option<CoverageLoss>,
 }
 
 impl PipelineService {
     #[must_use]
     pub fn new(state: AppState) -> Self {
         Self { state }
+    }
+
+    /// WS2-3 fix round 1 — reject a request whose ML coverage was lost, in a
+    /// `block` workspace.
+    ///
+    /// Alerts, records the failure metrics, **enqueues an audit row**, and
+    /// returns the 503. The audit row is the fix for a real hole: the first
+    /// version returned 503 straight from the gate, so a fail-closed
+    /// workspace's rejected traffic existed only in logs — invisible in
+    /// `request_events` and therefore in the audit UI. Its policy-deny twin
+    /// has always written a row, and on a governance product "we blocked it"
+    /// has to be as auditable as "we allowed it".
+    ///
+    /// `final_action` is `block_sidecar_unavailable` — deliberately distinct
+    /// from a policy `deny` so an operator can separate "your rules rejected
+    /// this" from "our detector was down". `floor_only` stays false: the
+    /// request was never answered, so it was not answered on the floor.
+    async fn fail_closed_on_coverage_loss(
+        &self,
+        auth: &AuthContext,
+        request: &GatewayRequest,
+        resolved: &ResolvedModel,
+        request_id: RequestId,
+        reason: CoverageLoss,
+        detections: &[secureprompt_common::types::Detection],
+        start: Instant,
+    ) -> ApiError {
+        alert_sidecar_unavailable(
+            &self.state,
+            request_id,
+            auth.workspace_id,
+            reason,
+            ACTION_BLOCK,
+        );
+
+        let provider_name = resolved
+            .targets
+            .first()
+            .map_or("unconfigured", |t| t.provider_name.as_str())
+            .to_owned();
+        let usage = TokenUsage::default();
+        let cost_usd = self
+            .state
+            .pricing
+            .compute_cost(&request.public_model, &usage);
+        let mut event = RequestEvent::new(
+            request_id,
+            auth.workspace_id,
+            provider_name,
+            request.public_model.clone(),
+            "block_sidecar_unavailable".to_owned(),
+            &usage,
+            false,
+            cost_usd,
+            Vec::new(),
+        );
+        event.user_id = auth.user_id;
+        event.api_key_id = Some(auth.api_key_id);
+        event.api_key_name = Some(auth.api_key_name.clone());
+        event.ip_address = request.client_ip.clone();
+        event.user_agent = request.user_agent.clone();
+        event.raw_prompt = last_user_message_raw(&request.messages);
+        // Reuses the detections this request already produced — NO second
+        // sidecar call on a path that is failing precisely because detection
+        // is unavailable or over budget. Shows what was actually caught
+        // (deterministic floor, plus whatever partial ML coverage there was),
+        // which is the evidence for "why was this not safe to forward".
+        event.redacted_prompt = Some(redact_last_user_message_with(&request.messages, detections));
+        self.state
+            .analytics
+            .enqueue(event, self.state.metrics.as_ref())
+            .await;
+
+        self.state
+            .metrics
+            .observe_request_duration("unknown", start.elapsed());
+        self.state.metrics.record_request(false);
+        log_request_finish(
+            request_id,
+            auth.workspace_id,
+            "block_sidecar_unavailable",
+            false,
+        );
+
+        ApiError::ServiceUnavailable(
+            "PII detection coverage is unavailable for this request and the workspace is \
+             configured to fail closed"
+                .to_owned(),
+        )
     }
 
     /// Run all input-side processing up to (but not including) the upstream
@@ -149,8 +349,63 @@ impl PipelineService {
         )
         .await;
         let regex_detections = detect_content(&prompt);
-        let ml_detections = self.state.ml_sidecar.detect_if_available(&prompt).await;
-        pipeline_state.detections = merge_detections(regex_detections, ml_detections);
+        let ml_outcome = self.state.ml_sidecar.detect_if_available(&prompt).await;
+
+        // WS2-3 — the workspace's `sidecar_unavailable` policy.
+        //
+        // This is THE gate: it runs before policy evaluation, before the
+        // secure-mode injection check, and — critically — before any provider
+        // is invoked, which is what makes `block` mean "the prompt is never
+        // forwarded" rather than "we billed you and then apologised".
+        //
+        // A failed read fails CLOSED: `SidecarUnavailablePolicy::default()`
+        // is `Block`, so a Postgres outage cannot turn into permission to
+        // forward unscanned prompts.
+        let sidecar_policy = SidecarPolicyRepository::new(self.state.db.clone())
+            .get_effective(
+                auth.workspace_id,
+                SidecarUnavailablePolicy::from_db(&self.state.config.sidecar_unavailable_default),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    workspace_id = %auth.workspace_id,
+                    error = %err,
+                    "sidecar_unavailable policy read failed; failing closed to 'block'"
+                );
+                SidecarUnavailablePolicy::default()
+            });
+        // Merged BEFORE the gate so the fail-closed path can reuse these for
+        // the audit row instead of paying for a second scan.
+        let merged_detections = merge_detections(regex_detections, ml_outcome.detections);
+        let mut degraded_reason = match sidecar_gate(&ml_outcome.coverage, sidecar_policy) {
+            SidecarGate::Proceed => None,
+            SidecarGate::Block(reason) => {
+                return Err(self
+                    .fail_closed_on_coverage_loss(
+                        auth,
+                        request,
+                        resolved,
+                        request_id,
+                        reason,
+                        &merged_detections,
+                        start,
+                    )
+                    .await);
+            }
+            SidecarGate::Degrade(reason) => {
+                alert_sidecar_unavailable(
+                    &self.state,
+                    request_id,
+                    auth.workspace_id,
+                    reason,
+                    ACTION_DEGRADE,
+                );
+                Some(reason)
+            }
+        };
+
+        pipeline_state.detections = merged_detections;
 
         let rag_result = self
             .state
@@ -212,11 +467,56 @@ impl PipelineService {
                 row
             });
         if secure_mode.enabled {
-            let injection = self
+            let injection_outcome = self
                 .state
                 .ml_sidecar
                 .injection_check_if_available(&prompt)
                 .await;
+
+            // Fix round 1 — `/detect/injection` fails INDEPENDENTLY of
+            // `/detect/ner`: a 5xx or unparseable body yields
+            // `is_injection = false`, which is what a clean prompt also looks
+            // like. With NER coverage `Complete` the gate above proceeds, so
+            // the workspace's injection block was being silently bypassed
+            // with no 503, no header, no alert and no `floor_only`.
+            //
+            // Gated only where the answer actually changes enforcement:
+            // `apply_secure_mode_override` consults `injection` at
+            // `level = strict` and at `level = standard` with
+            // `block_on_injection_detection`. At `permissive` it is never
+            // read, so a missing answer there has no security consequence and
+            // must not cost the operator a 503.
+            let injection_enforced = secure_mode.level == "strict"
+                || (secure_mode.level != "permissive" && secure_mode.block_on_injection_detection);
+            if injection_enforced {
+                match sidecar_gate(&injection_outcome.coverage, sidecar_policy) {
+                    SidecarGate::Proceed => {}
+                    SidecarGate::Block(reason) => {
+                        return Err(self
+                            .fail_closed_on_coverage_loss(
+                                auth,
+                                request,
+                                resolved,
+                                request_id,
+                                reason,
+                                &pipeline_state.detections,
+                                start,
+                            )
+                            .await);
+                    }
+                    SidecarGate::Degrade(reason) => {
+                        alert_sidecar_unavailable(
+                            &self.state,
+                            request_id,
+                            auth.workspace_id,
+                            reason,
+                            ACTION_DEGRADE,
+                        );
+                        degraded_reason = degraded_reason.or(Some(reason));
+                    }
+                }
+            }
+            let injection = injection_outcome.response;
             // Clone detections so we can borrow `pipeline_state` mutably for
             // the redaction step inside the override. Detections are
             // typically <10 items per request; the clone is cheap relative
@@ -338,6 +638,7 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         })
     }
 
@@ -357,7 +658,13 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         } = self.prepare(auth, resolved, &request).await?;
+        // WS2-3 — may be upgraded below if the RESPONSE-side detection pass
+        // also loses coverage (a sidecar that fell over during the upstream
+        // call). Prompt-side reason wins when both fire; it is the one the
+        // header already committed to.
+        let mut degraded_reason = degraded_reason;
 
         let t0 = Instant::now();
         let (chosen_target, provider_output) = if self.state.config.chat_debug_mode {
@@ -426,8 +733,31 @@ impl PipelineService {
             match restored_content.as_deref() {
                 Some(text) => {
                     let regex = detect_content(text);
-                    let ml = self.state.ml_sidecar.detect_if_available(text).await;
-                    let merged = merge_detections(regex, ml);
+                    // WS2-3 — the response-side pass is a SECOND chance to
+                    // lose coverage: the sidecar may have been healthy when
+                    // the prompt was scanned and dead by the time the reply
+                    // came back. `block` is not enforced here — the prompt
+                    // has already been forwarded and the tokens already
+                    // spent, so the only honest option left is to make the
+                    // degradation visible — but the request is marked and
+                    // alerted exactly as the prompt-side path would.
+                    let ml_out = self.state.ml_sidecar.detect_if_available(text).await;
+                    // Fix round 1 (CRITICAL 2): this was `if let
+                    // SidecarCoverage::Absent(..)`, which compiles unchanged
+                    // when a coverage variant is added and silently treats it
+                    // as covered — the compile-time net claimed for this site
+                    // did not exist. Routed through the single classifier now.
+                    if let Some(reason) = CoverageLoss::from_coverage(&ml_out.coverage) {
+                        alert_sidecar_unavailable(
+                            &self.state,
+                            request_id,
+                            auth.workspace_id,
+                            reason,
+                            ACTION_DEGRADE_RESPONSE_SIDE,
+                        );
+                        degraded_reason = degraded_reason.or(Some(reason));
+                    }
+                    let merged = merge_detections(regex, ml_out.detections);
                     let detections =
                         filter_response_side_detections(&merged, &client_originals);
                     let scrubbed = if detections.is_empty() {
@@ -552,6 +882,9 @@ impl PipelineService {
         // restoration. Storing the post-restore version keeps the
         // panel labels semantically honest.
         event.restored_response = restored_content.clone();
+        // WS2-3 — the audit/analytics row records that this answer was
+        // produced with the deterministic floor alone.
+        event.floor_only = degraded_reason.is_some();
         self.state
             .analytics
             .enqueue(event, self.state.metrics.as_ref())
@@ -588,6 +921,7 @@ impl PipelineService {
             stream_chunks,
             finish_reason: provider_output.finish_reason.clone(),
             pipeline_output,
+            degraded_reason,
         })
     }
 
@@ -613,7 +947,7 @@ impl PipelineService {
         resolved: &ResolvedModel,
         request: GatewayRequest,
         estimated_input: u64,
-    ) -> Result<Pin<Box<dyn Stream<Item = ChatStreamItem> + Send>>, ApiError> {
+    ) -> Result<StreamExecution, ApiError> {
         let Prepared {
             request_id,
             pipeline_state,
@@ -621,6 +955,7 @@ impl PipelineService {
             secure_mode,
             pipeline_input,
             start,
+            degraded_reason,
         } = self.prepare(auth, resolved, &request).await?;
 
         let kind = match request.request_kind {
@@ -670,6 +1005,9 @@ impl PipelineService {
             let mut finish_reason: Option<String> = None;
             let mut ttft_ms: Option<u32> = None;
             let mut stream_ok = true;
+            // WS2-3 — prompt-side determination, possibly upgraded by a
+            // mid-stream response-side coverage loss below.
+            let mut stream_degraded = degraded_reason;
             let t0 = Instant::now();
 
             // Scan a completed (restored) segment for PII and re-redact it
@@ -679,8 +1017,26 @@ impl PipelineService {
                     let restored: String = $restored;
                     restored_full.push_str(&restored);
                     let regex = detect_content(&restored);
-                    let ml = state.ml_sidecar.detect_if_available(&restored).await;
-                    let merged = merge_detections(regex, ml);
+                    // WS2-3 — same second-chance coverage loss as the
+                    // buffered path's response-side pass. `block` cannot be
+                    // honoured here: the SSE status line was committed
+                    // before the first token, so the request is marked and
+                    // alerted instead.
+                    let ml_out = state.ml_sidecar.detect_if_available(&restored).await;
+                    // Fix round 1 (CRITICAL 2): see the buffered path above —
+                    // was an `if let` on one variant, now the single
+                    // classifier.
+                    if let Some(reason) = CoverageLoss::from_coverage(&ml_out.coverage) {
+                        alert_sidecar_unavailable(
+                            &state,
+                            request_id,
+                            workspace_id,
+                            reason,
+                            ACTION_DEGRADE_RESPONSE_SIDE,
+                        );
+                        stream_degraded = stream_degraded.or(Some(reason));
+                    }
+                    let merged = merge_detections(regex, ml_out.detections);
                     let detections =
                         filter_response_side_detections(&merged, &client_originals);
                     if detections.is_empty() {
@@ -796,6 +1152,9 @@ impl PipelineService {
             event.raw_response = if raw_full.is_empty() { None } else { Some(raw_full.clone()) };
             event.restored_response =
                 if restored_full.is_empty() { None } else { Some(restored_full.clone()) };
+            // WS2-3 — floor-only for the whole stream: set at prepare time,
+            // or upgraded by a mid-stream response-side coverage loss.
+            event.floor_only = stream_degraded.is_some();
             state.analytics.enqueue(event, state.metrics.as_ref()).await;
             // KPI-2 monitoring, Task 2 (fix-up) — `start` (from `prepare`,
             // captured outside this generator and moved in) times this
@@ -827,7 +1186,10 @@ impl PipelineService {
             };
         };
 
-        Ok(Box::pin(stream))
+        Ok(StreamExecution {
+            items: Box::pin(stream),
+            degraded_reason,
+        })
     }
 
     /// Open an incremental provider event stream, walking the failover chain
@@ -1050,39 +1412,73 @@ fn policy_violation_label(action: &str) -> Option<&'static str> {
 /// PII back into the model's response, while the marker — a bare ref, no PII — is
 /// removed before the prompt reaches detection / redaction / the provider.
 /// Best-effort: a missing or expired ref just leaves its tokens unrestored.
-async fn preload_file_vault(
-    prompt: &mut String,
-    vault: &mut secureprompt_common::types::TokenVault,
-    redis_pool: &deadpool_redis::Pool,
-) {
-    const OPEN: &str = "[[sp:v=";
-    const CLOSE: &str = "]]";
-    if !prompt.contains(OPEN) {
-        return;
-    }
+const FILE_VAULT_MARKER_OPEN: &str = "[[sp:v=";
+const FILE_VAULT_MARKER_CLOSE: &str = "]]";
+
+/// Remove `[[sp:v=<ref>]]` file-vault markers, returning the cleaned text and
+/// the refs found, in order.
+///
+/// Extracted from `preload_file_vault` so that the span arithmetic in
+/// `last_user_message_span` applies the same stripping rules as the request
+/// path. `preload_file_vault` mutates the prompt before detection runs, so
+/// detection offsets are relative to the cleaned text; measuring message
+/// lengths against the raw text instead shifts every span by each preceding
+/// marker's byte length. Two copies of this loop would be one refactor away
+/// from silently disagreeing again.
+///
+/// NOT a perfect equivalence, and the difference is deliberate to state:
+/// `preload_file_vault` strips the JOINED prompt, while
+/// `last_user_message_span` strips PER MESSAGE. A marker split across the
+/// `\n` join (`"…[[sp:v="` ending one message, `"ref]]"` opening the next) is
+/// therefore stripped by the join-path and NOT by the per-message path, so
+/// the two disagree on offsets for that input. It fails safe: the value guard
+/// in `redact_last_user_message_with` sees mismatched bytes and drops the
+/// detection, so the audit row's `redacted_prompt` shows that text unredacted
+/// rather than redacting the wrong bytes. `raw_prompt` stores the message raw
+/// regardless, so this is not an incremental disclosure — but it IS one fewer
+/// redaction in the audit view for a genuinely pathological input.
+pub(crate) fn strip_file_vault_markers(text: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
-    let mut cleaned = String::with_capacity(prompt.len());
-    let mut rest = prompt.as_str();
-    while let Some(idx) = rest.find(OPEN) {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(FILE_VAULT_MARKER_OPEN) {
         cleaned.push_str(&rest[..idx]);
-        let after = &rest[idx + OPEN.len()..];
-        match after.find(CLOSE) {
+        let after = &rest[idx + FILE_VAULT_MARKER_OPEN.len()..];
+        match after.find(FILE_VAULT_MARKER_CLOSE) {
             Some(end) => {
                 let vref = &after[..end];
                 if !vref.is_empty() {
                     refs.push(vref.to_owned());
                 }
-                rest = &after[end + CLOSE.len()..];
+                rest = &after[end + FILE_VAULT_MARKER_CLOSE.len()..];
             }
             None => {
-                // Unterminated marker — keep the remaining text verbatim.
-                cleaned.push_str(rest);
+                // Unterminated marker: keep the remainder verbatim, starting
+                // at the marker. `rest[..idx]` was already pushed above, so
+                // pushing all of `rest` here duplicated the text before the
+                // marker — and since `preload_file_vault` mutates the prompt
+                // that is both scanned AND forwarded upstream, a user typing a
+                // bare `[[sp:v=` duplicated part of their own prompt to the
+                // provider.
+                cleaned.push_str(&rest[idx..]);
                 rest = "";
                 break;
             }
         }
     }
     cleaned.push_str(rest);
+    (cleaned, refs)
+}
+
+async fn preload_file_vault(
+    prompt: &mut String,
+    vault: &mut secureprompt_common::types::TokenVault,
+    redis_pool: &deadpool_redis::Pool,
+) {
+    if !prompt.contains(FILE_VAULT_MARKER_OPEN) {
+        return;
+    }
+    let (cleaned, refs) = strip_file_vault_markers(prompt);
     *prompt = cleaned;
 
     for vref in refs {
@@ -1410,7 +1806,11 @@ async fn redact_last_user_message(
 
     // Detection scoped to this single message — no transcript bleed.
     let regex = detect_content(content);
-    let ml = state.ml_sidecar.detect_if_available(content).await;
+    let ml = state
+        .ml_sidecar
+        .detect_if_available(content)
+        .await
+        .detections;
     let detections = merge_detections(regex, ml);
     if detections.is_empty() {
         return content.to_owned();
@@ -1423,6 +1823,97 @@ async fn redact_last_user_message(
     let mut audit_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     crate::vault::apply_redaction(content, &detections, &mut audit_vault, &mut audit_map)
+}
+
+/// Byte range of the message `last_user_message_raw` reports, inside the
+/// prompt DETECTION ACTUALLY RAN OVER, plus that message's cleaned text.
+///
+/// Two transforms sit between `request.messages` and the string detection
+/// sees: `prompt_from_messages` joins with a single `\n`, and
+/// `preload_file_vault` then strips `[[sp:v=…]]` markers. Detections carry
+/// offsets into the result of BOTH. Measuring against the raw messages — as
+/// this did before — shifts every span by the byte length of each marker at
+/// or before the audited message, and `apply_redaction` does not verify that
+/// a span's bytes match the detection's value, so the wrong bytes get
+/// redacted with no error. Audit-record only, but silent and
+/// plausible-looking, which is the failure mode this whole change exists to
+/// remove.
+pub(crate) fn last_user_message_span(messages: &[Message]) -> Option<(usize, usize, String)> {
+    let idx = messages
+        .iter()
+        .rposition(|m| m.role.eq_ignore_ascii_case("user"))
+        .or_else(|| messages.len().checked_sub(1))?;
+    let mut offset = 0usize;
+    for (i, message) in messages.iter().enumerate() {
+        let cleaned = strip_file_vault_markers(&message.content).0;
+        if i == idx {
+            let end = offset + cleaned.len();
+            return Some((offset, end, cleaned));
+        }
+        // +1 for the "\n" separator `prompt_from_messages` inserts.
+        offset += cleaned.len() + 1;
+    }
+    None
+}
+
+/// Redact the latest user message using detections ALREADY computed over the
+/// joined prompt — no second sidecar call.
+///
+/// `redact_last_user_message` re-runs a full scan, which is right on the
+/// success paths (it wants message-scoped placeholder numbering) but wrong on
+/// the fail-closed path: that path is already failing because detection is
+/// unavailable or over budget, and a second scan there can pay another full
+/// `ner_total_budget` before the 503, or — on the injection gate, where NER
+/// is healthy — double sidecar load exactly when the sidecar is struggling.
+///
+/// Detections outside the audited message are dropped and the rest rebased to
+/// message-local offsets, so the result is the same shape the success paths
+/// produce.
+pub(crate) fn redact_last_user_message_with(
+    messages: &[Message],
+    detections: &[secureprompt_common::types::Detection],
+) -> String {
+    let Some((start, end, content)) = last_user_message_span(messages) else {
+        return String::new();
+    };
+    if content.is_empty() {
+        return String::new();
+    }
+
+    let scoped: Vec<secureprompt_common::types::Detection> = detections
+        .iter()
+        .filter_map(|detection| {
+            let (s, e) = detection.span?;
+            // Fully inside the audited message. One straddling the boundary
+            // is dropped rather than clamped: a partial span would redact an
+            // arbitrary fragment. That is one fewer redaction than the
+            // scanning path produced, and the safe direction.
+            if s < start || e > end {
+                return None;
+            }
+            let (local_start, local_end) = (s - start, e - start);
+            // Belt and braces. `apply_redaction` trusts spans blindly, so
+            // verify the bytes still say what the detection says they say.
+            // If any future transform shifts the prompt between detection and
+            // here, this drops the detection instead of redacting the wrong
+            // bytes. Detections whose `value` is empty are not checkable and
+            // are dropped for the same reason.
+            let bytes_match = content
+                .get(local_start..local_end)
+                .is_some_and(|actual| !actual.is_empty() && actual == detection.value);
+            bytes_match.then(|| secureprompt_common::types::Detection {
+                span: Some((local_start, local_end)),
+                ..detection.clone()
+            })
+        })
+        .collect();
+    if scoped.is_empty() {
+        return content;
+    }
+
+    let mut vault = secureprompt_common::types::TokenVault::default();
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    crate::vault::apply_redaction(&content, &scoped, &mut vault, &mut map)
 }
 
 /// Decrypt a stored provider credential via the configured KMS backend.

@@ -5,6 +5,7 @@ pub mod policy_repo;
 pub mod provider_repo;
 pub mod refresh_token_repo;
 pub mod secure_mode_repo;
+pub mod sidecar_policy_repo;
 pub mod token_vault_repo;
 pub mod user_repo;
 pub mod workspace_repo;
@@ -16,6 +17,7 @@ pub use budget_repo::{BudgetBehavior, BudgetRepository, WorkspaceBudgetRow};
 pub use policy_repo::{PolicyRepository, PolicyRuleRow};
 pub use provider_repo::{ProviderRepository, ResolvedModelTarget};
 pub use refresh_token_repo::RefreshTokenRepository;
+pub use sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy};
 pub use user_repo::UserRepository;
 pub use workspace_repo::WorkspaceRepository;
 

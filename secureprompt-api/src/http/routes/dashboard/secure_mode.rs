@@ -24,18 +24,27 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    db::{secure_mode_repo::SecureModeRepository, token_vault_repo::TokenVaultRepository},
+    db::{
+        secure_mode_repo::SecureModeRepository,
+        sidecar_policy_repo::{SidecarPolicyRepository, SidecarUnavailablePolicy},
+        token_vault_repo::TokenVaultRepository,
+    },
+    detection::{detect_content, merge::merge_detections},
     http::{
         api_error_response,
         middleware::jwt_auth::{JwtAuthContext, UserRole},
         routes::dashboard::role::require_role,
     },
+    ml_sidecar::types::MlDetection,
     vault::{apply_redaction, restore_content},
 };
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
 const VALID_LEVELS: &[&str] = &["permissive", "standard", "strict"];
+/// WS2-3 — accepted values for `sidecar_unavailable`. Kept next to
+/// `VALID_LEVELS` because both are validated by the same PUT handler.
+const VALID_SIDECAR_POLICIES: &[&str] = &["block", "degrade_with_alert"];
 
 #[derive(Debug, Serialize)]
 pub struct SecureModeResponse {
@@ -45,6 +54,11 @@ pub struct SecureModeResponse {
     pub block_on_pii_detection: bool,
     pub block_on_injection_detection: bool,
     pub redact_pii_in_responses: bool,
+    /// WS2-3 — `block` (default) or `degrade_with_alert`. Stored in its own
+    /// table (`workspace_sidecar_policy`, migration 018) but surfaced here
+    /// because it is part of the same per-workspace security posture an
+    /// admin configures on one screen.
+    pub sidecar_unavailable: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -55,6 +69,7 @@ pub struct PutSecureModeRequest {
     pub block_on_pii_detection: Option<bool>,
     pub block_on_injection_detection: Option<bool>,
     pub redact_pii_in_responses: Option<bool>,
+    pub sidecar_unavailable: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +183,17 @@ async fn get_secure_mode(
         .get(ctx.workspace_id)
         .await
         .map_err(api_error_response)?;
+    // WS2-3 — the EFFECTIVE policy: the workspace's stored choice, or the
+    // deployment default when it has never chosen. Reporting the stored value
+    // alone would make this endpoint lie on any deployment that set
+    // SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT.
+    let sidecar_unavailable = SidecarPolicyRepository::new(state.db.clone())
+        .get_effective(
+            ctx.workspace_id,
+            SidecarUnavailablePolicy::from_db(&state.config.sidecar_unavailable_default),
+        )
+        .await
+        .map_err(api_error_response)?;
 
     Ok(Json(SecureModeResponse {
         workspace_id: row.workspace_id,
@@ -176,6 +202,7 @@ async fn get_secure_mode(
         block_on_pii_detection: row.block_on_pii_detection,
         block_on_injection_detection: row.block_on_injection_detection,
         redact_pii_in_responses: row.redact_pii_in_responses,
+        sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
         updated_at: row.updated_at,
     }))
 }
@@ -197,6 +224,26 @@ async fn put_secure_mode(
         }
     }
 
+    if let Some(ref value) = body.sidecar_unavailable {
+        if !VALID_SIDECAR_POLICIES.contains(&value.as_str()) {
+            return Err(api_error_response(ApiError::BadRequest(format!(
+                "sidecar_unavailable must be one of: {}",
+                VALID_SIDECAR_POLICIES.join(", ")
+            ))));
+        }
+    }
+
+    let sidecar_repo = SidecarPolicyRepository::new(state.db.clone());
+    let deployment_default =
+        SidecarUnavailablePolicy::from_db(&state.config.sidecar_unavailable_default);
+
+    // The secure-mode row is written FIRST so a failure there cannot leave a
+    // changed sidecar policy behind. The two live in different tables and are
+    // still not written in one transaction — a partial write remains possible
+    // in the other direction (secure mode applied, sidecar policy not) — but
+    // that direction fails safe: the sidecar policy keeps its previous, more
+    // conservative-or-equal value rather than being loosened by a request
+    // that then errored.
     let repo = SecureModeRepository::new(state.db.clone());
     let row = repo
         .upsert(
@@ -210,6 +257,17 @@ async fn put_secure_mode(
         .await
         .map_err(api_error_response)?;
 
+    let sidecar_unavailable = match body.sidecar_unavailable.as_deref() {
+        Some(value) => sidecar_repo
+            .upsert(ctx.workspace_id, SidecarUnavailablePolicy::from_db(value))
+            .await
+            .map_err(api_error_response)?,
+        None => sidecar_repo
+            .get_effective(ctx.workspace_id, deployment_default)
+            .await
+            .map_err(api_error_response)?,
+    };
+
     Ok((
         StatusCode::OK,
         Json(SecureModeResponse {
@@ -219,20 +277,222 @@ async fn put_secure_mode(
             block_on_pii_detection: row.block_on_pii_detection,
             block_on_injection_detection: row.block_on_injection_detection,
             redact_pii_in_responses: row.redact_pii_in_responses,
+            sidecar_unavailable: sidecar_unavailable.as_str().to_owned(),
             updated_at: row.updated_at,
         }),
     ))
 }
 
-/// `POST /v1/secure-mode/tokenize` — redact PII in `text` via the ML sidecar
-/// and persist the placeholder→original mapping so the caller can later
-/// detokenize. Returns an empty `tokenized_text` + warning if the sidecar is
-/// unavailable (circuit open / disabled).
+/// Assemble the detection set backing `/tokenize`, then apply the caller's
+/// optional `entity_labels` filter.
+///
+/// The deterministic regex floor runs first and unconditionally. This
+/// endpoint used to source detections from the ML sidecar alone, so a
+/// disabled sidecar, an unreachable one, or an open circuit breaker all
+/// produced the same result: an empty detection set, nothing for
+/// `apply_redaction` to replace, and a cheerful "no PII found" response
+/// carrying the caller's PII back verbatim. Every other detection path
+/// (chat completions, `/v1/redact`, `/v1/policy-check`) already merged the
+/// regex floor in; this one was the outlier.
+fn tokenize_detections(
+    text: &str,
+    ml: Vec<MlDetection>,
+    allowed: Option<&[String]>,
+) -> Vec<Detection> {
+    merge_detections(detect_content(text), ml)
+        .into_iter()
+        .filter(|detection| {
+            allowed.is_none_or(|list| {
+                list.iter()
+                    .any(|label| label.eq_ignore_ascii_case(&detection.class))
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tokenize_detection_tests {
+    use super::tokenize_detections;
+    use crate::ml_sidecar::types::MlDetection;
+    use secureprompt_common::types::TokenVault;
+    use std::collections::HashMap;
+
+    fn ml(class: &str, start: usize, end: usize, value: &str) -> MlDetection {
+        MlDetection {
+            class: class.to_owned(),
+            confidence: 0.9,
+            span: Some((start, end)),
+            value: value.to_owned(),
+            compliance_categories: vec![],
+        }
+    }
+
+    /// The leak this guards: `/tokenize` used to build its detection set from
+    /// the ML sidecar ALONE. With the sidecar disabled, unreachable, or its
+    /// circuit breaker open, `detect_if_available` returns an empty vector,
+    /// `apply_redaction` has nothing to replace, and the endpoint answers
+    /// "no PII found" while echoing the caller's PII back verbatim.
+    #[test]
+    fn regex_floor_applies_when_sidecar_returns_nothing() {
+        let detections = tokenize_detections("PINFL 50101901234567", vec![], None);
+        assert!(
+            detections
+                .iter()
+                .any(|detection| detection.class == "PINFL"),
+            "expected the deterministic floor to find the PINFL with no ML \
+             detections, got: {detections:?}"
+        );
+    }
+
+    #[test]
+    fn regex_floor_and_ml_detections_are_merged() {
+        let text = "Ali Aliev, PINFL 50101901234567";
+        let detections = tokenize_detections(text, vec![ml("PERSON", 0, 9, "Ali Aliev")], None);
+        let classes: Vec<_> = detections
+            .iter()
+            .map(|detection| detection.class.as_str())
+            .collect();
+        assert!(classes.contains(&"PERSON"), "got: {classes:?}");
+        assert!(classes.contains(&"PINFL"), "got: {classes:?}");
+    }
+
+    /// Round-1 review: adding the regex floor to this endpoint also made it
+    /// inherit `merge_detections`' "regex wins on overlap" rule.
+    ///
+    /// When a short regex span sits INSIDE a longer ML span, dropping the ML
+    /// detection redacts only the inner fragment and forwards the rest of the
+    /// entity — a partial leak that is worse than either layer alone, and one
+    /// that only appeared once this endpoint gained a regex layer.
+    #[test]
+    fn ml_span_containing_a_regex_span_is_fully_redacted() {
+        let text = "Manzil: Toshkent shahri, AA1234567 blok, 5-uy";
+        let address_start = text.find("Toshkent").expect("fixture");
+        let address = &text[address_start..];
+
+        let detections = tokenize_detections(
+            text,
+            vec![ml("ADDRESS", address_start, text.len(), address)],
+            None,
+        );
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let redacted = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        assert!(
+            !redacted.contains("Toshkent"),
+            "the ML address was dropped because a regex span sat inside it, \
+             so only the inner fragment got redacted: {redacted:?}"
+        );
+        assert!(
+            !redacted.contains("AA1234567"),
+            "passport leaked: {redacted:?}"
+        );
+    }
+
+    /// Round-2 review: the end-to-end form of the containment regression.
+    /// An ML span that covers one regex detection but only PART of another
+    /// must not leave the tail of the second one in the output.
+    #[test]
+    fn no_byte_of_a_regex_identifier_survives_a_partly_covering_ml_span() {
+        let text = "Manzil: Toshkent, AA1234567 blok, STIR 300111222 raqami";
+        let address_start = text.find("Toshkent").expect("fixture");
+        // Deliberately ends mid-STIR: covers the passport in full and the
+        // STIR only partly.
+        let address_end = text.find("300111222").expect("fixture") + 4;
+
+        let detections = tokenize_detections(
+            text,
+            vec![ml(
+                "ADDRESS",
+                address_start,
+                address_end,
+                &text[address_start..address_end],
+            )],
+            None,
+        );
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let redacted = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        assert!(
+            !redacted.contains("300111222"),
+            "STIR leaked whole: {redacted:?}"
+        );
+        for tail in ["1222", "222", "22"] {
+            assert!(
+                !redacted.contains(tail),
+                "a tail fragment of the STIR was forwarded: {redacted:?}"
+            );
+        }
+        assert!(
+            !redacted.contains("AA1234567"),
+            "passport leaked: {redacted:?}"
+        );
+    }
+
+    /// Round-3 review: the tokenize → detokenize round-trip must survive
+    /// the overlapping-window fix. `detokenize` restores from the stored
+    /// mapping, so a placeholder whose recorded original does not match the
+    /// bytes it replaced would corrupt the caller's text.
+    #[test]
+    fn tokenize_detokenize_round_trips_over_overlapping_windows() {
+        let text = "ИНН 12345 6789 01234 (ИНН), karta 8600 1234 5678 9012";
+        let detections = tokenize_detections(text, vec![], None);
+
+        let mut vault = TokenVault::default();
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        let tokenized = super::apply_redaction(text, &detections, &mut vault, &mut mapping);
+
+        // Placeholder counters contain digits; strip the `{{...}}` tokens
+        // before checking that no identifier digit survived.
+        let mut visible = tokenized.clone();
+        while let (Some(open), Some(close)) = (visible.find("{{"), visible.find("}}")) {
+            if close < open {
+                break;
+            }
+            visible.replace_range(open..close + 2, "");
+        }
+        assert!(
+            !visible.chars().any(|character| character.is_ascii_digit()),
+            "a digit survived tokenize: {tokenized:?}"
+        );
+
+        // Exactly what the detokenize handler does: rebuild a vault from the
+        // persisted mapping, then restore.
+        let mut restored_vault = TokenVault::default();
+        for (placeholder, original) in mapping {
+            restored_vault.insert(placeholder, original);
+        }
+        assert_eq!(
+            super::restore_content(&tokenized, &restored_vault),
+            text,
+            "detokenize did not reproduce the original text"
+        );
+    }
+
+    #[test]
+    fn entity_label_filter_still_applies_to_floor_detections() {
+        let text = "PINFL 50101901234567 va STIR 300111222";
+        let allowed = vec!["STIR".to_owned()];
+        let detections = tokenize_detections(text, vec![], Some(&allowed));
+        assert!(
+            detections.iter().all(|detection| detection.class == "STIR"),
+            "filter must apply to regex detections too, got: {detections:?}"
+        );
+        assert_eq!(detections.len(), 1, "got: {detections:?}");
+    }
+}
+
+/// `POST /v1/secure-mode/tokenize` — redact PII in `text` using the
+/// deterministic regex floor merged with the ML sidecar, and persist the
+/// placeholder→original mapping so the caller can later detokenize.
 async fn tokenize(
     State(state): State<AppState>,
     Extension(ctx): Extension<JwtAuthContext>,
     Json(body): Json<TokenizeRequest>,
-) -> Result<Json<TokenizeResponse>, axum::response::Response> {
+) -> Result<axum::response::Response, axum::response::Response> {
     if body.text.is_empty() {
         return Err(api_error_response(ApiError::BadRequest(
             "text must not be empty".into(),
@@ -244,25 +504,28 @@ async fn tokenize(
         )));
     }
 
-    let raw = state.ml_sidecar.detect_if_available(&body.text).await;
+    let outcome = state.ml_sidecar.detect_if_available(&body.text).await;
+
+    // WS2-4 — honour the workspace's `sidecar_unavailable` policy. This
+    // endpoint hands the caller a `tokenized_text` they will paste somewhere
+    // else, so a floor-only answer served as a plain 200 is a laundered
+    // artifact. Runs BEFORE the vault insert below, so a blocked request
+    // leaves no half-redacted mapping behind.
+    let degraded = crate::http::sidecar_coverage::enforce(
+        &state,
+        secureprompt_common::types::RequestId::new(),
+        ctx.workspace_id,
+        &outcome.coverage,
+    )
+    .await
+    .map_err(api_error_response)?;
+    let raw = outcome.detections;
 
     let allowed: Option<Vec<String>> = body
         .entity_labels
         .map(|labels| labels.into_iter().map(|l| l.to_uppercase()).collect());
 
-    let detections: Vec<Detection> = raw
-        .into_iter()
-        .filter(|d| match &allowed {
-            Some(list) => list.iter().any(|l| l.eq_ignore_ascii_case(&d.class)),
-            None => true,
-        })
-        .map(|d| Detection {
-            class: d.class,
-            confidence: d.confidence,
-            span: d.span,
-            value: d.value,
-        })
-        .collect();
+    let detections = tokenize_detections(&body.text, raw, allowed.as_deref());
 
     let mut vault = TokenVault::default();
     let mut mapping: HashMap<String, String> = HashMap::new();
@@ -287,11 +550,14 @@ async fn tokenize(
         .await
         .map_err(api_error_response)?;
 
-    Ok(Json(TokenizeResponse {
-        tokenized_text,
-        token_vault_id: vault_id,
-        entity_counts,
-    }))
+    Ok(crate::http::sidecar_coverage::with_sidecar_degraded(
+        axum::response::IntoResponse::into_response(Json(TokenizeResponse {
+            tokenized_text,
+            token_vault_id: vault_id,
+            entity_counts,
+        })),
+        degraded,
+    ))
 }
 
 /// `POST /v1/secure-mode/detokenize` — reverse tokenize by looking up the

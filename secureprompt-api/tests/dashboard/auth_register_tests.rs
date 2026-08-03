@@ -51,6 +51,7 @@ fn test_config(public_signup_enabled: bool) -> AppConfig {
         public_signup_enabled,
         chat_debug_mode: false,
         redact_when_no_rules: false,
+        sidecar_unavailable_default: "block".to_owned(),
         license: LicenseConfig::default(),
     }
 }

@@ -151,7 +151,7 @@ async fn cost_by_model(
     let start = Instant::now();
     let result = state
         .dashboard_reader
-        .query_cost_by_model(&state.metrics, params.from, params.to)
+        .query_cost_by_model(&state.metrics, ctx.workspace_id.0, params.from, params.to)
         .await;
     let elapsed = start.elapsed();
 
