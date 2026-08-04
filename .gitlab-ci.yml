@@ -339,6 +339,49 @@ supply-chain:cargo-deny:
     # see its header, and the `bench` job's, for that judgement.
     - bash scripts/ci/cargo-deny-gate.sh
 
+# ---------------------------------------------------------------------------
+# WS6-2 — pip-audit over the ML sidecar's dependency set.
+#
+# WHY python:3.11-slim AND NOT $RUST_IMAGE, measured rather than assumed:
+# rust:1.89-bookworm ships python3 3.11.2 but NO pip and no `cryptography` —
+# that measurement is already recorded twice in this repository, in
+# scripts/ci/quarantine.tsv and in the test:audit-export-doc job header, and it
+# is why those two doc-gate tests are #[ignore]d. pip-audit is a pip package,
+# so it cannot be installed there without an apt detour.
+#
+# python:3.11-slim is not merely "an image with pip": it is the sidecar's OWN
+# base image (secureprompt-ml/Dockerfile:41) and the image test:ml-sidecar
+# already uses. Auditing on it resolves the same interpreter and the same
+# wheels that ship, so the answer is about production rather than about the
+# runner.
+#
+# NO torch INSTALL, deliberately. pip-audit RESOLVES requirements.txt; it does
+# not install it. test:ml-sidecar needs the ~200 MB CPU torch wheel because it
+# imports the app; this job needs none of it and finishes in a couple of
+# minutes.
+# ---------------------------------------------------------------------------
+supply-chain:pip-audit:
+  stage: lint
+  image: "python:3.11-slim"
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  cache:
+    key: "pip-audit-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cache/pip
+  before_script:
+    # Pinned: an unpinned auditor changes its own findings between runs, which
+    # makes the baseline argue with a moving target.
+    - python -m pip install --quiet pip-audit==2.10.1
+  script:
+    # Ratcheting gate against scripts/ci/pip-audit-baseline.tsv — 34 advisories
+    # recorded on 2026-08-04, all four packages in the /v1/scan-file upload
+    # path. Fails on a new advisory AND on a baseline row that was fixed, so
+    # the list can only shrink. See the baseline's header: those 34 are a real
+    # exposure with a scheduled fix order, not routine noise.
+    - bash scripts/ci/pip-audit-gate.sh
+
 helm-render:
   stage: lint
   image:

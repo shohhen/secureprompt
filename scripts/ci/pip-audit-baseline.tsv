@@ -1,0 +1,96 @@
+# SecurePrompt — pip-audit baseline (WS6-2).
+#
+# Gate: scripts/ci/pip-audit-gate.sh, run by the `supply-chain:pip-audit` job.
+# Scope: secureprompt-ml/requirements.txt, fully resolved (104 packages).
+#
+# MEASURED 2026-08-04 with pip-audit 2.10.1 against PyPI + the PyPI advisory
+# database. 34 unique (package, advisory) pairs across FOUR packages. Every row
+# below was produced by the tool; none was guessed.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE TREATING THE LIST AS ROUTINE DEBT. IT IS NOT.
+#
+# All four packages sit in the request path of `/v1/scan-file`, the endpoint
+# that accepts an uploaded document from a customer and parses it:
+#     python-multipart  parses the multipart upload itself
+#     starlette         reconstructs the URL and handles the request
+#     pillow            decodes image pages and writes redacted output
+#     pdfminer-six      parses PDFs
+# These are not transitive libraries that happen to be installed — they are the
+# code that touches untrusted bytes first. Several of the advisories are
+# denial-of-service or path-traversal reachable from exactly that input
+# (CVE-2026-24486 path traversal in python-multipart; CVE-2026-42310 a PDF that
+# hangs Pillow indefinitely; CVE-2025-70559 privilege escalation in
+# pdfminer-six).
+#
+# WHY THEY ARE BASELINED RATHER THAN FIXED IN THE SAME COMMIT: the fixes are
+# real dependency upgrades, not patch bumps —
+#     python-multipart  0.0.12  -> 0.0.31   direct pin, clears 7
+#     pdfminer.six      20240706-> 20251230 direct pin, clears 2
+#     Pillow            <12     -> >=12.3   the pin's own upper bound must move,
+#                                           clears 18
+#     starlette         0.46.2  -> 1.3.1    TRANSITIVE via fastapi==0.115.14,
+#                                           which pins starlette<0.47 — needs a
+#                                           fastapi major bump, clears 7
+# and this workstream is CI configuration. Landing an untested upgrade of the
+# document-parsing stack alongside a pipeline change would be the more
+# dangerous of the two options. The gate exists so the number cannot grow
+# quietly while that work is scheduled.
+#
+# FOLLOW-UP WS6-2-FU1: take the two direct pins (python-multipart, pdfminer.six)
+# first — 9 of 34, no API surface shared with our code beyond the parse call —
+# then Pillow, then fastapi/starlette last. Each needs `test:ml-sidecar` green.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE GATES
+#
+# The key is (package, advisory-id) — deliberately NOT the version. Three of
+# the four constraints in requirements.txt are ranges (`cryptography>=42`,
+# `Pillow>=10.4,<12`, `prometheus-client==0.21.*`), so the resolved version
+# drifts with time and no repository change. Keying on the version would turn
+# every upstream patch release into a wall of spurious "new" and "stale" rows.
+# The `resolved=` column is INFORMATIONAL — the version seen on 2026-08-04 —
+# and is not compared.
+#
+# The gate fails in BOTH directions, like scripts/ci/fmt-gate.sh:
+#   * an advisory NOT in this file      -> FAIL, something new appeared.
+#   * a row here no longer reported     -> FAIL, delete it; the list must shrink.
+# So the debt can only go down, and it cannot rot into a permanent excuse list.
+#
+# Columns: package <TAB> advisory <TAB> cve <TAB> resolved-version <TAB> fix
+# ---------------------------------------------------------------------------
+
+pdfminer-six	PYSEC-2026-1761	CVE-2025-70559	resolved=20240706	fix>=20251230
+pdfminer-six	PYSEC-2026-1762	CVE-2025-64512	resolved=20240706	fix>=20251107
+pillow	PYSEC-2026-165	CVE-2026-42308	resolved=11.3.0	fix>=12.2.0
+pillow	PYSEC-2026-2249	CVE-2026-25990	resolved=11.3.0	fix>=12.1.1
+pillow	PYSEC-2026-2250	CVE-2026-40192	resolved=11.3.0	fix>=12.2.0
+pillow	PYSEC-2026-2251	CVE-2026-42309	resolved=11.3.0	fix>=12.2.0
+pillow	PYSEC-2026-2252	CVE-2026-42311	resolved=11.3.0	fix>=12.2.0
+pillow	PYSEC-2026-2253	CVE-2026-54059	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-2254	CVE-2026-54060	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-2255	CVE-2026-55379	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-2256	CVE-2026-55380	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-2257	CVE-2026-55798	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-2874	CVE-2026-42310	resolved=11.3.0	fix>=12.2.0
+pillow	PYSEC-2026-3451	CVE-2026-59199	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3453	CVE-2026-59205	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3454	CVE-2026-59197	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3493	CVE-2026-54058	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3494	CVE-2026-59198	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3495	CVE-2026-59200	resolved=11.3.0	fix>=12.3.0
+pillow	PYSEC-2026-3496	CVE-2026-59204	resolved=11.3.0	fix>=12.3.0
+python-multipart	PYSEC-2026-1851	CVE-2024-53981	resolved=0.0.12	fix>=0.0.18
+python-multipart	PYSEC-2026-1852	CVE-2026-24486	resolved=0.0.12	fix>=0.0.22
+python-multipart	PYSEC-2026-3036	CVE-2026-53539	resolved=0.0.12	fix>=0.0.30
+python-multipart	PYSEC-2026-3037	CVE-2026-53538	resolved=0.0.12	fix>=0.0.30
+python-multipart	PYSEC-2026-3038	CVE-2026-40347	resolved=0.0.12	fix>=0.0.26
+python-multipart	PYSEC-2026-3039	CVE-2026-42561	resolved=0.0.12	fix>=0.0.27
+python-multipart	PYSEC-2026-3040	CVE-2026-53540	resolved=0.0.12	fix>=0.0.31
+starlette	PYSEC-2026-161	CVE-2026-48710	resolved=0.46.2	fix>=1.0.1
+starlette	PYSEC-2026-1941	CVE-2025-54121	resolved=0.46.2	fix>=0.47.2
+starlette	PYSEC-2026-1942	CVE-2025-62727	resolved=0.46.2	fix>=0.49.1
+starlette	PYSEC-2026-2280	CVE-2026-48817	resolved=0.46.2	fix>=1.1.0
+starlette	PYSEC-2026-2281	CVE-2026-48818	resolved=0.46.2	fix>=1.1.0
+starlette	PYSEC-2026-248	CVE-2026-54282	resolved=0.46.2	fix>=1.3.0
+starlette	PYSEC-2026-249	CVE-2026-54283	resolved=0.46.2	fix>=1.3.1
