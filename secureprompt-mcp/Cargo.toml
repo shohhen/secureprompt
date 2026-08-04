@@ -2,6 +2,10 @@
 name = "secureprompt-mcp"
 version = "0.1.0"
 edition = "2021"
+# Proprietary: this crate must never reach crates.io. `publish = false` is
+# also what makes deny.toml\'s `[licenses] private.ignore` and
+# `[bans] allow-wildcard-paths` apply to it (WS6-2).
+publish = false
 
 [dependencies]
 secureprompt-common = { path = "../secureprompt-common" }

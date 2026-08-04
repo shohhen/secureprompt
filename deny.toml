@@ -1,0 +1,255 @@
+# SecurePrompt — cargo-deny configuration (WS6-2).
+#
+# Gate: `bash scripts/ci/cargo-deny-gate.sh`, run by the `supply-chain:cargo-deny`
+# job in .gitlab-ci.yml. Four checks: advisories, licenses, bans, sources.
+#
+# MEASURED WITH cargo-deny 0.20.2 ON 2026-08-04, against this workspace's
+# Cargo.lock (495 `name =` entries). Every number and every ID below was
+# produced by running the tool, not estimated, and each check below was
+# mutation-tested — deliberately broken, observed to FAIL, restored, observed
+# to pass. The transcripts are in the WS6-2 report.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE IS SHAPED LIKE THE fmt/clippy RATCHETS
+#
+# `.github/workflows-retired/README` records four workflows that were abandoned
+# once they went permanently red, and both `fmt` and `clippy` had to be rebuilt
+# as ratchets for the same reason. A supply-chain gate has a sharper version of
+# that failure mode: the RustSec database is updated by third parties, so a gate
+# with no baseline goes red on a morning when nobody changed anything. The three
+# `[advisories] ignore` entries below are therefore an explicit, dated, reasoned
+# baseline — not a mute button — and each carries the condition that retires it.
+#
+# THE RULE FOR THIS FILE: an entry may be added only with an ID, a date, the
+# measured reason it cannot be fixed today, and what would remove it. If a fix
+# exists, take the fix. Three of the six advisories found on 2026-08-04 had
+# patch-level fixes and were FIXED rather than ignored:
+#     anyhow        1.0.102 -> 1.0.104   (RUSTSEC-2026-0190, unsound downcast_mut)
+#     rand          0.8.5   -> 0.8.7     (RUSTSEC-2026-0097, unsound custom logger)
+#     rustls-webpki 0.103.12 -> 0.103.13 (RUSTSEC-2026-0104, reachable panic)
+# That is a 14-line Cargo.lock diff, semver-compatible in all three cases, and
+# it is why the ignore list below has three entries instead of six.
+# ---------------------------------------------------------------------------
+
+# Restrict the graph to the platforms this product is actually built for, so
+# the gate audits what ships rather than every target Rust can name.
+#
+# linux-gnu + linux-musl are what ships (the Dockerfiles build amd64; sp-agent
+# is statically linked against musl). The two darwin entries are so a developer
+# running this locally sees the same answer CI does.
+#
+# WHAT THIS DOES AND DOES NOT BUY, measured rather than assumed. An earlier
+# draft of this comment claimed the restriction was what kept the graph's only
+# copyleft licence out — `r-efi` (5.3.0 and 6.0.0), a UEFI-only crate reached
+# through `getrandom`, which `cargo deny list` reports under
+# LGPL-2.1-or-later. THAT CLAIM WAS FALSE and the mutation test caught it:
+# deleting the `targets` key entirely still leaves `licenses ok`. The reason is
+# that r-efi is dual-licensed —
+#     license = "MIT OR Apache-2.0 OR LGPL-2.1-or-later"   (its Cargo.toml:39)
+# — an OR-choice cargo-deny satisfies with MIT. So this key narrows the graph
+# (with it, `cargo deny list` matches r-efi zero times); it is NOT what
+# enforces the licence policy. The allow list below is.
+# `[graph]`, not the bare top-level keys: cargo-deny 0.20.2 accepts
+# `targets`/`exclude-dev` at the root but emits
+# `warning[deprecated]: this key has been moved to [graph]` four times per run.
+# A gate that prints warnings on every green run trains people to skim its
+# output, which is the habit this whole workstream is trying not to build.
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+
+# Dev-dependencies stay in scope: a compromised test-only crate still executes
+# on a developer's machine and on this runner.
+exclude-dev = false
+
+# ===========================================================================
+# ADVISORIES — RustSec.
+# ===========================================================================
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# `yanked = "warn"`, deliberately, and this is the one place this file declines
+# to be a hard gate. MEASURED: `spin 0.9.8` is yanked and is reached through
+# lazy_static <- num-bigint-dig <- rsa <- jsonwebtoken, i.e. it is not ours to
+# bump; and a crate can be yanked by its author at any moment, with no code
+# change on our side, which is the "red on a morning when nobody changed
+# anything" shape the header warns about. It is reported on every run and is
+# not silent.
+yanked = "warn"
+
+# The baseline. Three entries, all measured 2026-08-04, all with
+# "No safe upgrade is available!" in cargo-deny's own Solution field —
+# verified by re-running after `cargo update`, which fixed the other three.
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack: potential key recovery through timing
+    # sidechannels", rsa 0.9.10. Severity 5.9 medium.
+    # WHY IT IS HERE: there is no fixed release of `rsa`; the advisory itself
+    # says so and cargo-deny reports "No safe upgrade is available!". The crate
+    # is not a direct dependency — it arrives as
+    #     rsa 0.9.10 <- jsonwebtoken 10.3.0 <- secureprompt-api
+    # and jsonwebtoken pulls it in for RS256 support.
+    # REACHABILITY, checked rather than assumed: the workspace configures
+    # jsonwebtoken with `default-features = false, features = ["rust_crypto"]`
+    # (workspace Cargo.toml) and the dashboard signs with HS256 — a symmetric
+    # HMAC that does not execute RSA private-key operations at all. The attack
+    # requires the victim to perform RSA decryption/signing with a key an
+    # attacker can time. If this repository ever switches to RS256, this entry
+    # must be re-argued rather than carried forward.
+    # RETIRES WHEN: `rsa` ships a constant-time fix, or jsonwebtoken drops it.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 — "paste - no longer maintained", paste 1.0.15.
+    # Unmaintained, not a vulnerability: no known defect, the author archived
+    # the repository. Transitive only.
+    # RETIRES WHEN: the dependents move to `pastey` (already present in this
+    # graph at 0.2.1, the maintained fork) and `paste` leaves Cargo.lock.
+    "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2025-0134 — "rustls-pemfile is unmaintained", rustls-pemfile 2.2.0.
+    # Unmaintained, not a vulnerability: its functionality was folded into
+    # `rustls-pki-types` (present here at 1.14.0), so the crate is deprecated
+    # rather than broken. Transitive, via the rustls stack.
+    # RETIRES WHEN: rustls/reqwest/sqlx finish migrating to rustls-pki-types'
+    # built-in PEM parsing and the crate leaves Cargo.lock.
+    "RUSTSEC-2025-0134",
+]
+
+# ===========================================================================
+# LICENSES
+# ===========================================================================
+#
+# Confidence threshold for a text-matched (non-SPDX) licence file. 0.8 is
+# cargo-deny's default; kept explicit so a future reader knows it was chosen.
+[licenses]
+confidence-threshold = 0.8
+
+# Every entry below was OBSERVED in this graph via `cargo deny list` on
+# 2026-08-04 — this is not a copy of a generic permissive-licence list. The
+# count after each name is how many crates carried it on that date.
+#
+# All are permissive / non-reciprocal, which is what an on-prem product shipped
+# as a binary to customers needs. Copyleft is deliberately ABSENT: there is no
+# GPL/LGPL/AGPL/MPL entry, so any future dependency carrying one fails the gate
+# rather than being quietly inherited. (See the `targets` note at the top for
+# the LGPL crate that a naive all-targets scan would have dragged in.)
+allow = [
+    "MIT",                          # 405
+    "Apache-2.0",                   # 328
+    "Apache-2.0 WITH LLVM-exception", # 6  — rustix/wasi/wit-bindgen
+    "Unicode-3.0",                  # 19  — the icu_* stack, via idna
+    "BSD-3-Clause",                 # 12  — curve25519-dalek, ed25519-dalek, redis
+    "Zlib",                         # 10  — tinyvec, miniz_oxide, arcstr
+    "ISC",                          # 9   — ring, rustls, aws-lc-rs, untrusted
+    "Unlicense",                    # 6   — memchr, walkdir, aho-corasick
+    "BSL-1.0",                      # 4   — ryu, whoami, xxhash-rust
+    "MIT-0",                        # 3   — aws-lc-sys, constant_time_eq, dunce
+    "CDLA-Permissive-2.0",          # 3   — webpki-roots, webpki-root-certs
+    "BSD-2-Clause",                 # 2   — zerocopy, zerocopy-derive
+    "CC0-1.0",                      # 2   — constant_time_eq, dunce
+    "0BSD",                         # 1   — adler2
+]
+# BSD-1-Clause IS NOT LISTED, and that is measured rather than an oversight.
+# `cargo deny list` attributes it to fiat-crypto, but that crate is
+# `MIT OR Apache-2.0 OR BSD-1-Clause` and cargo-deny satisfies the expression
+# with MIT, so the entry was never used: with it present, every run printed
+#     warning[license-not-encountered]: license was not encountered
+#         "BSD-1-Clause"  unmatched license allowance
+# It was the ONLY unmatched entry of the 15 originally listed — i.e. the other
+# 14 are each load-bearing for at least one crate. If a BSD-1-Clause-only
+# dependency ever appears, this gate will go red and that is the correct
+# prompt for a human decision.
+
+# The six crates cargo-deny reports as "Unlicensed" are the five workspace
+# members plus `sp-license`, the private git dependency. None of them publishes
+# a `license` field because none of them is published at all — they are this
+# product's own source. A THIRD-PARTY crate with no licence field still fails.
+#
+# `ignore = true` covers the five workspace members, but ONLY because the same
+# commit added `publish = false` to each of their manifests — measured: with
+# `ignore = true` alone, all five still failed as `unlicensed`, because
+# cargo-deny's definition of "private" is `publish = false`, not "is a
+# workspace member".
+#
+# `ignore-sources` covers the sixth. sp-license is not a workspace member; it
+# arrives from a git source and so has no `publish` field this repository can
+# set. The URL is the source as recorded in Cargo.lock, minus the
+# `?tag=...#<sha>` fragment, so a tag bump does not silently un-exempt it.
+[licenses.private]
+ignore = true
+ignore-sources = ["git+ssh://git@gitlab.com/secureprompt/admin.git"]
+
+# ===========================================================================
+# BANS — duplicate versions, and crates that must never appear.
+# ===========================================================================
+[bans]
+# MEASURED 2026-08-04: 32 duplicate-version warnings (axum 0.7/0.8, reqwest
+# 0.12/0.13, rand 0.8/0.9, thiserror 1/2, syn 1/2, four generations of
+# windows-sys, ...). Every one is a transitive dependency of a third-party
+# crate, so none can be fixed here — `deny` would be an immediately-red gate
+# for a condition this repository cannot act on. Reported, not enforced.
+multiple-versions = "warn"
+wildcards = "deny"          # no `foo = "*"` in any manifest
+# MEASURED: `wildcards = "deny"` alone fails on 5 sites that are not wildcards
+# in the dangerous sense — `secureprompt-common = { path = "../..." }` in four
+# crates and `sp-license = { workspace = true }` in the api. An intra-workspace
+# path dependency has no registry to be confused with, which is the attack
+# `wildcards` exists to stop. This field exempts path/git deps *in private
+# crates only*, which is why the five workspace members gained `publish = false`
+# in the same commit; a wildcard on a crates.io dependency still fails.
+allow-wildcard-paths = true
+highlight = "all"
+
+# `deny` here is the list of crates that must never enter the graph. It is
+# empty on purpose rather than pre-populated with a guess: the two candidates
+# worth banning (openssl-sys in favour of rustls; git2) are both already
+# absent... except openssl-sys, which IS present at 0.9.113 via `native-tls`
+# <- reqwest 0.12's default features. Banning it today would be red, so it is
+# recorded here as the next thing to fix rather than as a broken gate.
+deny = []
+
+# ===========================================================================
+# SOURCES — where crates may come from. This is the section that matters most
+# for supply-chain integrity, and the only one that is fully strict.
+# ===========================================================================
+[sources]
+unknown-registry = "deny"
+# The teeth: any git dependency whose URL is not listed below fails the gate.
+# A dependency-confusion or typosquat attack that swaps a crates.io crate for a
+# git fork is exactly what this catches.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# sp-license: the private licence-verification crate, pinned by TAG (not a
+# branch) in the workspace Cargo.toml:
+#     sp-license = { git = "ssh://git@gitlab.com/secureprompt/admin.git",
+#                    tag = "sp-license-v0.3.0" }
+# It is the ONLY git source in the graph — measured: `cargo deny check sources`
+# reports exactly one `source-not-allowed` warning before this entry exists,
+# and zero after.
+#
+# NOTE ON THE URL FORM, measured. ONE entry is listed, not two, because
+# cargo-deny's comparison ignores the scheme and the userinfo:
+#     ssh:// entry only    -> sources ok
+#     https:// entry only  -> sources ok   (still matches the ssh:// source)
+#     BOTH entries         -> sources ok, plus a permanent
+#                             warning[unmatched-source] on whichever did not
+#                             match first
+#     NEITHER              -> sources FAILED, naming sp-license
+# So an air-gapped mirror that rewrites the manifest to https keeps working
+# with this single line, and adding the https spelling as well would buy
+# nothing but a warning on every green run.
+#
+# THE REAL TEST of this section is a foreign host, and it passes: planting
+#     itoa = { git = "https://github.com/dtolnay/itoa", tag = "1.0.11" }
+# in sp-agent/Cargo.toml produced
+#     error[source-not-allowed]: detected 'git' source not explicitly allowed
+#     itoa 1.0.11 git+https://github.com/dtolnay/itoa?tag=1.0.11
+# while sp-license continued to pass.
+allow-git = [
+    "ssh://git@gitlab.com/secureprompt/admin.git",
+]

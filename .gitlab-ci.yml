@@ -250,6 +250,95 @@ static-checks:
 # alpine/helm ships helm as the entrypoint; `entrypoint: [""]` gets a shell,
 # and bash is a 2 MB apk away.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# WS6-2 — SUPPLY-CHAIN GATES.
+#
+# Four tools, three stages, one rule they all follow: each captured today's
+# findings as an explicit, dated, reviewed baseline and fails only on NEW ones.
+# That is the same ratchet `fmt` and `clippy` use, for the same reason —
+# .github/workflows-retired/README documents four workflows abandoned once they
+# went permanently red.
+#
+#   supply-chain:cargo-deny   lint   Rust deps      (deny.toml)
+#   supply-chain:pip-audit    lint   Python deps    (scripts/ci/pip-audit-*)
+#   supply-chain:gitleaks     lint   secrets        (.gitleaks.toml + baseline)
+#   supply-chain:image-scan   scan   built images   (trivy, scheduled)
+#   supply-chain:sbom         scan   SBOM artifacts (syft, tags only)
+#
+# The first three are cheap and run on every merge request. The last two need
+# images that only the manual `build` stage produces — see their own headers
+# for why they are scheduled/tag-triggered rather than per-MR.
+# ---------------------------------------------------------------------------
+supply-chain:cargo-deny:
+  # extends .rust-gate for the SSH key, not for the compiler: cargo-deny never
+  # builds the workspace, but it does run `cargo metadata`, which has to resolve
+  # the private git+ssh sp-license dependency like every other Rust job here.
+  extends: .rust-gate
+  stage: lint
+  variables:
+    SQLX_OFFLINE: "true"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - .cargo/git/db
+      # NOT in .rust-gate's cache list: this job installs a binary into
+      # CARGO_HOME/bin and would otherwise pay for it on every run.
+      - .cargo/bin
+  before_script:
+    # .rust-gate's before_script is REPLACED by this one (YAML merge semantics),
+    # so the ssh setup is repeated here rather than inherited. Keeping it inline
+    # is deliberate: `!reference` is a GitLab-only YAML tag that ordinary yaml
+    # parsers choke on, which the test:rls-nonsuperuser job already notes.
+    - |
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      if [ -z "${SP_LICENSE_DEPLOY_KEY:-}" ]; then
+        echo "SP_LICENSE_DEPLOY_KEY is not set — cargo cannot fetch sp-license." >&2
+        exit 1
+      fi
+      echo "$SP_LICENSE_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
+      chmod 600 ~/.ssh/id_ed25519
+      ssh-keyscan gitlab.com >> ~/.ssh/known_hosts 2>/dev/null || true
+      eval "$(ssh-agent -s)"
+      ssh-add ~/.ssh/id_ed25519
+    - |
+      # Pinned to the version deny.toml's measurements were taken with. The
+      # prebuilt musl binary is ~2 s; `cargo install` compiles for minutes, so
+      # it is the FALLBACK, not the default — but it is present so that a moved
+      # release URL degrades to "slow" instead of "red".
+      #
+      # HONESTY NOTE: neither path could be executed while authoring this job —
+      # github.com was unreachable from the authoring machine (measured:
+      # "Failed to connect to github.com port 443 after 2032 ms"), and there is
+      # no runner to try it on. WATCH THE FIRST PIPELINE RUN. This is the same
+      # caveat the test:ml-sidecar job carries about `pip install`.
+      set -e
+      DENY_VERSION="0.20.2"
+      export PATH="$CARGO_HOME/bin:$PATH"
+      if cargo deny --version 2>/dev/null | grep -q "$DENY_VERSION"; then
+        echo "cargo-deny $DENY_VERSION already cached."
+      else
+        url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/cargo-deny-${DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        mkdir -p "$CARGO_HOME/bin"
+        if curl -fsSL "$url" | tar -xz -C /tmp --strip-components=1 2>/dev/null \
+           && install -m 0755 /tmp/cargo-deny "$CARGO_HOME/bin/cargo-deny"; then
+          echo "cargo-deny $DENY_VERSION installed from release binary."
+        else
+          echo "Release binary unavailable; falling back to cargo install."
+          cargo install cargo-deny --locked --version "$DENY_VERSION"
+        fi
+      fi
+    - cargo deny --version
+  script:
+    # advisories + bans + licenses + sources. The script degrades to the cached
+    # advisory database (with a loud, dated warning) when github.com is
+    # unreachable, rather than turning a third-party outage into a red MR —
+    # see its header, and the `bench` job's, for that judgement.
+    - bash scripts/ci/cargo-deny-gate.sh
+
 helm-render:
   stage: lint
   image:
