@@ -23,13 +23,13 @@ use crate::{
     vault::restore_content,
 };
 use futures_util::stream::{Stream, StreamExt};
+use std::pin::Pin;
+use std::time::Instant;
 use secureprompt_common::{
     errors::ApiError,
     pipeline::{PipelineInput, PipelineOutput, PipelineState},
     types::{Message, ProviderResponse, RequestId, TokenUsage},
 };
-use std::pin::Pin;
-use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -973,7 +973,8 @@ impl PipelineService {
                         degraded_reason = degraded_reason.or(Some(reason));
                     }
                     let merged = merge_detections(regex, ml_out.detections);
-                    let detections = filter_response_side_detections(&merged, &client_originals);
+                    let detections =
+                        filter_response_side_detections(&merged, &client_originals);
                     let scrubbed = if detections.is_empty() {
                         text.to_owned()
                     } else {
@@ -1488,11 +1489,7 @@ impl PipelineService {
 
         let mut last_retryable_error = None;
         for target in targets {
-            let Some(adapter) = self
-                .state
-                .providers
-                .adapter_for(&target.provider_type)
-                .await
+            let Some(adapter) = self.state.providers.adapter_for(&target.provider_type).await
             else {
                 continue;
             };
@@ -1577,17 +1574,19 @@ impl PipelineService {
             // fails (corrupt ciphertext, key rotation), log and skip to the
             // next target instead of leaking the failure to the user.
             let decrypted = match target.encrypted_credential.as_deref() {
-                Some(stored) => match decrypt_credential(stored, &self.state).await {
-                    Ok(plain) => Some(plain),
-                    Err(e) => {
-                        tracing::warn!(
-                            provider = target.provider_name,
-                            error = %e,
-                            "credential decrypt failed; trying next target"
-                        );
-                        continue;
+                Some(stored) => {
+                    match decrypt_credential(stored, &self.state).await {
+                        Ok(plain) => Some(plain),
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = target.provider_name,
+                                error = %e,
+                                "credential decrypt failed; trying next target"
+                            );
+                            continue;
+                        }
                     }
-                },
+                }
                 None => None,
             };
             let invocation = ProviderInvocation {
@@ -1829,15 +1828,12 @@ fn record_secure_mode_event(
     rule_name: &str,
     action: &str,
 ) {
-    outcome
-        .result
-        .events
-        .push(secureprompt_common::types::PolicyEvent {
-            rule_id: secure_mode_rule_id(),
-            rule_name: rule_name.to_owned(),
-            action: action.to_owned(),
-            dry_run: false,
-        });
+    outcome.result.events.push(secureprompt_common::types::PolicyEvent {
+        rule_id: secure_mode_rule_id(),
+        rule_name: rule_name.to_owned(),
+        action: action.to_owned(),
+        dry_run: false,
+    });
 }
 
 /// Default-redact safety net. Fires when EITHER:
@@ -1877,7 +1873,8 @@ pub(crate) fn apply_fallback_redaction(
     outcome: &mut crate::policy::engine::PolicyEvaluationOutcome,
     pipeline_state: &mut secureprompt_common::pipeline::PipelineState,
 ) {
-    let use_fallback_redact = chat_debug_mode || (redact_when_no_rules && outcome.unprotected);
+    let use_fallback_redact =
+        chat_debug_mode || (redact_when_no_rules && outcome.unprotected);
     if use_fallback_redact
         && pipeline_state.redaction_map.is_empty()
         && !pipeline_state.detections.is_empty()
@@ -1906,7 +1903,8 @@ pub(crate) fn apply_secure_mode_override(
     pipeline_state: &mut secureprompt_common::pipeline::PipelineState,
 ) {
     let any_detection = !detections.is_empty();
-    let injection_blocking = injection.is_injection && injection.score >= INJECTION_BLOCK_THRESHOLD;
+    let injection_blocking =
+        injection.is_injection && injection.score >= INJECTION_BLOCK_THRESHOLD;
     match config.level.as_str() {
         "permissive" => {
             // Never block. If policy denied, downgrade to redact (PII still
@@ -1970,7 +1968,11 @@ pub(crate) fn apply_secure_mode_override(
             if config.block_on_pii_detection && any_detection {
                 outcome.denied = true;
                 outcome.result.final_action = "deny".to_owned();
-                record_secure_mode_event(outcome, "Secure mode: block on PII detection", "deny");
+                record_secure_mode_event(
+                    outcome,
+                    "Secure mode: block on PII detection",
+                    "deny",
+                );
                 tracing::info!("secure_mode standard: block_on_pii_detection triggered");
             } else if config.block_on_injection_detection && injection_blocking {
                 outcome.denied = true;
@@ -2046,8 +2048,8 @@ fn filter_response_side_detections(
     const MIN_NER_LEN: usize = 3;
     const MIN_NER_CONFIDENCE: f32 = 0.85;
     const PRONOUN_BLOCKLIST: &[&str] = &[
-        "i", "me", "my", "you", "your", "we", "us", "he", "she", "him", "her", "his", "hers", "it",
-        "its", "they", "them", "their",
+        "i", "me", "my", "you", "your", "we", "us", "he", "she", "him",
+        "her", "his", "hers", "it", "its", "they", "them", "their",
     ];
     detections
         .iter()
@@ -2056,7 +2058,9 @@ fn filter_response_side_detections(
             // through restored — never re-redact what we just detokenized for
             // them. Check both the raw and trimmed value so incidental
             // surrounding whitespace in a detection span can't defeat the match.
-            if client_originals.contains(&d.value) || client_originals.contains(d.value.trim()) {
+            if client_originals.contains(&d.value)
+                || client_originals.contains(d.value.trim())
+            {
                 return false;
             }
             let class_upper = d.class.to_uppercase();
@@ -2131,7 +2135,10 @@ fn last_user_message_raw(messages: &[Message]) -> Option<String> {
 /// prompt whose PII the sidecar could not see. Callers must not assume the
 /// result is placeholder-safe — decide with [`audit_prompt`], which knows
 /// whether coverage was lost.
-async fn redact_last_user_message(state: &AppState, messages: &[Message]) -> String {
+async fn redact_last_user_message(
+    state: &AppState,
+    messages: &[Message],
+) -> String {
     let last_msg = messages
         .iter()
         .rev()
@@ -2161,7 +2168,8 @@ async fn redact_last_user_message(state: &AppState, messages: &[Message]) -> Str
     // built upstream is intentionally untouched so we don't pollute
     // restoration on the response side.
     let mut audit_vault = secureprompt_common::types::TokenVault::default();
-    let mut audit_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut audit_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     crate::vault::apply_redaction(content, &detections, &mut audit_vault, &mut audit_map)
 }
 
@@ -2311,7 +2319,10 @@ fn audit_prompt_with(
 /// Mirrors `dashboard::providers::decrypt_stored_credential` but importable
 /// from the pipeline path without pulling the dashboard handler module
 /// into the deep call chain.
-async fn decrypt_credential(stored: &str, state: &AppState) -> Result<String, String> {
+async fn decrypt_credential(
+    stored: &str,
+    state: &AppState,
+) -> Result<String, String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let raw = URL_SAFE_NO_PAD
         .decode(stored)
@@ -2504,11 +2515,7 @@ mod response_redaction_filter_tests {
         let filtered =
             filter_response_side_detections(&[person("Alice")], &vault.original_values());
 
-        assert_eq!(
-            filtered.len(),
-            1,
-            "new PII the model introduced must still be redacted"
-        );
+        assert_eq!(filtered.len(), 1, "new PII the model introduced must still be redacted");
         assert_eq!(filtered[0].value, "Alice");
     }
 
@@ -2540,10 +2547,7 @@ mod response_redaction_filter_tests {
         // The exclusion is class-agnostic: an email the client provided is in
         // the vault too, and must not be re-redacted in the reply.
         let mut vault = TokenVault::default();
-        vault.insert(
-            "{{Email_Address_1}}".to_owned(),
-            "bob@example.com".to_owned(),
-        );
+        vault.insert("{{Email_Address_1}}".to_owned(), "bob@example.com".to_owned());
         let det = Detection {
             class: "EMAIL_ADDRESS".to_owned(),
             confidence: 1.0,
