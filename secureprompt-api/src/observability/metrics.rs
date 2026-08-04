@@ -238,14 +238,32 @@ pub struct MetricsRegistry {
     /// was SERVED in that state.
     auth_gate_engaged: Mutex<Vec<(String, String, u64)>>,
     /// GAUGE `secureprompt_clickhouse_schema_mismatch` — 1 when the live
-    /// `request_events` table is missing columns the writer serialises (the
+    /// `request_events` table cannot take the row the writer serialises (the
     /// worker's ClickHouse migrations have not run, and every analytics event
     /// is being dropped), 0 otherwise.
     ///
-    /// A gauge, not a counter, because it describes a STATE that can heal:
-    /// the startup probe sets it, and the first insert that actually lands
-    /// clears it. As a monotonic counter the alert would keep firing after
-    /// the worker migrated and inserts recovered, until an API restart.
+    /// TWO paths raise it, not one. This comment used to name only the startup
+    /// probe, which is the WS2-3 R4 residual: `alerts.yml` carried the same
+    /// claim and was corrected in 45b741b, this copy was not.
+    ///
+    /// * The **startup probe** (`clickhouse_writer::probe_request_events_schema`),
+    ///   for a missing table or missing columns.
+    /// * The **write path**, when the server itself rejects the row layout with
+    ///   `clickhouse::error::Error::SchemaMismatch`. That arm catches type-level
+    ///   drift the probe cannot see, and it fires after the probe has already
+    ///   passed — including on a cache that was warm when the drift appeared.
+    ///
+    /// A gauge, not a counter, because it describes a STATE that can heal: the
+    /// first insert the server validates and accepts clears it, whichever path
+    /// raised it. As a monotonic counter the alert would keep firing after the
+    /// worker migrated and inserts recovered, until an API restart.
+    ///
+    /// Executed, not asserted: `tests/clickhouse_schema_probe.rs` —
+    /// `stale_schema_raises_the_gauge_from_the_write_path`,
+    /// `drift_after_a_warm_cache_still_raises_the_gauge` and
+    /// `a_successful_write_lowers_a_probe_raised_gauge` are the three that hold
+    /// each clause above, and all three were run against a live ClickHouse for
+    /// this edit.
     clickhouse_schema_mismatch: AtomicU64,
 }
 
