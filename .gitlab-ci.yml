@@ -94,6 +94,13 @@ workflow:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_PIPELINE_SOURCE == "schedule"
+    # WS6-2. ADDED, and without it "an SBOM per release" is unimplementable:
+    # pushing a tag produced NO PIPELINE AT ALL before this line. A tag pipeline
+    # has $CI_PIPELINE_SOURCE == "push" and an EMPTY $CI_COMMIT_BRANCH, so it
+    # matched none of the rules above — rule 1 requires $CI_COMMIT_BRANCH to be
+    # set, and rule 3 compares it against $CI_DEFAULT_BRANCH, which an empty
+    # value never equals. Read out of the rules rather than assumed.
+    - if: $CI_COMMIT_TAG
 
 variables:
   # Rust toolchain: pinned to the version the gate was verified against
@@ -914,6 +921,76 @@ supply-chain:image-scan:
   script:
     - bash scripts/ci/image-scan-gate.sh
 
+# ---------------------------------------------------------------------------
+# WS6-2 — SBOM per release.
+#
+# WHAT TRIGGERS IT: a git TAG, i.e. a release, plus a manual `web` run for
+# rehearsal. Note the `- if: $CI_COMMIT_TAG` line added to `workflow: rules:`
+# at the top of this file — without it a tag push produced no pipeline at all,
+# so this job could never have fired. That was true before this change and is
+# the kind of thing a job header can assert falsely for a year.
+#
+# WHERE THE ARTIFACT GOES: GitLab job artifacts, `expire_in: never`. A release
+# SBOM whose retention is 30 days is not a release SBOM — the question it
+# answers ("what was in version X?") is asked years later, typically during an
+# incident or a procurement review. This is the one artifact in this pipeline
+# that must outlive its pipeline.
+#   To attach them to the GitLab Release object as well, add a `release:` block
+#   with release-cli once a release workflow exists; the files are already
+#   named `secureprompt-<tag>.<format>.json` for that.
+#
+# TWO FORMATS: SPDX 2.3 (what compliance and procurement ask for by name) and
+# CycloneDX 1.6 (what the security tooling ecosystem — dependency-track, grype,
+# trivy — actually reads). Shipping one means answering the other by hand.
+#
+# IT ASSERTS ITS OWN OUTPUT, which is the whole reason this is a script and not
+# a one-line syft invocation: `syft scan dir:<path>` against a wrong or empty
+# path exits 0 and writes a VALID SPDX document containing zero packages.
+# Shipping that as a compliance artifact is worse than shipping nothing,
+# because it looks like an answer. Proven: run against an effectively empty
+# tree the gate reports `only 0 packages catalogued` and fails.
+#
+# MEASURED 2026-08-04 with syft 1.50.0 on this commit: 4643 packages —
+# 4036 npm, 495 rust-crate, 27 python. The 495 is cross-checked for EXACT
+# equality against Cargo.lock's own `name =` count, so a broken cataloger
+# cannot pass by emitting a plausible subset; planting one extra lockfile entry
+# fails the job.
+# ---------------------------------------------------------------------------
+supply-chain:sbom:
+  stage: scan
+  image: "debian:bookworm-slim"
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: false
+    - when: never
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl git python3 ca-certificates
+    - |
+      # Pinned to the version the assertions were measured with. syft's own
+      # installer is used rather than a hand-built URL so that a moved release
+      # asset does not silently break the job.
+      #
+      # HONESTY NOTE: this install could not be executed while authoring —
+      # github.com was unreachable from the authoring machine (measured:
+      # "Failed to connect to github.com port 443 after 2032 ms") and there is
+      # no runner to try it on. The GATE ITSELF was run, repeatedly, against
+      # syft 1.50.0 installed locally. WATCH THE FIRST TAG PIPELINE. Same
+      # caveat the test:ml-sidecar job carries about `pip install`.
+      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+        | sh -s -- -b /usr/local/bin v1.50.0
+    - syft version
+  artifacts:
+    # A release SBOM must outlive its pipeline. See the header.
+    expire_in: never
+    when: on_success
+    paths:
+      - sbom/
+  script:
+    - bash scripts/ci/sbom-gate.sh
+
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.
 # ===========================================================================
@@ -950,6 +1027,20 @@ build:
     - test
     - test:rls-nonsuperuser
     - bench
+    # WS6-2. Two of the three supply-chain gates are load-bearing for a
+    # publish: you should not push an image built from a tree that leaks a
+    # secret, or whose Rust dependencies pull from an unapproved git host.
+    # Both are robust to a third-party outage — gitleaks needs no network at
+    # all, and cargo-deny degrades to its cached advisory database with a loud
+    # warning rather than failing.
+    - supply-chain:cargo-deny
+    - supply-chain:gitleaks
+    # supply-chain:pip-audit is DELIBERATELY ABSENT from this list. It has no
+    # offline fallback — pip-audit must reach pypi.org to resolve the tree, and
+    # its own header says so — so listing it here would let a PyPI outage make
+    # a hotfix image unbuildable. It still runs on every merge request and
+    # still reddens the pipeline; it just does not hold the publish hostage to
+    # someone else's uptime.
   rules:
     # Manual because each run is 6 concurrent image builds. Not `allow_failure`
     # — a started build that fails must fail the pipeline.
