@@ -1,0 +1,117 @@
+# SecurePrompt — gitleaks baseline (WS6-2).
+#
+# Gate: scripts/ci/gitleaks-gate.sh, run by `supply-chain:gitleaks`.
+# Scope: the committed tree at HEAD (`git archive`), 5796 files.
+#
+# MEASURED 2026-08-04 with gitleaks 8.30.1 and this repository's
+# .gitleaks.toml. 56 findings. EVERY ONE WAS OPENED AND READ before it was
+# written down here, and NONE is a live credential. The reason column below is
+# per-row, not a blanket category, so a reviewer can disagree with any single
+# line.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE 56 ARE
+#
+#   41  secureprompt-chat/**   the vendored LibreChat fork — its own test
+#                              fixtures, .env templates and chart examples.
+#                              Third-party code we carry, not code written
+#                              here. A fork sync that adds a new one will fail
+#                              this gate, which is the correct moment to look.
+#    7  docs/superpowers/results/2026-07-22-2fa-console-demo.md   see below.
+#    2  */alertmanager.yml     the literal Slack example webhook
+#                              T00000000/B00000000/XXXXXXXX.
+#    2  secureprompt-api/tests/  self-describing test fixtures.
+#    2  secureprompt-ml/       the GLiNER probe corpus and a monkeypatched
+#                              token assertion.
+#    1  secureprompt-docs/     `sp-your-key-here` in a curl example.
+#    1  secureprompt-web/      a FALSE POSITIVE — `rolling_7d_cost_usd`, a
+#                              chart series key that generic-api-key matched.
+#
+# THE ONE WORTH A SECOND LOOK, and it is booked as a follow-up rather than
+# waved through: docs/superpowers/results/2026-07-22-2fa-console-demo.md is a
+# verbatim transcript of a 2FA enrolment against a LOCAL dev instance — port
+# 18080, `SECUREPROMPT_JWT_SECRET="dev-jwt-secret-changeme-in-prod-1"`, account
+# admin-2fa-demo@example.com. It therefore contains a real TOTP secret, real
+# backup codes and real refresh tokens FOR THAT THROWAWAY LOCAL ACCOUNT. The
+# JWT's own `exp` is 1784719615, long past. Nothing here authenticates to any
+# deployed system. It is still poor hygiene to keep live-shaped session
+# material in a tracked document.
+#   FOLLOW-UP WS6-2-FU3: redact that transcript's token bodies to
+#   `<redacted>`; the document's argument does not depend on their values.
+#   Delete the seven rows here in the same commit.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE GATES
+#
+# Key: <path> <TAB> <ruleID> <TAB> first 16 hex of sha256(secret).
+# NOT gitleaks' own `file:rule:line` fingerprint — line numbers move whenever
+# anything above them is edited, so that key would go stale on unrelated
+# changes and make this gate flaky by construction.
+#
+# Fails in BOTH directions, like scripts/ci/fmt-gate.sh:
+#   * a finding NOT in this file  -> FAIL. New secret, or an old fixture moved
+#                                    into a new path.
+#   * a row here that matches nothing -> FAIL. Delete it; the list must shrink.
+#
+# NOTE ON THE THIRD COLUMN: it is a hash of the secret, not the secret. Adding
+# a row does not put the value back into the repository.
+#
+# Columns: path <TAB> rule <TAB> sha256(secret)[:16] <TAB> reason
+# ---------------------------------------------------------------------------
+
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	2035a542e154672b	localhost 2FA demo transcript; refresh/recovery token of a throwaway demo account, dev JWT secret
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	3ce708f3fd2b4ea3	localhost 2FA demo transcript; base64 of "secureprompt-dev-kms-key-32bytes", a known dev placeholder
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	575e3ad61efc761c	localhost 2FA demo transcript; refresh/recovery token of a throwaway demo account, dev JWT secret
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	6b7b418c68751f36	localhost 2FA demo transcript; refresh/recovery token of a throwaway demo account, dev JWT secret
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	882050b8a01412ad	localhost 2FA demo transcript; TOTP secret of a throwaway admin-2fa-demo@example.com account on port 18080
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	generic-api-key	ed99de4b2b384373	localhost 2FA demo transcript; refresh/recovery token of a throwaway demo account, dev JWT secret
+docs/superpowers/results/2026-07-22-2fa-console-demo.md	jwt	7c995c9cfdbc20bb	localhost 2FA demo transcript; session JWT signed with dev-jwt-secret-changeme-in-prod-1, exp 1784719615 (expired)
+helm/secureprompt/files/alertmanager/alertmanager.yml	slack-webhook-url	f5c388734d28087b	placeholder webhook: T00000000/B00000000/XXXXXXXX, the literal shape Slack docs use for an example
+monitoring/alertmanager/alertmanager.yml	slack-webhook-url	f5c388734d28087b	placeholder webhook: T00000000/B00000000/XXXXXXXX, the literal shape Slack docs use for an example
+secureprompt-api/tests/admin_audit.rs	generic-api-key	2e5943e3841e98dd	test fixture, self-describing literal "sk-fu5-rotated-secret" in a provider-update assertion
+secureprompt-api/tests/leak_report.rs	jwt	4f7af28bacd95594	test fixture; JWT payload is {"sub":"synthetic"} and the signature is the word "signature" base64d
+secureprompt-chat/.devcontainer/docker-compose.yml	generic-api-key	fb36b27e0ca1a37e	vendored LibreChat fork chart/compose example value
+secureprompt-chat/.env.example	generic-api-key	06d2e911edb4d459	vendored LibreChat fork env template placeholder
+secureprompt-chat/.env.example	generic-api-key	282ad5f60261639f	vendored LibreChat fork env template placeholder
+secureprompt-chat/.env.example	generic-api-key	69024f21e9ad1759	vendored LibreChat fork env template placeholder
+secureprompt-chat/.env.example	generic-api-key	7c1154b515298397	vendored LibreChat fork env template placeholder
+secureprompt-chat/.env.example	generic-api-key	c042516e4eac1baf	vendored LibreChat fork env template placeholder
+secureprompt-chat/api/config/__tests__/parsers.spec.js	generic-api-key	644218973b31fc79	vendored LibreChat fork test fixture
+secureprompt-chat/api/config/__tests__/parsers.spec.js	generic-api-key	9f9f5111f7b27a78	vendored LibreChat fork test fixture
+secureprompt-chat/api/config/__tests__/parsers.spec.js	generic-api-key	edbc0dff520d0b76	vendored LibreChat fork test fixture
+secureprompt-chat/api/config/__tests__/parsers.spec.js	generic-api-key	fe10d39898a11f52	vendored LibreChat fork test fixture
+secureprompt-chat/api/server/controllers/agents/__tests__/v1.duplicate-actions.spec.js	generic-api-key	7f7e8e577ba36089	vendored LibreChat fork test fixture
+secureprompt-chat/api/server/routes/agents/__tests__/responses.spec.js	generic-api-key	3eb1bd439947eb76	vendored LibreChat fork test fixture
+secureprompt-chat/api/server/routes/agents/__tests__/responses.spec.js	generic-api-key	9f9f5111f7b27a78	vendored LibreChat fork test fixture
+secureprompt-chat/api/test/.env.test.example	generic-api-key	698c21480703db9a	vendored LibreChat fork env template placeholder
+secureprompt-chat/api/test/.env.test.example	generic-api-key	9ede10595a00b838	vendored LibreChat fork env template placeholder
+secureprompt-chat/client/src/locales/en/translation.json	generic-api-key	58578043a0d625e0	vendored LibreChat fork UI translation string
+secureprompt-chat/client/src/locales/en/translation.json	generic-api-key	5b390d4aa558cf0a	vendored LibreChat fork UI translation string
+secureprompt-chat/helm/librechat/values.yaml	generic-api-key	282ad5f60261639f	vendored LibreChat fork chart/compose example value
+secureprompt-chat/helm/librechat/values.yaml	generic-api-key	69024f21e9ad1759	vendored LibreChat fork chart/compose example value
+secureprompt-chat/helm/librechat/values.yaml	generic-api-key	6aa4b14dcf6d5094	vendored LibreChat fork chart/compose example value
+secureprompt-chat/helm/librechat/values.yaml	generic-api-key	be066640b0c70fcf	vendored LibreChat fork chart/compose example value
+secureprompt-chat/packages/api/src/app/checks.spec.ts	generic-api-key	dd65e03569cfa4fa	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/app/checks.ts	generic-api-key	06d2e911edb4d459	vendored LibreChat fork source constant (upstream code, not authored here)
+secureprompt-chat/packages/api/src/app/checks.ts	generic-api-key	282ad5f60261639f	vendored LibreChat fork source constant (upstream code, not authored here)
+secureprompt-chat/packages/api/src/app/checks.ts	generic-api-key	69024f21e9ad1759	vendored LibreChat fork source constant (upstream code, not authored here)
+secureprompt-chat/packages/api/src/app/checks.ts	generic-api-key	7c1154b515298397	vendored LibreChat fork source constant (upstream code, not authored here)
+secureprompt-chat/packages/api/src/endpoints/openai/config.anthropic.spec.ts	generic-api-key	194794b17f056407	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/mcp/__tests__/mcp.spec.ts	generic-api-key	bf0316155996e95e	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/mcp/__tests__/mcp.spec.ts	github-pat	8841c2397d5af201	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/mcp/registry/__tests__/ServerConfigsDB.test.ts	generic-api-key	3eb1bd439947eb76	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/mcp/registry/__tests__/ServerConfigsDB.test.ts	generic-api-key	a8ae6e6ee929abea	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/utils/key.test.ts	private-key	0addc50b32650317	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/utils/key.test.ts	private-key	13478605d6d9c39a	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/utils/key.test.ts	private-key	adbce402e29dfb9e	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/utils/key.test.ts	private-key	cb32d4b0b1867628	vendored LibreChat fork test fixture
+secureprompt-chat/packages/api/src/utils/key.test.ts	private-key	eb34f21f340ffa2a	vendored LibreChat fork test fixture
+secureprompt-chat/packages/data-provider/specs/azure.spec.ts	generic-api-key	50a363138cc3e483	vendored LibreChat fork test fixture
+secureprompt-chat/packages/data-provider/specs/azure.spec.ts	generic-api-key	e1bf68395df677e4	vendored LibreChat fork test fixture
+secureprompt-chat/packages/data-schemas/src/methods/tx.spec.ts	generic-api-key	04990685a32c51f0	vendored LibreChat fork test fixture
+secureprompt-chat/packages/data-schemas/src/methods/tx.spec.ts	generic-api-key	cab1e8918f0942de	vendored LibreChat fork test fixture
+secureprompt-chat/src/tests/oidc-integration.test.ts	jwt	20905883d94bdd4e	vendored LibreChat fork test fixture
+secureprompt-docs/docs/getting-started/quickstart.md	curl-auth-header	8da6239fc5088a51	documentation placeholder "sp-your-key-here" in a curl example
+secureprompt-ml/scripts/probe_gliner2_zeroshot.py	generic-api-key	fbf52105b9039f7c	detector probe corpus: SECRET_SENTENCES fed to GLiNER to measure whether it finds api keys
+secureprompt-ml/tests/test_sidecar_route_auth.py	generic-api-key	a6d75dfe9b1ab8d9	test fixture; asserts config.INTERNAL_TOKEN equals a monkeypatched env value
+secureprompt-web/src/app/(dashboard)/cost/cost-chart.tsx	generic-api-key	74908b3feaeb6fd1	FALSE POSITIVE: "rolling_7d_cost_usd" is a chart series key, not a credential

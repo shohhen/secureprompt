@@ -382,6 +382,56 @@ supply-chain:pip-audit:
     # exposure with a scheduled fix order, not routine noise.
     - bash scripts/ci/pip-audit-gate.sh
 
+# ---------------------------------------------------------------------------
+# WS6-2 — gitleaks over the committed tree.
+#
+# WHY THIS ONE IS NOT DECORATIVE HERE: during this project an agent committed
+# three freshly generated, working secrets into `.env.example` — while fixing
+# the very defect that file exists to prevent. `.env.example` deliberately
+# ships values the boot gate REJECTS, so a copied-but-unedited file fails
+# loudly; replacing them with real values silently inverts that.
+# scripts/ci/check-env-hygiene.sh (in static-checks) covers four NAMED keys.
+# This is the general case, and it was proven against that exact defect —
+# see the gate script's and the baseline's headers.
+#
+# IMAGE: the official gitleaks image, pinned. VERIFIED BY RUNNING IT, not
+# assumed: `docker run zricethezav/gitleaks:v8.30.1` is Alpine and already
+# carries bash, git and tar, but NOT python3, which the gate needs to parse
+# gitleaks' JSON and hash secrets. `apk add python3` supplies 3.12.13. The
+# whole job was executed locally in this image against this commit and
+# reported `56 in baseline, 56 found now / OK: no new secrets`, extracting
+# 5812 of 5812 tracked files.
+#
+# (On macOS the same run extracts 5800 — `git archive | tar` cannot write two
+# graphify-out/ paths that differ only in case. CI is Linux and does not hit
+# it; the gate warns and asserts a floor rather than trusting the count.)
+#
+# NO SSH KEY, no services, no cargo: this job reads files. ~10 s of work.
+# ---------------------------------------------------------------------------
+supply-chain:gitleaks:
+  stage: lint
+  image:
+    name: zricethezav/gitleaks:v8.30.1
+    # The image's entrypoint IS gitleaks; clear it to get a shell.
+    entrypoint: [""]
+  variables:
+    # The gate runs `git archive HEAD`, so it needs real history, not the
+    # default shallow-but-sufficient checkout — GIT_DEPTH 1 is fine for
+    # `HEAD`, and this job deliberately does NOT scan history (see
+    # .gitleaks.toml for why that is a refusal and not an oversight).
+    GIT_DEPTH: "1"
+  before_script:
+    - apk add --no-cache python3 >/dev/null
+    # GitLab checks out as a different uid than the image's user in some runner
+    # configurations; without this, `git archive` fails with "detected dubious
+    # ownership" and the gate would exit 2 rather than mis-report a clean tree.
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    # Ratcheting gate against scripts/ci/gitleaks-baseline.tsv — 56 findings,
+    # each one opened and read, none a live credential. Fails on a new secret
+    # AND on a baseline row that stopped matching, so the list only shrinks.
+    - bash scripts/ci/gitleaks-gate.sh
+
 helm-render:
   stage: lint
   image:
