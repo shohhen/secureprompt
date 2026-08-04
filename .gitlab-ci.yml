@@ -73,6 +73,14 @@ stages:
   - fmt
   - lint
   - test
+  # WS6-2. Container scanning and SBOM generation. Placed BEFORE `build` and
+  # given `needs: []`, which looks backwards until you check what `build` is:
+  # it is `when: manual`, and a manual job that nobody clicks leaves the
+  # pipeline blocked, so anything in a LATER stage would simply never run. The
+  # jobs here do not consume build's output anyway — see their headers — and
+  # their `rules:` keep them off merge-request pipelines entirely, so they
+  # cannot block a merge from a stage that precedes `build`.
+  - scan
   - build
   - deploy
 
@@ -843,6 +851,68 @@ test:ml-sidecar:
         tests/test_ready.py \
         tests/test_stateless.py \
         -v --tb=short
+
+# ===========================================================================
+# Stage: scan — WS6-2 container scanning and SBOM.
+# ===========================================================================
+#
+# WS6-2 — trivy over the images this product runs on.
+#
+# WHY SCHEDULED AND NOT PER-MERGE-REQUEST. Container vulnerabilities are a
+# function of TIME, not of a diff: an image that was clean when built acquires
+# CVEs while it sits in the registry because someone else published an
+# advisory. So a per-MR scan is both the wrong cadence — it would block a
+# one-line docs change on a CVE disclosed overnight in a base image that MR
+# never touched, the same "red through no fault of yours" shape that emptied
+# .github/workflows-retired/ — and insufficient, because `build` is manual and
+# weeks can pass between publishes with nothing scanning what is deployed.
+#
+# A failure here is a work item, not a blocked merge. The `rules:` below mean
+# this job does not even EXIST on a merge-request pipeline.
+#
+# WHAT IT SCANS: scripts/ci/scan-images.txt — today the runtime BASE images,
+# which for the distroless and scratch services are the entire OS surface of
+# the published image. The published images themselves are one uncommented
+# line away; that file's header carries the exact steps and the reason they
+# are not enabled yet (no published image exists to baseline against, and a
+# ratchet with no baseline fails on everything).
+#
+# MEASURED 2026-08-04 with trivy 0.73.0 — 28 fixable HIGH/CRITICAL:
+# distroless 0, debian:bookworm-slim 0, node:22-alpine 8, node:20-alpine 20.
+# Both gate directions were mutation-tested; see the WS6-2 report.
+# ---------------------------------------------------------------------------
+supply-chain:image-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:0.73.0
+    # The image's entrypoint IS trivy; clear it to get a shell.
+    entrypoint: [""]
+  # Independent of every other job — it consumes no build output.
+  needs: []
+  rules:
+    # Scheduled is the intended cadence (configure a weekly schedule under
+    # CI/CD -> Schedules). `web` so it can be run on demand after a base-image
+    # bump without waiting a week.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: false
+    - when: never
+  before_script:
+    # VERIFIED by running the image: aquasec/trivy:0.73.0 is Alpine with sh and
+    # grep but NOT bash and NOT python3, both of which the gate needs. `apk add`
+    # supplies bash 5.3.9 and python3 3.14.5.
+    - apk add --no-cache bash python3 >/dev/null
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      # FULL reports — every severity, including the unfixed ones the gate
+      # deliberately does not fail on. See the gate script's header for why
+      # `--ignore-unfixed` is used and what it costs.
+      - trivy-reports/
+  script:
+    - bash scripts/ci/image-scan-gate.sh
 
 # ===========================================================================
 # Stage: build — publish images to the GitLab Container Registry.

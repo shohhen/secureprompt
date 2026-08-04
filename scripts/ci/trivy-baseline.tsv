@@ -1,0 +1,86 @@
+# SecurePrompt — trivy image-scan baseline (WS6-2).
+#
+# Gate: scripts/ci/image-scan-gate.sh, run by `supply-chain:image-scan`.
+# Scope: the runtime base images in scripts/ci/scan-images.txt — see that
+# file's header for why those and not (yet) the published registry images.
+#
+# MEASURED 2026-08-04 with trivy 0.73.0, `--scanners vuln --severity
+# HIGH,CRITICAL --ignore-unfixed`. 28 findings across 4 images:
+#
+#   gcr.io/distroless/cc-debian12:nonroot    0    <- api, worker
+#   debian:bookworm-slim                     0    <- mcp
+#   node:22-alpine                           8    <- web
+#   node:20-alpine                          20    <- chat
+#   scratch                                  -    <- sp-agent, nothing to scan
+#
+# ---------------------------------------------------------------------------
+# THE HEADLINE IS THE SHAPE OF THAT TABLE, NOT THE TOTAL.
+#
+# The two images carrying every one of the 28 are the Node ones, and the
+# distroless/debian bases the Rust services run on are CLEAN. This is direct
+# evidence for a decision this repository already made — the Rust services ship
+# on distroless — and a direct argument about the one that lags:
+#
+#   secureprompt-chat is on node:20-alpine and carries 20; secureprompt-web is
+#   on node:22-alpine and carries 8. Twelve of chat's twenty, INCLUDING the
+#   only OpenSSL one (CVE-2026-45447 in libcrypto3/libssl3), are absent from
+#   node:22-alpine. Moving secureprompt-chat/Dockerfile from node:20-alpine to
+#   node:22-alpine would clear them in one line.
+#     FOLLOW-UP WS6-2-FU5. It is not done in this commit because bumping the
+#     Node major of the vendored LibreChat fork is a compatibility question for
+#     that fork, not a CI question, and it needs its own test run.
+#
+# Most of the rest are CVEs in npm's OWN bundled tooling (tar, minimatch, glob,
+# brace-expansion, sigstore) that ships inside the node image rather than in
+# our application's dependencies. They are still in the shipped image, so they
+# are still listed; they are not reachable from the gateway's request path.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE GATES
+#
+# Key: <image> <TAB> <package> <TAB> <CVE>. The installed/fixed VERSIONS are in
+# the trailing informational column and are NOT compared — upstream rebuilds
+# floating tags like `node:22-alpine` constantly, so a version-keyed baseline
+# would churn on every rebuild that changed a package but not its CVE set.
+#
+# Fails in BOTH directions, like scripts/ci/fmt-gate.sh:
+#   * a finding NOT here  -> FAIL. A new fixable HIGH/CRITICAL appeared.
+#   * a row here that is no longer reported -> FAIL. Upstream fixed it; delete
+#     the row so the baseline shrinks.
+#
+# EXPECT THE SECOND KIND ROUTINELY, and that is the design working rather than
+# a nuisance: these are floating tags, so upstream rebuilds WILL retire rows.
+# That is also exactly why this job is scheduled and does not gate merges —
+# see the gate script's header.
+#
+# Columns: image <TAB> package <TAB> cve <TAB> severity <TAB> versions
+# ---------------------------------------------------------------------------
+
+node:22-alpine	brace-expansion	CVE-2026-13149	HIGH	installed=2.0.2 fix>=5.0.7
+node:22-alpine	brace-expansion	CVE-2026-14257	HIGH	installed=2.0.2 fix>=5.0.8
+node:22-alpine	brace-expansion	CVE-2026-69152	HIGH	installed=2.0.2 fix>=1.1.18
+node:22-alpine	ip-address	CVE-2026-69192	HIGH	installed=10.1.0 fix>=10.3.1
+node:22-alpine	picomatch	CVE-2026-33671	HIGH	installed=4.0.3 fix>=4.0.4
+node:22-alpine	sigstore	CVE-2026-48815	HIGH	installed=3.1.0 fix>=4.1.1
+node:22-alpine	tar	CVE-2026-59873	CRITICAL	installed=7.5.11 fix>=7.5.19
+node:22-alpine	tar	CVE-2026-59874	HIGH	installed=7.5.11 fix>=7.5.18
+node:20-alpine	brace-expansion	CVE-2026-13149	HIGH	installed=2.0.1 fix>=5.0.7
+node:20-alpine	brace-expansion	CVE-2026-14257	HIGH	installed=2.0.1 fix>=5.0.8
+node:20-alpine	brace-expansion	CVE-2026-69152	HIGH	installed=2.0.1 fix>=1.1.18
+node:20-alpine	cross-spawn	CVE-2024-21538	HIGH	installed=7.0.3 fix>=7.0.5
+node:20-alpine	glob	CVE-2025-64756	HIGH	installed=10.4.2 fix>=11.1.0
+node:20-alpine	ip-address	CVE-2026-69192	HIGH	installed=9.0.5 fix>=10.3.1
+node:20-alpine	libcrypto3	CVE-2026-45447	HIGH	installed=3.5.6-r0 fix>=3.5.7-r0
+node:20-alpine	libssl3	CVE-2026-45447	HIGH	installed=3.5.6-r0 fix>=3.5.7-r0
+node:20-alpine	minimatch	CVE-2026-26996	HIGH	installed=9.0.5 fix>=10.2.1
+node:20-alpine	minimatch	CVE-2026-27903	HIGH	installed=9.0.5 fix>=10.2.3
+node:20-alpine	minimatch	CVE-2026-27904	HIGH	installed=9.0.5 fix>=10.2.3
+node:20-alpine	sigstore	CVE-2026-48815	HIGH	installed=2.3.1 fix>=4.1.1
+node:20-alpine	tar	CVE-2026-23745	HIGH	installed=6.2.1 fix>=7.5.3
+node:20-alpine	tar	CVE-2026-23950	HIGH	installed=6.2.1 fix>=7.5.4
+node:20-alpine	tar	CVE-2026-24842	HIGH	installed=6.2.1 fix>=7.5.7
+node:20-alpine	tar	CVE-2026-26960	HIGH	installed=6.2.1 fix>=7.5.8
+node:20-alpine	tar	CVE-2026-29786	HIGH	installed=6.2.1 fix>=7.5.10
+node:20-alpine	tar	CVE-2026-31802	HIGH	installed=6.2.1 fix>=7.5.11
+node:20-alpine	tar	CVE-2026-59873	CRITICAL	installed=6.2.1 fix>=7.5.19
+node:20-alpine	tar	CVE-2026-59874	HIGH	installed=6.2.1 fix>=7.5.18

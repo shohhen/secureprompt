@@ -103,3 +103,9 @@ scripts/v6_*.py
 # scripts/backup/*.sh against a running dev stack — not source)
 /backups/
 /data
+
+# WS6-2 supply-chain scan output. scripts/ci/image-scan-gate.sh writes full
+# trivy reports here and scripts/ci/sbom-gate.sh writes SBOMs; both are CI
+# artifacts, regenerated every run, never source.
+/trivy-reports/
+/sbom/
