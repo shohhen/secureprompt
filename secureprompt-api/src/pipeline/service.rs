@@ -379,9 +379,11 @@ impl PipelineService {
         // `redact_last_user_message_with(&request.messages, detections)`,
         // justified as "shows what was actually caught". On the NER gate what
         // it actually showed was the user's prompt VERBATIM: that gate fires
-        // when NER coverage is lost, PERSON / ORGANIZATION / ADDRESS are
-        // ML-only classes, and both redaction helpers return the content
-        // unchanged when no detection survives. Because `redacted_prompt` was
+        // when NER coverage is lost, ORGANIZATION and ADDRESS are ML-only
+        // classes and PERSON is very nearly one (WS2-2 gave the floor an
+        // ANCHORED slice of it and nothing more), and both redaction helpers
+        // return the content unchanged when no detection survives. Because
+        // `redacted_prompt` was
         // also exempt from the WS3-1 capture gate, a 503 that forwarded
         // nothing upstream wrote a plaintext copy of the prompt into
         // `request_events` — 90-day TTL, no opt-in. The gateway refused to
@@ -2219,9 +2221,16 @@ pub(crate) fn last_user_message_span(messages: &[Message]) -> Option<(usize, usi
 /// RETURNS THE MESSAGE VERBATIM when no detection survives — and on the
 /// fail-closed NER path that is the NORMAL case, not an edge case, because
 /// that path fires when ML coverage is gone and the deterministic floor has
-/// no PERSON / ORGANIZATION / ADDRESS recogniser. Callers must not assume the
-/// result is placeholder-safe: use [`audit_prompt_with`], which refuses to
-/// record anything when coverage was lost.
+/// no ORGANIZATION or ADDRESS recogniser and only an ANCHORED slice of
+/// PERSON. Callers must not assume the result is placeholder-safe: use
+/// [`audit_prompt_with`], which refuses to record anything when coverage was
+/// lost.
+///
+/// WS2-2 added `Matcher::PatronymicName`, so the floor now claims Uzbek full
+/// names terminated by `O'G'LI` / `QIZI`. That is one construction in one
+/// language, not name coverage: a name written without the patronymic is
+/// still invisible to the floor, so the sentence above is narrowed rather
+/// than deleted.
 pub(crate) fn redact_last_user_message_with(
     messages: &[Message],
     detections: &[secureprompt_common::types::Detection],
@@ -2274,10 +2283,10 @@ pub(crate) fn redact_last_user_message_with(
 /// `degraded.is_some()` is the same condition that sets `floor_only` on the
 /// row: the ML sidecar produced no usable coverage and the workspace's
 /// `sidecar_unavailable` policy is `degrade_with_alert`. The answer was then
-/// produced by the deterministic Rust floor alone, which has no PERSON,
-/// ORGANIZATION or ADDRESS recognisers — so the "redacted" prompt is the
-/// user's prompt with those classes intact. It is not recorded. See
-/// [`RedactedPrompt`].
+/// produced by the deterministic Rust floor alone, which has no ORGANIZATION
+/// or ADDRESS recogniser and only WS2-2's patronymic-anchored slice of PERSON
+/// — so the "redacted" prompt is the user's prompt with those classes
+/// substantially intact. It is not recorded. See [`RedactedPrompt`].
 ///
 /// Skipping the call on that branch also skips a second sidecar round-trip
 /// on a path that exists because the sidecar is unavailable.
