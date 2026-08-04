@@ -1,0 +1,55 @@
+# SecurePrompt — the image list scripts/ci/image-scan-gate.sh scans (WS6-2).
+#
+# One image reference per line. Blank lines and `#` comments ignored.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS LIST IS THE RUNTIME BASE IMAGES AND NOT (YET) THE PUBLISHED ONES
+#
+# The `build` stage publishes six images to the GitLab Container Registry, and
+# those are the ideal scan target. They are not on this list today for one
+# honest reason: `build` is `when: manual`, nothing has published from this
+# branch, and a baseline cannot be measured against images that do not exist.
+# Wiring a ratcheting gate with no baseline means a first run that fails on
+# everything — the permanently-red gate this workstream exists to avoid.
+#
+# WHAT IS ON THE LIST IS NOT A CONSOLATION PRIZE. Each entry is the FINAL
+# `FROM` of one of those Dockerfiles, i.e. the entire OS package surface of the
+# image that ships:
+#   secureprompt-api, secureprompt-worker  ->  gcr.io/distroless/cc-debian12
+#   secureprompt-mcp                       ->  debian:bookworm-slim
+#   secureprompt-web                       ->  node:22-alpine
+#   secureprompt-chat                      ->  node:20-alpine
+#   sp-agent                               ->  scratch  (NOTHING to scan: no
+#                                                OS, no package manager, one
+#                                                static musl binary)
+# For api/worker/sp-agent the base IS the runtime: a distroless or scratch
+# image plus a Rust binary adds no OS packages, so scanning the base and
+# scanning the published image give the same OS-layer answer.
+#
+# WHAT THIS DOES NOT COVER, stated rather than discovered later: the
+# APPLICATION layer of secureprompt-web and secureprompt-chat — their
+# node_modules — is not on any list here. Those are Node images where the app
+# layer is substantial. Covering it needs either the published image or an
+# `npm audit` gate. WS6-2-FU4.
+#
+# TO ADD THE PUBLISHED IMAGES once `build` has run:
+#   1. run the scan by hand against a published tag, e.g.
+#        trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+#          registry.gitlab.com/secureprompt/secure-prompt/secureprompt-api:latest
+#   2. append the findings to scripts/ci/trivy-baseline.tsv with a reason
+#   3. uncomment the matching line below, in the same commit
+# The gate needs no other change — it already loops over whatever is here.
+# ---------------------------------------------------------------------------
+
+gcr.io/distroless/cc-debian12:nonroot
+debian:bookworm-slim
+node:22-alpine
+node:20-alpine
+
+# Published images — see the instructions above before uncommenting.
+# $CI_REGISTRY_IMAGE/secureprompt-api:latest
+# $CI_REGISTRY_IMAGE/secureprompt-worker:latest
+# $CI_REGISTRY_IMAGE/secureprompt-mcp:latest
+# $CI_REGISTRY_IMAGE/secureprompt-web:latest
+# $CI_REGISTRY_IMAGE/secureprompt-chat:latest
+# $CI_REGISTRY_IMAGE/sp-agent:latest

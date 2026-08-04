@@ -1,0 +1,126 @@
+# SecurePrompt — gitleaks configuration (WS6-2).
+#
+# Gate: `bash scripts/ci/gitleaks-gate.sh`, run by `supply-chain:gitleaks` in
+# .gitlab-ci.yml. Measured with gitleaks 8.30.1 on 2026-08-04.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS GATE EXISTS AT ALL, SPECIFICALLY HERE
+#
+# During this project an agent committed three freshly generated, working
+# secrets into `.env.example` — while fixing the very defect that file guards
+# against. `.env.example` deliberately holds values the boot gate REJECTS
+# (`SECUREPROMPT_JWT_SECRET=CHANGEME`, and PLACEHOLDER_SECRET_MARKERS in
+# secureprompt-common/src/config.rs), precisely so a copied-but-unedited file
+# fails loudly instead of running on a secret published in this repository.
+# Replacing those with real values silently inverts the protection.
+# scripts/ci/check-env-hygiene.sh catches that for four NAMED keys; this gate
+# is the general case.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS SCANNED — TRACKED FILES ONLY, AND WHY THAT IS NOT PEDANTRY
+#
+# The gate scans a `git archive HEAD` extraction, i.e. exactly the committed
+# tree. It does NOT run `gitleaks dir .`. MEASURED, both on this repository:
+#
+#     gitleaks dir .                  204 findings   13.88 GB   9m 3s
+#     gitleaks dir <git archive HEAD>  68 findings   39.53 MB   4.8s
+#
+# The 9-minute run reads `target/`, `node_modules`, sibling worktrees under
+# `.worktrees/`, the DVC data directory — and, worse, the developer's REAL
+# untracked `.env` and `secrets/`, which are gitignored and are supposed to
+# hold live credentials. A gate that reports a developer's own local secrets as
+# leaks is a gate that gets muted in a week. This repository already learned
+# the same lesson once: the Bitnami check in .gitlab-ci.yml carries a note
+# about swapping `find` for `git ls-files` because the former "swept up
+# node_modules and sibling git worktrees".
+#
+# ---------------------------------------------------------------------------
+# WHAT IS *NOT* SCANNED — GIT HISTORY — AND WHY THAT IS A DELIBERATE REFUSAL
+#
+# MEASURED: `gitleaks git .` over 900 commits reports 69 findings in 57s.
+# Every one was inspected; none is a live credential (test fixtures, RFC
+# example JWTs, `ghp_1234567890abcdef...`, a private key whose body is the
+# literal string `test-key`, a `T00000000/B00000000/XXXX` Slack placeholder).
+#
+# History is IMMUTABLE. A baseline over it could never shrink — no amount of
+# work would remove an entry, because the commit cannot change. That is the
+# definition of the permanent excuse column this repository's ratchets exist to
+# prevent (`scripts/ci/fmt-gate.sh` fails in BOTH directions for exactly this
+# reason). So history is audited once, by hand, and recorded in the WS6-2
+# report — not wired to a pass/fail gate. Same judgement as the `bench` job's
+# refusal to assert a wall-clock threshold.
+#
+# If a real credential is ever committed, rewriting history is not the remedy
+# anyway: rotation is. The gate's job is to stop the NEXT one.
+
+[extend]
+# Start from gitleaks' maintained rule set (~170 rules) rather than hand-rolling
+# provider patterns that would rot. Verified present in 8.30.1: the default
+# rules already flag a genuine 64-hex value assigned to
+# SECUREPROMPT_JWT_SECRET, and do NOT flag `SECUREPROMPT_JWT_SECRET=CHANGEME`.
+# Both directions were run before relying on it.
+useDefault = true
+
+# ===========================================================================
+# PRODUCT-SPECIFIC RULE — SecurePrompt's own gateway API key.
+#
+# gitleaks ships rules for other people's credentials (AWS, GitHub, Stripe...)
+# and necessarily knows nothing about ours. This is the credential a customer
+# uses to authenticate to THIS gateway, so it is the single highest-value
+# pattern to add.
+#
+# FORMAT, read out of the generator rather than guessed:
+#   secureprompt-api/src/db/api_key_repo.rs:178-184
+#     // Generate: "sp_" + 48 random alphanumeric chars = 51 chars total.
+#     .sample_iter(&Alphanumeric).take(48) ... format!("sp_{suffix}")
+# so the key is exactly `sp_` followed by 48 [A-Za-z0-9]. The rotation path at
+# the same file's line 379-383 produces the identical shape.
+# ===========================================================================
+[[rules]]
+id = "secureprompt-gateway-api-key"
+description = "SecurePrompt gateway API key (sp_ + 48 alphanumeric)"
+# Anchored on both ends so `sp_` inside a longer token does not match, and so
+# the 48-char length is enforced rather than approximated.
+regex = '''\bsp_[A-Za-z0-9]{48}\b'''
+keywords = ["sp_"]
+entropy = 3.5
+
+[rules.allowlist]
+# The docs' placeholder is `sp-your-key-here` (hyphen, not underscore) and does
+# not match the rule, so no allowlist entry is needed for it. This block exists
+# for the shape that WOULD collide: a 48-char run of a single repeated
+# character used as an obvious dummy.
+regexes = [
+    '''\bsp_(?:X{48}|x{48}|0{48}|A{48}|a{48})\b''',
+]
+
+# ===========================================================================
+# GLOBAL ALLOWLIST
+# ===========================================================================
+[allowlist]
+description = "Paths whose PURPOSE is to contain realistic fake secrets."
+
+# ONE path is allowlisted, and only because this product's test corpus is
+# literally made of fake credentials.
+#
+# `secureprompt-api/src/detection/` is the secret- and PII-DETECTOR's own
+# fixture set: strings like `sk-live-4f8Ba2Xc91mQpR7tYw3v`,
+# `-----BEGIN PRIVATE KEY-----`, and a dozen RFC-example JWTs exist there
+# BECAUSE the detector must find them. New fixtures are added as routine
+# development, so baselining them individually would mean a baseline edit on
+# every ordinary change to the detector — friction with no security return,
+# and the kind of friction that gets a gate switched off.
+#
+# THE COST, stated plainly: a genuine credential pasted into that directory is
+# invisible to this gate. That is accepted because the directory contains no
+# configuration and no deployment material — it is detector source and its
+# corpus. Everything else in the repository, including every other test
+# directory, is enumerated row-by-row in scripts/ci/gitleaks-baseline.tsv
+# instead, where each entry is individually reviewable.
+#
+# The regex is unanchored on the left so it matches whether the scanner is
+# given repo-relative paths or the absolute path of the `git archive`
+# extraction directory.
+paths = [
+    '''secureprompt-api/src/detection/''',
+]
