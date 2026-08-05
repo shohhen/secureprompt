@@ -43,12 +43,35 @@ export interface PollOptions {
   signal?: AbortSignal;
 }
 
-/** An error carrying a user-facing message and, when known, the HTTP status. */
+/**
+ * Codes, not sentences. This module runs outside React, so it cannot resolve a
+ * message itself; baking English in here is exactly how failure copy ends up
+ * untranslatable. `file-scan-form.tsx` maps the code onto the `fileScan`
+ * catalogue at render time.
+ */
+export type FileScanErrorCode =
+  | "cancelled"
+  | "fileTooLarge"
+  | "unsupportedType"
+  | "tooManyScans"
+  | "tooManySecures"
+  | "modelLoading"
+  | "sessionExpired"
+  | "jobExpired"
+  | "scanFailed"
+  | "secureFailed"
+  | "scanTimedOut"
+  | "secureTimedOut"
+  | "noResult";
+
+/** An error carrying a message *key* and, when known, the HTTP status. */
 export class FileScanError extends Error {
+  code: FileScanErrorCode;
   status?: number;
-  constructor(message: string, status?: number) {
-    super(message);
+  constructor(code: FileScanErrorCode, status?: number) {
+    super(code);
     this.name = "FileScanError";
+    this.code = code;
     this.status = status;
   }
 }
@@ -69,40 +92,27 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function abortError(): FileScanError {
-  return new FileScanError("Cancelled.");
+  return new FileScanError("cancelled");
 }
 
-/** Map a non-OK submit response to a friendly, action-specific message. */
+/** Map a non-OK submit response to an action-specific message code. */
 function submitError(status: number, kind: "scan" | "secure"): FileScanError {
-  if (status === 413) return new FileScanError("File too large (max 15 MB).", status);
-  if (status === 415)
-    return new FileScanError("Unsupported file type for securing.", status);
+  if (status === 413) return new FileScanError("fileTooLarge", status);
+  if (status === 415) return new FileScanError("unsupportedType", status);
   if (status === 429)
-    return new FileScanError(
-      kind === "scan"
-        ? "Too many scans in progress — try again in a moment."
-        : "Too many secure jobs in progress — try again in a moment.",
-      status,
-    );
-  if (status === 503)
-    return new FileScanError("Model still loading — try again in a moment.", status);
-  if (status === 401)
-    return new FileScanError("Session expired — reload the page.", status);
-  return new FileScanError(
-    `${kind === "scan" ? "Scan" : "Securing"} failed (HTTP ${status}).`,
-    status,
-  );
+    return new FileScanError(kind === "scan" ? "tooManyScans" : "tooManySecures", status);
+  if (status === 503) return new FileScanError("modelLoading", status);
+  if (status === 401) return new FileScanError("sessionExpired", status);
+  return new FileScanError(kind === "scan" ? "scanFailed" : "secureFailed", status);
 }
 
-/** Map a background-task error string to a friendly message. */
+/** Map a background-task error string to a message code. */
 function taskError(kind: "scan" | "secure", detail?: string | null): FileScanError {
+  // The sidecar's detail string is English and not ours to localise; it is
+  // matched, not displayed.
   if (detail && /unsupported file type/i.test(detail))
-    return new FileScanError("Unsupported file type for securing.");
-  return new FileScanError(
-    kind === "scan"
-      ? "Scan failed while processing the document."
-      : "Securing failed while processing the document.",
-  );
+    return new FileScanError("unsupportedType");
+  return new FileScanError(kind === "scan" ? "scanFailed" : "secureFailed");
 }
 
 async function submit(path: string, file: File | Blob, signal?: AbortSignal): Promise<string> {
@@ -139,12 +149,10 @@ async function pollUntilDone(
   for (;;) {
     const res = await fetch(statusUrl, { signal: opts.signal });
     if (!res.ok) {
-      if (res.status === 404)
-        throw new FileScanError("The job expired — please try again.", 404);
-      if (res.status === 401)
-        throw new FileScanError("Session expired — reload the page.", 401);
+      if (res.status === 404) throw new FileScanError("jobExpired", 404);
+      if (res.status === 401) throw new FileScanError("sessionExpired", 401);
       throw new FileScanError(
-        `${kind === "scan" ? "Scan" : "Securing"} failed (HTTP ${res.status}).`,
+        kind === "scan" ? "scanFailed" : "secureFailed",
         res.status,
       );
     }
@@ -152,9 +160,7 @@ async function pollUntilDone(
     if (body.status === "done") return body;
     if (body.status === "error") throw taskError(kind, body.error);
     if (Date.now() - started >= maxWait) {
-      throw new FileScanError(
-        `${kind === "scan" ? "Scan" : "Securing"} timed out — the document may be very large.`,
-      );
+      throw new FileScanError(kind === "scan" ? "scanTimedOut" : "secureTimedOut");
     }
     await delay(interval, opts.signal);
   }
@@ -165,7 +171,7 @@ export async function scanFile(file: File | Blob, opts: PollOptions = {}): Promi
   const taskId = await submit(`${ML}/scan-file/async`, file, opts.signal);
   const terminal = await pollUntilDone(`${ML}/scan-file/tasks/${taskId}`, "scan", opts);
   if (!terminal.result) {
-    throw new FileScanError("Scan finished but returned no result.");
+    throw new FileScanError("noResult");
   }
   return terminal.result;
 }

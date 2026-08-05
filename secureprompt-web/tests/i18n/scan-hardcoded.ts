@@ -45,6 +45,8 @@ export const RULE_TOAST = "toast-literal";
 export const RULE_JSX_EXPR = "jsx-expression-literal";
 /** `new FileScanError("Model still loading — try again in a moment.")`. */
 export const RULE_ERROR_PROSE = "error-prose";
+/** `z.string().min(1, "Name is required")` — rendered by <FormMessage>. */
+export const RULE_VALIDATION = "validation-prose";
 
 /**
  * Attribute names that render to the user by definition.  This is the
@@ -119,6 +121,27 @@ const NEVER_PROSE_ATTRS = new Set([
   "locale",
   "value",
   "defaultValue",
+]);
+
+/**
+ * Schema validators whose message argument is rendered to the user verbatim by
+ * <FormMessage>. A message that is a catalogue key rather than English prose
+ * passes, because keys are single tokens and the prose rule needs a phrase.
+ */
+const VALIDATION_METHODS = new Set([
+  "min",
+  "max",
+  "email",
+  "url",
+  "uuid",
+  "regex",
+  "refine",
+  "length",
+  "nonempty",
+  "int",
+  "positive",
+  "startsWith",
+  "endsWith",
 ]);
 
 const TOAST_METHODS = new Set([
@@ -265,6 +288,15 @@ export function scanSource(relPath: string, source: string): Violation[] {
         const value = literalOf(node.arguments[0]);
         if (value !== null && HAS_LETTER.test(value)) {
           record(node, RULE_TOAST, `toast.${method}("${value}")`);
+        }
+      }
+
+      if (VALIDATION_METHODS.has(method)) {
+        for (const arg of node.arguments) {
+          const value = literalOf(arg);
+          if (value !== null && LOOKS_LIKE_PROSE.test(value)) {
+            record(node, RULE_VALIDATION, `.${method}(…, "${value}")`);
+          }
         }
       }
     }
