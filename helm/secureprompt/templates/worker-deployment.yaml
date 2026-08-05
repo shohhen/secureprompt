@@ -75,3 +75,7 @@ spec:
                   key: ml-sidecar-internal-token
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+          # Same base image as api. MEASURED read-only: the only failure was
+          # `tcp connect error / Connection refused` reaching ClickHouse.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 65532 "gid" 65532 "readOnly" .Values.worker.security.readOnlyRootFilesystem) | nindent 12 }}

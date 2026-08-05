@@ -20,46 +20,37 @@ import yaml
 # clean read-only and so carry the setting.
 # ---------------------------------------------------------------------------
 EXEMPT_RO_ROOTFS = {
-    # postgres:16-alpine.  Measured read-only:
-    #   FATAL: could not create lock file "/var/run/postgresql/.s.PGSQL.5432.lock":
-    #   Read-only file system
-    # It boots read-only once /var/run/postgresql and /tmp are writable, and the
-    # chart now mounts emptyDirs there — so postgres is NOT exempt. Kept out of
-    # this map on purpose; see the runAsNonRoot exemption below, which is a
-    # different (and unresolved) problem.
-    # ---------------------------------------------------------------------
     # secureprompt-ml.  NOT MEASURED. The image is 12.6 GB and is deliberately
     # excluded from the CI `build` stage (.gitlab-ci.yml "KNOWN CAVEATS": it
     # needs the raw model DEK), so it is not built here and was never started
-    # read-only. Asserting a property nobody executed is exactly the failure
-    # mode this repo has been burned by, so the chart ships
+    # read-only. Asserting a property nobody executed is the failure mode this
+    # repo has been burned by, so the chart ships
     # ml.security.readOnlyRootFilesystem=false and an operator who has the
-    # image can flip it. /tmp is given an emptyDir either way — /v1/scan-file
-    # spools uploads there.
+    # image can flip it -- /tmp already has an emptyDir, so that is a values
+    # change with no template change.
     "ml": "12.6 GB image is excluded from CI build (needs the model DEK); never started read-only, so not asserted",
-    # librechat + mongo.  NOT MEASURED — same reason, images not built here.
+    # librechat + mongo.  NOT MEASURED -- images not built in this environment.
     "librechat": "image not built in this environment; never started read-only, so not asserted",
     "mongo": "image not built in this environment; never started read-only, so not asserted",
-    # backup CronJob. NOT MEASURED — sp-backup is built out-of-band and writes
-    # dumps to its PVC; never started read-only here.
+    # backup CronJob. NOT MEASURED -- sp-backup is built out-of-band.
     "backup": "sp-backup image is built out-of-band; never started read-only, so not asserted",
 }
 
 # ---------------------------------------------------------------------------
 # runAsNonRoot exemptions. Same rule: measured, not assumed.
+#
+# postgres is NOT here, and the reason is worth recording. It was first
+# recorded as impossible -- `docker run --user 999:999` gave
+#   initdb: error: could not change permissions of directory
+#   "/var/lib/postgresql/data": Operation not permitted
+# -- and the conclusion was wrong, because 999 is the postgres uid on the
+# DEBIAN image. `id postgres` inside postgres:16-alpine is 70. At uid 70 the
+# same run reaches "database system is ready to accept connections", including
+# against the 0775 root:70 data dir a k8s fsGroup leaves behind. The chart also
+# already set PGDATA to a subdirectory of the mount, which is the other half of
+# the usual problem.
 # ---------------------------------------------------------------------------
 EXEMPT_NONROOT = {
-    # postgres:16-alpine. Measured with `--user 999:999` against a volume
-    # pre-chowned 999:999 and chmod 700:
-    #   initdb: error: could not change permissions of directory
-    #   "/var/lib/postgresql/data": Operation not permitted
-    # It starts only when PGDATA points at a SUBDIRECTORY of the mount
-    # (measured: PGDATA=/var/lib/postgresql/data/pgdata -> "database system is
-    # ready to accept connections"). Moving PGDATA on a chart that already
-    # ships data at the mount root orphans every existing volume, so this is
-    # opt-in per install (postgres.security.runAsNonRoot) and default false.
-    "postgres": "official image initdb cannot chmod the mount root as non-root; needs a PGDATA subdir, which would orphan existing volumes",
-    "ml": "12.6 GB image is excluded from CI build; never started as an explicit uid here, so not asserted",
     "librechat": "image not built in this environment; not asserted",
     "mongo": "image not built in this environment; not asserted",
     "backup": "sp-backup image is built out-of-band; not asserted",

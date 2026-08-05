@@ -54,6 +54,18 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.librechat.mongo.resources | nindent 12 }}
+          # NOT MEASURED here, and the settings say so. This image is not built in
+          # the environment that ran every other container in this chart under
+          # `docker run --read-only`, so runAsNonRoot and readOnlyRootFilesystem
+          # are left off rather than guessed -- an unexecuted `readOnly: true`
+          # is a boot loop discovered by the customer. The three settings below
+          # are the ones that cannot break a process that starts at all.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -190,6 +202,18 @@ spec:
             failureThreshold: 5
           resources:
             {{- toYaml .Values.librechat.resources | nindent 12 }}
+          # NOT MEASURED here, and the settings say so. This image is not built in
+          # the environment that ran every other container in this chart under
+          # `docker run --read-only`, so runAsNonRoot and readOnlyRootFilesystem
+          # are left off rather than guessed -- an unexecuted `readOnly: true`
+          # is a boot loop discovered by the customer. The three settings below
+          # are the ones that cannot break a process that starts at all.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
       volumes:
         - name: config
           configMap:

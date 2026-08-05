@@ -1,0 +1,121 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullName := include "secureprompt.fullname" . -}}
+{{/*
+WS6-5 — NetworkPolicy. The chart rendered NONE before this file existed, which
+in a shared cluster means every pod in every other namespace can open a socket
+to Postgres, ClickHouse, Valkey, Qdrant and the ML sidecar directly. The
+sidecar's bearer token and the RLS role split both assume something in front of
+them; a flat network is what makes "the runtime role cannot bypass RLS" the
+only line of defence rather than the last one.
+
+READ THIS BEFORE ENABLING ON AN EXISTING CLUSTER
+------------------------------------------------
+A NetworkPolicy is enforced by the CNI, not by Kubernetes. On a cluster whose
+CNI does not implement them (plain kubenet, some managed defaults, Docker
+Desktop) these objects are ACCEPTED BY THE API SERVER AND DO NOTHING -- which
+is the worst possible outcome, because `kubectl get networkpolicy` then shows a
+policy that is not being enforced. Confirm with your platform team before
+treating this as a control. On GKE, Dataplane V2 or `--enable-network-policy`.
+
+The default is ENABLED, and deliberately so: a policy that has to be turned on
+is a policy nobody turns on. Set networkPolicy.enabled=false if your CNI cannot
+enforce it and you would rather not carry an object that lies.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullName }}-default-deny
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  # Empty podSelector = every pod in this namespace. With policyTypes Ingress
+  # and no ingress rules, that is deny-all-inbound; the policies below then
+  # ADD back the specific flows. Egress is deliberately NOT denied here -- the
+  # gateway's whole job is to call cloud providers, and SSRF egress control
+  # already lives in the application (WS: ssrf-egress-guard), where it can tell
+  # a provider apart from link-local metadata.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+{{/*
+The two workloads that are supposed to be reachable from outside the namespace:
+the API and the dashboard, both fronted by the Ingress controller. The
+controller runs in its own namespace, and there is no portable label for it, so
+this allows ingress from anywhere for these two ports only. That is a real
+narrowing -- it is the datastores and the ML sidecar that must not be reachable
+-- but it is not a substitute for authentication on those ports, and both have
+it (API keys / JWT).
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullName }}-allow-edge
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - {{ $fullName }}-api
+          - {{ $fullName }}-web
+          {{- if .Values.librechat.enabled }}
+          - {{ $fullName }}-librechat
+          {{- end }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+        - port: 3000
+          protocol: TCP
+        {{- if .Values.librechat.enabled }}
+        - port: 3080
+          protocol: TCP
+        {{- end }}
+---
+{{/*
+Everything else in the namespace may only be reached BY this namespace. The
+namespaceSelector with an empty matchLabels means "any namespace" in the
+NetworkPolicy spec -- what is wanted here is `podSelector: {}` under `from`,
+which means "any pod in the SAME namespace as this policy". That distinction is
+the whole point of this object; getting it backwards silently allows the
+cluster.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullName }}-allow-internal
+  labels:
+    {{- include "secureprompt.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - {{ $fullName }}-postgres
+          - {{ $fullName }}-clickhouse
+          - {{ $fullName }}-valkey
+          - {{ $fullName }}-qdrant
+          - {{ $fullName }}-ml
+          - {{ $fullName }}-worker
+          - {{ $fullName }}-prometheus
+          - {{ $fullName }}-alertmanager
+          - {{ $fullName }}-grafana
+          {{- if .Values.librechat.enabled }}
+          - {{ $fullName }}-librechat-mongo
+          {{- end }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+{{- if .Values.networkPolicy.monitoringNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
+{{- end }}
+{{- end }}

@@ -83,6 +83,16 @@ api:
     publicSignupEnabled: "true"
     chatDebugMode: "false"
     corsOrigins: "https://app.secureprompt.tech,https://secureprompt.tech"
+  # WS6-5 pod hardening. allowPrivilegeEscalation=false, capabilities.drop
+  # [ALL], seccompProfile RuntimeDefault and runAsNonRoot are unconditional in
+  # the template -- they cost nothing and are not negotiable. Only
+  # readOnlyRootFilesystem is a value, because it is the one that can break a
+  # container that writes, and the default below is what a `docker run
+  # --read-only` against the pinned image actually did.
+  security:
+    # MEASURED: distroless/cc-debian12:nonroot starts read-only (it got as far
+    # as the DB connect, not an EROFS).
+    readOnlyRootFilesystem: true
   # Service shape. NodePort is what the GKE ingress controller requires; on a
   # cluster whose controller routes to ClusterIP (ingress-nginx does), NodePort
   # additionally opens a port on every node for no reason. Set ClusterIP
@@ -107,6 +117,10 @@ worker:
   metrics:
     enabled: true
     port: 9091
+  security:
+    # MEASURED: same base image as api; read-only run failed only on
+    # `Connection refused` reaching ClickHouse.
+    readOnlyRootFilesystem: true
 
 web:
   image:
@@ -121,6 +135,10 @@ web:
     apiUrl: "http://secureprompt-api"
     nextauthUrl: "https://app.secureprompt.tech"
     nextPublicApiUrl: "https://api.secureprompt.tech"
+  security:
+    # MEASURED: node:22-alpine standalone build, uid 1001, "Ready in 0ms"
+    # read-only.
+    readOnlyRootFilesystem: true
   # Service shape. NodePort is what the GKE ingress controller requires; on a
   # cluster whose controller routes to ClusterIP (ingress-nginx does), NodePort
   # additionally opens a port on every node for no reason. Set ClusterIP
@@ -158,6 +176,14 @@ ml:
     # (multilingual_ner_v8_xlmr). Comma-separated to run several, or "all" to register
     # every shipped checkpoint. Rollback to v7: multilingual_ner_v7_xlmr (also shipped).
     activeNerModels: "multilingual_ner_v8_xlmr"
+  security:
+    # DEFAULT FALSE, and deliberately so. The 12.6 GB ML image is excluded from
+    # the CI `build` stage (it needs the raw model DEK), so it was not built in
+    # the environment that measured every other entry in this file and was
+    # never started read-only. /tmp already has an emptyDir, so flipping this to
+    # true is a values change with no template change -- do it once you have
+    # run the image read-only and watched /v1/scan-file succeed.
+    readOnlyRootFilesystem: false
 
 # ----------------------------------------------------------------------------
 # LibreChat (browser chat UI, SP-modified fork) + its MongoDB
@@ -324,11 +350,35 @@ backup:
     tag: "latest"
   keySecret: "secureprompt-backup-key"
   retentionDaily: 7
+  # The CronJob container rendered with NO resources block at all, which makes
+  # it BestEffort: a pg_dump of a large database is then the first thing the
+  # kubelet evicts under node pressure, silently, at 02:00.
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
   # PVC mounted at /backups by the CronJob.
   storageSize: 20Gi
   storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
                   # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
                   # on any other cluster. values-gke.yaml sets it back for GKE.
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy (WS6-5)
+# ----------------------------------------------------------------------------
+# The chart rendered zero NetworkPolicies. In a shared cluster that means any
+# pod in any namespace can open a socket straight to Postgres, ClickHouse,
+# Valkey, Qdrant or the ML sidecar.
+#
+# CAVEAT WORTH READING BEFORE YOU TRUST IT: NetworkPolicies are enforced by the
+# CNI. On a cluster whose CNI does not implement them they are accepted by the
+# API server and do nothing, so `kubectl get networkpolicy` shows a control
+# that is not a control. See templates/networkpolicy.yaml.
+networkPolicy:
+  enabled: true
+  # Optional: let a Prometheus that lives in ANOTHER namespace scrape the
+  # workloads here, e.g. { matchLabels: { kubernetes.io/metadata.name: monitoring } }.
+  # The in-chart Prometheus is in this namespace and needs nothing.
+  monitoringNamespaceSelector: {}
 
 serviceMesh:
   enabled: false
