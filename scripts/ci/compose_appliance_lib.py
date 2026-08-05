@@ -73,6 +73,16 @@ def main() -> int:
             # '@'. redis://redis:6379 does not.
             if "@" not in url:
                 problems.append(f"{name}: REDIS_URL carries no credential ({url!r})")
+            elif not url.startswith("redis://default:"):
+                # MEASURED against valkey 8.1.6: the userinfo-with-empty-username
+                # form `redis://:pw@host` makes valkey-cli send two-arg AUTH and
+                # fail with WRONGPASS. The Rust client happens to be fine with it
+                # (redis 1.2.0 maps an empty username to None), but a URL that
+                # only works for one of its two consumers is a debugging trap.
+                problems.append(
+                    f"{name}: REDIS_URL should name the `default` user explicitly "
+                    f"({url.split('@')[-1]}) — the empty-username form fails under redis-cli/valkey-cli"
+                )
 
         if name in CH_CLIENTS and "CLICKHOUSE_URL" in env:
             if not env.get("CLICKHOUSE_PASSWORD"):
@@ -110,10 +120,11 @@ def main() -> int:
         for name, svc in services.items():
             if not svc.get("image"):
                 problems.append(f"{name}: no image: — an air-gapped host has nothing to build from")
-            elif svc.get("build") and svc.get("pull_policy") not in ("never",):
+            if svc.get("pull_policy") != "never":
                 problems.append(
-                    f"{name}: still has build: and pull_policy={svc.get('pull_policy')!r} "
-                    "— an air-gapped host can neither build nor pull it"
+                    f"{name}: pull_policy={svc.get('pull_policy')!r}, not 'never' — on an "
+                    "air-gapped host that is a registry call that hangs and fails, after "
+                    "`docker load` has already put the exact image in the local store"
                 )
 
     if problems:

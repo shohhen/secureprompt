@@ -472,6 +472,35 @@ test:
   # Service versions are pinned to match docker-compose.yml exactly. Testing
   # against a different Postgres/ClickHouse than you ship is how schema bugs
   # reach production green.
+  #
+  # WS6-5 — A DELIBERATE DIVERGENCE, STATED RATHER THAN HIDDEN.
+  # docker-compose.yml now runs Redis under --requirepass and ClickHouse with a
+  # password on the `default` user. These service containers do NOT, and are
+  # not going to in this change:
+  #
+  #   MEASURED: 10 test files reach ClickHouse from `CLICKHOUSE_URL` WITHOUT
+  #   going through `build_clickhouse_client` -- they build their own
+  #   `clickhouse::Client::default()` or a raw `reqwest` POST (e.g.
+  #   secureprompt-worker/src/tasks/retention_purge/tests.rs:29,
+  #   secureprompt-api/tests/clickhouse_schema_probe.rs,
+  #   .../raw_content_capture.rs, .../leak_report.rs). Putting a password on
+  #   this service container reddens every one of them, and .github/workflows-
+  #   retired/README records four workflows abandoned once they went
+  #   permanently red. That is not a trade worth making for a service container
+  #   that lives for the duration of one job on an isolated network.
+  #
+  # What makes this safe rather than a hole: the credentials are OPTIONAL by
+  # construction. `with_env_credentials` (api) and the matching block in the
+  # worker send no auth headers when the vars are unset, so this job exercises
+  # exactly the code path it exercised before. The AUTHENTICATED path was
+  # proven by execution against the real images instead -- see the WS6-5 report
+  # for the transcripts (HTTP 403 `Code: 516 Authentication failed`
+  # unauthenticated vs 200 authenticated; `NOAUTH Authentication required.` vs
+  # PONG).
+  #
+  # To close it: give the clickhouse service CLICKHOUSE_PASSWORD, set
+  # CLICKHOUSE_USER/CLICKHOUSE_PASSWORD in variables, teach
+  # scripts/ci/clickhouse-migrate.sh to send them, and fix those 10 files.
   services:
     - name: postgres:16-alpine
       alias: postgres

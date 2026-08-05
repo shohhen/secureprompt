@@ -115,11 +115,37 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let ch_client = clickhouse::Client::default()
+    // WS6-5. `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`, applied here rather
+    // than folded into the URL: clickhouse 0.15 does not read credentials from
+    // the URL at all. `Query::do_execute` parses the URL and passes it straight
+    // to `Request::uri()`; auth comes from `headers::with_authentication`,
+    // which emits `X-ClickHouse-User` / `X-ClickHouse-Key` from
+    // `with_user`/`with_password`. `http://user:pass@host:8123` would connect
+    // as the default user and authenticate nothing.
+    //
+    // Unset = no auth headers = exactly the previous behaviour, which is what
+    // keeps the CI service container and existing deployments working. The
+    // matching function in the API is
+    // `secureprompt-api/src/analytics/clickhouse_writer.rs::with_env_credentials`;
+    // it is duplicated rather than shared because secureprompt-common does not
+    // depend on the clickhouse crate, and adding it there to save six lines
+    // would pull ClickHouse into every crate in the workspace.
+    let mut ch_client = clickhouse::Client::default()
         .with_url(&config.clickhouse.url)
         .with_database(&config.clickhouse.database)
         .with_setting("async_insert", "1")
         .with_setting("wait_for_async_insert", "1");
+    if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+        if !user.is_empty() {
+            ch_client = ch_client.with_user(user);
+        }
+    }
+    if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+        if !password.is_empty() {
+            ch_client = ch_client.with_password(password);
+        }
+    }
+    let ch_client = ch_client;
 
     // Apply ClickHouse DDL migrations on startup (D-06, D-12)
     apply_migrations(&ch_client)
