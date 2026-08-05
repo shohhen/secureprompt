@@ -82,7 +82,7 @@ export function LatencyChart({ workspaceId }: LatencyChartProps) {
                   : "text-muted-foreground hover:text-foreground")
               }
             >
-              {opt === "day" ? "Daily" : "Hourly"}
+              {opt === "day" ? t("granularityDaily") : t("granularityHourly")}
             </button>
           ))}
         </div>

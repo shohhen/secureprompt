@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { useMyProfile, useUpdateMyProfile } from "@/lib/hooks/use-profile";
 import { Button } from "@/components/ui/button";
@@ -9,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export function ProfileForm() {
+  const t = useTranslations("profileSettings");
   const { data, isLoading, error } = useMyProfile();
   const update = useUpdateMyProfile();
 
@@ -40,7 +42,7 @@ export function ProfileForm() {
   if (error) {
     return (
       <p className="text-sm text-destructive">
-        Failed to load profile: {error.message}
+        {t("loadFailed", { message: error.message })}
       </p>
     );
   }
@@ -55,44 +57,44 @@ export function ProfileForm() {
         last_name: lastName,
         position,
       });
-      toast.success("Profile updated.");
+      toast.success(t("updated"));
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Update failed.");
+      toast.error(e instanceof Error ? e.message : t("updateFailed"));
     }
   }
 
   return (
     <form onSubmit={onSubmit} className="space-y-6 max-w-lg">
       <div className="rounded-lg border p-5 space-y-4">
-        <ReadOnlyField label="Email" value={data.email} mono />
-        <ReadOnlyField label="Role" value={data.role} />
+        <ReadOnlyField label={t("email")} value={data.email} mono />
+        <ReadOnlyField label={t("role")} value={data.role} />
       </div>
 
       <div className="rounded-lg border p-5 space-y-4">
         <FieldRow
           id="first_name"
-          label="First name"
+          label={t("firstName")}
           value={firstName}
           onChange={setFirstName}
         />
         <FieldRow
           id="last_name"
-          label="Last name"
+          label={t("lastName")}
           value={lastName}
           onChange={setLastName}
         />
         <FieldRow
           id="position"
-          label="Position / job title"
+          label={t("position")}
           value={position}
           onChange={setPosition}
-          placeholder="e.g. Backend Engineer"
+          placeholder={t("positionPlaceholder")}
         />
       </div>
 
       <div className="flex justify-end">
         <Button type="submit" size="sm" disabled={update.isPending}>
-          {update.isPending ? "Saving…" : "Save"}
+          {update.isPending ? t("saving") : t("save")}
         </Button>
       </div>
     </form>

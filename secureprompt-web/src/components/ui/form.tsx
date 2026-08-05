@@ -51,6 +51,7 @@ const useFormField = () => {
   const fieldState = getFieldState(fieldContext.name, formState);
 
   if (!fieldContext) {
+    // i18n-exempt: developer error, thrown at render time and never shown to a user
     throw new Error("useFormField should be used within <FormField>");
   }
 

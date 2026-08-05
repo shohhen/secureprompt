@@ -47,6 +47,8 @@ export const RULE_JSX_EXPR = "jsx-expression-literal";
 export const RULE_ERROR_PROSE = "error-prose";
 /** `z.string().min(1, "Name is required")` — rendered by <FormMessage>. */
 export const RULE_VALIDATION = "validation-prose";
+/** `window.confirm("Revoke key…? This cannot be undone.")` — destructive copy. */
+export const RULE_DIALOG = "browser-dialog-prose";
 
 /**
  * Attribute names that render to the user by definition.  This is the
@@ -153,6 +155,12 @@ const TOAST_METHODS = new Set([
   "message",
   "custom",
 ]);
+
+/**
+ * Browser dialogs. Destructive-action confirmations live here and are read at
+ * the exact moment a mistake becomes irreversible, so they must be translated.
+ */
+const DIALOG_FNS = new Set(["confirm", "alert", "prompt"]);
 
 const HAS_LETTER = /\p{L}/u;
 /** Two or more whitespace-separated words, each carrying a letter. */
@@ -281,6 +289,16 @@ export function scanSource(relPath: string, source: string): Violation[] {
       }
     }
 
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      const fn = node.expression.text;
+      if (DIALOG_FNS.has(fn)) {
+        const value = literalOf(node.arguments[0]);
+        if (value !== null && LOOKS_LIKE_PROSE.test(value)) {
+          record(node, RULE_DIALOG, `${fn}("${value}")`);
+        }
+      }
+    }
+
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const obj = node.expression.expression.getText(sf);
       const method = node.expression.name.getText(sf);
@@ -288,6 +306,13 @@ export function scanSource(relPath: string, source: string): Violation[] {
         const value = literalOf(node.arguments[0]);
         if (value !== null && HAS_LETTER.test(value)) {
           record(node, RULE_TOAST, `toast.${method}("${value}")`);
+        }
+      }
+
+      if (DIALOG_FNS.has(method) && obj === "window") {
+        const value = literalOf(node.arguments[0]);
+        if (value !== null && LOOKS_LIKE_PROSE.test(value)) {
+          record(node, RULE_DIALOG, `window.${method}("${value}")`);
         }
       }
 
