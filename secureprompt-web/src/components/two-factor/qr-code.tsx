@@ -11,11 +11,13 @@
  */
 
 import { QRCodeSVG } from "qrcode.react";
+import { useTranslations } from "next-intl";
 
 export function TwoFactorQr({ value }: { value: string }) {
+  const t = useTranslations("twoFactor");
   return (
     <div className="flex justify-center rounded-lg border bg-white p-4">
-      <QRCodeSVG value={value} size={192} includeMargin aria-label="2FA QR code" />
+      <QRCodeSVG value={value} size={192} includeMargin aria-label={t("qrAlt")} />
     </div>
   );
 }

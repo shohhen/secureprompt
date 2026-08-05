@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, type ReactNode } from "react";
+import { useTranslations } from "next-intl";
 import { SessionProvider } from "next-auth/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { toast, Toaster } from "sonner";
@@ -17,15 +18,14 @@ import { getQueryClient } from "@/lib/query-client";
  */
 
 function BudgetExceededListener() {
+  const t = useTranslations("errors");
   useEffect(() => {
     const handler = () => {
-      toast.error(
-        "Budget exceeded. Requests are being blocked. Contact an admin.",
-      );
+      toast.error(t("budgetExceeded"));
     };
     window.addEventListener("sp:budget-exceeded", handler);
     return () => window.removeEventListener("sp:budget-exceeded", handler);
-  }, []);
+  }, [t]);
   return null;
 }
 

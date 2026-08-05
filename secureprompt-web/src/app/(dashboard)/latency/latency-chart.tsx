@@ -18,6 +18,7 @@
  */
 
 import { useMemo } from "react";
+import { useTranslations } from "next-intl";
 import { useQueryState } from "nuqs";
 import { format, subDays } from "date-fns";
 import {
@@ -49,6 +50,7 @@ export function LatencyChart({ workspaceId }: LatencyChartProps) {
   const [model] = useQueryState("model");
   const [bucket, setBucket] = useQueryState("bucket", { defaultValue: "day" });
 
+  const t = useTranslations("latency");
   const { data, isLoading, error } = useLatencyPctiles({
     from,
     to,
@@ -87,11 +89,11 @@ export function LatencyChart({ workspaceId }: LatencyChartProps) {
       </div>
 
       {isLoading && (
-        <p className="text-sm text-muted-foreground">Loading latency data…</p>
+        <p className="text-sm text-muted-foreground">{t("loading")}</p>
       )}
       {error && (
         <p className="text-sm text-destructive">
-          Failed to load latency data. Marts may not be populated yet.
+          {t("loadFailed")}
         </p>
       )}
 
@@ -114,7 +116,7 @@ export function LatencyChart({ workspaceId }: LatencyChartProps) {
           />
           {data && data.rows.length === 0 && !isLoading && (
             <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
-              No latency samples for the selected period.
+              {t("empty")}
             </p>
           )}
         </div>

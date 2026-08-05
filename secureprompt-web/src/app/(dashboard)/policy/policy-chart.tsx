@@ -5,6 +5,7 @@
  */
 
 import { useQueryState } from "nuqs";
+import { useTranslations } from "next-intl";
 import { format, subDays } from "date-fns";
 import { usePolicyViolations } from "@/lib/hooks/use-analytics";
 import { StackedBarChart } from "@/components/charts/stacked-bar-chart";
@@ -25,6 +26,7 @@ export function PolicyChart({ workspaceId }: PolicyChartProps) {
   });
   const [to] = useQueryState("to", { defaultValue: format(new Date(), FORMAT) });
 
+  const t = useTranslations("policy");
   const { data, isLoading, error } = usePolicyViolations({
     from,
     to,
@@ -40,12 +42,12 @@ export function PolicyChart({ workspaceId }: PolicyChartProps) {
 
       {isLoading && (
         <p className="text-sm text-muted-foreground">
-          Loading policy violations…
+          {t("loading")}
         </p>
       )}
       {error && (
         <p className="text-sm text-destructive">
-          Failed to load policy data. Marts may not be populated yet.
+          {t("loadFailed")}
         </p>
       )}
 
@@ -72,7 +74,7 @@ export function PolicyChart({ workspaceId }: PolicyChartProps) {
           />
           {data && data.length === 0 && !isLoading && (
             <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
-              No policy violations in the selected period.
+              {t("empty")}
             </p>
           )}
         </div>

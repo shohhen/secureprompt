@@ -7,6 +7,7 @@
  */
 
 import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
 import { getServerSession } from "@/lib/session";
 import { RequestsTable } from "./requests-table";
 import { DateRangeFilter } from "@/components/filters/date-range-filter";
@@ -14,13 +15,14 @@ import { DateRangeFilter } from "@/components/filters/date-range-filter";
 export default async function RequestsPage() {
   const session = await getServerSession();
   if (!session) redirect("/login?reason=unauthenticated");
+  const t = await getTranslations("requests");
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Requests</h1>
+        <h1 className="text-2xl font-semibold">{t("title")}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Audit trail of all LLM requests proxied through SecurePrompt.
+          {t("description")}
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-4">

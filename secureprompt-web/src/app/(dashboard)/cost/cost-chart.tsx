@@ -5,6 +5,7 @@
  */
 
 import { useQueryState } from "nuqs";
+import { useTranslations } from "next-intl";
 import { format, subDays } from "date-fns";
 import { useCostByModel } from "@/lib/hooks/use-analytics";
 import { BarChart } from "@/components/charts/bar-chart";
@@ -25,6 +26,7 @@ export function CostChart({ workspaceId }: CostChartProps) {
   });
   const [to] = useQueryState("to", { defaultValue: format(new Date(), FORMAT) });
 
+  const t = useTranslations("cost");
   const { data, isLoading, error } = useCostByModel({ from, to, workspaceId });
 
   return (
@@ -35,11 +37,11 @@ export function CostChart({ workspaceId }: CostChartProps) {
       </div>
 
       {isLoading && (
-        <p className="text-sm text-muted-foreground">Loading cost data…</p>
+        <p className="text-sm text-muted-foreground">{t("loading")}</p>
       )}
       {error && (
         <p className="text-sm text-destructive">
-          Failed to load cost data. Marts may not be populated yet.
+          {t("loadFailed")}
         </p>
       )}
 
@@ -72,7 +74,7 @@ export function CostChart({ workspaceId }: CostChartProps) {
           />
           {data && data.length === 0 && !isLoading && (
             <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
-              No cost recorded for the selected period.
+              {t("empty")}
             </p>
           )}
         </div>
