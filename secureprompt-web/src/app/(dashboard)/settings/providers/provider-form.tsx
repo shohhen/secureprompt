@@ -5,6 +5,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import { useTranslations } from "next-intl";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -29,8 +30,8 @@ import { Label } from "@/components/ui/label";
 const PROVIDER_TYPES = ["openai", "anthropic", "google", "vertex", "azure", "bedrock", "custom"];
 
 const schema = z.object({
-  name: z.string().min(1, "Name is required").max(120),
-  provider_type: z.string().min(1, "Provider type is required"),
+  name: z.string().min(1, "validation.nameRequired").max(120),
+  provider_type: z.string().min(1, "validation.providerTypeRequired"),
   credential: z.string().optional(),
   region: z.string().optional(),
   project: z.string().optional(),
@@ -44,6 +45,7 @@ interface ProviderFormProps {
 }
 
 export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps) {
+  const t = useTranslations("providers");
   const isEdit = Boolean(provider);
   const create = useCreateProvider();
   const update = useUpdateProvider();
@@ -127,7 +129,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
           ...(data.credential ? { credential: data.credential } : {}),
           ...(config ? { config } : {}),
         });
-        toast.success("Provider updated.");
+        toast.success(t("updated"));
       } else {
         await create.mutateAsync({
           name: data.name,
@@ -135,11 +137,11 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
           ...(data.credential ? { credential: data.credential } : {}),
           ...(config ? { config } : {}),
         });
-        toast.success("Provider created.");
+        toast.success(t("created"));
       }
       onOpenChange(false);
     } catch {
-      toast.error(isEdit ? "Failed to update provider." : "Failed to create provider.");
+      toast.error(isEdit ? t("updateFailed") : t("createFailed"));
     }
   }
 
@@ -149,15 +151,15 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
         <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 max-h-[85vh] overflow-y-auto rounded-lg bg-background border shadow-lg p-6 space-y-4">
           <Dialog.Title className="text-lg font-semibold">
-            {isEdit ? "Edit Provider" : "Add Provider"}
+            {isEdit ? t("editTitle") : t("addProvider")}
           </Dialog.Title>
 
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
             <div className="space-y-1.5">
-              <Label htmlFor="prov-name">Name</Label>
+              <Label htmlFor="prov-name">{t("fieldName")}</Label>
               <Input
                 id="prov-name"
-                placeholder="e.g. OpenAI Production"
+                placeholder={t("fieldNamePlaceholder")}
                 {...form.register("name")}
               />
               {form.formState.errors.name && (
@@ -168,15 +170,15 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
             </div>
 
             <div className="space-y-1.5">
-              <Label htmlFor="prov-type">Provider Type</Label>
+              <Label htmlFor="prov-type">{t("fieldType")}</Label>
               <select
                 id="prov-type"
                 {...form.register("provider_type")}
                 className="w-full rounded-md border bg-background px-3 py-2 text-sm"
               >
-                {PROVIDER_TYPES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
+                {PROVIDER_TYPES.map((pt) => (
+                  <option key={pt} value={pt}>
+                    {pt}
                   </option>
                 ))}
               </select>
@@ -185,14 +187,15 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
             {isVertex && (
               <>
                 <div className="space-y-1.5">
-                  <Label htmlFor="prov-region">Region</Label>
+                  <Label htmlFor="prov-region">{t("fieldRegion")}</Label>
+                  {/* i18n-exempt: a GCP region identifier, identical in every locale */}
                   <Input id="prov-region" placeholder="us-central1" {...form.register("region")} />
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="prov-project">Project (optional)</Label>
+                  <Label htmlFor="prov-project">{t("fieldProject")}</Label>
                   <Input
                     id="prov-project"
-                    placeholder="leave blank to use the SA key's project"
+                    placeholder={t("fieldProjectPlaceholder")}
                     {...form.register("project")}
                   />
                 </div>
@@ -202,16 +205,16 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
             <div className="space-y-1.5">
               <Label htmlFor="prov-cred">
                 {isVertex
-                  ? "Service Account JSON"
+                  ? t("fieldServiceAccountJson")
                   : isEdit
-                    ? "API Key (leave blank to keep existing)"
-                    : "API Key"}
+                    ? t("fieldApiKeyExisting")
+                    : t("fieldApiKey")}
               </Label>
               {isVertex ? (
                 <textarea
                   id="prov-cred"
                   className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono min-h-[120px]"
-                  placeholder={'{ "type": "service_account", ... }  — optional (ADC if blank)'}
+                  placeholder={t("fieldServiceAccountPlaceholder")}
                   {...form.register("credential")}
                   onChange={(e) => {
                     form.setValue("credential", e.target.value);
@@ -234,7 +237,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
               )}
               {isVertex && (
                 <p className="text-xs text-muted-foreground">
-                  Optional — uses Workload Identity / ADC if blank
+                  {t("adcHint")}
                 </p>
               )}
               <div className="flex items-center gap-2 pt-1">
@@ -245,7 +248,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
                   onClick={handleTestConnection}
                   disabled={testConn.isPending}
                 >
-                  {testConn.isPending ? "Testing…" : "Test Connection"}
+                  {testConn.isPending ? t("testing") : t("testConnection")}
                 </Button>
                 {testResult && (
                   <span
@@ -256,8 +259,10 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
                     }
                   >
                     {testResult.success
-                      ? `✓ Connected (${testResult.model_count ?? 0} models)`
-                      : `✗ ${testResult.error ?? "Connection failed"}`}
+                      ? t("testSucceeded", { count: testResult.model_count ?? 0 })
+                      : t("testFailed", {
+                          reason: testResult.error ?? t("connectionFailed"),
+                        })}
                   </span>
                 )}
               </div>
@@ -268,11 +273,11 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
             <div className="flex justify-end gap-2">
               <Dialog.Close asChild>
                 <Button variant="outline" size="sm" type="button">
-                  Cancel
+                  {t("cancel")}
                 </Button>
               </Dialog.Close>
               <Button size="sm" type="submit" disabled={isPending}>
-                {isPending ? "Saving…" : isEdit ? "Save" : "Add"}
+                {isPending ? t("saving") : isEdit ? t("save") : t("add")}
               </Button>
             </div>
           </form>
@@ -289,6 +294,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
  * client (nested `models` field on `GET /v1/providers`).
  */
 function ModelsPanel({ providerId }: { providerId: string }) {
+  const t = useTranslations("providerModels");
   const { data: models = [], isLoading } = useProviderModels(providerId);
   const add = useAddProviderModel(providerId);
   const remove = useDeleteProviderModel(providerId);
@@ -331,11 +337,9 @@ function ModelsPanel({ providerId }: { providerId: string }) {
     try {
       await add.mutateAsync({ name: trimmed });
       setName("");
-      toast.success(`Added ${trimmed}`);
+      toast.success(t("added", { name: trimmed }));
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to add model.",
-      );
+      toast.error(err instanceof Error ? err.message : t("addFailed"));
     }
   }
 
@@ -344,11 +348,9 @@ function ModelsPanel({ providerId }: { providerId: string }) {
     try {
       const { deleted } = await bulkDelete.mutateAsync(selectedNames);
       setSelected(new Set());
-      toast.success(`Removed ${deleted} model${deleted === 1 ? "" : "s"}`);
+      toast.success(t("removedCount", { count: deleted }));
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to delete models.",
-      );
+      toast.error(err instanceof Error ? err.message : t("deleteFailed"));
     }
   }
 
@@ -356,27 +358,21 @@ function ModelsPanel({ providerId }: { providerId: string }) {
     try {
       const diff = await sync.mutateAsync();
       if (diff.added.length === 0) {
-        toast.success(
-          `Already in sync (${diff.kept.length} models tracked).`,
-        );
+        toast.success(t("alreadyInSync", { count: diff.kept.length }));
       } else {
         toast.success(
-          `Synced — added ${diff.added.length} new model${
-            diff.added.length === 1 ? "" : "s"
-          } (${diff.total} total).`,
+          t("synced", { count: diff.added.length, total: diff.total }),
         );
       }
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to sync models.",
-      );
+      toast.error(err instanceof Error ? err.message : t("syncFailed"));
     }
   }
 
   return (
     <div className="space-y-2 border-t pt-4">
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-sm font-medium">Models</Label>
+        <Label className="text-sm font-medium">{t("title")}</Label>
         <Button
           type="button"
           size="sm"
@@ -384,19 +380,17 @@ function ModelsPanel({ providerId }: { providerId: string }) {
           onClick={handleSync}
           disabled={sync.isPending}
         >
-          {sync.isPending ? "Syncing…" : "Sync from upstream"}
+          {sync.isPending ? t("syncing") : t("syncFromUpstream")}
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Auto-fetched from the provider&apos;s API key on save. Removed models
-        stay removed across syncs. Add one back manually below, or click Sync
-        to pull newly-released upstream models.
+        {t("description")}
       </p>
       {isLoading ? (
-        <p className="text-xs text-muted-foreground">Loading…</p>
+        <p className="text-xs text-muted-foreground">{t("loading")}</p>
       ) : models.length === 0 ? (
         <p className="text-xs text-muted-foreground italic">
-          No models registered yet.
+          {t("empty")}
         </p>
       ) : (
         <>
@@ -411,11 +405,11 @@ function ModelsPanel({ providerId }: { providerId: string }) {
                       selectedCount > 0 && selectedCount < models.length;
                 }}
                 onChange={toggleAll}
-                aria-label="Select all models"
+                aria-label={t("selectAllAria")}
               />
               {selectedCount > 0
-                ? `${selectedCount} selected`
-                : `Select all (${models.length})`}
+                ? t("selectedCount", { count: selectedCount })
+                : t("selectAllCount", { count: models.length })}
             </label>
             {selectedCount > 0 && (
               <Button
@@ -426,8 +420,8 @@ function ModelsPanel({ providerId }: { providerId: string }) {
                 disabled={bulkDelete.isPending}
               >
                 {bulkDelete.isPending
-                  ? "Deleting…"
-                  : `Delete selected (${selectedCount})`}
+                  ? t("deleting")
+                  : t("deleteSelected", { count: selectedCount })}
               </Button>
             )}
           </div>
@@ -442,7 +436,7 @@ function ModelsPanel({ providerId }: { providerId: string }) {
                     type="checkbox"
                     checked={selected.has(m.name)}
                     onChange={() => toggleOne(m.name)}
-                    aria-label={`Select ${m.name}`}
+                    aria-label={t("selectAria", { name: m.name })}
                   />
                   <span className="truncate font-mono">{m.name}</span>
                 </label>
@@ -450,14 +444,14 @@ function ModelsPanel({ providerId }: { providerId: string }) {
                   type="button"
                   onClick={() =>
                     remove.mutate(m.name, {
-                      onSuccess: () => toast.success(`Removed ${m.name}`),
+                      onSuccess: () => toast.success(t("removed", { name: m.name })),
                       onError: (e) => toast.error(e.message),
                     })
                   }
                   className="shrink-0 text-destructive hover:underline"
                   disabled={remove.isPending}
                 >
-                  Remove
+                  {t("remove")}
                 </button>
               </li>
             ))}
@@ -468,7 +462,7 @@ function ModelsPanel({ providerId }: { providerId: string }) {
         <Input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Model name (e.g. gemini-2.5-flash)"
+          placeholder={t("addPlaceholder")}
           className="text-xs"
         />
         <Button
@@ -477,7 +471,7 @@ function ModelsPanel({ providerId }: { providerId: string }) {
           variant="outline"
           disabled={add.isPending || !name.trim()}
         >
-          {add.isPending ? "Adding…" : "Add"}
+          {add.isPending ? t("adding") : t("add")}
         </Button>
       </form>
     </div>
