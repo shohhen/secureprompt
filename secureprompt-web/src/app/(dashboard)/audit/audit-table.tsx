@@ -12,6 +12,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useRouter } from "next/navigation";
 import { useRequestsPage } from "@/lib/hooks/use-requests";
 import { Badge } from "@/components/ui/badge";
@@ -37,6 +38,7 @@ const ACTION_VARIANT: Record<
 
 export function AuditTable({ workspaceId }: Props) {
   const router = useRouter();
+  const t = useTranslations("audit");
   const [violationsOnly, setViolationsOnly] = useState(false);
   // Stack of cursors visited. Empty = page 1. push = Next, pop = Prev.
   // The cursor is what the *current* page was loaded with — so the
@@ -75,22 +77,22 @@ export function AuditTable({ workspaceId }: Props) {
           <Switch
             checked={violationsOnly}
             onCheckedChange={onFilterChange}
-            aria-label="Only violations"
+            aria-label={t("onlyViolations")}
           />
-          <Label>Only violations</Label>
+          <Label>{t("onlyViolations")}</Label>
         </div>
         <p className="text-xs text-muted-foreground">
-          Page {pageNumber}
-          {violationsOnly ? " — violations only" : ""}
-          {isFetching ? " — loading…" : ""}
+          {t("pageIndicator", { page: pageNumber })}
+          {violationsOnly ? t("pageIndicatorViolations") : ""}
+          {isFetching ? t("pageIndicatorLoading") : ""}
         </p>
       </div>
 
       {isLoading && (
-        <p className="text-sm text-muted-foreground">Loading audit log…</p>
+        <p className="text-sm text-muted-foreground">{t("loading")}</p>
       )}
       {error && (
-        <p className="text-sm text-destructive">Failed to load audit log.</p>
+        <p className="text-sm text-destructive">{t("loadFailed")}</p>
       )}
 
       {!isLoading && !error && (
@@ -98,14 +100,14 @@ export function AuditTable({ workspaceId }: Props) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
-                <th className="px-4 py-3 text-left font-medium">Time</th>
-                <th className="px-4 py-3 text-left font-medium">Provider</th>
-                <th className="px-4 py-3 text-left font-medium">Model</th>
-                <th className="px-4 py-3 text-left font-medium">Action</th>
-                <th className="px-4 py-3 text-left font-medium">Violation</th>
-                <th className="px-4 py-3 text-right font-medium">In</th>
-                <th className="px-4 py-3 text-right font-medium">Out</th>
-                <th className="px-4 py-3 text-right font-medium">Cost (USD)</th>
+                <th className="px-4 py-3 text-left font-medium">{t("colTime")}</th>
+                <th className="px-4 py-3 text-left font-medium">{t("colProvider")}</th>
+                <th className="px-4 py-3 text-left font-medium">{t("colModel")}</th>
+                <th className="px-4 py-3 text-left font-medium">{t("colAction")}</th>
+                <th className="px-4 py-3 text-left font-medium">{t("colViolation")}</th>
+                <th className="px-4 py-3 text-right font-medium">{t("colIn")}</th>
+                <th className="px-4 py-3 text-right font-medium">{t("colOut")}</th>
+                <th className="px-4 py-3 text-right font-medium">{t("colCost")}</th>
               </tr>
             </thead>
             <tbody>
@@ -115,9 +117,7 @@ export function AuditTable({ workspaceId }: Props) {
                     colSpan={8}
                     className="px-4 py-10 text-center text-sm text-muted-foreground"
                   >
-                    {violationsOnly
-                      ? "No violations recorded yet."
-                      : "No gateway traffic recorded yet."}
+                    {violationsOnly ? t("emptyViolations") : t("empty")}
                   </td>
                 </tr>
               )}
@@ -143,7 +143,7 @@ export function AuditTable({ workspaceId }: Props) {
                   </td>
                   <td className="px-4 py-3">
                     {r.has_violation ? (
-                      <Badge variant="destructive">violation</Badge>
+                      <Badge variant="destructive">{t("violation")}</Badge>
                     ) : (
                       <span className="text-xs text-muted-foreground">—</span>
                     )}
@@ -172,10 +172,10 @@ export function AuditTable({ workspaceId }: Props) {
             disabled={!hasPrev || isFetching}
             onClick={() => setCursorStack((s) => s.slice(0, -1))}
           >
-            ← Previous
+            {t("previous")}
           </Button>
           <span className="text-xs text-muted-foreground">
-            Page {pageNumber} · {rows.length} row{rows.length === 1 ? "" : "s"}
+            {t("pageAndRows", { page: pageNumber, count: rows.length })}
           </span>
           <Button
             variant="outline"
@@ -186,7 +186,7 @@ export function AuditTable({ workspaceId }: Props) {
               if (next) setCursorStack((s) => [...s, next]);
             }}
           >
-            Next →
+            {t("next")}
           </Button>
         </div>
       )}

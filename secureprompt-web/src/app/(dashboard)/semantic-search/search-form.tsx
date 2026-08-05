@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 
 interface RagMatch {
@@ -15,6 +16,7 @@ interface RagResult {
 
 export function SearchForm() {
   const { data: session } = useSession();
+  const t = useTranslations("semanticSearch");
   const [text, setText] = useState("");
   const [result, setResult] = useState<RagResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -24,7 +26,7 @@ export function SearchForm() {
     e.preventDefault();
     if (!text.trim()) return;
     if (!session?.workspaceId) {
-      setError("No active workspace — sign in again.");
+      setError(t("noWorkspace"));
       return;
     }
 
@@ -44,7 +46,9 @@ export function SearchForm() {
       }
       setResult(await res.json());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Search failed");
+      // A transport message from the proxy is not ours to localise; only the
+      // generic fallback is.
+      setError(err instanceof Error ? err.message : t("searchFailed"));
     } finally {
       setLoading(false);
     }
@@ -55,14 +59,14 @@ export function SearchForm() {
       <form onSubmit={handleSubmit} className="rounded-lg border p-6 space-y-4">
         <div>
           <label className="block text-sm font-medium mb-1" htmlFor="prompt-input">
-            Prompt text
+            {t("promptLabel")}
           </label>
           <textarea
             id="prompt-input"
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={4}
-            placeholder="Enter a prompt to check against indexed policy rules…"
+            placeholder={t("promptPlaceholder")}
             className="w-full rounded-md border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
           />
         </div>
@@ -71,7 +75,7 @@ export function SearchForm() {
           disabled={loading || !text.trim()}
           className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
-          {loading ? "Searching…" : "Check Prompt"}
+          {loading ? t("searching") : t("checkPrompt")}
         </button>
       </form>
 
@@ -84,7 +88,7 @@ export function SearchForm() {
       {result && (
         <div className="rounded-lg border p-6 space-y-4">
           <div className="flex items-center gap-3">
-            <h2 className="font-semibold">Results</h2>
+            <h2 className="font-semibold">{t("resultsTitle")}</h2>
             <span
               className={`rounded-full px-3 py-1 text-xs font-medium ${
                 result.is_match
@@ -92,7 +96,7 @@ export function SearchForm() {
                   : "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
               }`}
             >
-              {result.is_match ? "Policy Match" : "No Match"}
+              {result.is_match ? t("policyMatch") : t("noMatch")}
             </span>
           </div>
 
@@ -102,13 +106,13 @@ export function SearchForm() {
                 <div key={m.rule_id} className="flex items-center justify-between px-4 py-3">
                   <span className="font-mono text-xs text-muted-foreground">{m.rule_id}</span>
                   <span className="text-sm font-medium">
-                    {(m.score * 100).toFixed(1)}% match
+                    {t("scoreMatch", { score: (m.score * 100).toFixed(1) })}
                   </span>
                 </div>
               ))}
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">No policy rules matched.</p>
+            <p className="text-sm text-muted-foreground">{t("noMatches")}</p>
           )}
         </div>
       )}
