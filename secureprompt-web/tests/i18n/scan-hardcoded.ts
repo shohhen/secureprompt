@@ -41,6 +41,10 @@ export const RULE_JSX_TEXT = "jsx-text";
 export const RULE_VISIBLE_ATTR = "visible-attr";
 export const RULE_PROSE = "prose-attr";
 export const RULE_TOAST = "toast-literal";
+/** `{cond ? "Sign in" : "Signing in…"}` — a literal rendered as a JSX child. */
+export const RULE_JSX_EXPR = "jsx-expression-literal";
+/** `new FileScanError("Model still loading — try again in a moment.")`. */
+export const RULE_ERROR_PROSE = "error-prose";
 
 /**
  * Attribute names that render to the user by definition.  This is the
@@ -130,22 +134,34 @@ const TOAST_METHODS = new Set([
 const HAS_LETTER = /\p{L}/u;
 /** Two or more whitespace-separated words, each carrying a letter. */
 const LOOKS_LIKE_PROSE = /\p{L}[\p{L}'’]*\s+\p{L}/u;
+/**
+ * Shape of a literal a user could plausibly read: a phrase, or a word that
+ * starts capitalised. Deliberately excludes lowercase single tokens, which is
+ * what config values look like (`"outline"`, `"yyyy-MM-dd"`, `"numeric"`).
+ */
+const LOOKS_USER_FACING = /^\p{Lu}|\p{L}\s+\p{L}|…$/u;
 
-/** Recursively list `.tsx` files under a root, ignoring nothing. */
-function walkTsx(absRoot: string, out: string[] = []): string[] {
+/** Recursively list source files under a root, ignoring nothing. */
+function walkSource(absRoot: string, out: string[] = []): string[] {
   if (!fs.existsSync(absRoot)) return out;
   for (const entry of fs.readdirSync(absRoot, { withFileTypes: true })) {
     const abs = path.join(absRoot, entry.name);
-    if (entry.isDirectory()) walkTsx(abs, out);
-    else if (entry.isFile() && abs.endsWith(".tsx")) out.push(abs);
+    if (entry.isDirectory()) walkSource(abs, out);
+    else if (entry.isFile() && (abs.endsWith(".tsx") || abs.endsWith(".ts"))) out.push(abs);
   }
   return out;
 }
 
-/** Every `.tsx` under the scanned roots, sorted for stable output. */
+/**
+ * Every `.ts`/`.tsx` under the scanned roots, sorted for stable output.
+ *
+ * `.ts` is included because the file-scan failure copy lives in
+ * `file-scan-api.ts`, not in a component — a scanner that only reads `.tsx`
+ * cannot see it, which is precisely the invisible failure this guards against.
+ */
 export function scannedFiles(): string[] {
   const files: string[] = [];
-  for (const root of SCANNED_ROOTS) walkTsx(path.join(WEB_ROOT, root), files);
+  for (const root of SCANNED_ROOTS) walkSource(path.join(WEB_ROOT, root), files);
   return files.sort();
 }
 
@@ -159,7 +175,32 @@ function literalOf(init: ts.Node | undefined): string | null {
   if (ts.isStringLiteral(init)) return init.text;
   if (ts.isNoSubstitutionTemplateLiteral(init)) return init.text;
   if (ts.isJsxExpression(init) && init.expression) return literalOf(init.expression);
+  // `aria-label={`${label} token usage`}` — the interpolations are data, but
+  // the fixed parts are copy, so join them and judge that.
+  if (ts.isTemplateExpression(init)) {
+    return [init.head.text, ...init.templateSpans.map((s) => s.literal.text)].join(" ");
+  }
   return null;
+}
+
+/**
+ * True when `node` is rendered as a JSX child rather than sitting in an
+ * attribute — i.e. a user reads it. Walks up to the nearest JsxExpression and
+ * checks that the expression is a child position.
+ */
+function insideJsxChildExpression(node: ts.Node): boolean {
+  for (let cur = node.parent; cur; cur = cur.parent) {
+    if (ts.isJsxAttribute(cur)) return false;
+    if (ts.isJsxExpression(cur)) {
+      const owner = cur.parent;
+      return (
+        !!owner &&
+        (ts.isJsxElement(owner) || ts.isJsxFragment(owner) || ts.isJsxSelfClosingElement(owner))
+      );
+    }
+    if (ts.isJsxElement(cur) || ts.isJsxFragment(cur)) return false;
+  }
+  return false;
 }
 
 function isExempt(lines: string[], lineIndex: number): boolean {
@@ -196,6 +237,24 @@ export function scanSource(relPath: string, source: string): Violation[] {
         } else if (!NEVER_PROSE_ATTRS.has(name) && LOOKS_LIKE_PROSE.test(value)) {
           record(node, RULE_PROSE, `${name}="${value}"`);
         }
+      }
+    }
+
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      HAS_LETTER.test(node.text) &&
+      LOOKS_USER_FACING.test(node.text) &&
+      insideJsxChildExpression(node)
+    ) {
+      record(node, RULE_JSX_EXPR, node.text);
+    }
+
+    // `new SomeError("prose")` — user-facing failure copy that never reaches a
+    // component, so no JSX rule would ever see it.
+    if (ts.isNewExpression(node) && /Error$/.test(node.expression.getText(sf))) {
+      const value = literalOf(node.arguments?.[0]);
+      if (value !== null && LOOKS_LIKE_PROSE.test(value)) {
+        record(node, RULE_ERROR_PROSE, `new ${node.expression.getText(sf)}("${value}")`);
       }
     }
 
