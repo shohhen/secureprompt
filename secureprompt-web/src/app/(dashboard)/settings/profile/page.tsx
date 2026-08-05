@@ -1,13 +1,14 @@
+import { getTranslations } from "next-intl/server";
 import { ProfileForm } from "./profile-form";
 
-export default function ProfileSettingsPage() {
+export default async function ProfileSettingsPage() {
+  const t = await getTranslations("profileSettings");
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-lg font-medium">Profile</h2>
+        <h2 className="text-lg font-medium">{t("title")}</h2>
         <p className="text-sm text-muted-foreground">
-          Personal info displayed in the dashboard. Email and role are
-          managed by the workspace owner — contact them to change either.
+          {t("description")}
         </p>
       </div>
       <ProfileForm />

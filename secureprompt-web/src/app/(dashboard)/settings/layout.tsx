@@ -3,25 +3,29 @@
  */
 
 import Link from "next/link";
+import { getTranslations } from "next-intl/server";
 import type { ReactNode } from "react";
 
+/** `key` indexes the `settingsNav` namespace. */
 const NAV_ITEMS = [
-  { href: "/settings/keys", label: "API Keys" },
-  { href: "/settings/providers", label: "Providers" },
-  { href: "/settings/policy-rules", label: "Policy Rules" },
-  { href: "/settings/workspace", label: "Workspace" },
-  { href: "/settings/members", label: "Members" },
-  { href: "/settings/security", label: "Security" },
-  { href: "/settings/license", label: "License" },
-];
+  { href: "/settings/keys", key: "keys" },
+  { href: "/settings/providers", key: "providers" },
+  { href: "/settings/policy-rules", key: "policyRules" },
+  { href: "/settings/workspace", key: "workspace" },
+  { href: "/settings/members", key: "members" },
+  { href: "/settings/security", key: "security" },
+  { href: "/settings/license", key: "license" },
+] as const;
 
-export default function SettingsLayout({ children }: { children: ReactNode }) {
+export default async function SettingsLayout({ children }: { children: ReactNode }) {
+  const t = await getTranslations("settings");
+  const tNav = await getTranslations("settingsNav");
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Settings</h1>
+        <h1 className="text-2xl font-semibold">{t("title")}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Manage API keys, AI providers, and policy enforcement rules.
+          {t("description")}
         </p>
       </div>
 
@@ -33,7 +37,7 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
             href={item.href}
             className="px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-t-md transition-colors"
           >
-            {item.label}
+            {tNav(item.key)}
           </Link>
         ))}
       </nav>

@@ -515,6 +515,43 @@ test:
       bash scripts/ci/rust-test-gate.sh
 
 # ---------------------------------------------------------------------------
+# WS6-3 — the console i18n gates.
+#
+# Deliberately NOT `pnpm test`. The full web suite is red today (3 failures in
+# keys.test.tsx > CreateKeyDialog, tracked as WS6-1-FU4) and a job that is red
+# on the day it lands gets ignored and then deleted — four .github workflows
+# in this repo died that way. This runs the two i18n files only, which are
+# green, so a failure here always means someone broke i18n.
+#
+# What it actually enforces:
+#   - i18n-no-hardcoded-strings walks src/app and src/components on disk and
+#     parses each .ts/.tsx with the TypeScript AST, so a component added in a
+#     later commit is scanned without anyone editing the test;
+#   - i18n-key-parity asserts ru has exactly the keys en has (missing OR
+#     orphan both fail), that a missing key throws rather than falling back,
+#     and that every t() key the console asks for exists in en.
+# ---------------------------------------------------------------------------
+web-i18n:
+  stage: test
+  image: node:22-alpine
+  needs: []
+  before_script:
+    # Pinned, not bare `corepack enable`: corepack otherwise activates the
+    # latest pnpm (11.x), whose stricter lockfile policy rejects the v10
+    # lockfile in this repo outright. Verified by running this job in
+    # node:22-alpine — unpinned it fails before a single test executes.
+    - corepack enable
+    - corepack prepare pnpm@10.6.3 --activate
+    - cd secureprompt-web
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm vitest run tests/unit/i18n-no-hardcoded-strings.test.ts tests/unit/i18n-key-parity.test.ts
+  rules:
+    - changes:
+        - secureprompt-web/**/*
+        - .gitlab-ci.yml
+
+# ---------------------------------------------------------------------------
 # WS2-5 — the deterministic detection floor's latency budget.
 #
 # WHAT RUNS HERE, AND WHAT DELIBERATELY DOES NOT

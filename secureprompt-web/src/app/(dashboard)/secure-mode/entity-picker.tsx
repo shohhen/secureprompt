@@ -10,6 +10,7 @@
  */
 
 import { useMemo } from "react";
+import { useTranslations } from "next-intl";
 import { Label } from "@/components/ui/label";
 
 export interface EntityGroup {
@@ -84,6 +85,7 @@ interface Props {
 }
 
 export function EntityPicker({ value, onChange, disabled }: Props) {
+  const t = useTranslations("entityPicker");
   const totalSelected = value.size;
   const total = ALL_ENTITY_VALUES.length;
 
@@ -98,16 +100,16 @@ export function EntityPicker({ value, onChange, disabled }: Props) {
   const selectNone = () => onChange(new Set());
 
   const summary = useMemo(() => {
-    if (totalSelected === 0) return "No types selected — nothing will redact.";
-    if (totalSelected === total) return "All PII types (backend default).";
-    return `${totalSelected} of ${total} types.`;
-  }, [totalSelected, total]);
+    if (totalSelected === 0) return t("summaryNone");
+    if (totalSelected === total) return t("summaryAll");
+    return t("summarySome", { selected: totalSelected, total });
+  }, [t, totalSelected, total]);
 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <div>
-          <Label className="text-sm font-medium">PII types to redact</Label>
+          <Label className="text-sm font-medium">{t("title")}</Label>
           <p className="text-xs text-muted-foreground">{summary}</p>
         </div>
         <div className="flex gap-2 text-xs">
@@ -117,7 +119,7 @@ export function EntityPicker({ value, onChange, disabled }: Props) {
             disabled={disabled}
             className="underline text-muted-foreground hover:text-foreground disabled:opacity-50"
           >
-            Select all
+            {t("selectAll")}
           </button>
           <span className="text-muted-foreground">·</span>
           <button
@@ -126,7 +128,7 @@ export function EntityPicker({ value, onChange, disabled }: Props) {
             disabled={disabled}
             className="underline text-muted-foreground hover:text-foreground disabled:opacity-50"
           >
-            Clear
+            {t("clear")}
           </button>
         </div>
       </div>

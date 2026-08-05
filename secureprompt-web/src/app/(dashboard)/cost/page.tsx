@@ -3,6 +3,7 @@
  */
 
 import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
 import { getServerSession } from "@/lib/session";
 import { CostChart } from "./cost-chart";
 import type { MartName } from "@/lib/mart-exposures";
@@ -13,13 +14,14 @@ export const MART_EXPOSURES: MartName[] = ["mart_cost_by_model"];
 export default async function CostPage() {
   const session = await getServerSession();
   if (!session) redirect("/login?reason=unauthenticated");
+  const t = await getTranslations("cost");
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Cost by Model</h1>
+        <h1 className="text-2xl font-semibold">{t("title")}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Daily and rolling 7-day cost breakdown by AI model.
+          {t("description")}
         </p>
       </div>
       <CostChart workspaceId={session.workspaceId} />

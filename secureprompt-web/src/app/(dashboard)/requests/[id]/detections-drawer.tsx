@@ -8,6 +8,7 @@
  */
 
 import type { PolicyEventSummary } from "@/lib/hooks/use-requests";
+import { useTranslations } from "next-intl";
 
 interface DetectionsDrawerProps {
   events: PolicyEventSummary[];
@@ -22,6 +23,7 @@ const ACTION_COLORS: Record<string, string> = {
 };
 
 function DetectionChip({ event }: { event: PolicyEventSummary }) {
+  const t = useTranslations("requestDetail");
   const colorClass =
     ACTION_COLORS[event.action] ?? "bg-muted text-muted-foreground border-border";
 
@@ -34,17 +36,18 @@ function DetectionChip({ event }: { event: PolicyEventSummary }) {
       {/* Rule name — plain React text node, no innerHTML */}
       {event.rule_name}
       {event.dry_run && (
-        <span className="opacity-60">(dry-run)</span>
+        <span className="opacity-60">{t("dryRunChip")}</span>
       )}
     </mark>
   );
 }
 
 export function DetectionsDrawer({ events }: DetectionsDrawerProps) {
+  const t = useTranslations("requestDetail");
   if (events.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        No policy events for this request.
+        {t("noPolicyEvents")}
       </p>
     );
   }
@@ -52,7 +55,7 @@ export function DetectionsDrawer({ events }: DetectionsDrawerProps) {
   return (
     <div className="space-y-2">
       <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-        Policy Events
+        {t("policyEvents")}
       </p>
       <div className="flex flex-wrap gap-2">
         {events.map((ev) => (

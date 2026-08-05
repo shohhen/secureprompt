@@ -1,7 +1,13 @@
 "use client";
 
 import { useState, useRef } from "react";
-import { scanFile, secureFile, type ScanResult } from "./file-scan-api";
+import { useTranslations } from "next-intl";
+import {
+  FileScanError,
+  scanFile,
+  secureFile,
+  type ScanResult,
+} from "./file-scan-api";
 
 interface SecureSummary {
   entities_count: number;
@@ -12,6 +18,7 @@ interface SecureSummary {
 }
 
 export function FileScanForm() {
+  const t = useTranslations("fileScan");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -19,6 +26,19 @@ export function FileScanForm() {
   const [secured, setSecured] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const busy = scanning || securing;
+
+  /**
+   * FileScanError carries a catalogue key; anything else is unexpected and
+   * falls back to the action's generic failure copy.
+   */
+  function messageFor(err: unknown, fallback: "scanFailed" | "secureFailed"): string {
+    if (err instanceof FileScanError) {
+      return err.status
+        ? t(`error.${err.code}`, { status: err.status })
+        : t(`error.${err.code}`, { status: "" });
+    }
+    return t(`error.${fallback}`, { status: "" });
+  }
 
   async function handleScan(e: React.FormEvent) {
     e.preventDefault();
@@ -33,7 +53,7 @@ export function FileScanForm() {
     try {
       setResult(await scanFile(file));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Scan failed");
+      setError(messageFor(err, "scanFailed"));
     } finally {
       setScanning(false);
     }
@@ -42,7 +62,7 @@ export function FileScanForm() {
   async function handleSecure() {
     const file = fileRef.current?.files?.[0];
     if (!file) {
-      setError("Choose a file first.");
+      setError(t("chooseFileFirst"));
       return;
     }
 
@@ -58,9 +78,9 @@ export function FileScanForm() {
         defaultSecuredName(file.name),
       );
       triggerDownload(blob, filename);
-      setSecured(secureConfirmation(summaryHeader, filename));
+      setSecured(secureConfirmation(t, summaryHeader, filename));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Securing failed");
+      setError(messageFor(err, "secureFailed"));
     } finally {
       setSecuring(false);
     }
@@ -71,7 +91,7 @@ export function FileScanForm() {
       <form onSubmit={handleScan} className="rounded-lg border p-6 space-y-4">
         <div>
           <label className="block text-sm font-medium mb-1" htmlFor="file-input">
-            Select a file
+            {t("selectFile")}
           </label>
           <input
             id="file-input"
@@ -81,7 +101,7 @@ export function FileScanForm() {
             className="block w-full text-sm text-muted-foreground file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-primary file:text-primary-foreground hover:file:bg-primary/90"
           />
           <p className="text-xs text-muted-foreground mt-1">
-            Scan reads .txt, .pdf, .docx. Secure &amp; download also supports images and .xlsx (max 15 MB).
+            {t("acceptedFormats")}
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
@@ -90,7 +110,7 @@ export function FileScanForm() {
             disabled={busy}
             className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            {scanning ? "Scanning…" : "Scan File"}
+            {scanning ? t("scanning") : t("scanFile")}
           </button>
           <button
             type="button"
@@ -98,13 +118,11 @@ export function FileScanForm() {
             disabled={busy}
             className="rounded-md border border-primary px-4 py-2 text-sm font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
           >
-            {securing ? "Securing…" : "Secure & Download"}
+            {securing ? t("securing") : t("secureAndDownload")}
           </button>
         </div>
         <p className="text-xs text-muted-foreground">
-          Securing redacts PII &amp; secrets in place, covering each value with a
-          labelled black box, and returns the file in its original format. The
-          redaction is one-way — the original text is removed, not hidden.
+          {t("secureExplainer")}
         </p>
       </form>
 
@@ -122,19 +140,18 @@ export function FileScanForm() {
 
       {result && (
         <div className="rounded-lg border p-6 space-y-4">
-          <h2 className="font-semibold">Scan Results</h2>
+          <h2 className="font-semibold">{t("resultsTitle")}</h2>
           <div className="grid grid-cols-3 gap-4">
-            <Flag label="PII Found" active={result.pii_found} />
-            <Flag label="Secrets Found" active={result.secrets_found} />
-            <Flag label="Injection Detected" active={result.injection_detected} />
+            <Flag label={t("piiFound")} active={result.pii_found} />
+            <Flag label={t("secretsFound")} active={result.secrets_found} />
+            <Flag label={t("injectionDetected")} active={result.injection_detected} />
           </div>
           {result.entities.length > 0 && (
             <div>
               <p className="text-sm font-medium mb-2">
-                Detected Entities{" "}
+                {t("detectedEntities")}{" "}
                 <span className="text-muted-foreground font-normal">
-                  ({result.entities.length} occurrence
-                  {result.entities.length === 1 ? "" : "s"})
+                  {t("occurrenceCount", { count: result.entities.length })}
                 </span>
               </p>
               <div className="flex flex-wrap gap-2">
@@ -142,9 +159,14 @@ export function FileScanForm() {
                   <span
                     key={`${e.label}|${e.text}`}
                     className="rounded-full bg-muted px-3 py-1 text-xs"
-                    title={`max score: ${e.score.toFixed(2)}${
-                      e.count > 1 ? ` · ${e.count} occurrences` : ""
-                    }`}
+                    title={
+                      e.count > 1
+                        ? t("entityTitleRepeated", {
+                            score: e.score.toFixed(2),
+                            count: e.count,
+                          })
+                        : t("entityTitle", { score: e.score.toFixed(2) })
+                    }
                   >
                     <span className="font-medium">{e.label}</span>: {e.text}
                     {e.count > 1 && (
@@ -159,7 +181,7 @@ export function FileScanForm() {
           )}
           {result.redacted_text && (
             <div>
-              <p className="text-sm font-medium mb-2">Redacted Preview</p>
+              <p className="text-sm font-medium mb-2">{t("redactedPreview")}</p>
               <pre className="rounded bg-muted p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto">
                 {result.redacted_text}
               </pre>
@@ -193,21 +215,30 @@ function defaultSecuredName(name: string): string {
   return `${stem}-secured${ext}`;
 }
 
-function secureConfirmation(summaryHeader: string | null, filename: string): string {
-  let detail = "";
+/**
+ * Built from ICU messages rather than string concatenation: Russian needs
+ * one/few/many for both the entity and page counts, which no amount of
+ * `n === 1 ? "" : "s"` can express.
+ */
+function secureConfirmation(
+  t: ReturnType<typeof useTranslations<"fileScan">>,
+  summaryHeader: string | null,
+  filename: string,
+): string {
   if (summaryHeader) {
     try {
       const s = JSON.parse(summaryHeader) as SecureSummary;
-      const n = s.entities_count;
-      detail =
-        ` — ${n} ${n === 1 ? "entity" : "entities"} redacted` +
-        (s.pages ? ` across ${s.pages} page${s.pages === 1 ? "" : "s"}` : "") +
-        (s.ocr_used ? " (OCR)" : "");
+      return t("securedWithDetail", {
+        filename,
+        count: s.entities_count,
+        pages: s.pages ?? 0,
+        ocr: s.ocr_used ? "yes" : "no",
+      });
     } catch {
       /* header malformed — fall back to a plain confirmation */
     }
   }
-  return `✓ Secured${detail}. Downloaded ${filename}.`;
+  return t("secured", { filename });
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -248,14 +279,16 @@ function dedupeEntities(entities: RawEntity[]): DedupedEntity[] {
   });
 }
 
+/** `label` arrives already translated from the caller. */
 function Flag({ label, active }: { label: string; active: boolean }) {
+  const t = useTranslations("common");
   return (
     <div className="rounded-md border p-3 text-center">
       <p className="text-xs text-muted-foreground mb-1">{label}</p>
       <span
         className={`text-sm font-semibold ${active ? "text-destructive" : "text-green-600 dark:text-green-400"}`}
       >
-        {active ? "Yes" : "No"}
+        {active ? t("yes") : t("no")}
       </span>
     </div>
   );

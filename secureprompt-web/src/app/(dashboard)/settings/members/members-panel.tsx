@@ -10,6 +10,7 @@
  */
 
 import { useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import type { ColumnDef } from "@tanstack/react-table";
 import { DataTable } from "@/components/data-table/data-table";
@@ -30,6 +31,7 @@ const ROLE_BADGE_VARIANT: Record<AppRole, "default" | "secondary" | "outline"> =
 
 export function MembersPanel() {
   const { data: session } = useSession();
+  const t = useTranslations("members");
   const canInvite = !!session?.role && ADMIN_ROLES.includes(session.role);
   const { data: users, isLoading } = useUsers();
 
@@ -37,14 +39,14 @@ export function MembersPanel() {
     return [
       {
         accessorKey: "email",
-        header: "Email",
+        header: t("colEmail"),
         cell: ({ row, getValue }) => {
           const isSelf = row.original.id === session?.user?.id;
           return (
             <span className="font-medium">
               {getValue<string>()}
               {isSelf && (
-                <span className="ml-2 text-xs text-muted-foreground">(you)</span>
+                <span className="ml-2 text-xs text-muted-foreground">{t("you")}</span>
               )}
             </span>
           );
@@ -52,7 +54,7 @@ export function MembersPanel() {
       },
       {
         accessorKey: "role",
-        header: "Role",
+        header: t("colRole"),
         cell: ({ getValue }) => {
           const role = getValue<AppRole>();
           return (
@@ -62,7 +64,7 @@ export function MembersPanel() {
       },
       {
         accessorKey: "created_at",
-        header: "Joined",
+        header: t("colJoined"),
         cell: ({ getValue }) => (
           <span className="text-xs text-muted-foreground">
             {new Date(getValue<string>()).toLocaleDateString()}
@@ -70,16 +72,15 @@ export function MembersPanel() {
         ),
       },
     ];
-  }, [session?.user?.id])();
+  }, [session?.user?.id, t])();
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-medium">Workspace Members</h2>
+          <h2 className="text-lg font-medium">{t("title")}</h2>
           <p className="text-sm text-muted-foreground">
-            Everyone with access to this workspace. Admins can invite new
-            members.
+            {t("description")}
           </p>
         </div>
         {canInvite && <InviteUserDialog />}
@@ -89,7 +90,7 @@ export function MembersPanel() {
         columns={columns}
         data={users ?? []}
         isLoading={isLoading}
-        emptyMessage="No members yet."
+        emptyMessage={t("empty")}
       />
     </div>
   );

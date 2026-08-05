@@ -6,6 +6,7 @@
  */
 
 import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
 import { getServerSession } from "@/lib/session";
 import { RequestDetailView } from "./request-detail-view";
 
@@ -20,11 +21,12 @@ export default async function RequestDetailPage({
   if (!session) redirect("/login?reason=unauthenticated");
 
   const { id } = await params;
+  const t = await getTranslations("requestDetail");
 
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Request Detail</h1>
+        <h1 className="text-2xl font-semibold">{t("title")}</h1>
         <p className="text-sm text-muted-foreground mt-1 font-mono">{id}</p>
       </div>
       <RequestDetailView requestId={id} workspaceId={session.workspaceId} />

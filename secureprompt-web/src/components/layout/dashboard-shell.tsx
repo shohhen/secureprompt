@@ -1,6 +1,7 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 import { usePathname } from "next/navigation";
 import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { Sidebar } from "@/components/layout/sidebar";
@@ -14,6 +15,7 @@ interface DashboardShellProps {
 }
 
 export function DashboardShell({ children, workspaceId }: DashboardShellProps) {
+  const t = useTranslations("header");
   const pathname = usePathname();
   const [desktopCollapsed, setDesktopCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -49,7 +51,7 @@ export function DashboardShell({ children, workspaceId }: DashboardShellProps) {
         {mobileOpen && (
           <button
             type="button"
-            aria-label="Close sidebar"
+            aria-label={t("closeSidebar")}
             className="fixed inset-0 z-20 bg-black/45 md:hidden"
             onClick={() => setMobileOpen(false)}
           />

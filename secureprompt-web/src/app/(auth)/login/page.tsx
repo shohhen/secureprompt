@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
 import { auth } from "@/lib/auth";
 import {
   Card,
@@ -27,6 +28,7 @@ function resolveCallbackUrl(
 }
 
 export default async function LoginPage({ searchParams }: LoginPageProps) {
+  const t = await getTranslations("login");
   const params = await searchParams;
   const callbackUrl = resolveCallbackUrl(params);
 
@@ -39,10 +41,9 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Sign in to SecurePrompt</CardTitle>
+        <CardTitle>{t("title")}</CardTitle>
         <CardDescription>
-          Access the SecurePrompt Console — redact secrets &amp; PII, enforce
-          policy, and monitor LLM usage, cost, and governance.
+          {t("subtitle")}
         </CardDescription>
       </CardHeader>
       <CardContent>

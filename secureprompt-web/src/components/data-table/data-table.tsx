@@ -10,6 +10,7 @@
  * optional empty-state slot. No dangerouslySetInnerHTML anywhere.
  */
 
+import { useTranslations } from "next-intl";
 import {
   flexRender,
   getCoreRowModel,
@@ -20,6 +21,7 @@ import {
 interface DataTableProps<TData> {
   columns: ColumnDef<TData>[];
   data: TData[];
+  /** Already-translated copy. Falls back to `common.noResults`. */
   emptyMessage?: string;
   isLoading?: boolean;
 }
@@ -27,9 +29,10 @@ interface DataTableProps<TData> {
 export function DataTable<TData>({
   columns,
   data,
-  emptyMessage = "No results.",
+  emptyMessage,
   isLoading = false,
 }: DataTableProps<TData>) {
+  const t = useTranslations("common");
   const table = useReactTable({
     data,
     columns,
@@ -62,7 +65,7 @@ export function DataTable<TData>({
                 colSpan={columns.length}
                 className="py-8 text-center text-muted-foreground"
               >
-                Loading…
+                {t("loading")}
               </td>
             </tr>
           ) : table.getRowModel().rows.length === 0 ? (
@@ -71,7 +74,7 @@ export function DataTable<TData>({
                 colSpan={columns.length}
                 className="py-8 text-center text-muted-foreground"
               >
-                {emptyMessage}
+                {emptyMessage ?? t("noResults")}
               </td>
             </tr>
           ) : (

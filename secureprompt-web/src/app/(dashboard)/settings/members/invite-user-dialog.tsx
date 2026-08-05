@@ -9,6 +9,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -23,16 +24,17 @@ import type { AppRole } from "@/types/next-auth";
 const ROLE_OPTIONS: AppRole[] = ["admin", "developer", "viewer"];
 
 const schema = z.object({
-  email: z.string().email("Valid email required"),
+  email: z.string().email("validation.emailRequired"),
   password: z
     .string()
-    .min(12, "At least 12 characters")
-    .max(128, "Max 128 characters"),
+    .min(12, "validation.passwordMin12")
+    .max(128, "validation.passwordMax128"),
   role: z.enum(["admin", "developer", "viewer"]),
 });
 type FormData = z.infer<typeof schema>;
 
 export function InviteUserDialog() {
+  const t = useTranslations("members");
   const [open, setOpen] = useState(false);
   const { mutateAsync, isPending } = useCreateUser();
 
@@ -49,10 +51,12 @@ export function InviteUserDialog() {
   async function onSubmit(values: FormData) {
     try {
       await mutateAsync(values);
-      toast.success(`Invited ${values.email}.`);
+      toast.success(t("invited", { email: values.email }));
       handleOpenChange(false);
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Failed to invite user.";
+      // A gateway message is already localised server-side; only the
+      // fallback is ours.
+      const message = e instanceof Error ? e.message : t("inviteFailed");
       toast.error(message);
     }
   }
@@ -60,28 +64,26 @@ export function InviteUserDialog() {
   return (
     <Dialog.Root open={open} onOpenChange={handleOpenChange}>
       <Dialog.Trigger asChild>
-        <Button size="sm">Invite member</Button>
+        <Button size="sm">{t("invite")}</Button>
       </Dialog.Trigger>
 
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg bg-background border shadow-lg p-6 space-y-4">
           <Dialog.Title className="text-lg font-semibold">
-            Invite workspace member
+            {t("inviteTitle")}
           </Dialog.Title>
           <Dialog.Description className="text-sm text-muted-foreground">
-            The new account is created immediately with the password you set —
-            share it with the member out-of-band and ask them to change it on
-            first login.
+            {t("inviteDescription")}
           </Dialog.Description>
 
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
             <div className="space-y-1.5">
-              <Label htmlFor="invite-email">Email</Label>
+              <Label htmlFor="invite-email">{t("email")}</Label>
               <Input
                 id="invite-email"
                 type="email"
-                placeholder="teammate@company.com"
+                placeholder={t("emailPlaceholder")}
                 autoComplete="off"
                 {...form.register("email")}
               />
@@ -93,7 +95,7 @@ export function InviteUserDialog() {
             </div>
 
             <div className="space-y-1.5">
-              <Label htmlFor="invite-password">Temporary password</Label>
+              <Label htmlFor="invite-password">{t("temporaryPassword")}</Label>
               <Input
                 id="invite-password"
                 type="password"
@@ -108,7 +110,7 @@ export function InviteUserDialog() {
             </div>
 
             <div className="space-y-1.5">
-              <Label htmlFor="invite-role">Role</Label>
+              <Label htmlFor="invite-role">{t("role")}</Label>
               <select
                 id="invite-role"
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-1"
@@ -121,19 +123,18 @@ export function InviteUserDialog() {
                 ))}
               </select>
               <p className="text-xs text-muted-foreground">
-                Owner role is assigned automatically at workspace creation and
-                cannot be granted from this form.
+                {t("ownerRoleHint")}
               </p>
             </div>
 
             <div className="flex justify-end gap-2 pt-2">
               <Dialog.Close asChild>
                 <Button variant="outline" size="sm" type="button">
-                  Cancel
+                  {t("cancel")}
                 </Button>
               </Dialog.Close>
               <Button size="sm" type="submit" disabled={isPending}>
-                {isPending ? "Inviting…" : "Send invite"}
+                {isPending ? t("inviting") : t("sendInvite")}
               </Button>
             </div>
           </form>
