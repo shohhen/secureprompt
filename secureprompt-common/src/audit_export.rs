@@ -623,7 +623,16 @@ pub const CONTROL_COVERAGE: &str =
      results are a summary of the document itself. If your control objective \
      is `which documents were scanned` or `what personal data they contained`, \
      this artifact does not meet it — it answers `who scanned, when, and how \
-     much`. Rows of `retention_purge_audit` whose \
+     much`. AND IT DOES NOT COVER EVERY SCAN IN THE PRODUCT. \
+     `file_scan.requested` records scans that went through the gateway's \
+     `POST /v1/scan-file` — the chat client's file uploads. The DASHBOARD's own \
+     file-scan page reaches the ML sidecar through a same-origin proxy in the \
+     web tier (`/api/proxy/ml/v1/scan-file`, and `/v1/secure-file` for the \
+     redacted-document download), which is session-authenticated and refuses \
+     the `viewer` role but writes NO ROW ANYWHERE. So a `file_scan.requested` \
+     count is a floor on the documents this workspace put through detection, \
+     not a total, and the absence of a row does not mean a document was not \
+     scanned. Rows of `retention_purge_audit` whose \
      `workspace_id` is NULL — \
      purge scopes that are not per-workspace, such as the token vault — are \
      excluded because they are not this tenant's records; the section's source \
