@@ -230,7 +230,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** p50/p95/p99 latency percentiles by model and workspace, daily */
+        /** p50/p95/p99 latency + TTFT percentiles by model, daily or hourly */
         get: operations["getLatencyPctiles"];
         put?: never;
         post?: never;
@@ -1588,8 +1588,59 @@ export interface components {
             p95_latency_ms: number;
             /** Format: double */
             p99_latency_ms: number;
+            /** Format: double */
+            p50_ttft_ms?: number;
+            /** Format: double */
+            p95_ttft_ms?: number;
+            /** Format: double */
+            p99_ttft_ms?: number;
+            /**
+             * Format: int64
+             * @description How many samples in the bucket carried a TTFT measurement. Zero means the three TTFT percentiles are `0.0` for want of data, not because latency was zero — render "—", not "0ms".
+             */
+            ttft_sample_count?: number;
             /** Format: int64 */
             sample_count: number;
+        };
+        LatencyPctilesHourlyRow: {
+            /** Format: uuid */
+            workspace_id: string;
+            model: string;
+            /** Format: date-time */
+            bucket_ts: string;
+            /** Format: double */
+            p50_latency_ms: number;
+            /** Format: double */
+            p95_latency_ms: number;
+            /** Format: double */
+            p99_latency_ms: number;
+            /** Format: double */
+            p50_ttft_ms: number;
+            /** Format: double */
+            p95_ttft_ms: number;
+            /** Format: double */
+            p99_ttft_ms: number;
+            /** Format: int64 */
+            ttft_sample_count: number;
+            /** Format: int64 */
+            sample_count: number;
+        };
+        LatencyPctilesResponse: components["schemas"]["LatencyPctilesDaily"] | components["schemas"]["LatencyPctilesHourly"];
+        LatencyPctilesDaily: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            bucket: "day";
+            rows: components["schemas"]["LatencyPctilesRow"][];
+        };
+        LatencyPctilesHourly: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            bucket: "hour";
+            rows: components["schemas"]["LatencyPctilesHourlyRow"][];
         };
         SecureMode: {
             enabled: boolean;
@@ -2536,6 +2587,8 @@ export interface operations {
                 /** @description IDOR guard — must equal the JWT workspace_id when provided */
                 workspace_id?: components["parameters"]["WorkspaceIdQuery"];
                 model?: string;
+                /** @description `day` (the default) returns daily mart rows keyed by `usage_date`; `hour` returns intra-day rows keyed by `bucket_ts`, capped at 31 days to bound the payload. */
+                bucket?: "day" | "hour";
             };
             header?: never;
             path?: never;
@@ -2543,13 +2596,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Latency percentile rows */
+            /** @description WS6-4 — this was documented as a bare array of daily rows. The handler returns `analytics::LatencyPctilesResponse`, a `#[serde(tag = "bucket")]` envelope, and always has; the console carried a hand-written interface for the real shape. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LatencyPctilesRow"][];
+                    "application/json": components["schemas"]["LatencyPctilesResponse"];
                 };
             };
             401: components["responses"]["Unauthorized"];

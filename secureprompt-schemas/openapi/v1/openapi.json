@@ -651,7 +651,7 @@
         "tags": [
           "Analytics"
         ],
-        "summary": "p50/p95/p99 latency percentiles by model and workspace, daily",
+        "summary": "p50/p95/p99 latency + TTFT percentiles by model, daily or hourly",
         "operationId": "getLatencyPctiles",
         "security": [
           {
@@ -675,18 +675,28 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "bucket",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "day",
+                "hour"
+              ]
+            },
+            "description": "`day` (the default) returns daily mart rows keyed by `usage_date`; `hour` returns intra-day rows keyed by `bucket_ts`, capped at 31 days to bound the payload."
           }
         ],
         "responses": {
           "200": {
-            "description": "Latency percentile rows",
+            "description": "WS6-4 — this was documented as a bare array of daily rows. The handler returns `analytics::LatencyPctilesResponse`, a `#[serde(tag = \"bucket\")]` envelope, and always has; the console carried a hand-written interface for the real shape.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/LatencyPctilesRow"
-                  }
+                  "$ref": "#/components/schemas/LatencyPctilesResponse"
                 }
               }
             }
@@ -4454,10 +4464,150 @@
             "type": "number",
             "format": "double"
           },
+          "p50_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "ttft_sample_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "How many samples in the bucket carried a TTFT measurement. Zero means the three TTFT percentiles are `0.0` for want of data, not because latency was zero — render \"—\", not \"0ms\"."
+          },
           "sample_count": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "LatencyPctilesHourlyRow": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "model",
+          "bucket_ts",
+          "p50_latency_ms",
+          "p95_latency_ms",
+          "p99_latency_ms",
+          "p50_ttft_ms",
+          "p95_ttft_ms",
+          "p99_ttft_ms",
+          "ttft_sample_count",
+          "sample_count"
+        ],
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "model": {
+            "type": "string"
+          },
+          "bucket_ts": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "p50_latency_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95_latency_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99_latency_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p50_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99_ttft_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "ttft_sample_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sample_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LatencyPctilesResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LatencyPctilesDaily"
+          },
+          {
+            "$ref": "#/components/schemas/LatencyPctilesHourly"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "bucket",
+          "mapping": {
+            "day": "#/components/schemas/LatencyPctilesDaily",
+            "hour": "#/components/schemas/LatencyPctilesHourly"
+          }
+        }
+      },
+      "LatencyPctilesDaily": {
+        "type": "object",
+        "required": [
+          "bucket",
+          "rows"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "enum": [
+              "day"
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LatencyPctilesRow"
+            }
+          }
+        }
+      },
+      "LatencyPctilesHourly": {
+        "type": "object",
+        "required": [
+          "bucket",
+          "rows"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "enum": [
+              "hour"
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LatencyPctilesHourlyRow"
+            }
           }
         }
       },
