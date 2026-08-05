@@ -1198,16 +1198,16 @@ export interface components {
              * @description Unix seconds
              */
             refresh_expires_at: number;
-            user?: {
+            user: {
                 /** Format: uuid */
                 id: string;
                 /** Format: email */
                 email: string;
             };
             /** Format: uuid */
-            workspace_id?: string;
+            workspace_id: string;
             /** @enum {string} */
-            role?: "owner" | "admin" | "developer" | "employee" | "viewer";
+            role: "owner" | "admin" | "developer" | "employee" | "viewer";
         };
         ChatMessage: {
             /** @enum {string} */
@@ -1295,8 +1295,8 @@ export interface components {
             provider: string;
             model: string;
             final_action: string;
-            input_tokens?: number | null;
-            output_tokens?: number | null;
+            input_tokens: number | null;
+            output_tokens: number | null;
             /** Format: double */
             cost_usd: number;
             has_violation: boolean;
@@ -1306,7 +1306,7 @@ export interface components {
         ListRequestsResponse: {
             items: components["schemas"]["RequestListItem"][];
             /** @description Opaque cursor for the next page; null when no more pages */
-            next_cursor?: string | null;
+            next_cursor: string | null;
         };
         PolicyEventSummary: {
             /** Format: uuid */
@@ -1323,40 +1323,40 @@ export interface components {
             provider: string;
             model: string;
             final_action: string;
-            input_tokens?: number | null;
-            output_tokens?: number | null;
-            reasoning_tokens?: number | null;
-            cache_read_tokens?: number | null;
-            cache_write_tokens?: number | null;
+            input_tokens: number | null;
+            output_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_read_tokens: number | null;
+            cache_write_tokens: number | null;
             /** Format: double */
             cost_usd: number;
             /** Format: date-time */
             created_at: string;
             policy_events: components["schemas"]["PolicyEventSummary"][];
             /** Format: uuid */
-            user_id?: string | null;
+            user_id: string | null;
             /** @description Looked up from `users` at read time. */
-            user_email?: string | null;
+            user_email: string | null;
             /** Format: uuid */
-            api_key_id?: string | null;
-            api_key_name?: string | null;
-            ip_address?: string | null;
-            user_agent?: string | null;
+            api_key_id: string | null;
+            api_key_name: string | null;
+            ip_address: string | null;
+            user_agent: string | null;
             /** @description The latest user message post-redaction, placeholders substituted in. */
-            redacted_prompt?: string | null;
+            redacted_prompt: string | null;
             /** @description What was returned to the client after placeholder restoration. */
-            restored_response?: string | null;
+            restored_response: string | null;
             /** @description Raw user input pre-redaction. Present only for workspaces that opted into `capture_raw_content`. */
-            raw_prompt?: string | null;
-            raw_response?: string | null;
-            user_first_name?: string | null;
-            user_last_name?: string | null;
-            user_position?: string | null;
-            user_device_mac?: string | null;
+            raw_prompt: string | null;
+            raw_response: string | null;
+            user_first_name: string | null;
+            user_last_name: string | null;
+            user_position: string | null;
+            user_device_mac: string | null;
             /** @description Coarse origin classifier derived from the user-agent. */
-            source?: string | null;
+            source: string | null;
             /** @description WS2-4 — which detection engines produced coverage for this request's prompt. EMPTY for rows written before ClickHouse migration 009: that means "not recorded", NOT "no engine ran" — the deterministic floor is unconditional. */
-            engines?: string[];
+            engines: string[];
         };
         CreateKeyRequest: {
             name: string;
@@ -1375,7 +1375,7 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
-            revoked_at?: string | null;
+            revoked_at: string | null;
             /**
              * Format: uuid
              * @description Workspace member this key belongs to. Absent (not null) for legacy unassigned workspace-scoped keys — the handler skips the field.
@@ -1416,11 +1416,11 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /** @description Provider-type-specific settings. Vertex AI uses `{ region, project }`; every other provider type ignores it. */
-            config?: {
+            config: {
                 [key: string]: unknown;
             };
             /** @description Models registered for this provider. Empty means the caller should fall back to the per-type defaults. */
-            models?: components["schemas"]["ModelSummary"][];
+            models: components["schemas"]["ModelSummary"][];
         };
         CreateProviderRequest: {
             name: string;
@@ -1510,9 +1510,9 @@ export interface components {
         BudgetBehavior: "block" | "warn" | "flag";
         BudgetResponse: {
             /** Format: int64 */
-            daily_token_limit?: number | null;
+            daily_token_limit: number | null;
             /** Format: int64 */
-            monthly_token_limit?: number | null;
+            monthly_token_limit: number | null;
             behavior: components["schemas"]["BudgetBehavior"];
             /** Format: date-time */
             updated_at: string;
@@ -1650,19 +1650,19 @@ export interface components {
             block_on_injection_detection: boolean;
             redact_pii_in_responses: boolean;
             /** Format: uuid */
-            workspace_id?: string;
+            workspace_id: string;
             /**
              * @description WS2-3. What to do when the ML sidecar produces no detection coverage for a request. `block` (the default for any workspace that has not chosen) rejects the request with 503 rather than forward a prompt the PII detector never saw; `degrade_with_alert` proceeds on the deterministic detection floor, emits an alert, sets the `x-secureprompt-sidecar-degraded` response header, and marks the audit row `floor_only = true`.
              * @enum {string}
              */
             sidecar_unavailable: "block" | "degrade_with_alert";
             /** @description WS3-1 — whether this workspace retains RAW request content (the un-redacted prompt, the un-restored upstream reply, and the reply with PII restored). False for every workspace that has not explicitly opted in. */
-            capture_raw_content?: boolean;
+            capture_raw_content: boolean;
             /**
              * Format: int32
              * @description WS3-2 — days captured content is retained. Meaningless while `capture_raw_content` is false, but round-tripped so an admin can set the window before switching capture on.
              */
-            raw_capture_retention_days?: number;
+            raw_capture_retention_days: number;
             /** Format: date-time */
             updated_at: string;
         };
@@ -1711,13 +1711,13 @@ export interface components {
             workspace_id: string;
             email: string;
             role: string;
-            first_name?: string | null;
-            last_name?: string | null;
-            position?: string | null;
+            first_name: string | null;
+            last_name: string | null;
+            position: string | null;
             /** @description "First Last", or the local part of the email while the profile is empty. Computed server-side so every surface shows the same name. */
             display_name: string;
             /** @description Self-reported MAC from the Electron desktop wrapper; null for browser users. */
-            device_mac?: string | null;
+            device_mac: string | null;
         };
         UpdateProfileRequest: {
             first_name?: string | null;
@@ -1759,8 +1759,8 @@ export interface components {
             last_seen_at: string;
             /** Format: date-time */
             expires_at: string;
-            client_ip?: string | null;
-            client?: string | null;
+            client_ip: string | null;
+            client: string | null;
             /** @description True for the session whose access token made this request. */
             is_current: boolean;
         };
@@ -1799,11 +1799,12 @@ export interface components {
             revoked_at: string;
         };
         LicenseStatus: {
-            customer_name?: string | null;
-            lic_id?: string | null;
-            expires_at?: string | null;
+            customer_name: string | null;
+            lic_id: string | null;
+            expires_at: string | null;
             features: string[];
-            status: string;
+            /** @enum {string} */
+            status: "Valid" | "Grace" | "Unlicensed" | "Revoked";
             /**
              * @description Where the active token came from. `db` wins over `env`.
              * @enum {string}
@@ -2027,13 +2028,13 @@ export interface components {
             /** Format: date-time */
             window_to: string;
             /** Format: int64 */
-            total_rows?: number | null;
+            total_rows: number | null;
             /** Format: int32 */
-            total_pages?: number | null;
+            total_pages: number | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
-            completed_at?: string | null;
+            completed_at: string | null;
         };
         AuditExportDetail: {
             /** Format: uuid */
@@ -2049,20 +2050,20 @@ export interface components {
             /** Format: date-time */
             window_to: string;
             /** Format: int64 */
-            total_rows?: number | null;
+            total_rows: number | null;
             /** Format: int32 */
-            total_pages?: number | null;
+            total_pages: number | null;
             /** @description The exact bytes the signature covers. Null until the export completes. */
-            manifest_json?: string | null;
-            signature_b64?: string | null;
-            public_key_b64?: string | null;
-            signing_key_id?: string | null;
-            error?: string | null;
+            manifest_json: string | null;
+            signature_b64: string | null;
+            public_key_b64: string | null;
+            signing_key_id: string | null;
+            error: string | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
-            completed_at?: string | null;
-            page_url_template?: string | null;
+            completed_at: string | null;
+            page_url_template: string | null;
             signature_note: string;
         };
         ModelSummary: {
@@ -2086,8 +2087,8 @@ export interface components {
         TestConnectionResult: {
             success: boolean;
             /** Format: int32 */
-            model_count?: number | null;
-            error?: string | null;
+            model_count: number | null;
+            error: string | null;
         };
         SyncModelsResponse: {
             added: string[];

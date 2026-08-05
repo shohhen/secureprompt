@@ -88,7 +88,15 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
     const credential = form.getValues("credential");
     const provider_type = form.getValues("provider_type");
     if (provider_type !== "vertex" && (!credential || credential.trim().length === 0)) {
-      setTestResult({ success: false, error: "Enter an API key first." });
+      // WS6-4: `model_count` is required-and-nullable now that the spec says
+      // what the handler actually sends (`Option<u32>` with no
+      // skip_serializing_if is always emitted, as null). A locally-built
+      // failure result has to say so rather than omit the key.
+      setTestResult({
+        success: false,
+        model_count: null,
+        error: "Enter an API key first.",
+      });
       return;
     }
     const config =
@@ -108,6 +116,7 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
     } catch (e) {
       setTestResult({
         success: false,
+        model_count: null,
         error: e instanceof Error ? e.message : "Test request failed.",
       });
     }

@@ -2,92 +2,80 @@
 
 /**
  * Phase 5 / Plan 05-04 — TanStack Query hooks for /v1/providers.
+ *
+ * WS6-4: on the generated client. Nine of the eleven routes this file calls
+ * were undocumented until this workstream — `test-connection` (both forms) and
+ * the whole `/models` sub-tree — so every request and response shape here was
+ * hand-written. They come from the codegen now.
+ *
+ * `config` (Vertex AI's `{ region, project }`) is the field whose absence from
+ * the spec kept `check-openapi-codegen.sh` unwired; see the note above
+ * `ProviderResponse` in openapi.yaml for why it was restored rather than
+ * dropped.
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "@/lib/api-fetch";
+import { makeApiClient, unwrap, type ApiError } from "@/lib/api-client";
+import type { components } from "@/types/api.gen";
 
-export interface ModelSummary {
-  id: string;
-  name: string;
-}
-
-export interface ProviderResponse {
-  id: string;
-  name: string;
-  provider_type: string;
-  has_credential: boolean;
-  last_rotated_at: string;
-  created_at: string;
-  /** Models registered against this provider. Empty when none configured;
-   *  the LibreChat fork's discovery client falls back to per-type defaults
-   *  in that case. */
-  models?: ModelSummary[];
-  /** Provider-specific config (e.g. Vertex AI's { region, project }). */
-  config?: Record<string, unknown>;
-}
-
-export interface CreateProviderBody {
-  name: string;
-  provider_type: string;
-  credential?: string;
-  config?: Record<string, unknown>;
-}
-
-export interface UpdateProviderBody {
-  name?: string;
-  provider_type?: string;
-  credential?: string;
-  config?: Record<string, unknown>;
-}
+export type ModelSummary = components["schemas"]["ModelSummary"];
+export type ProviderResponse = components["schemas"]["ProviderResponse"];
+export type CreateProviderBody =
+  components["schemas"]["CreateProviderRequest"];
+export type UpdateProviderBody =
+  components["schemas"]["UpdateProviderRequest"];
+export type TestConnectionResult =
+  components["schemas"]["TestConnectionResult"];
+export type TestUnsavedBody = components["schemas"]["TestConnectionRequest"];
+export type SyncModelsResponse = components["schemas"]["SyncModelsResponse"];
+export type BulkDeleteModelsResponse =
+  components["schemas"]["BulkDeleteModelsResponse"];
 
 export function useProviders() {
-  return useQuery<ProviderResponse[]>({
+  return useQuery<ProviderResponse[], ApiError>({
     queryKey: ["providers"],
-    queryFn: () => apiFetch<ProviderResponse[]>("/v1/providers"),
+    queryFn: () => unwrap(makeApiClient().GET("/v1/providers")),
   });
 }
 
 export function useCreateProvider() {
   const qc = useQueryClient();
-  return useMutation<ProviderResponse, Error, CreateProviderBody>({
+  return useMutation<ProviderResponse, ApiError, CreateProviderBody>({
     mutationFn: (body) =>
-      apiFetch<ProviderResponse>("/v1/providers", { method: "POST", body }),
+      unwrap(makeApiClient().POST("/v1/providers", { body })),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
   });
 }
 
 export function useUpdateProvider() {
   const qc = useQueryClient();
-  return useMutation<ProviderResponse, Error, { id: string } & UpdateProviderBody>({
+  return useMutation<
+    ProviderResponse,
+    ApiError,
+    { id: string } & UpdateProviderBody
+  >({
     mutationFn: ({ id, ...body }) =>
-      apiFetch<ProviderResponse>(`/v1/providers/${id}`, { method: "PUT", body }),
+      unwrap(
+        makeApiClient().PUT("/v1/providers/{id}", {
+          params: { path: { id } },
+          body,
+        }),
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
   });
 }
 
 export function useDeleteProvider() {
   const qc = useQueryClient();
-  return useMutation<void, Error, string>({
+  return useMutation<void, ApiError, string>({
     mutationFn: (id) =>
-      apiFetch<void>(`/v1/providers/${id}`, { method: "DELETE" }),
+      unwrap(
+        makeApiClient().DELETE("/v1/providers/{id}", {
+          params: { path: { id } },
+        }),
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
   });
-}
-
-export interface TestConnectionResult {
-  success: boolean;
-  /** Number of models the provider returned. Undefined when the test failed. */
-  model_count?: number;
-  /** Short, human-readable failure reason. */
-  error?: string;
-}
-
-export interface TestUnsavedBody {
-  provider_type: string;
-  credential: string;
-  base_url?: string;
-  config?: Record<string, unknown>;
 }
 
 /**
@@ -96,12 +84,9 @@ export interface TestUnsavedBody {
  * key works before persisting it.
  */
 export function useTestProviderConnection() {
-  return useMutation<TestConnectionResult, Error, TestUnsavedBody>({
+  return useMutation<TestConnectionResult, ApiError, TestUnsavedBody>({
     mutationFn: (body) =>
-      apiFetch<TestConnectionResult>("/v1/providers/test-connection", {
-        method: "POST",
-        body,
-      }),
+      unwrap(makeApiClient().POST("/v1/providers/test-connection", { body })),
   });
 }
 
@@ -111,11 +96,12 @@ export function useTestProviderConnection() {
  * to verify rotation / expiration without exposing the plaintext.
  */
 export function useTestStoredProviderConnection() {
-  return useMutation<TestConnectionResult, Error, string>({
+  return useMutation<TestConnectionResult, ApiError, string>({
     mutationFn: (id) =>
-      apiFetch<TestConnectionResult>(
-        `/v1/providers/${id}/test-connection`,
-        { method: "POST" },
+      unwrap(
+        makeApiClient().POST("/v1/providers/{id}/test-connection", {
+          params: { path: { id } },
+        }),
       ),
   });
 }
@@ -123,21 +109,28 @@ export function useTestStoredProviderConnection() {
 // ── Per-provider model registration ──────────────────────────────────────────
 
 export function useProviderModels(providerId: string | undefined) {
-  return useQuery<ModelSummary[]>({
+  return useQuery<ModelSummary[], ApiError>({
     queryKey: ["providerModels", providerId],
     enabled: !!providerId,
-    queryFn: () => apiFetch<ModelSummary[]>(`/v1/providers/${providerId}/models`),
+    queryFn: () =>
+      unwrap(
+        makeApiClient().GET("/v1/providers/{id}/models", {
+          params: { path: { id: providerId as string } },
+        }),
+      ),
   });
 }
 
 export function useAddProviderModel(providerId: string) {
   const qc = useQueryClient();
-  return useMutation<ModelSummary, Error, { name: string }>({
+  return useMutation<ModelSummary, ApiError, { name: string }>({
     mutationFn: (body) =>
-      apiFetch<ModelSummary>(`/v1/providers/${providerId}/models`, {
-        method: "POST",
-        body,
-      }),
+      unwrap(
+        makeApiClient().POST("/v1/providers/{id}/models", {
+          params: { path: { id: providerId } },
+          body,
+        }),
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providerModels", providerId] });
       // Provider list response embeds the model list nestedly — refresh
@@ -149,23 +142,21 @@ export function useAddProviderModel(providerId: string) {
 
 export function useDeleteProviderModel(providerId: string) {
   const qc = useQueryClient();
-  return useMutation<void, Error, string>({
+  return useMutation<void, ApiError, string>({
     mutationFn: (name) =>
-      apiFetch<void>(
-        `/v1/providers/${providerId}/models/${encodeURIComponent(name)}`,
-        { method: "DELETE" },
+      unwrap(
+        // openapi-fetch percent-encodes path params itself, so the explicit
+        // encodeURIComponent the hand-rolled URL needed is gone. A model name
+        // containing "/" is still encoded, verified against the same route.
+        makeApiClient().DELETE("/v1/providers/{id}/models/{name}", {
+          params: { path: { id: providerId, name } },
+        }),
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providerModels", providerId] });
       qc.invalidateQueries({ queryKey: ["providers"] });
     },
   });
-}
-
-export interface SyncModelsResponse {
-  added: string[];
-  kept: string[];
-  total: number;
 }
 
 /**
@@ -177,21 +168,18 @@ export interface SyncModelsResponse {
  */
 export function useSyncProviderModels(providerId: string) {
   const qc = useQueryClient();
-  return useMutation<SyncModelsResponse, Error, void>({
+  return useMutation<SyncModelsResponse, ApiError, void>({
     mutationFn: () =>
-      apiFetch<SyncModelsResponse>(
-        `/v1/providers/${providerId}/models/sync`,
-        { method: "POST" },
+      unwrap(
+        makeApiClient().POST("/v1/providers/{id}/models/sync", {
+          params: { path: { id: providerId } },
+        }),
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providerModels", providerId] });
       qc.invalidateQueries({ queryKey: ["providers"] });
     },
   });
-}
-
-export interface BulkDeleteModelsResponse {
-  deleted: number;
 }
 
 /**
@@ -201,11 +189,13 @@ export interface BulkDeleteModelsResponse {
  */
 export function useBulkDeleteProviderModels(providerId: string) {
   const qc = useQueryClient();
-  return useMutation<BulkDeleteModelsResponse, Error, string[]>({
+  return useMutation<BulkDeleteModelsResponse, ApiError, string[]>({
     mutationFn: (names) =>
-      apiFetch<BulkDeleteModelsResponse>(
-        `/v1/providers/${providerId}/models/bulk-delete`,
-        { method: "POST", body: { names } },
+      unwrap(
+        makeApiClient().POST("/v1/providers/{id}/models/bulk-delete", {
+          params: { path: { id: providerId } },
+          body: { names },
+        }),
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providerModels", providerId] });

@@ -148,6 +148,53 @@ describe("unwrap() — the error contract apiFetch callers already depend on", (
     expect(err).toBeInstanceOf(NetworkError);
   });
 
+  it("preserves the Content-Type openapi-fetch set", async () => {
+    // Regression, found by probe while migrating: openapi-fetch calls the
+    // custom fetch as `fetch(request)` with the header already on the
+    // Request, and `fetch(request, { headers })` REPLACES the header list
+    // rather than merging. The old object-literal spread therefore dropped
+    // `Content-Type: application/json` from every request with a body, which
+    // axum's `Json<T>` extractor answers with 415. It was invisible until
+    // this workstream because the only caller was `use-analytics`, four GETs.
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, {}));
+    const client = makeApiClient({ bearer: "tok" });
+    await client.POST("/v1/auth/token", {
+      body: { email: "a@b.test", password: "pw" },
+    });
+    const [input, init] = vi.mocked(fetch).mock.calls[0] as [
+      Request,
+      RequestInit | undefined,
+    ];
+    // Premise: openapi-fetch really does hand us a Request that already
+    // carries the header — otherwise this test proves nothing about merging.
+    expect(input).toBeInstanceOf(Request);
+    expect(input.headers.get("content-type")).toBe("application/json");
+    // What the platform would actually send.
+    const effective = new Request(input, init);
+    expect(effective.headers.get("content-type")).toBe("application/json");
+    expect(effective.headers.get("authorization")).toBe("Bearer tok");
+    // Bidirectional: the merge must not have dropped what it was added for.
+    expect(await effective.text()).toBe(
+      JSON.stringify({ email: "a@b.test", password: "pw" }),
+    );
+  });
+
+  it("sends no Authorization header when bearer is explicitly null", async () => {
+    // `loginStep1` runs before any session exists. Resolving one would fire a
+    // second fetch at /api/auth/session on every login attempt.
+    const { getSession } = await import("next-auth/react");
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, {}));
+    await makeApiClient({ bearer: null }).POST("/v1/auth/token", {
+      body: { email: "a@b.test", password: "pw" },
+    });
+    const [input, init] = vi.mocked(fetch).mock.calls[0] as [
+      Request,
+      RequestInit | undefined,
+    ];
+    expect(new Request(input, init).headers.get("authorization")).toBeNull();
+    expect(getSession).not.toHaveBeenCalled();
+  });
+
   // Positive control: the assertions above must be capable of failing. A
   // 200 must NOT produce an ApiError, or "throws ApiError" would be
   // satisfied by a function that throws unconditionally.

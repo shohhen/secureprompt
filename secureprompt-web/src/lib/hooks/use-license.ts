@@ -6,37 +6,43 @@
  * GET  /v1/license  → LicenseStatus
  * PUT  /v1/license  { token } → LicenseStatus
  * DELETE /v1/license → LicenseStatus
+ *
+ * WS6-4: on the generated client. `license-client.tsx` branches on
+ * `err instanceof ApiError && err.status === 400` and on `error.status === 403`,
+ * which is why every call here goes through `unwrap` rather than reading
+ * `{ data, error }` directly — `unwrap` throws the same `ApiError` `apiFetch`
+ * threw.
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch, ApiError } from "@/lib/api-fetch";
+import { makeApiClient, unwrap, type ApiError } from "@/lib/api-client";
 
+import type { components } from "@/types/api.gen";
+
+export type LicenseStatus = components["schemas"]["LicenseStatus"];
+export type LicenseSource = LicenseStatus["source"];
+/**
+ * Not generated: the gateway serialises `license::Status` with `Display`, so
+ * the OpenAPI document types `status` as a bare string rather than an enum.
+ * Kept as a named union for the console's switch, and deliberately NOT
+ * asserted onto `LicenseStatus["status"]` — that would be inventing a contract
+ * the server does not publish. WS6-4-FU3.
+ */
 export type LicenseStatusValue = "Valid" | "Grace" | "Unlicensed" | "Revoked";
-export type LicenseSource = "db" | "env" | "none";
-
-export interface LicenseStatus {
-  customer_name: string | null;
-  lic_id: string | null;
-  expires_at: string | null;
-  features: string[];
-  status: LicenseStatusValue;
-  source: LicenseSource;
-}
 
 export const LICENSE_QUERY_KEY = ["license"] as const;
 
 export function useLicense() {
-  return useQuery<LicenseStatus>({
+  return useQuery<LicenseStatus, ApiError>({
     queryKey: LICENSE_QUERY_KEY,
-    queryFn: () => apiFetch<LicenseStatus>("/v1/license"),
+    queryFn: () => unwrap(makeApiClient().GET("/v1/license")),
   });
 }
 
 export function useActivateLicense() {
   const qc = useQueryClient();
   return useMutation<LicenseStatus, ApiError, { token: string }>({
-    mutationFn: (body) =>
-      apiFetch<LicenseStatus>("/v1/license", { method: "PUT", body }),
+    mutationFn: (body) => unwrap(makeApiClient().PUT("/v1/license", { body })),
     onSuccess: () => qc.invalidateQueries({ queryKey: LICENSE_QUERY_KEY }),
   });
 }
@@ -44,7 +50,7 @@ export function useActivateLicense() {
 export function useRemoveLicense() {
   const qc = useQueryClient();
   return useMutation<LicenseStatus, ApiError, void>({
-    mutationFn: () => apiFetch<LicenseStatus>("/v1/license", { method: "DELETE" }),
+    mutationFn: () => unwrap(makeApiClient().DELETE("/v1/license")),
     onSuccess: () => qc.invalidateQueries({ queryKey: LICENSE_QUERY_KEY }),
   });
 }

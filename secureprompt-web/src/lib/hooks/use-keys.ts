@@ -2,60 +2,42 @@
 
 /**
  * Phase 5 / Plan 05-04 — TanStack Query hooks for /v1/keys.
+ *
+ * WS6-4: on the generated client. The three interfaces that used to live here
+ * are now type aliases onto `api.gen.ts`, so `assigned_user_id` (migration
+ * 009) and `user_id` on create cannot drift from the Rust structs again.
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "@/lib/api-fetch";
+import { makeApiClient, unwrap, type ApiError } from "@/lib/api-client";
+import type { components } from "@/types/api.gen";
 
-export interface KeyResponse {
-  id: string;
-  name: string;
-  prefix: string;
-  created_at: string;
-  revoked_at: string | null;
-  /** Set when the key was assigned to a workspace member (009 migration). */
-  assigned_user_id?: string | null;
-}
-
-export interface CreateKeyResponse {
-  id: string;
-  name: string;
-  /** Full plaintext — shown once, flushed on dialog close. */
-  api_key: string;
-  prefix: string;
-  created_at: string;
-  assigned_user_id?: string | null;
-}
-
-export interface CreateKeyBody {
-  name: string;
-  /** When set, the key is assigned to this workspace member; the plaintext
-   *  is encrypted-at-rest so the LibreChat backend can fetch it
-   *  server-to-server (member never types or sees it). */
-  user_id?: string;
-}
+export type KeyResponse = components["schemas"]["KeyResponse"];
+export type CreateKeyResponse = components["schemas"]["CreateKeyResponse"];
+export type CreateKeyBody = components["schemas"]["CreateKeyRequest"];
 
 export function useKeys() {
-  return useQuery<KeyResponse[]>({
+  return useQuery<KeyResponse[], ApiError>({
     queryKey: ["keys"],
-    queryFn: () => apiFetch<KeyResponse[]>("/v1/keys"),
+    queryFn: () => unwrap(makeApiClient().GET("/v1/keys")),
   });
 }
 
 export function useCreateKey() {
   const qc = useQueryClient();
-  return useMutation<CreateKeyResponse, Error, CreateKeyBody>({
-    mutationFn: (body) =>
-      apiFetch<CreateKeyResponse>("/v1/keys", { method: "POST", body }),
+  return useMutation<CreateKeyResponse, ApiError, CreateKeyBody>({
+    mutationFn: (body) => unwrap(makeApiClient().POST("/v1/keys", { body })),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["keys"] }),
   });
 }
 
 export function useRevokeKey() {
   const qc = useQueryClient();
-  return useMutation<void, Error, string>({
+  return useMutation<void, ApiError, string>({
     mutationFn: (id) =>
-      apiFetch<void>(`/v1/keys/${id}`, { method: "DELETE" }),
+      unwrap(
+        makeApiClient().DELETE("/v1/keys/{id}", { params: { path: { id } } }),
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["keys"] }),
   });
 }

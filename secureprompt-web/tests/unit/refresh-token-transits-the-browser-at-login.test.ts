@@ -39,21 +39,34 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/**
+ * WS6-4: a REAL `Response`, not a `{ status, json }` duck.
+ *
+ * `loginStep1` now goes through the generated openapi-fetch client
+ * (`lib/api-client.ts`), which reads `response.ok` and
+ * `response.headers.get("content-type")` before parsing — fields the old duck
+ * did not have. Neither assertion below was weakened: the fixture is simply
+ * what a browser actually hands back, so the test now exercises the same
+ * parse path production does.
+ */
 function stubTokenResponse(): void {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => ({
-      status: 200,
-      json: async () => ({
-        access_token: "access-fixture",
-        refresh_token: REFRESH,
-        access_expires_at: 1,
-        refresh_expires_at: 2,
-        user: { id: "u1", email: "a@b.test" },
-        workspace_id: "ws-1",
-        role: "admin",
-      }),
-    })),
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            access_token: "access-fixture",
+            refresh_token: REFRESH,
+            access_expires_at: 1,
+            refresh_expires_at: 2,
+            user: { id: "u1", email: "a@b.test" },
+            workspace_id: "ws-1",
+            role: "admin",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    ),
   );
 }
 
@@ -82,9 +95,19 @@ describe("the refresh token transits the browser during sign-in (MR1 I9)", () =>
     // server-side exchange would post to a same-origin route handler or run
     // as a server action, and would not call `fetch` with the public API
     // base at all.
+    //
+    // WS6-4: `toHaveBeenCalledTimes(1)` now also pins that sign-in makes NO
+    // session lookup. It caught exactly that regression — routing this helper
+    // through the generated client resolved a session bearer it does not have
+    // and does not need, adding a second `fetch` to `/api/auth/session` on
+    // every login attempt. Fixed with `bearer: null` in `twofa-api`'s
+    // `authClient`.
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url] = fetchMock.mock.calls[0] as [string];
+    // openapi-fetch hands the custom fetch a built `Request`, not a URL
+    // string. The destination is unchanged and is still what is asserted.
+    const [input] = fetchMock.mock.calls[0] as [Request | string];
+    const url = input instanceof Request ? input.url : input;
     expect(url).toMatch(/\/v1\/auth\/token$/);
   });
 });
