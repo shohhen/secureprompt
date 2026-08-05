@@ -1,13 +1,32 @@
+{{- $gke := eq (.Values.ingress.platform | default "generic") "gke" -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "secureprompt.fullname" . }}-api
   labels:
     {{- include "secureprompt.labels" . | nindent 4 }}
+  {{- /*
+    WS6-5. `cloud.google.com/neg` is a GKE network-endpoint-group hint. It is
+    inert on other clusters, but it was emitted unconditionally, which made a
+    render that claims to be portable advertise a platform it is not on.
+    values-gke.yaml turns it back on.
+  */}}
+  {{- if or $gke .Values.api.service.annotations }}
   annotations:
+    {{- if $gke }}
     cloud.google.com/neg: '{"ingress": true}'
+    {{- end }}
+    {{- range $k, $v := .Values.api.service.annotations }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+  {{- end }}
 spec:
-  type: NodePort
+  {{- /*
+    NodePort is what the GKE ingress controller requires. On a cluster whose
+    controller routes to ClusterIP (ingress-nginx does), NodePort also opens a
+    port on every node — set `api.service.type: ClusterIP` on-prem.
+  */}}
+  type: {{ .Values.api.service.type | default "NodePort" }}
   ports:
     - port: 80
       targetPort: 8080
