@@ -8,6 +8,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -39,20 +40,26 @@ function statusVariant(
   }
 }
 
-function sourceLabel(source: LicenseSource): string {
+/**
+ * Licence status and source are enum values from the gateway, so they are
+ * rendered through the catalogue rather than printed raw — an auditor reading
+ * a Russian console should not meet the word "Unlicensed".
+ */
+function sourceKey(source: LicenseSource): string {
   switch (source) {
     case "db":
-      return "Database";
+      return "sourceDatabase";
     case "env":
-      return "Environment";
+      return "sourceEnvironment";
     default:
-      return "None";
+      return "sourceNone";
   }
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function LicenseClient() {
+  const t = useTranslations("license");
   const { data: session } = useSession();
   const writable = canWrite(session?.role);
 
@@ -68,22 +75,24 @@ export function LicenseClient() {
     setActivateError(null);
     try {
       await activate.mutateAsync({ token: token.trim() });
-      toast.success("License activated.");
+      toast.success(t("activated"));
       setToken("");
     } catch (err) {
       if (err instanceof ApiError && err.status === 400) {
-        setActivateError(err.message || "Invalid license signature.");
+        // A 400 body from the gateway names the specific signature defect;
+        // only the empty case is ours to phrase.
+        setActivateError(err.message || t("invalidSignature"));
       } else {
-        toast.error("Failed to activate license.");
+        toast.error(t("activateFailed"));
       }
     }
   };
 
   const handleRemove = () => {
-    if (!window.confirm("Remove the database license? The gateway will fall back to the environment token (if any).")) return;
+    if (!window.confirm(t("removeConfirm"))) return;
     remove.mutate(undefined, {
-      onSuccess: () => toast.success("License removed."),
-      onError: () => toast.error("Failed to remove license."),
+      onSuccess: () => toast.success(t("removed")),
+      onError: () => toast.error(t("removeFailed")),
     });
   };
 
@@ -91,13 +100,11 @@ export function LicenseClient() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h2 className="text-lg font-medium">License</h2>
+        <h2 className="text-lg font-medium">{t("title")}</h2>
         <p className="text-sm text-muted-foreground">
-          View your current license status and activate or remove a token.
+          {t("description")}
           {!writable && (
-            <span className="block mt-1 text-xs">
-              Only owners and admins can activate or remove a license.
-            </span>
+            <span className="block mt-1 text-xs">{t("readOnlyNotice")}</span>
           )}
         </p>
       </div>
@@ -105,37 +112,39 @@ export function LicenseClient() {
       {/* Status card */}
       <div className="rounded-lg border p-5 space-y-4">
         {isLoading ? (
-          <p className="text-sm text-muted-foreground">Loading license status…</p>
+          <p className="text-sm text-muted-foreground">{t("loading")}</p>
         ) : error ? (
           <p role="alert" className="text-sm text-destructive">
             {error instanceof ApiError && error.status === 403
-              ? "You need owner or admin access to view license status."
-              : "Could not load license status."}
+              ? t("forbidden")
+              : t("loadFailed")}
           </p>
         ) : license ? (
           <>
             <div className="flex items-center gap-3">
-              <Badge variant={statusVariant(license.status)}>{license.status}</Badge>
+              <Badge variant={statusVariant(license.status)}>
+                {t(`status${license.status}`)}
+              </Badge>
               <span className="text-xs text-muted-foreground">
-                Source: {sourceLabel(license.source)}
+                {t("source", { source: t(sourceKey(license.source)) })}
               </span>
             </div>
 
             <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2 text-sm">
               <div>
-                <dt className="text-muted-foreground">Customer</dt>
+                <dt className="text-muted-foreground">{t("customer")}</dt>
                 <dd className="font-medium">
                   {license.customer_name ?? <span className="text-muted-foreground italic">—</span>}
                 </dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">License ID</dt>
+                <dt className="text-muted-foreground">{t("licenseId")}</dt>
                 <dd className="font-mono text-xs break-all">
                   {license.lic_id ?? <span className="text-muted-foreground italic">—</span>}
                 </dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">Expires</dt>
+                <dt className="text-muted-foreground">{t("expires")}</dt>
                 <dd>
                   {license.expires_at
                     ? new Date(license.expires_at).toLocaleDateString(undefined, {
@@ -147,7 +156,7 @@ export function LicenseClient() {
                 </dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">Features</dt>
+                <dt className="text-muted-foreground">{t("features")}</dt>
                 <dd>
                   {license.features.length > 0 ? (
                     <div className="flex flex-wrap gap-1 mt-1">
@@ -158,7 +167,7 @@ export function LicenseClient() {
                       ))}
                     </div>
                   ) : (
-                    <span className="text-muted-foreground italic">None</span>
+                    <span className="text-muted-foreground italic">{t("featuresNone")}</span>
                   )}
                 </dd>
               </div>
@@ -173,13 +182,13 @@ export function LicenseClient() {
                   onClick={handleRemove}
                   disabled={remove.isPending}
                 >
-                  Remove license
+                  {t("removeLicense")}
                 </Button>
               </div>
             )}
           </>
         ) : (
-          <p className="text-sm text-muted-foreground">Could not load license status.</p>
+          <p className="text-sm text-muted-foreground">{t("loadFailed")}</p>
         )}
       </div>
 
@@ -191,12 +200,12 @@ export function LicenseClient() {
               htmlFor="license-token"
               className="block text-sm font-medium mb-1"
             >
-              Activate a new license token
+              {t("activateLabel")}
             </label>
             <textarea
               id="license-token"
               className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono resize-y min-h-[80px] focus:outline-none focus:ring-2 focus:ring-ring"
-              placeholder="Paste compact license token…"
+              placeholder={t("activatePlaceholder")}
               value={token}
               onChange={(e) => {
                 setToken(e.target.value);
@@ -215,7 +224,7 @@ export function LicenseClient() {
             onClick={handleActivate}
             disabled={activate.isPending || !token.trim()}
           >
-            {activate.isPending ? "Activating…" : "Activate"}
+            {activate.isPending ? t("activating") : t("activate")}
           </Button>
         </div>
       )}

@@ -10,6 +10,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { useTokenize, useDetokenize } from "@/lib/hooks/use-secure-mode";
 import { Button } from "@/components/ui/button";
@@ -28,6 +29,7 @@ export function TokenizePlayground() {
   const [vaultId, setVaultId] = useState("");
   const [entityCounts, setEntityCounts] = useState<Record<string, number>>({});
 
+  const t = useTranslations("tokenize");
   const [detokText, setDetokText] = useState("");
   const [detokVaultId, setDetokVaultId] = useState("");
   const [detokOutput, setDetokOutput] = useState("");
@@ -39,7 +41,7 @@ export function TokenizePlayground() {
   async function handleTokenize() {
     if (!input.trim()) return;
     if (selectedEntities.size === 0) {
-      toast.error("Pick at least one PII type to redact.");
+      toast.error(t("pickAtLeastOne"));
       return;
     }
     try {
@@ -58,7 +60,7 @@ export function TokenizePlayground() {
       setDetokText(res.tokenized_text);
       setDetokVaultId(res.token_vault_id);
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Tokenize failed";
+      const message = e instanceof Error ? e.message : t("tokenizeFailed");
       toast.error(message);
     }
   }
@@ -72,7 +74,7 @@ export function TokenizePlayground() {
       });
       setDetokOutput(res.text);
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Detokenize failed";
+      const message = e instanceof Error ? e.message : t("detokenizeFailed");
       toast.error(message);
     }
   }
@@ -80,10 +82,9 @@ export function TokenizePlayground() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-lg font-medium">Tokenize / Detokenize</h2>
+        <h2 className="text-lg font-medium">{t("title")}</h2>
         <p className="text-sm text-muted-foreground">
-          Round-trip PII through the ML sidecar. Originals are stored in a
-          workspace-scoped vault and expire after 24 hours.
+          {t("description")}
         </p>
       </div>
 
@@ -99,7 +100,7 @@ export function TokenizePlayground() {
         <div className="rounded-lg border p-5 space-y-3">
           <div className="flex items-center justify-between">
             <Label htmlFor="tokenize-input" className="font-medium">
-              Original text
+              {t("originalText")}
             </Label>
             <Button
               size="sm"
@@ -108,13 +109,13 @@ export function TokenizePlayground() {
                 tokenize.isPending || !input.trim() || selectedEntities.size === 0
               }
             >
-              {tokenize.isPending ? "Tokenizing…" : "Tokenize"}
+              {tokenize.isPending ? t("tokenizing") : t("tokenize")}
             </Button>
           </div>
           <Textarea
             id="tokenize-input"
             rows={6}
-            placeholder="Email bob@example.com from +1 (415) 555-0104 about the $12k invoice…"
+            placeholder={t("inputPlaceholder")}
             value={input}
             onChange={(e) => setInput(e.target.value)}
           />
@@ -122,7 +123,7 @@ export function TokenizePlayground() {
           {tokenized && (
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">
-                Tokenized output
+                {t("tokenizedOutput")}
               </Label>
               <pre className="rounded bg-muted p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto">
                 {tokenized}
@@ -136,13 +137,13 @@ export function TokenizePlayground() {
                 ))}
                 {Object.keys(entityCounts).length === 0 && (
                   <span className="text-xs text-muted-foreground">
-                    No PII detected.
+                    {t("noPiiDetected")}
                   </span>
                 )}
               </div>
 
               <div className="text-xs text-muted-foreground">
-                <span className="font-medium">Vault ID:</span>{" "}
+                <span className="font-medium">{t("vaultIdLabel")}</span>{" "}
                 <span className="font-mono">{vaultId}</span>
               </div>
             </div>
@@ -151,7 +152,7 @@ export function TokenizePlayground() {
 
         <div className="rounded-lg border p-5 space-y-3">
           <div className="flex items-center justify-between">
-            <Label className="font-medium">Reverse</Label>
+            <Label className="font-medium">{t("reverse")}</Label>
             <Button
               size="sm"
               variant="outline"
@@ -160,17 +161,17 @@ export function TokenizePlayground() {
                 detokenize.isPending || !detokText.trim() || !detokVaultId.trim()
               }
             >
-              {detokenize.isPending ? "Detokenizing…" : "Detokenize"}
+              {detokenize.isPending ? t("detokenizing") : t("detokenize")}
             </Button>
           </div>
 
           <div className="space-y-1.5">
             <Label htmlFor="detok-vault" className="text-xs text-muted-foreground">
-              Vault ID
+              {t("vaultId")}
             </Label>
             <Input
               id="detok-vault"
-              placeholder="UUID from a previous tokenize call"
+              placeholder={t("vaultIdPlaceholder")}
               value={detokVaultId}
               onChange={(e) => setDetokVaultId(e.target.value)}
               className="font-mono text-xs"
@@ -179,7 +180,7 @@ export function TokenizePlayground() {
 
           <div className="space-y-1.5">
             <Label htmlFor="detok-input" className="text-xs text-muted-foreground">
-              Tokenized text
+              {t("tokenizedText")}
             </Label>
             <Textarea
               id="detok-input"
@@ -191,7 +192,7 @@ export function TokenizePlayground() {
 
           {detokOutput && (
             <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Restored</Label>
+              <Label className="text-xs text-muted-foreground">{t("restored")}</Label>
               <pre className="rounded bg-muted p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto">
                 {detokOutput}
               </pre>

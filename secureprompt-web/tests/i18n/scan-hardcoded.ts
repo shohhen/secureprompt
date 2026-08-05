@@ -357,3 +357,99 @@ export function formatViolations(violations: Violation[]): string {
   }
   return chunks.join("\n");
 }
+
+// ── Message-key usage ────────────────────────────────────────────────────────
+
+export interface KeyUse {
+  file: string;
+  line: number;
+  /** Fully-qualified key path, e.g. "secureMode.masterTitle". */
+  key: string;
+}
+
+/**
+ * Every `t("…")` call in the console, resolved to a full key path.
+ *
+ * Resolution is per file: a `const x = useTranslations("ns")` (or the awaited
+ * `getTranslations("ns")`) binds `x` to `ns`, and any later `x("k")` becomes
+ * `ns.k`. A translator created with no namespace binds to the root, so its
+ * argument is already a full path.
+ *
+ * Template-literal arguments (`t(\`level_${opt}\`)`) are deliberately skipped:
+ * they cannot be resolved statically, and guessing would put keys nobody uses
+ * into the parity check.
+ */
+export function scanKeyUses(relPath: string, source: string): KeyUse[] {
+  const sf = ts.createSourceFile(relPath, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
+  const uses: KeyUse[] = [];
+
+  const unwrap = (n: ts.Expression): ts.Expression =>
+    ts.isAwaitExpression(n) ? unwrap(n.expression) : n;
+
+  const namespaceFromDeclaration = (node: ts.Node): [string, string] | null => {
+    if (!ts.isVariableDeclaration(node) || !node.initializer || !ts.isIdentifier(node.name)) {
+      return null;
+    }
+    const init = unwrap(node.initializer);
+    if (!ts.isCallExpression(init) || !ts.isIdentifier(init.expression)) return null;
+    const fn = init.expression.text;
+    if (fn !== "useTranslations" && fn !== "getTranslations") return null;
+    const arg = init.arguments[0];
+    return [node.name.text, arg && ts.isStringLiteral(arg) ? arg.text : ""];
+  };
+
+  const introducesScope = (node: ts.Node): boolean =>
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node);
+
+  /**
+   * Scoped on purpose: a file may declare `const t = useTranslations("a")` in
+   * one component and `const t = useTranslations("b")` in another, and a flat
+   * map would attribute the first component's keys to the second namespace.
+   */
+  const walk = (node: ts.Node, inherited: Map<string, string>): void => {
+    const scope = introducesScope(node) ? new Map(inherited) : inherited;
+
+    // Bind every translator declared directly in this scope before reading
+    // any call, so declaration order inside the scope does not matter.
+    const bindLocal = (n: ts.Node): void => {
+      const found = namespaceFromDeclaration(n);
+      if (found) scope.set(found[0], found[1]);
+      if (!introducesScope(n)) ts.forEachChild(n, bindLocal);
+    };
+    if (introducesScope(node) || ts.isSourceFile(node)) {
+      ts.forEachChild(node, bindLocal);
+    }
+
+    if (ts.isCallExpression(node)) {
+      const callee = ts.isPropertyAccessExpression(node.expression)
+        ? node.expression.expression // t.rich("k"), t.has("k")
+        : node.expression;
+      if (ts.isIdentifier(callee) && scope.has(callee.text)) {
+        const arg = node.arguments[0];
+        if (arg && ts.isStringLiteral(arg)) {
+          const ns = scope.get(callee.text)!;
+          const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+          uses.push({ file: relPath, line: line + 1, key: ns ? `${ns}.${arg.text}` : arg.text });
+        }
+      }
+    }
+
+    ts.forEachChild(node, (child) => walk(child, scope));
+  };
+
+  walk(sf, new Map());
+  return uses;
+}
+
+/** Every statically-resolvable message key the console asks for. */
+export function scanConsoleKeyUses(): KeyUse[] {
+  const out: KeyUse[] = [];
+  for (const abs of scannedFiles()) {
+    const rel = path.relative(WEB_ROOT, abs);
+    out.push(...scanKeyUses(rel, fs.readFileSync(abs, "utf8")));
+  }
+  return out;
+}

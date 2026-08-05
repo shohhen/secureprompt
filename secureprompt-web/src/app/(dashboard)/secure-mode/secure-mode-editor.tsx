@@ -8,6 +8,7 @@
  */
 
 import { useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -33,27 +34,13 @@ const schema = z.object({
 });
 type FormData = z.infer<typeof schema>;
 
-const LEVEL_OPTIONS: { value: SecureModeLevel; label: string; hint: string }[] = [
-  {
-    value: "permissive",
-    label: "Permissive",
-    hint: "Log detections but never block. Good for onboarding.",
-  },
-  {
-    value: "standard",
-    label: "Standard",
-    hint: "Redact PII/secrets in-flight. Block only on high-confidence violations.",
-  },
-  {
-    value: "strict",
-    label: "Strict",
-    hint: "Block the request on any PII, secret, or injection detection.",
-  },
-];
+/** Values only; the label and hint are resolved per render from `secureMode`. */
+const LEVEL_OPTIONS: SecureModeLevel[] = ["permissive", "standard", "strict"];
 
 const ADMIN_ROLES: AppRole[] = ["owner", "admin"];
 
 export function SecureModeEditor() {
+  const t = useTranslations("secureMode");
   const { data: session } = useSession();
   const { data, isLoading, error } = useSecureMode();
   const update = useUpdateSecureMode();
@@ -85,9 +72,9 @@ export function SecureModeEditor() {
   async function onSubmit(values: FormData) {
     try {
       await update.mutateAsync(values);
-      toast.success("Secure mode updated.");
+      toast.success(t("updated"));
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Failed to update secure mode.";
+      const message = e instanceof Error ? e.message : t("updateFailed");
       toast.error(message);
     }
   }
@@ -126,7 +113,7 @@ export function SecureModeEditor() {
   if (error) {
     return (
       <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm">
-        <p className="font-medium text-destructive">Failed to load secure mode.</p>
+        <p className="font-medium text-destructive">{t("loadFailed")}</p>
         <p className="text-muted-foreground mt-1">{error.message}</p>
       </div>
     );
@@ -142,33 +129,30 @@ export function SecureModeEditor() {
         {/* Master switch */}
         <div className="rounded-lg border p-6 flex items-center justify-between gap-4">
           <div>
-            <p className="font-medium">Secure Mode</p>
+            <p className="font-medium">{t("masterTitle")}</p>
             <p className="text-sm text-muted-foreground max-w-2xl">
-              Master switch for all workspace-level security controls. When off,
-              the gateway still logs traffic but applies no redaction or blocking.
+              {t("masterDescription")}
             </p>
           </div>
           <Switch
             checked={form.watch("enabled")}
             onCheckedChange={(v) => form.setValue("enabled", v, { shouldDirty: true })}
-            aria-label="Enable secure mode"
+            aria-label={t("enableAria")}
           />
         </div>
 
         {/* Level radios */}
         <div className="rounded-lg border p-6 space-y-4">
           <div>
-            <p className="font-medium">Enforcement level</p>
-            <p className="text-sm text-muted-foreground">
-              Controls how aggressively the gateway reacts to detections.
-            </p>
+            <p className="font-medium">{t("levelTitle")}</p>
+            <p className="text-sm text-muted-foreground">{t("levelDescription")}</p>
           </div>
           <div className="grid gap-3 md:grid-cols-3">
             {LEVEL_OPTIONS.map((opt) => {
-              const active = level === opt.value;
+              const active = level === opt;
               return (
                 <label
-                  key={opt.value}
+                  key={opt}
                   className={`cursor-pointer rounded-md border p-4 transition-colors ${
                     active
                       ? "border-primary bg-primary/5"
@@ -178,14 +162,14 @@ export function SecureModeEditor() {
                   <input
                     type="radio"
                     className="sr-only"
-                    value={opt.value}
+                    value={opt}
                     checked={active}
-                    onChange={() =>
-                      form.setValue("level", opt.value, { shouldDirty: true })
-                    }
+                    onChange={() => form.setValue("level", opt, { shouldDirty: true })}
                   />
-                  <p className="font-medium text-sm">{opt.label}</p>
-                  <p className="text-xs text-muted-foreground mt-1">{opt.hint}</p>
+                  <p className="font-medium text-sm">{t(`level_${opt}`)}</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {t(`level_${opt}_hint`)}
+                  </p>
                 </label>
               );
             })}
@@ -196,15 +180,15 @@ export function SecureModeEditor() {
         {blockTogglesLocked && (
           <p className="text-xs text-muted-foreground -mb-3">
             {level === "permissive"
-              ? "Block toggles are forced off at Permissive level."
-              : "Block toggles are forced on at Strict level."}{" "}
-            Switch to Standard to control them individually.
+              ? t("togglesLockedPermissive")
+              : t("togglesLockedStrict")}{" "}
+            {t("togglesLockedHint")}
           </p>
         )}
         <div className="rounded-lg border divide-y">
           <ToggleRow
-            title="Block on PII detection"
-            hint="Reject the request when personal data (names, emails, SSNs, etc.) is detected."
+            title={t("blockPiiTitle")}
+            hint={t("blockPiiHint")}
             checked={form.watch("block_on_pii_detection")}
             onCheckedChange={(v) =>
               form.setValue("block_on_pii_detection", v, { shouldDirty: true })
@@ -212,8 +196,8 @@ export function SecureModeEditor() {
             disabled={blockTogglesLocked}
           />
           <ToggleRow
-            title="Block on prompt injection"
-            hint="Reject the request when the ML sidecar flags likely prompt injection (requires ML sidecar)."
+            title={t("blockInjectionTitle")}
+            hint={t("blockInjectionHint")}
             checked={form.watch("block_on_injection_detection")}
             onCheckedChange={(v) =>
               form.setValue("block_on_injection_detection", v, { shouldDirty: true })
@@ -221,8 +205,8 @@ export function SecureModeEditor() {
             disabled={blockTogglesLocked}
           />
           <ToggleRow
-            title="Redact PII in responses"
-            hint="Scan model completions and replace PII with opaque tokens before returning to the caller."
+            title={t("redactResponsesTitle")}
+            hint={t("redactResponsesHint")}
             checked={form.watch("redact_pii_in_responses")}
             onCheckedChange={(v) =>
               form.setValue("redact_pii_in_responses", v, { shouldDirty: true })
@@ -232,14 +216,13 @@ export function SecureModeEditor() {
 
         {!canEdit && (
           <p className="text-xs text-muted-foreground">
-            You have {session?.role ?? "guest"} access — only admins and owners
-            can modify secure-mode settings.
+            {t("readOnlyNotice", { role: session?.role ?? t("roleGuest") })}
           </p>
         )}
 
         {data?.updated_at && (
           <p className="text-xs text-muted-foreground">
-            Last updated {new Date(data.updated_at).toLocaleString()}.
+            {t("lastUpdated", { when: new Date(data.updated_at).toLocaleString() })}
           </p>
         )}
 
@@ -251,14 +234,14 @@ export function SecureModeEditor() {
             onClick={() => data && form.reset(data)}
             disabled={!form.formState.isDirty || update.isPending}
           >
-            Reset
+            {t("reset")}
           </Button>
           <Button
             type="submit"
             size="sm"
             disabled={!canEdit || !form.formState.isDirty || update.isPending}
           >
-            {update.isPending ? "Saving…" : "Save changes"}
+            {update.isPending ? t("saving") : t("saveChanges")}
           </Button>
         </div>
       </fieldset>

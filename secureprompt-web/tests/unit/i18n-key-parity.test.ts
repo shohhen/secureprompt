@@ -13,6 +13,7 @@ import { createTranslator } from "next-intl";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_LOCALE, LOCALES, SOURCE_LOCALE, type Locale } from "@/i18n/config";
 import { getMessageFallback, onIntlError } from "@/i18n/error-policy";
+import { scanConsoleKeyUses } from "../i18n/scan-hardcoded";
 
 const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const MESSAGES_DIR = path.join(WEB_ROOT, "src/i18n/messages");
@@ -42,7 +43,16 @@ const INCOMPLETE_LOCALES: Record<string, { since: string; reason: string }> = {
  * machine-translated silently: anything unresolved is written as
  * `TODO(ru): <english source>` and counted here.  The ceiling only moves down.
  */
-const RU_TODO_CEILING = { max: 0, since: "2026-08-05" };
+const RU_TODO_CEILING = {
+  max: 4,
+  since: "2026-08-05",
+  reason:
+    "Four security terms left for a native reviewer rather than guessed: the two "
+    + "'prompt injection' strings in secureMode (the Russian AI-security term is "
+    + "unsettled and this toggle decides whether a request is rejected), and the two "
+    + "GCP Workload Identity / ADC strings in providers (Google's own Russian "
+    + "renderings could not be verified offline). Tracked as WS6-3-FU2.",
+};
 
 type Catalogue = Record<string, unknown>;
 
@@ -124,6 +134,21 @@ describe("i18n catalogues", () => {
       expect(INCOMPLETE_LOCALES[locale].since).toMatch(/^\d{4}-\d{2}-\d{2}$/);
       expect(INCOMPLETE_LOCALES[locale].reason.length).toBeGreaterThan(20);
     }
+  });
+
+  it("every key the console asks for exists in en", () => {
+    // Closes the other half of the loop: the guard proves no string bypasses
+    // the catalogue, this proves no catalogue lookup misses. Both read the
+    // console off disk, so a component added later is covered by both.
+    const uses = scanConsoleKeyUses();
+    expect(uses.length, "premise: the scanner found no t() calls at all").toBeGreaterThan(300);
+
+    const en = flatten(readCatalogue("en"));
+    const unresolved = uses
+      .filter((u) => !en.has(u.key))
+      .map((u) => `${u.file}:${u.line} → ${u.key}`);
+
+    expect(unresolved, `message keys with no en entry:\n  ${unresolved.join("\n  ")}`).toEqual([]);
   });
 
   it("a missing key throws instead of silently falling back", () => {

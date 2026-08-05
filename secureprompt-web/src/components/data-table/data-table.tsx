@@ -10,8 +10,8 @@
  * optional empty-state slot. No dangerouslySetInnerHTML anywhere.
  */
 
-import {
 import { useTranslations } from "next-intl";
+import {
   flexRender,
   getCoreRowModel,
   useReactTable,

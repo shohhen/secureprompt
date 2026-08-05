@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslations } from "next-intl";
+
 /**
  * Phase 5 / Plan 05-03 — Workspace selector filter.
  *

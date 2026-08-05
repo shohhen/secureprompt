@@ -8,7 +8,8 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { screen, fireEvent } from "@testing-library/react";
+import { renderWithIntl as render } from "../utils/intl";
 import { ApiError } from "@/lib/api-fetch";
 
 // Component under test — doesn't exist yet; tests will fail until we create it.
