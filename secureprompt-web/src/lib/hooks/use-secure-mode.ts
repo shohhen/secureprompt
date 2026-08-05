@@ -1,86 +1,60 @@
 "use client";
 
 /**
- * TanStack Query hooks for /v1/secure-mode.
+ * TanStack Query hooks for /v1/secure-mode and the token vault.
  *
  * GET — any authenticated role; returns current workspace config.
  * PUT — admin only on the backend; the dashboard mirrors that by disabling
  *       the form when `session.role` is not admin/owner.
+ *
+ * WS6-4: on the generated client. The hand-written `SecureModeResponse` was
+ * missing `sidecar_unavailable` (WS2-3), `capture_raw_content` (WS3-1) and
+ * `raw_capture_retention_days` (WS3-2) — three security-posture fields the
+ * handler round-trips, so `SecureModeUpdate`, being `Partial<Omit<…>>` of it,
+ * could not express them either.
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "@/lib/api-fetch";
+import { makeApiClient, unwrap, type ApiError } from "@/lib/api-client";
+import type { components } from "@/types/api.gen";
 
-export type SecureModeLevel = "permissive" | "standard" | "strict";
+export type SecureModeResponse = components["schemas"]["SecureMode"];
+export type SecureModeLevel = SecureModeResponse["level"];
+export type SecureModeUpdate = components["schemas"]["SecureModeRequest"];
 
-export interface SecureModeResponse {
-  workspace_id: string;
-  enabled: boolean;
-  level: SecureModeLevel;
-  block_on_pii_detection: boolean;
-  block_on_injection_detection: boolean;
-  redact_pii_in_responses: boolean;
-  updated_at: string;
-}
-
-export type SecureModeUpdate = Partial<
-  Omit<SecureModeResponse, "workspace_id" | "updated_at">
->;
+export type TokenizeRequest = components["schemas"]["TokenizeRequest"];
+export type TokenizeResponse = components["schemas"]["TokenizeResponse"];
+export type DetokenizeRequest = components["schemas"]["DetokenizeRequest"];
+export type DetokenizeResponse = components["schemas"]["DetokenizeResponse"];
 
 export function useSecureMode() {
-  return useQuery<SecureModeResponse>({
+  return useQuery<SecureModeResponse, ApiError>({
     queryKey: ["secure-mode"],
-    queryFn: () => apiFetch<SecureModeResponse>("/v1/secure-mode"),
+    queryFn: () => unwrap(makeApiClient().GET("/v1/secure-mode")),
   });
 }
 
 export function useUpdateSecureMode() {
   const qc = useQueryClient();
-  return useMutation<SecureModeResponse, Error, SecureModeUpdate>({
+  return useMutation<SecureModeResponse, ApiError, SecureModeUpdate>({
     mutationFn: (body) =>
-      apiFetch<SecureModeResponse>("/v1/secure-mode", { method: "PUT", body }),
+      unwrap(makeApiClient().PUT("/v1/secure-mode", { body })),
     onSuccess: (data) => {
       qc.setQueryData(["secure-mode"], data);
     },
   });
 }
 
-export interface TokenizeRequest {
-  text: string;
-  entity_labels?: string[];
-}
-
-export interface TokenizeResponse {
-  tokenized_text: string;
-  token_vault_id: string;
-  entity_counts: Record<string, number>;
-}
-
-export interface DetokenizeRequest {
-  token_vault_id: string;
-  text: string;
-}
-
-export interface DetokenizeResponse {
-  text: string;
-}
-
 export function useTokenize() {
-  return useMutation<TokenizeResponse, Error, TokenizeRequest>({
+  return useMutation<TokenizeResponse, ApiError, TokenizeRequest>({
     mutationFn: (body) =>
-      apiFetch<TokenizeResponse>("/v1/secure-mode/tokenize", {
-        method: "POST",
-        body,
-      }),
+      unwrap(makeApiClient().POST("/v1/secure-mode/tokenize", { body })),
   });
 }
 
 export function useDetokenize() {
-  return useMutation<DetokenizeResponse, Error, DetokenizeRequest>({
+  return useMutation<DetokenizeResponse, ApiError, DetokenizeRequest>({
     mutationFn: (body) =>
-      apiFetch<DetokenizeResponse>("/v1/secure-mode/detokenize", {
-        method: "POST",
-        body,
-      }),
+      unwrap(makeApiClient().POST("/v1/secure-mode/detokenize", { body })),
   });
 }

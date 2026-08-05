@@ -55,6 +55,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register a new workspace and its owner (feature-flagged)
+         * @description Creates a workspace and its first owner user in one call and returns the same token pair as `POST /v1/auth/token`. Gated by the `SECUREPROMPT_PUBLIC_SIGNUP_ENABLED` server env var — 403 when off.
+         */
+        post: operations["register"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -210,7 +230,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** p50/p95/p99 latency percentiles by model and workspace, daily */
+        /** p50/p95/p99 latency + TTFT percentiles by model, daily or hourly */
         get: operations["getLatencyPctiles"];
         put?: never;
         post?: never;
@@ -483,74 +503,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/billing/usage": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get current billing period usage */
-        get: operations["getBillingUsage"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/billing/limits": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get billing limits and remaining allowance */
-        get: operations["getBillingLimits"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/billing/breakdown": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get billing breakdown by provider and model */
-        get: operations["getBillingBreakdown"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/billing/trends": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get billing trends over time */
-        get: operations["getBillingTrends"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/secure-mode": {
         parameters: {
             query?: never;
@@ -569,25 +521,294 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/webhooks": {
+    "/v1/auth/2fa/enroll": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** List all webhooks */
-        get: operations["listWebhooks"];
+        get?: never;
         put?: never;
-        /** Create a new webhook */
-        post: operations["createWebhook"];
+        /**
+         * Begin TOTP enrollment — returns the provisioning URI and backup codes
+         * @description Accepts either an `enrollment_token` (from a 202 on `POST /v1/auth/token`) or an ordinary session access token, so the Settings → Security panel and the forced-enrollment login screen share one endpoint. A 409 means the account is already enrolled; the console uses that as the "is 2FA on?" probe, because there is no status route.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Enrollment started — show the QR code and the backup codes once */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TwoFactorEnrollResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                /** @description Already enrolled */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiError"];
+                    };
+                };
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/v1/webhooks/{id}": {
+    "/v1/auth/2fa/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm enrollment with the first TOTP code
+         * @description Same bearer rules as `/enroll`. On success the account becomes two-factor, and the response is the ordinary token pair.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["TwoFactorCodeRequest"];
+                };
+            };
+            responses: {
+                /** @description Enrollment confirmed — access + refresh token pair */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TokenResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                /** @description Too many failed codes — the account is locked for 15 minutes */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiError"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/2fa/challenge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer a login 2FA challenge with a TOTP or backup code
+         * @description The bearer is the `challenge_token` from the 202 on `POST /v1/auth/token`, never a session token. A backup code is accepted in place of a TOTP code and is consumed on use.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["TwoFactorCodeRequest"];
+                };
+            };
+            responses: {
+                /** @description Challenge cleared — access + refresh token pair */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TokenResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                /** @description Too many failed codes — the account is locked for 15 minutes */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiError"];
+                    };
+                };
+                /** @description A KMS fault made verification impossible. Distinct from 401 on purpose — the code may have been correct, and this does NOT count against the lockout counter. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiError"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/2fa/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Turn off two-factor for the calling user
+         * @description Requires a session JWT and a currently valid TOTP or backup code.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["TwoFactorCodeRequest"];
+                };
+            };
+            responses: {
+                /** @description Two-factor disabled */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TwoFactorDisableResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the calling user's profile */
+        get: operations["getMyProfile"];
+        /** Update the calling user's profile */
+        put: operations["putMyProfile"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/api-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fetch the calling user's assigned API key in plaintext
+         * @description Server-to-server route for the LibreChat fork, which needs the gateway key belonging to the logged-in user. The response contains a live credential — it must not be logged or cached.
+         */
+        get: operations["getMyApiKey"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List workspace members */
+        get: operations["listUsers"];
+        put?: never;
+        /** Create a workspace member (admin only) */
+        post: operations["createUser"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/users/{user_id}/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: components["parameters"]["UserIdPath"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a member's live sessions (admin only)
+         * @description WS4-3 FU4. The read half of the pair — an administrator could previously terminate every session for a user without being able to see what they were terminating.
+         */
+        get: operations["listUserSessions"];
+        put?: never;
+        post?: never;
+        /** Terminate every session for a member (admin only) */
+        delete: operations["revokeUserSessions"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/users/{user_id}/sessions/{session_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -597,8 +818,302 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Delete a webhook */
-        delete: operations["deleteWebhook"];
+        /** Terminate one session (admin only) */
+        delete: operations["revokeUserSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/license": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Current license status
+         * @description `source` says where the active token came from — `db` (activated in the console, which wins), `env` (`SECUREPROMPT_LICENSE_TOKEN`), or `none`.
+         */
+        get: operations["getLicense"];
+        /**
+         * Activate a license token (admin only)
+         * @description Verifies, persists and applies the token live — no restart. A DB token takes precedence over `SECUREPROMPT_LICENSE_TOKEN`.
+         */
+        put: operations["activateLicense"];
+        post?: never;
+        /**
+         * Remove the stored license token (admin only)
+         * @description Clears the DB token. The deployment falls back to `SECUREPROMPT_LICENSE_TOKEN` if one is set, otherwise to unlicensed.
+         */
+        delete: operations["deleteLicense"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/data-inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What this deployment stores for the caller's workspace (admin only)
+         * @description Per-artifact-class inventory with live row counts, the encryption verdict and its basis, and the retention window. Classes that cannot be counted per workspace are reported separately with the reason, never folded into a zero.
+         */
+        get: operations["getDataInventory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/leak-report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** What would have leaked in a window, had the gateway not been there (admin only) */
+        get: operations["getLeakReport"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/audit-exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List audit-trail exports (admin only) */
+        get: operations["listAuditExports"];
+        put?: never;
+        /**
+         * Request a signed audit-trail export (admin only)
+         * @description Asynchronous — returns immediately with a `status_url` to poll. `from` is inclusive, `to` is exclusive.
+         */
+        post: operations["createAuditExport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/audit-exports/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Export status, manifest and detached signature (admin only) */
+        get: operations["getAuditExport"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/audit-exports/{id}/pages/{page}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One page of a completed export's rows (admin only)
+         * @description The bytes the manifest's per-page digest covers. Content type follows the export's `format` — `text/csv` or `application/x-ndjson`.
+         */
+        get: operations["getAuditExportPage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/test-connection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test a credential BEFORE saving it (admin only)
+         * @description Probes the upstream provider's list-models endpoint with the supplied plaintext credential. Nothing is persisted and nothing is logged.
+         */
+        post: operations["testProviderConnectionUnsaved"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/test-connection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test the STORED credential of a provider (admin only)
+         * @description Decrypts the stored ciphertext through the KMS and probes upstream, so rotation and expiry can be verified without ever exposing the plaintext to the dashboard.
+         */
+        post: operations["testProviderConnectionStored"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        /** List the models registered for a provider */
+        get: operations["listProviderModels"];
+        put?: never;
+        /** Register one model against a provider (admin only) */
+        post: operations["addProviderModel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/models/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sync the model catalogue from the upstream provider (admin only)
+         * @description Additive — existing registrations are kept, never deleted.
+         */
+        post: operations["syncProviderModels"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/models/bulk-delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Deregister several models at once (admin only)
+         * @description POST rather than DELETE because the names travel in a body; a DELETE with a body is not reliably forwarded by proxies.
+         */
+        post: operations["bulkDeleteProviderModels"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/models/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deregister one model (admin only) */
+        delete: operations["deleteProviderModel"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/secure-mode/tokenize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replace detected entities in text with vault placeholders */
+        post: operations["tokenizeText"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/secure-mode/detokenize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore original values from vault placeholders */
+        post: operations["detokenizeText"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/vault/stash": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stash a placeholder → original mapping for later restoration
+         * @description Companion to `POST /v1/redact` for MCP clients that redact locally and need the gateway to hold the mapping.
+         */
+        post: operations["vaultStash"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -654,6 +1169,19 @@ export interface components {
             /** Format: password */
             password: string;
         };
+        RegisterRequest: {
+            /**
+             * Format: email
+             * @description Globally unique across all workspaces.
+             */
+            email: string;
+            /**
+             * Format: password
+             * @description Argon2id-hashed server-side; never persisted in the clear.
+             */
+            password: string;
+            workspace_name: string;
+        };
         RefreshRequest: {
             refresh_token: string;
         };
@@ -670,16 +1198,16 @@ export interface components {
              * @description Unix seconds
              */
             refresh_expires_at: number;
-            user?: {
+            user: {
                 /** Format: uuid */
                 id: string;
                 /** Format: email */
                 email: string;
             };
             /** Format: uuid */
-            workspace_id?: string;
+            workspace_id: string;
             /** @enum {string} */
-            role?: "owner" | "admin" | "developer" | "viewer";
+            role: "owner" | "admin" | "developer" | "employee" | "viewer";
         };
         ChatMessage: {
             /** @enum {string} */
@@ -767,8 +1295,8 @@ export interface components {
             provider: string;
             model: string;
             final_action: string;
-            input_tokens?: number | null;
-            output_tokens?: number | null;
+            input_tokens: number | null;
+            output_tokens: number | null;
             /** Format: double */
             cost_usd: number;
             has_violation: boolean;
@@ -778,7 +1306,7 @@ export interface components {
         ListRequestsResponse: {
             items: components["schemas"]["RequestListItem"][];
             /** @description Opaque cursor for the next page; null when no more pages */
-            next_cursor?: string | null;
+            next_cursor: string | null;
         };
         PolicyEventSummary: {
             /** Format: uuid */
@@ -795,19 +1323,48 @@ export interface components {
             provider: string;
             model: string;
             final_action: string;
-            input_tokens?: number | null;
-            output_tokens?: number | null;
-            reasoning_tokens?: number | null;
-            cache_read_tokens?: number | null;
-            cache_write_tokens?: number | null;
+            input_tokens: number | null;
+            output_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_read_tokens: number | null;
+            cache_write_tokens: number | null;
             /** Format: double */
             cost_usd: number;
             /** Format: date-time */
             created_at: string;
             policy_events: components["schemas"]["PolicyEventSummary"][];
+            /** Format: uuid */
+            user_id: string | null;
+            /** @description Looked up from `users` at read time. */
+            user_email: string | null;
+            /** Format: uuid */
+            api_key_id: string | null;
+            api_key_name: string | null;
+            ip_address: string | null;
+            user_agent: string | null;
+            /** @description The latest user message post-redaction, placeholders substituted in. */
+            redacted_prompt: string | null;
+            /** @description What was returned to the client after placeholder restoration. */
+            restored_response: string | null;
+            /** @description Raw user input pre-redaction. Present only for workspaces that opted into `capture_raw_content`. */
+            raw_prompt: string | null;
+            raw_response: string | null;
+            user_first_name: string | null;
+            user_last_name: string | null;
+            user_position: string | null;
+            user_device_mac: string | null;
+            /** @description Coarse origin classifier derived from the user-agent. */
+            source: string | null;
+            /** @description WS2-4 — which detection engines produced coverage for this request's prompt. EMPTY for rows written before ClickHouse migration 009: that means "not recorded", NOT "no engine ran" — the deterministic floor is unconditional. */
+            engines: string[];
         };
         CreateKeyRequest: {
             name: string;
+            /**
+             * Format: uuid
+             * @description When present the key is assigned to that workspace member and its plaintext is encrypted at rest so the chat backend can fetch it server-to-server. Omit for a legacy unassigned workspace-scoped key.
+             */
+            user_id?: string | null;
         };
         KeyResponse: {
             /** Format: uuid */
@@ -818,7 +1375,12 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
-            revoked_at?: string | null;
+            revoked_at: string | null;
+            /**
+             * Format: uuid
+             * @description Workspace member this key belongs to. Absent (not null) for legacy unassigned workspace-scoped keys — the handler skips the field.
+             */
+            assigned_user_id?: string | null;
         };
         CreateKeyResponse: {
             /** Format: uuid */
@@ -829,6 +1391,8 @@ export interface components {
             prefix: string;
             /** Format: date-time */
             created_at: string;
+            /** Format: uuid */
+            assigned_user_id?: string | null;
         };
         RotateKeyResponse: {
             /** @description Plaintext replacement key — shown once */
@@ -851,8 +1415,12 @@ export interface components {
             last_rotated_at: string;
             /** Format: date-time */
             created_at: string;
-            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
-            config?: Record<string, unknown> | null;
+            /** @description Provider-type-specific settings. Vertex AI uses `{ region, project }`; every other provider type ignores it. */
+            config: {
+                [key: string]: unknown;
+            };
+            /** @description Models registered for this provider. Empty means the caller should fall back to the per-type defaults. */
+            models: components["schemas"]["ModelSummary"][];
         };
         CreateProviderRequest: {
             name: string;
@@ -860,16 +1428,20 @@ export interface components {
             provider_type: string;
             /** @description Plaintext API key — encrypted before storage */
             credential?: string | null;
-            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
-            config?: Record<string, unknown> | null;
+            /** @description Provider-type-specific settings (Vertex AI's `{ region, project }`). */
+            config?: {
+                [key: string]: unknown;
+            } | null;
         };
         UpdateProviderRequest: {
             name?: string | null;
             provider_type?: string | null;
             /** @description New plaintext key; omit to leave existing unchanged */
             credential?: string | null;
-            /** @description Provider-specific config (e.g. Vertex AI's { region, project }) */
-            config?: Record<string, unknown> | null;
+            /** @description Provider-type-specific settings (Vertex AI's `{ region, project }`). */
+            config?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** @enum {string} */
         PolicyAction: "deny" | "allow" | "redact" | "transform" | "flag";
@@ -938,9 +1510,9 @@ export interface components {
         BudgetBehavior: "block" | "warn" | "flag";
         BudgetResponse: {
             /** Format: int64 */
-            daily_token_limit?: number | null;
+            daily_token_limit: number | null;
             /** Format: int64 */
-            monthly_token_limit?: number | null;
+            monthly_token_limit: number | null;
             behavior: components["schemas"]["BudgetBehavior"];
             /** Format: date-time */
             updated_at: string;
@@ -1016,56 +1588,59 @@ export interface components {
             p95_latency_ms: number;
             /** Format: double */
             p99_latency_ms: number;
+            /** Format: double */
+            p50_ttft_ms?: number;
+            /** Format: double */
+            p95_ttft_ms?: number;
+            /** Format: double */
+            p99_ttft_ms?: number;
+            /**
+             * Format: int64
+             * @description How many samples in the bucket carried a TTFT measurement. Zero means the three TTFT percentiles are `0.0` for want of data, not because latency was zero — render "—", not "0ms".
+             */
+            ttft_sample_count?: number;
             /** Format: int64 */
             sample_count: number;
         };
-        BillingUsage: {
-            /** Format: date-time */
-            period_start: string;
-            /** Format: date-time */
-            period_end: string;
-            /** Format: int64 */
-            total_tokens: number;
-            /** Format: double */
-            total_cost_usd: number;
-            /** Format: int64 */
-            requests_count: number;
-        };
-        BillingLimits: {
-            /** Format: int64 */
-            monthly_token_limit?: number | null;
-            monthly_cost_limit_usd?: number | null;
-            /** Format: int64 */
-            tokens_remaining?: number | null;
-            cost_remaining_usd?: number | null;
-            /** @enum {string} */
-            limit_enforcement: "soft" | "hard";
-        };
-        BillingBreakdownItem: {
-            provider: string;
+        LatencyPctilesHourlyRow: {
+            /** Format: uuid */
+            workspace_id: string;
             model: string;
-            /** Format: int64 */
-            tokens: number;
+            /** Format: date-time */
+            bucket_ts: string;
             /** Format: double */
-            cost_usd: number;
-            /** Format: int64 */
-            requests: number;
-        };
-        BillingBreakdown: {
-            by_provider: components["schemas"]["BillingBreakdownItem"][];
-        };
-        BillingTrendItem: {
-            /** Format: date */
-            date: string;
-            /** Format: int64 */
-            tokens: number;
+            p50_latency_ms: number;
             /** Format: double */
-            cost_usd: number;
+            p95_latency_ms: number;
+            /** Format: double */
+            p99_latency_ms: number;
+            /** Format: double */
+            p50_ttft_ms: number;
+            /** Format: double */
+            p95_ttft_ms: number;
+            /** Format: double */
+            p99_ttft_ms: number;
             /** Format: int64 */
-            requests: number;
+            ttft_sample_count: number;
+            /** Format: int64 */
+            sample_count: number;
         };
-        BillingTrends: {
-            days: components["schemas"]["BillingTrendItem"][];
+        LatencyPctilesResponse: components["schemas"]["LatencyPctilesDaily"] | components["schemas"]["LatencyPctilesHourly"];
+        LatencyPctilesDaily: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            bucket: "day";
+            rows: components["schemas"]["LatencyPctilesRow"][];
+        };
+        LatencyPctilesHourly: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            bucket: "hour";
+            rows: components["schemas"]["LatencyPctilesHourlyRow"][];
         };
         SecureMode: {
             enabled: boolean;
@@ -1074,6 +1649,20 @@ export interface components {
             block_on_pii_detection: boolean;
             block_on_injection_detection: boolean;
             redact_pii_in_responses: boolean;
+            /** Format: uuid */
+            workspace_id: string;
+            /**
+             * @description WS2-3. What to do when the ML sidecar produces no detection coverage for a request. `block` (the default for any workspace that has not chosen) rejects the request with 503 rather than forward a prompt the PII detector never saw; `degrade_with_alert` proceeds on the deterministic detection floor, emits an alert, sets the `x-secureprompt-sidecar-degraded` response header, and marks the audit row `floor_only = true`.
+             * @enum {string}
+             */
+            sidecar_unavailable: "block" | "degrade_with_alert";
+            /** @description WS3-1 — whether this workspace retains RAW request content (the un-redacted prompt, the un-restored upstream reply, and the reply with PII restored). False for every workspace that has not explicitly opted in. */
+            capture_raw_content: boolean;
+            /**
+             * Format: int32
+             * @description WS3-2 — days captured content is retained. Meaningless while `capture_raw_content` is false, but round-tripped so an admin can set the window before switching capture on.
+             */
+            raw_capture_retention_days: number;
             /** Format: date-time */
             updated_at: string;
         };
@@ -1084,26 +1673,464 @@ export interface components {
             block_on_pii_detection?: boolean;
             block_on_injection_detection?: boolean;
             redact_pii_in_responses?: boolean;
+            /** @enum {string} */
+            sidecar_unavailable?: "block" | "degrade_with_alert";
+            capture_raw_content?: boolean;
+            /**
+             * Format: int32
+             * @description Clamped to [1, 3650] server-side rather than rejected.
+             */
+            raw_capture_retention_days?: number;
         };
-        Webhook: {
+        /** @description The 202 body of `POST /v1/auth/token` (and of the OIDC callback) when the account needs a second factor. Exactly one of the two token fields is present: `challenge_token` for an enrolled account, `enrollment_token` for one that must enroll before it can log in. */
+        TwoFactorPending: {
+            twofa_required?: boolean;
+            challenge_token?: string | null;
+            enroll_required?: boolean;
+            enrollment_token?: string | null;
+        };
+        TwoFactorCodeRequest: {
+            /** @description A 6-digit TOTP code, or a backup code (dashes optional). */
+            code: string;
+        };
+        TwoFactorEnrollResponse: {
+            /** @description `otpauth://` URI for the QR code. */
+            provisioning_uri: string;
+            /** @description Base32 TOTP secret, for manual entry. */
+            secret_b32: string;
+            /** @description Single-use recovery codes. Shown once and never again. */
+            backup_codes: string[];
+        };
+        TwoFactorDisableResponse: {
+            disabled: boolean;
+        };
+        MyProfile: {
+            /** Format: uuid */
+            user_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+            email: string;
+            role: string;
+            first_name: string | null;
+            last_name: string | null;
+            position: string | null;
+            /** @description "First Last", or the local part of the email while the profile is empty. Computed server-side so every surface shows the same name. */
+            display_name: string;
+            /** @description Self-reported MAC from the Electron desktop wrapper; null for browser users. */
+            device_mac: string | null;
+        };
+        UpdateProfileRequest: {
+            first_name?: string | null;
+            last_name?: string | null;
+            position?: string | null;
+        };
+        MyApiKey: {
+            /** @description Live plaintext credential. Do not log or cache. */
+            api_key: string;
+        };
+        UserResponse: {
             /** Format: uuid */
             id: string;
-            /** Format: uri */
-            url: string;
-            events: string[];
-            enabled: boolean;
+            /** Format: uuid */
+            workspace_id: string;
+            email: string;
+            /** @enum {string} */
+            role: "owner" | "admin" | "developer" | "employee" | "viewer";
             /** Format: date-time */
             created_at: string;
+            /** Format: date-time */
+            updated_at: string;
         };
-        WebhookRequest: {
-            /** Format: uri */
-            url: string;
-            events: string[];
-            /** @description Optional HMAC secret */
-            secret?: string | null;
+        CreateUserRequest: {
+            email: string;
+            password: string;
+            /** @enum {string} */
+            role: "owner" | "admin" | "developer" | "employee" | "viewer";
         };
-        WebhookList: {
-            webhooks: components["schemas"]["Webhook"][];
+        SessionDto: {
+            /** Format: uuid */
+            session_id: string;
+            /** Format: date-time */
+            started_at: string;
+            /**
+             * Format: date-time
+             * @description The last refresh-token rotation. An access token is spent without touching Postgres, so this is the freshest evidence of use that exists — it is NOT a last-request timestamp.
+             */
+            last_seen_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            client_ip: string | null;
+            client: string | null;
+            /** @description True for the session whose access token made this request. */
+            is_current: boolean;
+        };
+        SessionListResponse: {
+            /** Format: uuid */
+            user_id: string;
+            sessions: components["schemas"]["SessionDto"][];
+        };
+        RevokeSessionsResponse: {
+            /** Format: uuid */
+            user_id: string;
+            /**
+             * Format: int64
+             * @description Unix seconds. Every access token for this user minted at or before this second is refused from its next request onward.
+             */
+            revoked_before: number;
+            /** Format: int64 */
+            refresh_tokens_revoked: number;
+            /** Format: uuid */
+            audit_id: string;
+            /** Format: date-time */
+            revoked_at: string;
+        };
+        EndSessionResponse: {
+            /** Format: uuid */
+            user_id: string;
+            /** Format: uuid */
+            session_id: string;
+            /** Format: int64 */
+            refresh_tokens_revoked: number;
+            /** @description Already-minted access tokens blacklisted. Zero for a session that predates migration 027 and recorded no `jti`; such a session still dies, at its own access token's expiry rather than instantly, and this number is how a caller can tell. */
+            access_tokens_blacklisted: number;
+            /** Format: uuid */
+            audit_id: string;
+            /** Format: date-time */
+            revoked_at: string;
+        };
+        LicenseStatus: {
+            customer_name: string | null;
+            lic_id: string | null;
+            expires_at: string | null;
+            features: string[];
+            /** @enum {string} */
+            status: "Valid" | "Grace" | "Unlicensed" | "Revoked";
+            /**
+             * @description Where the active token came from. `db` wins over `env`.
+             * @enum {string}
+             */
+            source: "db" | "env" | "none";
+        };
+        ActivateLicenseRequest: {
+            token: string;
+        };
+        Retention: {
+            /**
+             * Format: int64
+             * @description Whole days when the window is whole days. Null when there is no deletion window at all, or when it is sub-day — `window` always carries the human form.
+             */
+            days?: number | null;
+            window: string;
+            mechanism: string;
+            mechanism_detail: string;
+        };
+        ShapeVerification: {
+            /** @description The predicate that was actually run, in words. */
+            predicate: string;
+            /** Format: int64 */
+            rows_matching: number;
+            /** Format: int64 */
+            rows_not_matching: number;
+        };
+        Encryption: {
+            at_rest: string;
+            basis: string[];
+            verification?: components["schemas"]["ShapeVerification"];
+            note?: string;
+        };
+        GovernedBy: {
+            endpoint: string;
+            field: string;
+            role_required: string;
+            audit_table: string;
+        };
+        ArtifactClass: {
+            class: string;
+            store: string;
+            location: string;
+            description: string;
+            /** @enum {string} */
+            sensitivity: "user_content" | "derived_metadata" | "credential_material" | "audit_trail" | "configuration" | "operational";
+            /**
+             * Format: int64
+             * @description Live count for this workspace. Null only when the store could not answer, in which case `row_count_status` says why — never a guess.
+             */
+            row_count: number | null;
+            /** @enum {string} */
+            row_count_status: "counted" | "unavailable";
+            row_count_detail?: string;
+            encryption: components["schemas"]["Encryption"];
+            retention: components["schemas"]["Retention"];
+            governed_by?: components["schemas"]["GovernedBy"];
+            enabled?: boolean;
+        };
+        UnenumerableClass: {
+            class: string;
+            store: string;
+            location: string;
+            description: string;
+            /** @description WHY no per-workspace count is possible — names the mechanism, not just the fact. */
+            reason: string;
+            /** @enum {string} */
+            per_workspace_erasure: "not_possible" | "whole_store_only" | "not_applicable";
+            /**
+             * Format: int64
+             * @description Always null. Present rather than omitted so its absence is never mistaken for a count of zero.
+             */
+            row_count: number | null;
+            encryption: components["schemas"]["Encryption"];
+            retention: components["schemas"]["Retention"];
+        };
+        EncryptionBasis: {
+            kms_backend: string;
+            /** @enum {string} */
+            kms_self_test: "ok" | "failed";
+            kms_self_test_detail: string;
+            /** @enum {string} */
+            provider_key_self_test: "ok" | "failed";
+            provider_key_self_test_detail: string;
+            ciphertext_shape_claim: string;
+        };
+        DataInventory: {
+            schema_version: number;
+            /** Format: uuid */
+            workspace_id: string;
+            /** Format: date-time */
+            generated_at: string;
+            encryption_basis: components["schemas"]["EncryptionBasis"];
+            artifacts: components["schemas"]["ArtifactClass"][];
+            not_enumerable: components["schemas"]["UnenumerableClass"][];
+            caveats: string[];
+        };
+        LeakWindow: {
+            /** Format: date */
+            from: string;
+            /** Format: date */
+            to: string;
+            interpretation: string;
+        };
+        LeakTotals: {
+            /**
+             * Format: int64
+             * @description The DENOMINATOR — every request in the window, detections or not. A numerator alone reads as either alarming or trivial.
+             */
+            requests_in_window: number;
+            /** Format: int64 */
+            requests_with_detections: number;
+            /** Format: int64 */
+            entities_detected: number;
+            /** Format: int64 */
+            distinct_classes: number;
+        };
+        ClassCount: {
+            entity_class: string;
+            /** Format: int64 */
+            entities: number;
+            /** Format: int64 */
+            requests: number;
+        };
+        ModelBreakdown: {
+            model: string;
+            /** Format: int64 */
+            entities: number;
+            /** Format: int64 */
+            requests: number;
+            by_class: components["schemas"]["ClassCount"][];
+        };
+        ActorBreakdown: {
+            /**
+             * Format: uuid
+             * @description Null for a workspace-scoped key never assigned to a member — reported as null rather than folded into an "unknown" bucket.
+             */
+            user_id: string | null;
+            api_key_name: string | null;
+            /** Format: int64 */
+            entities: number;
+            /** Format: int64 */
+            requests: number;
+            by_class: components["schemas"]["ClassCount"][];
+        };
+        LeakPlaceholders: {
+            /**
+             * Format: int64
+             * @description Always null today. Present rather than omitted so its absence is never read as a count of zero.
+             */
+            count: number | null;
+            status: string;
+            detail: string;
+        };
+        AvailableDimension: {
+            dimension: string;
+            source: string;
+            caveat: string;
+        };
+        UnavailableDimension: {
+            dimension: string;
+            reason: string;
+        };
+        LeakAttribution: {
+            available: components["schemas"]["AvailableDimension"][];
+            unavailable: components["schemas"]["UnavailableDimension"][];
+        };
+        LeakReport: {
+            schema_version: number;
+            /** Format: uuid */
+            workspace_id: string;
+            /** Format: date-time */
+            generated_at: string;
+            window: components["schemas"]["LeakWindow"];
+            totals: components["schemas"]["LeakTotals"];
+            coverage: string;
+            counting_rule: string;
+            placeholders: components["schemas"]["LeakPlaceholders"];
+            by_class: components["schemas"]["ClassCount"][];
+            by_model: components["schemas"]["ModelBreakdown"][];
+            by_actor: components["schemas"]["ActorBreakdown"][];
+            attribution: components["schemas"]["LeakAttribution"];
+            /** @description `locale -> entity_class -> label`, covering exactly the classes in `by_class`. */
+            labels: {
+                [key: string]: {
+                    [key: string]: string;
+                };
+            };
+            content_policy: string;
+        };
+        CreateAuditExportRequest: {
+            /**
+             * Format: date-time
+             * @description Inclusive lower bound.
+             */
+            from: string;
+            /**
+             * Format: date-time
+             * @description EXCLUSIVE upper bound.
+             */
+            to: string;
+            /** @enum {string} */
+            format: "csv" | "jsonl";
+            /** Format: int32 */
+            page_size?: number | null;
+        };
+        CreateAuditExportResponse: {
+            /** Format: uuid */
+            export_id: string;
+            status: string;
+            status_url: string;
+            note: string;
+        };
+        AuditExportSummary: {
+            /** Format: uuid */
+            export_id: string;
+            status: string;
+            format: string;
+            /** Format: date-time */
+            window_from: string;
+            /** Format: date-time */
+            window_to: string;
+            /** Format: int64 */
+            total_rows: number | null;
+            /** Format: int32 */
+            total_pages: number | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            completed_at: string | null;
+        };
+        AuditExportDetail: {
+            /** Format: uuid */
+            export_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+            status: string;
+            format: string;
+            /** Format: int32 */
+            page_size: number;
+            /** Format: date-time */
+            window_from: string;
+            /** Format: date-time */
+            window_to: string;
+            /** Format: int64 */
+            total_rows: number | null;
+            /** Format: int32 */
+            total_pages: number | null;
+            /** @description The exact bytes the signature covers. Null until the export completes. */
+            manifest_json: string | null;
+            signature_b64: string | null;
+            public_key_b64: string | null;
+            signing_key_id: string | null;
+            error: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            completed_at: string | null;
+            page_url_template: string | null;
+            signature_note: string;
+        };
+        ModelSummary: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
+        AddModelRequest: {
+            name: string;
+        };
+        TestConnectionRequest: {
+            provider_type: string;
+            /** @description Plaintext credential to test. Never logged, never persisted — only sent to the upstream provider's list-models endpoint. */
+            credential: string;
+            base_url?: string | null;
+            /** @description Same shape as `CreateProviderRequest.config`. Only Vertex reads it today. */
+            config?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        TestConnectionResult: {
+            success: boolean;
+            /** Format: int32 */
+            model_count: number | null;
+            error: string | null;
+        };
+        SyncModelsResponse: {
+            added: string[];
+            kept: string[];
+            /** Format: int32 */
+            total: number;
+        };
+        BulkDeleteModelsRequest: {
+            names: string[];
+        };
+        BulkDeleteModelsResponse: {
+            /** Format: int64 */
+            deleted: number;
+        };
+        TokenizeRequest: {
+            text: string;
+            /** @description When present, only detections whose class (case-insensitive) appears here are tokenized. */
+            entity_labels?: string[] | null;
+        };
+        TokenizeResponse: {
+            tokenized_text: string;
+            /** Format: uuid */
+            token_vault_id: string;
+            entity_counts: {
+                [key: string]: number;
+            };
+        };
+        DetokenizeRequest: {
+            /** Format: uuid */
+            token_vault_id: string;
+            text: string;
+        };
+        DetokenizeResponse: {
+            text: string;
+        };
+        VaultStashRequest: {
+            token_map: {
+                [key: string]: string;
+            };
+        };
+        VaultStashResponse: {
+            vault_ref: string;
         };
         ApiError: {
             error: {
@@ -1170,16 +2197,30 @@ export interface components {
                 "application/json": components["schemas"]["BudgetExceededError"];
             };
         };
+        /** @description WS2-3. PII detection coverage was unavailable for this request — the ML sidecar produced no detections, or scanned only part of a long prompt — and the workspace's `sidecar_unavailable` policy is `block`, so the prompt was NOT forwarded to the provider. Retry once the sidecar is healthy, or set `sidecar_unavailable` to `degrade_with_alert` (via `PUT /v1/secure-mode`) to accept answers produced with the deterministic detection floor only. */
+        SidecarUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ApiError"];
+            };
+        };
     };
     parameters: {
         IdPath: string;
+        UserIdPath: string;
+        SessionIdPath: string;
         FromDate: string;
         ToDate: string;
         /** @description IDOR guard — must equal the JWT workspace_id when provided */
         WorkspaceIdQuery: string;
     };
     requestBodies: never;
-    headers: never;
+    headers: {
+        /** @description WS2-3. Present only when this answer was produced with the deterministic detection floor alone, because the ML sidecar produced no (or incomplete) coverage and the workspace's `sidecar_unavailable` policy is `degrade_with_alert`. The value is the reason. The matching audit row carries `floor_only = true`. */
+        SidecarDegraded: "unconfigured" | "disabled" | "circuit_open" | "all_calls_failed" | "partial_coverage";
+    };
     pathItems: never;
 }
 export type $defs = Record<string, never>;
@@ -1204,6 +2245,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description A second factor is required before tokens are issued. Carries either `challenge_token` (enrolled — answer at `POST /v1/auth/2fa/challenge`) or `enrollment_token` (must enroll — start at `POST /v1/auth/2fa/enroll`). */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TwoFactorPending"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -1252,6 +2302,58 @@ export interface operations {
             };
         };
     };
+    register: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace + owner created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Public signup is disabled on this deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Email already in use */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Per-IP signup rate limit exceeded */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
     chatCompletions: {
         parameters: {
             query?: never;
@@ -1268,6 +2370,7 @@ export interface operations {
             /** @description OpenAI-compatible chat completion response, or a server-sent event stream when `stream: true`. */
             200: {
                 headers: {
+                    "x-secureprompt-sidecar-degraded": components["headers"]["SidecarDegraded"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1278,6 +2381,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             402: components["responses"]["BudgetExceeded"];
             403: components["responses"]["Forbidden"];
+            503: components["responses"]["SidecarUnavailable"];
         };
     };
     completions: {
@@ -1296,6 +2400,7 @@ export interface operations {
             /** @description OpenAI-compatible completion response */
             200: {
                 headers: {
+                    "x-secureprompt-sidecar-degraded": components["headers"]["SidecarDegraded"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1307,6 +2412,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             402: components["responses"]["BudgetExceeded"];
+            503: components["responses"]["SidecarUnavailable"];
         };
     };
     embeddings: {
@@ -1325,6 +2431,7 @@ export interface operations {
             /** @description OpenAI-compatible embeddings response */
             200: {
                 headers: {
+                    "x-secureprompt-sidecar-degraded": components["headers"]["SidecarDegraded"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1335,6 +2442,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             402: components["responses"]["BudgetExceeded"];
+            503: components["responses"]["SidecarUnavailable"];
         };
     };
     redact: {
@@ -1353,6 +2461,7 @@ export interface operations {
             /** @description Redacted text with detection list */
             200: {
                 headers: {
+                    "x-secureprompt-sidecar-degraded": components["headers"]["SidecarDegraded"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1360,6 +2469,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            503: components["responses"]["SidecarUnavailable"];
         };
     };
     estimateTokens: {
@@ -1402,6 +2512,7 @@ export interface operations {
             /** @description Policy check result */
             200: {
                 headers: {
+                    "x-secureprompt-sidecar-degraded": components["headers"]["SidecarDegraded"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1409,6 +2520,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            503: components["responses"]["SidecarUnavailable"];
         };
     };
     getUsageDaily: {
@@ -1476,6 +2588,8 @@ export interface operations {
                 /** @description IDOR guard — must equal the JWT workspace_id when provided */
                 workspace_id?: components["parameters"]["WorkspaceIdQuery"];
                 model?: string;
+                /** @description `day` (the default) returns daily mart rows keyed by `usage_date`; `hour` returns intra-day rows keyed by `bucket_ts`, capped at 31 days to bound the payload. */
+                bucket?: "day" | "hour";
             };
             header?: never;
             path?: never;
@@ -1483,13 +2597,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Latency percentile rows */
+            /** @description WS6-4 — this was documented as a bare array of daily rows. The handler returns `analytics::LatencyPctilesResponse`, a `#[serde(tag = "bucket")]` envelope, and always has; the console carried a hand-written interface for the real shape. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LatencyPctilesRow"][];
+                    "application/json": components["schemas"]["LatencyPctilesResponse"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2057,90 +3171,6 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
         };
     };
-    getBillingUsage: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Billing usage for current period */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BillingUsage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-        };
-    };
-    getBillingLimits: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Billing limits and remaining allowance */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BillingLimits"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-        };
-    };
-    getBillingBreakdown: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Billing breakdown by provider and model */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BillingBreakdown"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-        };
-    };
-    getBillingTrends: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Billing trends by day */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BillingTrends"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-        };
-    };
     getSecureMode: {
         parameters: {
             query?: never;
@@ -2187,7 +3217,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
         };
     };
-    listWebhooks: {
+    getMyProfile: {
         parameters: {
             query?: never;
             header?: never;
@@ -2196,19 +3226,19 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description List of webhooks */
+            /** @description Profile of the authenticated user */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["WebhookList"];
+                    "application/json": components["schemas"]["MyProfile"];
                 };
             };
             401: components["responses"]["Unauthorized"];
         };
     };
-    createWebhook: {
+    putMyProfile: {
         parameters: {
             query?: never;
             header?: never;
@@ -2217,23 +3247,348 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["WebhookRequest"];
+                "application/json": components["schemas"]["UpdateProfileRequest"];
             };
         };
         responses: {
-            /** @description Webhook created */
-            201: {
+            /** @description Updated profile */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Webhook"];
+                    "application/json": components["schemas"]["MyProfile"];
                 };
             };
             401: components["responses"]["Unauthorized"];
         };
     };
-    deleteWebhook: {
+    getMyApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The plaintext API key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyApiKey"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Members of the caller's workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserResponse"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateUserRequest"];
+            };
+        };
+        responses: {
+            /** @description Member created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Email already in use */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    listUserSessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: components["parameters"]["UserIdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The member's live sessions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    revokeUserSessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: components["parameters"]["UserIdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sessions terminated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevokeSessionsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    revokeUserSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: components["parameters"]["UserIdPath"];
+                session_id: components["parameters"]["SessionIdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session terminated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EndSessionResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getLicense: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description License status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    activateLicense: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActivateLicenseRequest"];
+            };
+        };
+        responses: {
+            /** @description License activated — the new status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    deleteLicense: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stored token removed — the resulting status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    getDataInventory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Data inventory */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataInventory"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    getLeakReport: {
+        parameters: {
+            query: {
+                from: components["parameters"]["FromDate"];
+                to: components["parameters"]["ToDate"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Leak report for the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LeakReport"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    listAuditExports: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recent exports, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditExportSummary"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    createAuditExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAuditExportRequest"];
+            };
+        };
+        responses: {
+            /** @description Export accepted — poll `status_url` */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateAuditExportResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    getAuditExport: {
         parameters: {
             query?: never;
             header?: never;
@@ -2244,7 +3599,218 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Webhook deleted */
+            /** @description Export detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditExportDetail"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getAuditExportPage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+                page: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The page, verbatim */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/csv": string;
+                    "application/x-ndjson": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    testProviderConnectionUnsaved: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description The probe ran. `success: false` with an `error` is a normal outcome, not an HTTP failure. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestConnectionResult"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    testProviderConnectionStored: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The probe ran */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestConnectionResult"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listProviderModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registered models. Empty means "fall back to the per-type defaults". */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSummary"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    addProviderModel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddModelRequest"];
+            };
+        };
+        responses: {
+            /** @description Model registered */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSummary"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    syncProviderModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sync result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncModelsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    bulkDeleteProviderModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkDeleteModelsRequest"];
+            };
+        };
+        responses: {
+            /** @description How many registrations were removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkDeleteModelsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    deleteProviderModel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Model deregistered */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -2252,7 +3818,87 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+        };
+    };
+    tokenizeText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenizeRequest"];
+            };
+        };
+        responses: {
+            /** @description Tokenized text plus the vault id needed to reverse it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenizeResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    detokenizeText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DetokenizeRequest"];
+            };
+        };
+        responses: {
+            /** @description Text with the original values restored */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DetokenizeResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    vaultStash: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VaultStashRequest"];
+            };
+        };
+        responses: {
+            /** @description Opaque reference to the stashed mapping */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VaultStashResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
         };
     };
     getMetrics: {

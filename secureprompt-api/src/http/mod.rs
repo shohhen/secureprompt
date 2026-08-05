@@ -1,5 +1,8 @@
 pub mod middleware;
 pub mod model_router;
+/// WS6-4 — the served path/method table, read out of the live `axum::Router`
+/// so the OpenAPI document can be checked against it instead of trusted.
+pub mod route_table;
 pub mod routes;
 /// WS2-4 — `sidecar_unavailable` enforcement for the routes that answer the
 /// caller directly instead of forwarding to a provider.

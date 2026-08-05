@@ -5,8 +5,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { screen, fireEvent } from "@testing-library/react";
-import { renderWithIntl as render } from "../utils/intl";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // ── CreateKeyDialog smoke ─────────────────────────────────────────────────────
 
@@ -50,28 +51,55 @@ describe("CreateKeyDialog", () => {
 // ── KeyResponse type contract ─────────────────────────────────────────────────
 
 describe("KeyResponse type contracts", () => {
-  it("KeyResponse does not include api_key (prefix only)", () => {
-    // Type-level check: if api_key existed on KeyResponse, this would fail tsc.
-    // Here we verify by inspecting the hook module's exported interface shape
-    // by checking the hook file's source for the correct type separation.
-    const { readFileSync } = require("fs");
-    const { resolve } = require("path");
-    const src = readFileSync(
-      resolve(process.cwd(), "src/lib/hooks/use-keys.ts"),
+  /**
+   * The plaintext key is returned exactly once, by `POST /v1/keys`. The list
+   * endpoint must never carry it.
+   *
+   * WS6-4 rewrote this test. It used to slice `use-keys.ts` between
+   * `indexOf("export interface KeyResponse")` and
+   * `indexOf("export interface CreateKeyResponse")` — and once those
+   * interfaces became aliases onto the codegen, BOTH `indexOf` calls returned
+   * -1, so `expect(block).not.toContain("api_key")` was asserting that the
+   * empty string does not contain "api_key". It would have passed forever,
+   * including on a `KeyResponse` that did leak the key. Only its sibling
+   * assertion failing gave the change away.
+   *
+   * It now reads the OpenAPI document the types are generated FROM, which is
+   * the same document the gateway serves and the same one
+   * `openapi_router_contract.rs` checks against the router — so this asserts
+   * the published contract rather than the punctuation of one TypeScript file.
+   */
+  const spec = JSON.parse(
+    readFileSync(
+      resolve(process.cwd(), "../secureprompt-schemas/openapi/v1/openapi.json"),
       "utf-8",
-    );
-    // KeyResponse (the GET list type) must NOT have api_key
-    // CreateKeyResponse (the POST response type) MUST have api_key
-    const keyResponseBlock = src.slice(
-      src.indexOf("export interface KeyResponse"),
-      src.indexOf("export interface CreateKeyResponse"),
-    );
-    expect(keyResponseBlock).not.toContain("api_key");
-    expect(src).toContain("CreateKeyResponse");
-    const createResponseBlock = src.slice(
-      src.indexOf("export interface CreateKeyResponse"),
-    );
-    expect(createResponseBlock).toContain("api_key");
+    ),
+  ) as {
+    components: {
+      schemas: Record<string, { properties?: Record<string, unknown> }>;
+    };
+  };
+
+  function props(schema: string): string[] {
+    const s = spec.components.schemas[schema];
+    // Premise: an absent or empty schema would make every assertion below
+    // vacuous — exactly the failure mode this rewrite exists to fix.
+    expect(s, `${schema} is missing from openapi.json`).toBeTruthy();
+    const keys = Object.keys(s.properties ?? {});
+    expect(keys.length, `${schema} declares no properties`).toBeGreaterThan(2);
+    return keys;
+  }
+
+  it("KeyResponse does not include api_key (prefix only)", () => {
+    expect(props("KeyResponse")).not.toContain("api_key");
+    expect(props("KeyResponse")).toContain("prefix");
+  });
+
+  it("CreateKeyResponse is the only one that carries the plaintext", () => {
+    // The positive control for the assertion above: if `api_key` were absent
+    // everywhere, "KeyResponse does not include api_key" would be satisfied by
+    // a document that describes no plaintext key at all.
+    expect(props("CreateKeyResponse")).toContain("api_key");
   });
 });
 

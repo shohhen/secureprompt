@@ -1,46 +1,45 @@
 /**
  * Typed 2FA API helpers (Task 2 of docs/superpowers/plans/2026-07-22-2fa-console.md).
  *
- * Talks directly to the Rust gateway's `POST /v1/auth/token` and
- * `POST /v1/auth/2fa/*` endpoints with plain `fetch` — NOT the openapi-fetch
- * client in `api-client.ts` — because the 202 challenge/enroll response
- * shapes for `/v1/auth/token` aren't represented in the generated OpenAPI
- * types (`src/types/api.gen.ts` only models the 200 `TokenResponse` case;
- * see `secureprompt-api/src/http/routes/dashboard/auth.rs` for the 202
- * `{twofa_required, challenge_token}` / `{enroll_required, enrollment_token}`
- * bodies).
+ * WS6-4 — this module used to talk to `POST /v1/auth/token` and
+ * `POST /v1/auth/2fa/*` with plain `fetch`, and said why in this comment:
+ * "the 202 challenge/enroll response shapes for /v1/auth/token aren't
+ * represented in the generated OpenAPI types". They are now
+ * (`TwoFactorPending`, plus the four `/v1/auth/2fa/*` paths that were served
+ * and undocumented), so the reason is gone and this file is on the generated
+ * client like every other data hook.
  *
- * Base URL resolution matches `api-client.ts` / `api-fetch.ts`
- * (`NEXT_PUBLIC_API_URL`, falling back to `http://localhost:8080`) rather
- * than `auth.ts`'s server-only `API_URL` — these helpers are called from
- * client components (login form, challenge/enroll screens, settings page).
+ * Two things it deliberately does NOT take from `api-client.ts`:
+ *
+ *   * `unwrap()`. The public contract here is `Tokens | null` and
+ *     `LoginResult`, with two typed throws (`TwoFaLockedError` on 429,
+ *     `TwoFaAlreadyEnabledError` on 409) that the challenge and settings
+ *     screens branch on. Throwing `ApiError` instead would be a behaviour
+ *     change for every caller, so the status mapping below is unchanged —
+ *     only the transport moved.
+ *   * the session bearer and the 401 signOut. These run DURING login, when
+ *     there is no session: the bearer is a short-lived `challenge_token` /
+ *     `enrollment_token`, and a signOut redirect on a wrong TOTP code would
+ *     bounce the user out of the flow they are in the middle of. Hence
+ *     `makeApiClient({ bearer, signOutOn401: false })`.
+ *
+ * Base URL resolution comes from `api-client.ts` (`NEXT_PUBLIC_API_URL`,
+ * falling back to `http://localhost:8080`) rather than `auth.ts`'s
+ * server-only `API_URL` — these helpers are called from client components
+ * (login form, challenge/enroll screens, settings page).
  *
  * Pure module: no React, no next-auth imports. Never logs tokens/secrets.
  */
+import { makeApiClient } from "@/lib/api-client";
+import type { components } from "@/types/api.gen";
 import type { AppRole, AppSessionUser } from "@/types/next-auth";
 
-const DEFAULT_API_URL = "http://localhost:8080";
+type BackendTokenResponse = components["schemas"]["TokenResponse"];
+type TwoFactorPending = components["schemas"]["TwoFactorPending"];
+type BackendEnrollResponse =
+  components["schemas"]["TwoFactorEnrollResponse"];
 
-function apiBaseUrl(): string {
-  const url = process.env.NEXT_PUBLIC_API_URL ?? DEFAULT_API_URL;
-  return url.replace(/\/+$/, "");
-}
-
-/** Backend `TokenResponse` shape (snake_case) — success body for
- *  `/v1/auth/token`, `/v1/auth/2fa/challenge`, and `/v1/auth/2fa/verify`. */
-interface BackendTokenResponse {
-  access_token: string;
-  refresh_token: string;
-  /** Unix seconds */
-  access_expires_at: number;
-  /** Unix seconds */
-  refresh_expires_at: number;
-  user?: AppSessionUser;
-  workspace_id?: string;
-  role?: AppRole;
-}
-
-/** camelCase mirror of `BackendTokenResponse`. */
+/** camelCase mirror of the backend's `TokenResponse`. */
 export interface Tokens {
   accessToken: string;
   refreshToken: string;
@@ -58,12 +57,6 @@ export type LoginResult =
   | { kind: "challenge"; challengeToken: string }
   | { kind: "enroll"; enrollmentToken: string }
   | { kind: "error" };
-
-interface BackendEnrollResponse {
-  provisioning_uri: string;
-  secret_b32: string;
-  backup_codes: string[];
-}
 
 export interface EnrollResult {
   provisioningUri: string;
@@ -104,10 +97,6 @@ export class TwoFaLockedError extends Error {
  * so the caller can tell it apart from a genuine failure (network/500,
  * still `null`) instead of collapsing both into the same falsy result.
  * Same pattern as `TwoFaLockedError` above for `challenge()`'s 429.
- * Existing callers that don't care about the distinction (the login flow's
- * forced-enrollment screen, `two-factor-enroll.tsx`) already funnel any
- * thrown error into a generic "something went wrong" state, so this is a
- * behavior-preserving change for them.
  */
 export class TwoFaAlreadyEnabledError extends Error {
   constructor(message = "Two-factor authentication is already enabled.") {
@@ -120,20 +109,25 @@ function mapTokens(body: BackendTokenResponse): Tokens {
   return {
     accessToken: body.access_token,
     refreshToken: body.refresh_token,
-    user: body.user,
+    user: body.user as AppSessionUser | undefined,
     workspaceId: body.workspace_id,
-    role: body.role,
+    role: body.role as AppRole | undefined,
     accessExpiresAt: body.access_expires_at,
     refreshExpiresAt: body.refresh_expires_at,
   };
 }
 
-async function safeJson<T>(res: Response): Promise<T | null> {
-  try {
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  }
+/**
+ * A client with no session bearer and no signOut-on-401 — see the module
+ * doc. `bearer` is a purpose token, or absent entirely for `loginStep1`.
+ */
+function authClient(bearer?: string) {
+  // `bearer ?? null` — never fall back to the session. `loginStep1` passes
+  // nothing and must send no Authorization header at all; resolving one would
+  // add a `getSession()` round-trip the raw-fetch version never made, and
+  // `tests/unit/refresh-token-transits-the-browser-at-login.test.ts` counts
+  // the calls.
+  return makeApiClient({ bearer: bearer ?? null, signOutOn401: false });
 }
 
 /**
@@ -150,28 +144,28 @@ export async function loginStep1(
   email: string,
   password: string,
 ): Promise<LoginResult> {
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`${apiBaseUrl()}/v1/auth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+    result = await authClient().POST("/v1/auth/token", {
+      body: { email, password },
     });
   } catch {
+    // makeApiClient turns a transport failure into NetworkError; this
+    // module's contract is `kind: "error"`, unchanged from the raw-fetch
+    // version's bare `catch`.
     return { kind: "error" };
   }
 
-  if (res.status === 200) {
-    const body = await safeJson<BackendTokenResponse>(res);
+  const { data, response } = result;
+
+  if (response.status === 200) {
+    const body = data as BackendTokenResponse | undefined;
     if (!body?.access_token || !body.refresh_token) return { kind: "error" };
     return { kind: "tokens", tokens: mapTokens(body) };
   }
 
-  if (res.status === 202) {
-    const body = await safeJson<{
-      challenge_token?: string;
-      enrollment_token?: string;
-    }>(res);
+  if (response.status === 202) {
+    const body = data as TwoFactorPending | undefined;
     if (body?.challenge_token) {
       return { kind: "challenge", challengeToken: body.challenge_token };
     }
@@ -195,26 +189,21 @@ export async function challenge(
   challengeToken: string,
   code: string,
 ): Promise<Tokens | null> {
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`${apiBaseUrl()}/v1/auth/2fa/challenge`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${challengeToken}`,
-      },
-      body: JSON.stringify({ code }),
+    result = await authClient(challengeToken).POST("/v1/auth/2fa/challenge", {
+      body: { code },
     });
   } catch {
     return null;
   }
 
-  if (res.status === 429) {
+  if (result.response.status === 429) {
     throw new TwoFaLockedError();
   }
-  if (res.status !== 200) return null;
+  if (result.response.status !== 200) return null;
 
-  const body = await safeJson<BackendTokenResponse>(res);
+  const body = result.data as BackendTokenResponse | undefined;
   if (!body?.access_token) return null;
   return mapTokens(body);
 }
@@ -227,22 +216,19 @@ export async function challenge(
  * `TwoFaAlreadyEnabledError` on 409 -- see that class's doc comment.
  */
 export async function enroll(bearer: string): Promise<EnrollResult | null> {
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`${apiBaseUrl()}/v1/auth/2fa/enroll`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${bearer}` },
-    });
+    result = await authClient(bearer).POST("/v1/auth/2fa/enroll", {});
   } catch {
     return null;
   }
 
-  if (res.status === 409) {
+  if (result.response.status === 409) {
     throw new TwoFaAlreadyEnabledError();
   }
-  if (res.status !== 200) return null;
+  if (result.response.status !== 200) return null;
 
-  const body = await safeJson<BackendEnrollResponse>(res);
+  const body = result.data as BackendEnrollResponse | undefined;
   if (!body?.provisioning_uri || !body.secret_b32 || !body.backup_codes) {
     return null;
   }
@@ -263,23 +249,18 @@ export async function verify2fa(
   bearer: string,
   code: string,
 ): Promise<Tokens | null> {
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`${apiBaseUrl()}/v1/auth/2fa/verify`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${bearer}`,
-      },
-      body: JSON.stringify({ code }),
+    result = await authClient(bearer).POST("/v1/auth/2fa/verify", {
+      body: { code },
     });
   } catch {
     return null;
   }
 
-  if (res.status !== 200) return null;
+  if (result.response.status !== 200) return null;
 
-  const body = await safeJson<BackendTokenResponse>(res);
+  const body = result.data as BackendTokenResponse | undefined;
   if (!body?.access_token) return null;
   return mapTokens(body);
 }
@@ -294,19 +275,14 @@ export async function disable2fa(
   accessToken: string,
   code: string,
 ): Promise<boolean> {
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`${apiBaseUrl()}/v1/auth/2fa/disable`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({ code }),
+    result = await authClient(accessToken).POST("/v1/auth/2fa/disable", {
+      body: { code },
     });
   } catch {
     return false;
   }
 
-  return res.status === 200;
+  return result.response.status === 200;
 }
