@@ -24,6 +24,24 @@ services:
     image: secureprompt/api:${SP_VERSION:-0.1.0}
     pull_policy: never
 
+  # WS6-5. secureprompt-ml was the biggest hole in this overlay: the base file
+  # only has a `build:` for it, so an air-gapped host running
+  # `docker compose -f docker-compose.yml -f docker-compose.onprem.yml up`
+  # tried to COMPILE the sidecar -- which additionally needs
+  # SECUREPROMPT_PINNED_MODEL_KEK, a secret that is not on that host.
+  #
+  # This image is the reason scripts/bundle-images.sh exists and treats it
+  # separately: at 12.6 GB it is excluded from the CI `build` stage (it needs
+  # the raw model DEK), so it is built and side-loaded out of band.
+  secureprompt-ml:
+    image: secureprompt/ml:${SP_VERSION:-0.1.0}
+    pull_policy: never
+
+  # Same problem, smaller: the chat UI is a `build:` of the SP-modified fork.
+  librechat:
+    image: secureprompt/librechat:${SP_VERSION:-0.1.0}
+    pull_policy: never
+
   api:
     image: secureprompt/api:${SP_VERSION:-0.1.0}
     pull_policy: never
@@ -38,4 +56,29 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
+    pull_policy: never
+
+  # WS6-5. These seven come from public registries in the base file and had NO
+  # pull_policy at all here, so on an air-gapped host each one is a pull attempt
+  # that hangs and then fails -- after `docker load` has already put the exact
+  # image in the local store. `never` makes compose use what is there.
+  postgres:
+    pull_policy: never
+
+  redis:
+    pull_policy: never
+
+  clickhouse:
+    pull_policy: never
+
+  qdrant:
+    pull_policy: never
+
+  grafana:
+    pull_policy: never
+
+  librechat-mongo:
+    pull_policy: never
+
+  librechat-nginx:
     pull_policy: never

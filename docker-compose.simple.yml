@@ -8,12 +8,25 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    # WS6-5 resource limits — see docker-compose.yml's `postgres` for why.
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1g }
+        reservations: { cpus: "0.10", memory: 256m }
 
   redis:
     image: redis:7.4-alpine
+    # WS6-5. Same --requirepass as the full appliance. This profile is for local
+    # evaluation, but it still publishes 6379, and "it's only the eval profile"
+    # is how an unauthenticated Redis ends up on a laptop on a corporate LAN.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}", "--save", ""]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+        reservations: { cpus: "0.05", memory: 64m }
 
   # WS1-P0 role split — see docker-compose.yml's `db-migrate` for the full
   # reasoning. Short version: migrations need CREATE ON SCHEMA public and table
@@ -38,6 +51,10 @@ services:
     environment:
       DATABASE_URL: postgres://secureprompt:secureprompt@postgres:5432/secureprompt
       SECUREPROMPT_APP_DB_PASSWORD: ${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+        reservations: { cpus: "0.05", memory: 64m }
     depends_on:
       - postgres
 
@@ -48,7 +65,7 @@ services:
     environment:
       # RUNTIME role: NOSUPERUSER, NOBYPASSRLS, owns nothing.
       DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://default:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@redis:6379
       LOG_LEVEL: debug
       # WS2-3. This profile deliberately ships NO ML sidecar, so the gateway
       # has no NER coverage for any request. The product default is
@@ -69,6 +86,10 @@ services:
       SECUREPROMPT_SIDECAR_UNAVAILABLE_DEFAULT: degrade_with_alert
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1g }
+        reservations: { cpus: "0.10", memory: 192m }
     depends_on:
       db-migrate:
         condition: service_completed_successfully

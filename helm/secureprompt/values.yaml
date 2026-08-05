@@ -5,24 +5,50 @@ nameOverride: ""
 fullnameOverride: ""
 
 # ----------------------------------------------------------------------------
-# Domain / Ingress (GKE)
+# Domain / Ingress
+#
+# WS6-5. This block used to be GKE-only, and not by configuration — by
+# construction. `helm template` at these defaults emitted
+# `apiVersion: networking.gke.io/v1 / kind: ManagedCertificate`, which is a
+# GKE CRD: `kubectl apply` on any other cluster fails the WHOLE release with
+# `no matches for kind "ManagedCertificate"`. `values-airgap.yaml` — the file
+# an on-prem bank installs — inherited every one of those, because it
+# overrides images and nothing else.
+#
+# The defaults below are now vanilla Kubernetes. GKE is an overlay:
+#   helm install ... -f helm/secureprompt/values-gke.yaml
+# `scripts/ci/check-helm-portability.sh` renders both and asserts each stays
+# what it claims to be.
 # ----------------------------------------------------------------------------
 ingress:
   enabled: true
-  # Hostnames -> services. Cert is provisioned via Google-managed cert.
+  # "generic" | "gke". Only "gke" emits the ManagedCertificate CRD and the
+  # cloud.google.com/neg Service annotations. Anything else is portable.
+  platform: "generic"
+  # Hostnames -> services.
   domain: "secureprompt.tech"
   hosts:
     web: "app.secureprompt.tech"
     api: "api.secureprompt.tech"
-  staticIpName: ""  # optional reserved global IP name. Leave empty for ephemeral.
+  # spec.ingressClassName — the portable way to name a controller. Set to the
+  # class your cluster actually runs: "nginx" for ingress-nginx, "traefik",
+  # "gce" on GKE (values-gke.yaml does that). Empty leaves the cluster's
+  # default IngressClass to claim it.
+  className: ""
+  # Free-form Ingress annotations. Controller-specific tuning goes here rather
+  # than in the template, e.g. for ingress-nginx:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+  #   nginx.ingress.kubernetes.io/proxy-buffering: "off"   # SSE — see docs/proxying/sse.md
+  annotations: {}
+  staticIpName: ""  # GKE only: reserved global IP name. Ignored elsewhere.
   # TLS: pick ONE.
-  #  - managedCertificate.enabled=true  → GCP-managed cert (needs DNS-only/grey-cloud
-  #    so Google can validate; cannot provision behind a Cloudflare proxy).
-  #  - tlsSecret="<name>" → use a self-managed kubernetes.io/tls secret on the LB
-  #    (e.g. a Cloudflare Origin Certificate). Required when fronting with the
-  #    Cloudflare proxy (orange cloud) in Full (strict) mode. Disable managedCertificate.
+  #  - tlsSecret="<name>" → a kubernetes.io/tls secret (cert-manager, a
+  #    Cloudflare Origin Certificate, or your bank's internal CA). This is the
+  #    portable option and the only one that works on-prem.
+  #  - managedCertificate.enabled=true → GKE-managed cert. REQUIRES
+  #    platform="gke"; ignored otherwise, because the CRD does not exist.
   managedCertificate:
-    enabled: true
+    enabled: false
   tlsSecret: ""
 
 # ----------------------------------------------------------------------------
@@ -57,6 +83,23 @@ api:
     publicSignupEnabled: "true"
     chatDebugMode: "false"
     corsOrigins: "https://app.secureprompt.tech,https://secureprompt.tech"
+  # WS6-5 pod hardening. allowPrivilegeEscalation=false, capabilities.drop
+  # [ALL], seccompProfile RuntimeDefault and runAsNonRoot are unconditional in
+  # the template -- they cost nothing and are not negotiable. Only
+  # readOnlyRootFilesystem is a value, because it is the one that can break a
+  # container that writes, and the default below is what a `docker run
+  # --read-only` against the pinned image actually did.
+  security:
+    # MEASURED: distroless/cc-debian12:nonroot starts read-only (it got as far
+    # as the DB connect, not an EROFS).
+    readOnlyRootFilesystem: true
+  # Service shape. NodePort is what the GKE ingress controller requires; on a
+  # cluster whose controller routes to ClusterIP (ingress-nginx does), NodePort
+  # additionally opens a port on every node for no reason. Set ClusterIP
+  # on-prem.
+  service:
+    type: NodePort
+    annotations: {}
 
 worker:
   image:
@@ -74,6 +117,10 @@ worker:
   metrics:
     enabled: true
     port: 9091
+  security:
+    # MEASURED: same base image as api; read-only run failed only on
+    # `Connection refused` reaching ClickHouse.
+    readOnlyRootFilesystem: true
 
 web:
   image:
@@ -88,6 +135,17 @@ web:
     apiUrl: "http://secureprompt-api"
     nextauthUrl: "https://app.secureprompt.tech"
     nextPublicApiUrl: "https://api.secureprompt.tech"
+  security:
+    # MEASURED: node:22-alpine standalone build, uid 1001, "Ready in 0ms"
+    # read-only.
+    readOnlyRootFilesystem: true
+  # Service shape. NodePort is what the GKE ingress controller requires; on a
+  # cluster whose controller routes to ClusterIP (ingress-nginx does), NodePort
+  # additionally opens a port on every node for no reason. Set ClusterIP
+  # on-prem.
+  service:
+    type: NodePort
+    annotations: {}
 
 ml:
   enabled: true
@@ -118,6 +176,14 @@ ml:
     # (multilingual_ner_v8_xlmr). Comma-separated to run several, or "all" to register
     # every shipped checkpoint. Rollback to v7: multilingual_ner_v7_xlmr (also shipped).
     activeNerModels: "multilingual_ner_v8_xlmr"
+  security:
+    # DEFAULT FALSE, and deliberately so. The 12.6 GB ML image is excluded from
+    # the CI `build` stage (it needs the raw model DEK), so it was not built in
+    # the environment that measured every other entry in this file and was
+    # never started read-only. /tmp already has an emptyDir, so flipping this to
+    # true is a values change with no template change -- do it once you have
+    # run the image read-only and watched /v1/scan-file succeed.
+    readOnlyRootFilesystem: false
 
 # ----------------------------------------------------------------------------
 # LibreChat (browser chat UI, SP-modified fork) + its MongoDB
@@ -144,7 +210,9 @@ librechat:
       tag: "7.0"
     persistence:
       size: "5Gi"
-      storageClass: "standard-rwo"
+      storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
     resources:
       requests: { cpu: "50m",  memory: "256Mi" }
       limits:   { cpu: "500m", memory: "512Mi" }
@@ -164,7 +232,9 @@ postgres:
   persistence:
     enabled: true
     size: "5Gi"
-    storageClass: "standard-rwo"
+    storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits:   { cpu: "500m", memory: "512Mi" }
@@ -181,7 +251,9 @@ clickhouse:
   persistence:
     enabled: true
     size: "10Gi"
-    storageClass: "standard-rwo"
+    storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
   resources:
     requests: { cpu: "200m",  memory: "1Gi" }
     limits:   { cpu: "1000m", memory: "2Gi" }
@@ -203,7 +275,9 @@ qdrant:
   persistence:
     enabled: true
     size: 5Gi
-    storageClass: "standard-rwo"
+    storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits:   { cpu: "500m", memory: "1Gi" }
@@ -217,7 +291,9 @@ grafana:
   persistence:
     enabled: true
     size: "2Gi"
-    storageClass: "standard-rwo"
+    storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
   resources:
     requests: { cpu: "25m",  memory: "128Mi" }
     limits:   { cpu: "200m", memory: "256Mi" }
@@ -274,9 +350,35 @@ backup:
     tag: "latest"
   keySecret: "secureprompt-backup-key"
   retentionDaily: 7
+  # The CronJob container rendered with NO resources block at all, which makes
+  # it BestEffort: a pg_dump of a large database is then the first thing the
+  # kubelet evicts under node pressure, silently, at 02:00.
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
   # PVC mounted at /backups by the CronJob.
   storageSize: 20Gi
-  storageClass: "standard-rwo"
+  storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy (WS6-5)
+# ----------------------------------------------------------------------------
+# The chart rendered zero NetworkPolicies. In a shared cluster that means any
+# pod in any namespace can open a socket straight to Postgres, ClickHouse,
+# Valkey, Qdrant or the ML sidecar.
+#
+# CAVEAT WORTH READING BEFORE YOU TRUST IT: NetworkPolicies are enforced by the
+# CNI. On a cluster whose CNI does not implement them they are accepted by the
+# API server and do nothing, so `kubectl get networkpolicy` shows a control
+# that is not a control. See templates/networkpolicy.yaml.
+networkPolicy:
+  enabled: true
+  # Optional: let a Prometheus that lives in ANOTHER namespace scrape the
+  # workloads here, e.g. { matchLabels: { kubernetes.io/metadata.name: monitoring } }.
+  # The in-chart Prometheus is in this namespace and needs nothing.
+  monitoringNamespaceSelector: {}
 
 serviceMesh:
   enabled: false
@@ -302,7 +404,9 @@ prometheus:
   persistence:
     enabled: true
     size: "10Gi"
-    storageClass: "standard-rwo"
+    storageClass: ""  # empty = the cluster's default StorageClass. WS6-5: this used to be
+                  # "standard-rwo", a GKE-only class name, which leaves every PVC Pending
+                  # on any other cluster. values-gke.yaml sets it back for GKE.
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits:   { cpu: "500m", memory: "1Gi" }

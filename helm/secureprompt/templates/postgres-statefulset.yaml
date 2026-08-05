@@ -44,6 +44,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            # MEASURED: without these two, a read-only rootfs kills postgres at
+            # boot with
+            #   FATAL: could not create lock file
+            #   "/var/run/postgresql/.s.PGSQL.5432.lock": Read-only file system
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "{{ .Values.postgres.auth.user }}"]
@@ -56,6 +64,22 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.postgres.resources | nindent 12 }}
+          # uid 70 -- `id postgres` inside postgres:16-alpine, not 999 (which is
+          # what the same user is on the DEBIAN image; getting that wrong is how
+          # this was first recorded as impossible). MEASURED at uid 70 with the
+          # two emptyDirs above and PGDATA already pointing at the `pgdata`
+          # SUBDIRECTORY this template sets: "database system is ready to accept
+          # connections", both with a 0700 data dir and with the 0775 root:70
+          # one a k8s fsGroup leaves behind.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 70 "gid" 70 "readOnly" true) | nindent 12 }}
+      securityContext:
+        fsGroup: 70
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

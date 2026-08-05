@@ -1,0 +1,55 @@
+# GKE overlay — WS6-5.
+#
+# Everything in this file USED TO BE the chart default, which is what made
+# `helm template helm/secureprompt` unusable anywhere except GKE:
+# ManagedCertificate is a `networking.gke.io/v1` CRD, so `kubectl apply` on a
+# vanilla cluster failed the whole release with `no matches for kind`, and the
+# `standard-rwo` StorageClass left every PVC Pending.
+#
+# The chart defaults are now vanilla Kubernetes. This file restores the GKE
+# behaviour exactly, so the existing GKE deploy is a `-f` away and not a
+# regression:
+#
+#   helm upgrade --install sp helm/secureprompt \
+#     -f helm/secureprompt/values-gke.yaml \
+#     --set global.imageRegistry=us-central1-docker.pkg.dev/<project>/secureprompt/
+#
+# scripts/gcp/deploy.sh passes it. scripts/ci/check-helm-portability.sh renders
+# it as a POSITIVE CONTROL: if this file stops producing ManagedCertificate and
+# the neg annotations, the portability assertions on the other modes stop
+# meaning anything and the check fails.
+
+ingress:
+  # The only switch that matters. Gates the ManagedCertificate CRD and the
+  # cloud.google.com/neg Service annotations.
+  platform: "gke"
+  # spec.ingressClassName, replacing the deprecated
+  # `kubernetes.io/ingress.class: "gce"` annotation the template hardcoded.
+  # Same controller, the supported spelling.
+  className: "gce"
+  managedCertificate:
+    enabled: true
+
+# GKE's PD-balanced StorageClass. Present on every GKE cluster, present on
+# nothing else.
+postgres:
+  persistence:
+    storageClass: "standard-rwo"
+clickhouse:
+  persistence:
+    storageClass: "standard-rwo"
+qdrant:
+  persistence:
+    storageClass: "standard-rwo"
+grafana:
+  persistence:
+    storageClass: "standard-rwo"
+prometheus:
+  persistence:
+    storageClass: "standard-rwo"
+backup:
+  storageClass: "standard-rwo"
+librechat:
+  mongo:
+    persistence:
+      storageClass: "standard-rwo"

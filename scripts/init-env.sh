@@ -92,6 +92,12 @@ APP_DB_PASSWORD="$(gen)"
 # It is now REQUIRED there, so it must be generated here. Format is fixed by
 # secureprompt-common/src/kms.rs: base64-standard of EXACTLY 32 decoded bytes.
 KMS_FILE_KEY="$(openssl rand 32 | base64)"
+# WS6-5. Redis and ClickHouse were both unauthenticated in compose. Generated
+# here for the same reason as everything above: docker-compose.yml requires
+# them with no fallback, and .env.example must keep a value the hygiene gate
+# rejects rather than a working one.
+REDIS_PASSWORD="$(gen)"
+CLICKHOUSE_PASSWORD="$(gen)"
 
 # --fill-missing: append the keys this .env does not have, and stop. Every
 # existing assignment is left byte-for-byte alone — that is the entire point,
@@ -121,6 +127,8 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fill NEXTAUTH_SECRET              "$NEXTAUTH"
     fill SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
     fill KMS_FILE_KEY                 "$KMS_FILE_KEY"
+    fill REDIS_PASSWORD               "$REDIS_PASSWORD"
+    fill CLICKHOUSE_PASSWORD          "$CLICKHOUSE_PASSWORD"
 
     if [[ "${#added[@]}" -eq 0 ]]; then
         echo "$TARGET already has every key this script manages. Nothing changed."
@@ -151,6 +159,8 @@ replace ML_SIDECAR_INTERNAL_TOKEN "$ML_TOKEN"
 replace NEXTAUTH_SECRET           "$NEXTAUTH"
 replace SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
 replace KMS_FILE_KEY                 "$KMS_FILE_KEY"
+replace REDIS_PASSWORD               "$REDIS_PASSWORD"
+replace CLICKHOUSE_PASSWORD          "$CLICKHOUSE_PASSWORD"
 
 echo "Wrote $TARGET with freshly generated secrets."
 echo

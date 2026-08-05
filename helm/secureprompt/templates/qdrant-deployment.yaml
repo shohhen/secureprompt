@@ -33,14 +33,32 @@ spec:
               port: 6333
             initialDelaySeconds: 10
             periodSeconds: 5
-          {{- if .Values.qdrant.persistence.enabled }}
+          resources:
+            {{- toYaml .Values.qdrant.resources | nindent 12 }}
+          # uid 1000. The image itself is USER 0:0, so this IMPOSES a uid --
+          # measured at 1000 with both paths below writable: HTTP on 6333, gRPC
+          # on 6334, no error. Bare read-only, by contrast, dies immediately:
+          #   Error: failed to create directory `./storage`: Read-only file system
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 1000 "gid" 1000 "readOnly" true) | nindent 12 }}
           volumeMounts:
+            # Mounted unconditionally now. With persistence disabled this used
+            # to be no volume at all, which under a read-only rootfs is the
+            # `./storage` failure above rather than "runs without persistence".
             - name: qdrant-storage
               mountPath: /qdrant/storage
-          {{- end }}
-      {{- if .Values.qdrant.persistence.enabled }}
+            # Qdrant writes snapshots next to storage, not inside it.
+            - name: qdrant-snapshots
+              mountPath: /qdrant/snapshots
+      securityContext:
+        fsGroup: 1000
       volumes:
         - name: qdrant-storage
+          {{- if .Values.qdrant.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "secureprompt.fullname" . }}-qdrant-pvc
-      {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: qdrant-snapshots
+          emptyDir: {}

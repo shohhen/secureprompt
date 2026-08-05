@@ -1,6 +1,16 @@
 {{- if .Values.ingress.enabled }}
 {{- $fullName := include "secureprompt.fullname" . -}}
-{{- if .Values.ingress.managedCertificate.enabled }}
+{{- $gke := eq (.Values.ingress.platform | default "generic") "gke" -}}
+{{/*
+WS6-5. ManagedCertificate is a GKE CRD (networking.gke.io/v1). Rendering it on
+any other cluster does not degrade gracefully -- `kubectl apply` rejects the
+whole manifest with `no matches for kind "ManagedCertificate"`, and
+`helm install --atomic` rolls the entire release back. So it is gated on
+ingress.platform, not on managedCertificate.enabled alone: an operator who
+turns the cert on without also being on GKE gets a portable render and a
+warning, rather than a release that cannot be applied.
+*/}}
+{{- if and $gke .Values.ingress.managedCertificate.enabled }}
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
 metadata:
@@ -15,6 +25,8 @@ spec:
     - {{ .Values.librechat.host | quote }}
     {{- end }}
 ---
+{{- else if .Values.ingress.managedCertificate.enabled }}
+{{- fail "ingress.managedCertificate.enabled requires ingress.platform=\"gke\" -- ManagedCertificate is a GKE CRD and does not exist on other clusters. Use ingress.tlsSecret with a kubernetes.io/tls secret instead." }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -22,15 +34,34 @@ metadata:
   name: {{ $fullName }}
   labels:
     {{- include "secureprompt.labels" . | nindent 4 }}
+  {{- $ann := dict }}
+  {{- if $gke }}
+  {{- /* GKE-only: the global-static-ip and managed-cert wiring. */}}
+  {{- if .Values.ingress.staticIpName }}
+  {{- $_ := set $ann "kubernetes.io/ingress.global-static-ip-name" .Values.ingress.staticIpName }}
+  {{- end }}
+  {{- if .Values.ingress.managedCertificate.enabled }}
+  {{- $_ := set $ann "networking.gke.io/managed-certificates" (printf "%s-cert" $fullName) }}
+  {{- end }}
+  {{- end }}
+  {{- range $k, $v := .Values.ingress.annotations }}
+  {{- $_ := set $ann $k $v }}
+  {{- end }}
+  {{- if $ann }}
   annotations:
-    kubernetes.io/ingress.class: "gce"
-    {{- if .Values.ingress.staticIpName }}
-    kubernetes.io/ingress.global-static-ip-name: {{ .Values.ingress.staticIpName | quote }}
+    {{- range $k, $v := $ann }}
+    {{ $k }}: {{ $v | quote }}
     {{- end }}
-    {{- if .Values.ingress.managedCertificate.enabled }}
-    networking.gke.io/managed-certificates: {{ $fullName }}-cert
-    {{- end }}
+  {{- end }}
 spec:
+  {{- /*
+    spec.ingressClassName, not the deprecated `kubernetes.io/ingress.class`
+    annotation this chart used to hardcode to "gce". Empty leaves the cluster's
+    default IngressClass to claim it, which is what a vanilla install wants.
+  */}}
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
   {{- if .Values.ingress.tlsSecret }}
   tls:
     - secretName: {{ .Values.ingress.tlsSecret | quote }}

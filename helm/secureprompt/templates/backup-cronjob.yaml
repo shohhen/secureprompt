@@ -46,6 +46,19 @@ spec:
                   value: http://{{ include "secureprompt.fullname" . }}-qdrant:6333
                 - name: RETENTION_DAILY
                   value: {{ .Values.backup.retentionDaily | quote }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              # NOT MEASURED: sp-backup is built out-of-band (scripts/backup/)
+              # and was not started read-only here. It also demonstrably WRITES
+              # -- pg_dump output, the ClickHouse BACKUP mount, the encrypted
+              # tarball -- all into /backups, but nothing here has established
+              # that its toolchain keeps out of /tmp.
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
               volumeMounts:
                 - name: backups
                   mountPath: /backups

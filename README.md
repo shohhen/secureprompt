@@ -1,5 +1,22 @@
 # SecurePrompt
 
+## Deploying
+
+**The Docker Compose single-VM appliance is the primary supported install path**
+— see [docs/deployment/](docs/deployment/README.md). Helm on Kubernetes is
+secondary. `docker-compose.simple.yml` is for local evaluation only: it ships no
+ML sidecar, so there is no NER coverage at all.
+
+```bash
+./scripts/init-env.sh     # generates every secret locally; .env.example is CHANGEME on purpose
+docker compose up -d
+```
+
+Air-gapped installs: `scripts/bundle-images.sh` then
+`docker compose -f docker-compose.yml -f docker-compose.onprem.yml up -d`.
+
+---
+
 SecurePrompt is an OpenAI-compatible LLM security gateway. The current Phase 2 slice exposes `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`, runs API-key auth and rate limiting, applies detection and policy evaluation before provider invocation, restores placeholders on the response path, and emits async analytics off the hot path.
 
 ## Local Run

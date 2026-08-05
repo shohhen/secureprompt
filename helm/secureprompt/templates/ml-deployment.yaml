@@ -92,6 +92,30 @@ spec:
             failureThreshold: 6
           resources:
             {{- toYaml .Values.ml.resources | nindent 12 }}
+          # runAsNonRoot with NO runAsUser: secureprompt-ml/Dockerfile ends
+          # `USER appuser` (uid 1001), so the kubelet's non-root check passes on
+          # the image's own user and no new uid is imposed on a filesystem that
+          # was chowned at build time.
+          #
+          # readOnlyRootFilesystem is VALUE-GATED AND DEFAULT FALSE, and that is
+          # the honest setting rather than the tidy one: this 12.6 GB image is
+          # deliberately excluded from the CI `build` stage (it needs the raw
+          # model DEK -- .gitlab-ci.yml "KNOWN CAVEATS"), so it was not built
+          # here and never started read-only. Every other workload's setting in
+          # this chart came from a `docker run --read-only` that either survived
+          # or named the path it needed. This one would be a guess.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "readOnly" .Values.ml.security.readOnlyRootFilesystem) | nindent 12 }}
+          volumeMounts:
+            # /v1/scan-file spools uploads and OCR intermediates here (pdf2image
+            # shells out to poppler, which writes real files). Mounted either
+            # way, so turning readOnlyRootFilesystem on is a values change and
+            # not a template change.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

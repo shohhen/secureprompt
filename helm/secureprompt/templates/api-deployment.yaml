@@ -149,3 +149,8 @@ spec:
             failureThreshold: 5
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+          # distroless/cc-debian12:nonroot -> uid 65532, no shell. MEASURED:
+          # the image starts read-only bare (`docker run --read-only` reached
+          # the DB-connect stage, not an EROFS).
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 65532 "gid" 65532 "readOnly" .Values.api.security.readOnlyRootFilesystem) | nindent 12 }}
