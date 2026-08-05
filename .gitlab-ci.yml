@@ -197,12 +197,12 @@ clippy:
 # today, so wiring it in would recreate the permanently-red pipeline this
 # workstream exists to end. They are listed here rather than dropped silently:
 #
-#   check-openapi-codegen.sh   RED. openapi.yaml on this branch gained
-#                              `sidecar_unavailable` and dropped the provider
-#                              `config` field, and api.gen.ts was never
-#                              regenerated. Regenerating would remove `config`
-#                              from the TS types, which is a product decision,
-#                              not a CI one.                       → WS6-1-FU3
+#   check-openapi-codegen.sh   WIRED IN — see `openapi:codegen` below.
+#                              WS6-1-FU3 is CLOSED: the `config` decision was
+#                              made (restored, not deleted — the reasoning is
+#                              in openapi.yaml above `ProviderResponse`), and
+#                              the spec was reconciled with the router, so the
+#                              check is green.                     → WS6-4
 #   pnpm lint                  RED. 9 eslint errors (setState-in-effect ×4,
 #                              no-unescaped-entities ×2, no-require-imports ×2,
 #                              no-empty-object-type ×1).           → WS6-1-FU4
@@ -284,6 +284,58 @@ static-checks:
 # images that only the manual `build` stage produces — see their own headers
 # for why they are scheduled/tag-triggered rather than per-MR.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# WS6-4 — OPENAPI CODEGEN DRIFT.
+#
+# `scripts/ci/check-openapi-codegen.sh` has existed, unwired, since VALIDATION
+# 5-10-01: it was red because the spec and `api.gen.ts` had drifted over the
+# provider `config` field. That is resolved (restored — the reasoning lives in
+# openapi.yaml, above `ProviderResponse`), and this job runs it.
+#
+# TWO diffs, because `pnpm codegen` now writes TWO files. `openapi.json` is
+# generated from `openapi.yaml` by `scripts/openapi-yaml-to-json.mjs`: the two
+# had already drifted (`POST /v1/auth/register` was in the JSON and not the
+# YAML) and they have different readers — openapi-typescript reads the YAML,
+# and the gateway `include_str!`s the JSON and serves it at
+# `GET /openapi.json`. The script only diffs `api.gen.ts`, and it belongs to
+# another workstream's tree, so the second diff is asserted here instead.
+#
+# This is NOT the guard that the spec matches the router — that is
+# `secureprompt-api/tests/openapi_router_contract.rs`, which reads the live
+# `axum::Router` and runs inside the `test` job. This job only guarantees that
+# the committed generated artifacts match the committed spec.
+#
+# DELIBERATELY ABSENT from `build`'s `needs:`, for the same reason
+# `supply-chain:pip-audit` is: `pnpm install` must reach the npm registry and
+# has no offline fallback, so listing it would let a registry outage make a
+# hotfix image unbuildable. It still runs on every merge request and still
+# reddens the pipeline.
+# ---------------------------------------------------------------------------
+openapi:codegen:
+  stage: lint
+  image: node:22-bookworm-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git
+    - corepack enable
+    - corepack prepare pnpm@10.6.3 --activate
+    - pnpm --dir secureprompt-web install --frozen-lockfile
+  script:
+    # Regenerates api.gen.ts + openapi.json and fails on any diff against the
+    # committed copies.
+    - bash scripts/ci/check-openapi-codegen.sh
+    - |
+      set -euo pipefail
+      # The script above only diffs api.gen.ts. `pnpm codegen` also rewrites
+      # openapi.json from openapi.yaml, so a hand-edited JSON — or a YAML edit
+      # committed without regenerating — shows up here.
+      if ! git diff --exit-code secureprompt-schemas/openapi/v1/openapi.json; then
+        echo "ERROR: openapi.json is not what openapi.yaml generates." >&2
+        echo "openapi.json is GENERATED. Edit openapi.yaml, then run" >&2
+        echo "  pnpm --filter secureprompt-web codegen" >&2
+        exit 1
+      fi
+      echo "openapi.json matches openapi.yaml"
+
 supply-chain:cargo-deny:
   # extends .rust-gate for the SSH key, not for the compiler: cargo-deny never
   # builds the workspace, but it does run `cargo metadata`, which has to resolve
