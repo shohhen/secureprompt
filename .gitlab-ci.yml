@@ -1290,3 +1290,143 @@ deploy:
         --set image.tag="$CI_COMMIT_SHORT_SHA" \
         --atomic \
         --timeout 10m
+
+# ===========================================================================
+# WS5-4 — model-activation gate. Runs in stage `lint`; it is written at the
+# end of the file only to keep the diff away from jobs other people are
+# editing, and GitLab does not care where a job is defined.
+# ===========================================================================
+#
+# WHAT "ACTIVATION" IS HERE. Not a deploy button — a diff. `xlmr_ner.
+# maybe_register()` registers a recognizer ONLY for the checkpoint directories
+# named in ACTIVE_NER_MODELS and logs every other one as "not in
+# ACTIVE_NER_MODELS, skipping". So a model becomes the model that redacts
+# customer traffic when `secureprompt-ml/app/config.py` (and the same variable
+# in docker-compose.yml / helm), the Dockerfile COPY of its
+# `model.safetensors.enc`, and its committed `app/resources/<name>.dvc` pointer
+# change. That set of paths is the `changes:` list below — it IS the model-eval
+# path, read out of the code rather than guessed at.
+#
+# WHY THE EVAL ITSELF IS NOT HERE, AND CANNOT BE. Scoring a board needs BOTH
+# checkpoints' weights: 2 x 2.1 GB, gitignored, with DVC deferred by the owner,
+# so there is no path by which a runner could obtain them. This file's own
+# header already records that `secureprompt-ml` is "intentionally excluded from
+# `build` — it needs the raw model DEK + plaintext weights, which aren't wired
+# up". The run also costs real time — 34.1 s and 30.1 s wall for the two
+# 58-document runs on an M-series host, and that is with the weights already on
+# local disk. So the BOARD is produced by whoever has the weights and is
+# committed under docs/superpowers/results/; this job re-derives the VERDICT
+# from it with the standard library in under a second.
+#
+# WHY NOT ON EVERY MERGE REQUEST. The gate would be pure cost on the ~99% of
+# merge requests that touch no checkpoint, and a job that is usually irrelevant
+# is a job people learn to ignore. `rules: changes:` means it does not even
+# EXIST on a pipeline whose diff leaves the activation paths alone. It is
+# scoped to merge_request_event because that is the only pipeline where
+# `changes:` compares against a target branch rather than against whatever the
+# previous push happened to be, and because CI_MERGE_REQUEST_DIFF_BASE_SHA —
+# which is how the PREVIOUS ACTIVE_NER_MODELS is read — only exists there.
+#
+# WHY IT WILL NOT GO PERMANENTLY RED. The same reasoning `bench` gives for
+# refusing to be a wall-clock threshold applies to a model gate, and this repo
+# has the receipts: .github/workflows-retired/README documents four workflows
+# that went invisible, and says outright that "a required check that fails on
+# every merge request is worse than no check". So:
+#   * the verdict is paired and exact (McNemar), not a flat percentage — it
+#     cannot fire on sampling noise, and at the n=30 support floor it cannot
+#     fire on anything smaller than a 16.7pp drop;
+#   * a 1pp effect floor stops a large gold set turning rounding into a block;
+#   * a population with no documents in the gold set (`mixed`) is NOT_COVERED,
+#     named in the output, and does NOT block — it is a permanent gold-set gap
+#     that no activation decision can fix, so blocking on it blocks forever;
+#   * a diff that activates NOTHING — which is every merge request that edits
+#     the gate's own source, and those are in the `changes:` list on purpose —
+#     is NO_ACTIVATION at exit 0. This was not foresight: the first version of
+#     this job BLOCKED on exactly that, and it was found by running the script
+#     body below against the real repo rather than by reading it.
+# THREE PATHS, ALL EXECUTED against this repo at fb5e1df with the committed
+# boards, before this job was committed:
+#   this branch's own diff (no checkpoint change) ...... NO_ACTIVATION, exit 0
+#   activating v8 over v7 .............................. BLOCK, exit 1, on three
+#     measured regressions (uz_latin ALL p=0.0064, uz_latin DATE_OF_BIRTH
+#     p=0.0059, uz_cyrillic DATE_OF_BIRTH p=0.035)
+#   activating a v9 nobody has scored ................... BLOCK, exit 1,
+#     "none of the 7 committed board(s) covers this activation"
+# And v8 scored against itself over the same 58 documents is ALLOW_WITH_GAPS,
+# exit 0 — the non-regression that must not fail.
+#
+# The two suites run first on purpose: a gate whose own logic is broken should
+# be red, not quietly permissive.
+# ---------------------------------------------------------------------------
+model-eval:activation-gate:
+  image: "python:3.11-slim"
+  stage: lint
+  # Consumes no build output and gates nothing else; it only has to be red.
+  needs: []
+  variables:
+    # The gate reads the PREVIOUS ACTIVE_NER_MODELS out of the merge base, so
+    # the shallow clone GitLab uses by default is not enough.
+    GIT_DEPTH: "0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - secureprompt-ml/app/config.py
+        - secureprompt-ml/app/resources/*.dvc
+        - secureprompt-ml/Dockerfile
+        - docker-compose.yml
+        - helm/secureprompt/templates/ml-deployment.yaml
+        - scripts/realdoc_leakboard.py
+        - scripts/model_eval_gate.py
+        - scripts/leakboard_gold_manifest.json
+        - docs/superpowers/results/*leakboard*.json
+      when: on_success
+    - when: never
+  before_script:
+    # python:3.11-slim has no git, and `git show <merge-base>:config.py` is how
+    # the previous ACTIVE_NER_MODELS is read. Nothing else is installed: the
+    # gate is standard library only.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+  script:
+    - |
+      set -eu
+      python3 scripts/test_realdoc_leakboard.py
+      python3 scripts/test_model_eval_gate.py
+    - |
+      set -eu
+      BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA:?merge-base SHA is unset}"
+      git show "$BASE:secureprompt-ml/app/config.py" > /tmp/config_before.py
+      # The weight pointers as the TARGET branch has them. A pointer missing at
+      # the merge base is a checkpoint this merge request adds, and `git show`
+      # failing is exactly how that is detected. Without this the gate BLOCKED
+      # every merge request that merely edits its own source — measured by
+      # running this script body, not imagined.
+      mkdir -p /tmp/res_before
+      for f in secureprompt-ml/app/resources/*.dvc; do
+        b=$(basename "$f")
+        git show "$BASE:$f" > "/tmp/res_before/$b" 2>/dev/null || rm -f "/tmp/res_before/$b"
+      done
+      BOARDS=$(ls docs/superpowers/results/*leakboard*.json 2>/dev/null || true)
+      if [ -z "$BOARDS" ]; then
+        echo "FAIL: no committed leakboard under docs/superpowers/results/." >&2
+        echo "      Produce one on a host that has the weights:" >&2
+        echo "      .venv-train/bin/python scripts/eval_realdoc_leakboard.py \\" >&2
+        echo "        --gold <the files in scripts/leakboard_gold_manifest.json> \\" >&2
+        echo "        --baseline <currently active> --candidate <new> --out <board>" >&2
+        exit 1
+      fi
+      # Every board is offered; only the ones whose candidate, baseline, gold
+      # SHA-256 set and weight pointer match THIS swap may certify it, and if
+      # none does that is a BLOCK rather than a skip.
+      python3 scripts/model_eval_gate.py \
+        --artifact $BOARDS \
+        --gold-manifest scripts/leakboard_gold_manifest.json \
+        --resources-dir secureprompt-ml/app/resources \
+        --resources-dir-before /tmp/res_before \
+        --config-before /tmp/config_before.py \
+        --config-after secureprompt-ml/app/config.py \
+        --json-out model-activation-verdict.json
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - model-activation-verdict.json
