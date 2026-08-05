@@ -3,7 +3,7 @@
   "info": {
     "title": "SecurePrompt Gateway API",
     "version": "1.0.0",
-    "description": "SecurePrompt is an LLM security gateway that sits between enterprise applications and AI providers. It redacts PII/secrets, enforces policy, tracks token costs, and provides governance analytics.\nTwo auth schemes are used: - **JWT** (`Authorization: Bearer eyJ...`) \u2014 dashboard routes - **API Key** (`Authorization: Bearer sp-...`) \u2014 gateway + MCP utility routes\n"
+    "description": "SecurePrompt is an LLM security gateway that sits between enterprise applications and AI providers. It redacts PII/secrets, enforces policy, tracks token costs, and provides governance analytics.\nTwo auth schemes are used: - **JWT** (`Authorization: Bearer eyJ...`) — dashboard routes - **API Key** (`Authorization: Bearer sp-...`) — gateway + MCP utility routes\n"
   },
   "servers": [
     {
@@ -26,7 +26,7 @@
     },
     {
       "name": "MCP",
-      "description": "MCP utility endpoints \u2014 redact, token estimate, policy check (API key auth)"
+      "description": "MCP utility endpoints — redact, token estimate, policy check (API key auth)"
     },
     {
       "name": "Analytics",
@@ -57,12 +57,24 @@
       "description": "Frontend error reporting (JWT auth)"
     },
     {
-      "name": "Billing",
-      "description": "Billing usage and limits (JWT auth)"
+      "name": "Settings",
+      "description": "Secure mode + token vault (JWT auth)"
     },
     {
-      "name": "Settings",
-      "description": "Secure mode and webhook configuration (JWT auth)"
+      "name": "Me",
+      "description": "The calling user's own profile and API key (JWT auth)"
+    },
+    {
+      "name": "Users",
+      "description": "Workspace membership and session termination (JWT auth)"
+    },
+    {
+      "name": "License",
+      "description": "License status and activation (JWT auth, admin)"
+    },
+    {
+      "name": "Governance",
+      "description": "Auditor-facing reports and signed exports: data inventory, leak report, audit-trail export (JWT auth, admin)"
     },
     {
       "name": "Observability",
@@ -94,6 +106,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A second factor is required before tokens are issued. Carries either `challenge_token` (enrolled — answer at `POST /v1/auth/2fa/challenge`) or `enrollment_token` (must enroll — start at `POST /v1/auth/2fa/enroll`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwoFactorPending"
                 }
               }
             }
@@ -159,32 +181,67 @@
     },
     "/v1/auth/register": {
       "post": {
-        "tags": ["auth"],
-        "summary": "Register a new workspace and owner user (feature-flagged).",
-        "description": "Creates a workspace and its first owner user in a single call. Returns an access/refresh token pair. Returns 403 when public signup is disabled on the deployment. Availability is controlled by the SECUREPROMPT_PUBLIC_SIGNUP_ENABLED server env var.",
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Register a new workspace and its owner (feature-flagged)",
+        "description": "Creates a workspace and its first owner user in one call and returns the same token pair as `POST /v1/auth/token`. Gated by the `SECUREPROMPT_PUBLIC_SIGNUP_ENABLED` server env var — 403 when off.",
+        "operationId": "register",
         "security": [],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/RegisterRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
             }
           }
         },
         "responses": {
           "201": {
-            "description": "Workspace + owner user created. Returns the same token pair shape as POST /v1/auth/token.",
+            "description": "Workspace + owner created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
               }
             }
           },
-          "400": { "description": "Validation error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "403": { "description": "Public signup disabled on this deployment.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "409": { "description": "Email already in use.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "429": { "description": "Per-IP rate limit exceeded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "500": { "description": "Internal error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "description": "Public signup is disabled on this deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Email already in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-IP signup rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -253,7 +310,7 @@
         "tags": [
           "Gateway"
         ],
-        "summary": "Text completions \u2014 legacy OpenAI endpoint",
+        "summary": "Text completions — legacy OpenAI endpoint",
         "operationId": "completions",
         "security": [
           {
@@ -296,7 +353,8 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "402": {
-            "$ref": "#/components/responses/BudgetExceeded"          },
+            "$ref": "#/components/responses/BudgetExceeded"
+          },
           "503": {
             "$ref": "#/components/responses/SidecarUnavailable"
           }
@@ -346,7 +404,8 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "402": {
-            "$ref": "#/components/responses/BudgetExceeded"          },
+            "$ref": "#/components/responses/BudgetExceeded"
+          },
           "503": {
             "$ref": "#/components/responses/SidecarUnavailable"
           }
@@ -393,7 +452,8 @@
             }
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"          },
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "503": {
             "$ref": "#/components/responses/SidecarUnavailable"
           }
@@ -406,7 +466,7 @@
           "MCP"
         ],
         "summary": "Estimate token count for a text + model pair",
-        "description": "Approximates token count (1 token \u2248 4 characters, GPT-family heuristic). No auth required for this endpoint.\n",
+        "description": "Approximates token count (1 token ≈ 4 characters, GPT-family heuristic). No auth required for this endpoint.\n",
         "operationId": "estimateTokens",
         "requestBody": {
           "required": true,
@@ -472,7 +532,8 @@
             }
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"          },
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "503": {
             "$ref": "#/components/responses/SidecarUnavailable"
           }
@@ -868,7 +929,7 @@
           "Keys"
         ],
         "summary": "Create a new API key (admin only)",
-        "description": "Returns the full plaintext key exactly once in `api_key`. Store it immediately \u2014 it cannot be retrieved again.\n",
+        "description": "Returns the full plaintext key exactly once in `api_key`. Store it immediately — it cannot be retrieved again.\n",
         "operationId": "createKey",
         "security": [
           {
@@ -887,7 +948,7 @@
         },
         "responses": {
           "201": {
-            "description": "Key created \u2014 plaintext returned once",
+            "description": "Key created — plaintext returned once",
             "content": {
               "application/json": {
                 "schema": {
@@ -958,7 +1019,7 @@
         ],
         "responses": {
           "200": {
-            "description": "New key issued \u2014 plaintext returned once",
+            "description": "New key issued — plaintext returned once",
             "content": {
               "application/json": {
                 "schema": {
@@ -1569,122 +1630,6 @@
         }
       }
     },
-    "/v1/billing/usage": {
-      "get": {
-        "tags": [
-          "Billing"
-        ],
-        "summary": "Get current billing period usage",
-        "operationId": "getBillingUsage",
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Billing usage for current period",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BillingUsage"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/v1/billing/limits": {
-      "get": {
-        "tags": [
-          "Billing"
-        ],
-        "summary": "Get billing limits and remaining allowance",
-        "operationId": "getBillingLimits",
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Billing limits and remaining allowance",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BillingLimits"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/v1/billing/breakdown": {
-      "get": {
-        "tags": [
-          "Billing"
-        ],
-        "summary": "Get billing breakdown by provider and model",
-        "operationId": "getBillingBreakdown",
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Billing breakdown by provider and model",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BillingBreakdown"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/v1/billing/trends": {
-      "get": {
-        "tags": [
-          "Billing"
-        ],
-        "summary": "Get billing trends over time",
-        "operationId": "getBillingTrends",
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Billing trends by day",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BillingTrends"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
     "/v1/secure-mode": {
       "get": {
         "tags": [
@@ -1751,13 +1696,13 @@
         }
       }
     },
-    "/v1/webhooks": {
-      "get": {
+    "/v1/auth/2fa/enroll": {
+      "post": {
         "tags": [
-          "Settings"
+          "Auth"
         ],
-        "summary": "List all webhooks",
-        "operationId": "listWebhooks",
+        "summary": "Begin TOTP enrollment — returns the provisioning URI and backup codes",
+        "description": "Accepts either an `enrollment_token` (from a 202 on `POST /v1/auth/token`) or an ordinary session access token, so the Settings → Security panel and the forced-enrollment login screen share one endpoint. A 409 means the account is already enrolled; the console uses that as the \"is 2FA on?\" probe, because there is no status route.",
         "security": [
           {
             "bearerAuth": []
@@ -1765,11 +1710,299 @@
         ],
         "responses": {
           "200": {
-            "description": "List of webhooks",
+            "description": "Enrollment started — show the QR code and the backup codes once",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WebhookList"
+                  "$ref": "#/components/schemas/TwoFactorEnrollResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "Already enrolled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/2fa/verify": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Confirm enrollment with the first TOTP code",
+        "description": "Same bearer rules as `/enroll`. On success the account becomes two-factor, and the response is the ordinary token pair.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwoFactorCodeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Enrollment confirmed — access + refresh token pair",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "description": "Too many failed codes — the account is locked for 15 minutes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/2fa/challenge": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Answer a login 2FA challenge with a TOTP or backup code",
+        "description": "The bearer is the `challenge_token` from the 202 on `POST /v1/auth/token`, never a session token. A backup code is accepted in place of a TOTP code and is consumed on use.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwoFactorCodeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Challenge cleared — access + refresh token pair",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "description": "Too many failed codes — the account is locked for 15 minutes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A KMS fault made verification impossible. Distinct from 401 on purpose — the code may have been correct, and this does NOT count against the lockout counter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/2fa/disable": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Turn off two-factor for the calling user",
+        "description": "Requires a session JWT and a currently valid TOTP or backup code.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwoFactorCodeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Two-factor disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwoFactorDisableResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/v1/me/profile": {
+      "get": {
+        "tags": [
+          "Me"
+        ],
+        "summary": "Read the calling user's profile",
+        "operationId": "getMyProfile",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile of the authenticated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyProfile"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Me"
+        ],
+        "summary": "Update the calling user's profile",
+        "operationId": "putMyProfile",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyProfile"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/v1/me/api-key": {
+      "get": {
+        "tags": [
+          "Me"
+        ],
+        "summary": "Fetch the calling user's assigned API key in plaintext",
+        "description": "Server-to-server route for the LibreChat fork, which needs the gateway key belonging to the logged-in user. The response contains a live credential — it must not be logged or cached.",
+        "operationId": "getMyApiKey",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The plaintext API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyApiKey"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List workspace members",
+        "operationId": "listUsers",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Members of the caller's workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserResponse"
+                  }
                 }
               }
             }
@@ -1781,10 +2014,10 @@
       },
       "post": {
         "tags": [
-          "Settings"
+          "Users"
         ],
-        "summary": "Create a new webhook",
-        "operationId": "createWebhook",
+        "summary": "Create a workspace member (admin only)",
+        "operationId": "createUser",
         "security": [
           {
             "bearerAuth": []
@@ -1795,35 +2028,442 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/WebhookRequest"
+                "$ref": "#/components/schemas/CreateUserRequest"
               }
             }
           }
         },
         "responses": {
           "201": {
-            "description": "Webhook created",
+            "description": "Member created",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Webhook"
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Email already in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/users/{user_id}/sessions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/UserIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List a member's live sessions (admin only)",
+        "description": "WS4-3 FU4. The read half of the pair — an administrator could previously terminate every session for a user without being able to see what they were terminating.",
+        "operationId": "listUserSessions",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The member's live sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionListResponse"
                 }
               }
             }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Terminate every session for a member (admin only)",
+        "operationId": "revokeUserSessions",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sessions terminated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeSessionsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
     },
-    "/v1/webhooks/{id}": {
+    "/v1/users/{user_id}/sessions/{session_id}": {
       "delete": {
         "tags": [
-          "Settings"
+          "Users"
         ],
-        "summary": "Delete a webhook",
-        "operationId": "deleteWebhook",
+        "summary": "Terminate one session (admin only)",
+        "operationId": "revokeUserSession",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/SessionIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session terminated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndSessionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/license": {
+      "get": {
+        "tags": [
+          "License"
+        ],
+        "summary": "Current license status",
+        "description": "`source` says where the active token came from — `db` (activated in the console, which wins), `env` (`SECUREPROMPT_LICENSE_TOKEN`), or `none`.",
+        "operationId": "getLicense",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "License status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "License"
+        ],
+        "summary": "Activate a license token (admin only)",
+        "description": "Verifies, persists and applies the token live — no restart. A DB token takes precedence over `SECUREPROMPT_LICENSE_TOKEN`.",
+        "operationId": "activateLicense",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivateLicenseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "License activated — the new status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "License"
+        ],
+        "summary": "Remove the stored license token (admin only)",
+        "description": "Clears the DB token. The deployment falls back to `SECUREPROMPT_LICENSE_TOKEN` if one is set, otherwise to unlicensed.",
+        "operationId": "deleteLicense",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored token removed — the resulting status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/data-inventory": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "What this deployment stores for the caller's workspace (admin only)",
+        "description": "Per-artifact-class inventory with live row counts, the encryption verdict and its basis, and the retention window. Classes that cannot be counted per workspace are reported separately with the reason, never folded into a zero.",
+        "operationId": "getDataInventory",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Data inventory",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataInventory"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/leak-report": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "What would have leaked in a window, had the gateway not been there (admin only)",
+        "operationId": "getLeakReport",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FromDate"
+          },
+          {
+            "$ref": "#/components/parameters/ToDate"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Leak report for the window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeakReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/audit-exports": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "List audit-trail exports (admin only)",
+        "operationId": "listAuditExports",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent exports, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditExportSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "Request a signed audit-trail export (admin only)",
+        "description": "Asynchronous — returns immediately with a `status_url` to poll. `from` is inclusive, `to` is exclusive.",
+        "operationId": "createAuditExport",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAuditExportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Export accepted — poll `status_url`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateAuditExportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/audit-exports/{id}": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "Export status, manifest and detached signature (admin only)",
+        "operationId": "getAuditExport",
         "security": [
           {
             "bearerAuth": []
@@ -1835,14 +2475,509 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Webhook deleted"
+          "200": {
+            "description": "Export detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/audit-exports/{id}/pages/{page}": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "One page of a completed export's rows (admin only)",
+        "description": "The bytes the manifest's per-page digest covers. Content type follows the export's `format` — `text/csv` or `application/x-ndjson`.",
+        "operationId": "getAuditExportPage",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "in": "path",
+            "name": "page",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The page, verbatim",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/providers/test-connection": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Test a credential BEFORE saving it (admin only)",
+        "description": "Probes the upstream provider's list-models endpoint with the supplied plaintext credential. Nothing is persisted and nothing is logged.",
+        "operationId": "testProviderConnectionUnsaved",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestConnectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The probe ran. `success: false` with an `error` is a normal outcome, not an HTTP failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestConnectionResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/test-connection": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Test the STORED credential of a provider (admin only)",
+        "description": "Decrypts the stored ciphertext through the KMS and probes upstream, so rotation and expiry can be verified without ever exposing the plaintext to the dashboard.",
+        "operationId": "testProviderConnectionStored",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The probe ran",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestConnectionResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/models": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "List the models registered for a provider",
+        "operationId": "listProviderModels",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registered models. Empty means \"fall back to the per-type defaults\".",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelSummary"
+                  }
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Register one model against a provider (admin only)",
+        "operationId": "addProviderModel",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddModelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Model registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/models/sync": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Sync the model catalogue from the upstream provider (admin only)",
+        "description": "Additive — existing registrations are kept, never deleted.",
+        "operationId": "syncProviderModels",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sync result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncModelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/models/bulk-delete": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Deregister several models at once (admin only)",
+        "description": "POST rather than DELETE because the names travel in a body; a DELETE with a body is not reliably forwarded by proxies.",
+        "operationId": "bulkDeleteProviderModels",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkDeleteModelsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "How many registrations were removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkDeleteModelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/models/{name}": {
+      "delete": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Deregister one model (admin only)",
+        "operationId": "deleteProviderModel",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Model deregistered"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/secure-mode/tokenize": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Replace detected entities in text with vault placeholders",
+        "operationId": "tokenizeText",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenizeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tokenized text plus the vault id needed to reverse it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenizeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/v1/secure-mode/detokenize": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Restore original values from vault placeholders",
+        "operationId": "detokenizeText",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DetokenizeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Text with the original values restored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetokenizeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/vault/stash": {
+      "post": {
+        "tags": [
+          "MCP"
+        ],
+        "summary": "Stash a placeholder → original mapping for later restoration",
+        "description": "Companion to `POST /v1/redact` for MCP clients that redact locally and need the gateway to hold the mapping.",
+        "operationId": "vaultStash",
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VaultStashRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Opaque reference to the stashed mapping",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultStashResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         }
       }
@@ -1893,38 +3028,41 @@
     }
   },
   "components": {
-    "headers": {
-      "SidecarDegraded": {
-        "description": "WS2-3. Present only when this answer was produced with the deterministic detection floor alone, because the ML sidecar produced no (or incomplete) coverage and the workspace's `sidecar_unavailable` policy is `degrade_with_alert`. The value is the reason. The matching audit row carries `floor_only = true`.",
-        "schema": {
-          "type": "string",
-          "enum": [
-            "unconfigured",
-            "disabled",
-            "circuit_open",
-            "all_calls_failed",
-            "partial_coverage"
-          ]
-        }
-      }
-    },
     "securitySchemes": {
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT",
-        "description": "Dashboard JWT \u2014 Authorization: Bearer eyJ..."
+        "description": "Dashboard JWT — Authorization: Bearer eyJ..."
       },
       "apiKeyAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "API key \u2014 Authorization: Bearer sp-..."
+        "description": "API key — Authorization: Bearer sp-..."
       }
     },
     "parameters": {
       "IdPath": {
         "in": "path",
         "name": "id",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "UserIdPath": {
+        "in": "path",
+        "name": "user_id",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "SessionIdPath": {
+        "in": "path",
+        "name": "session_id",
         "required": true,
         "schema": {
           "type": "string",
@@ -1957,12 +3095,27 @@
           "type": "string",
           "format": "uuid"
         },
-        "description": "IDOR guard \u2014 must equal the JWT workspace_id when provided"
+        "description": "IDOR guard — must equal the JWT workspace_id when provided"
+      }
+    },
+    "headers": {
+      "SidecarDegraded": {
+        "description": "WS2-3. Present only when this answer was produced with the deterministic detection floor alone, because the ML sidecar produced no (or incomplete) coverage and the workspace's `sidecar_unavailable` policy is `degrade_with_alert`. The value is the reason. The matching audit row carries `floor_only = true`.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "unconfigured",
+            "disabled",
+            "circuit_open",
+            "all_calls_failed",
+            "partial_coverage"
+          ]
+        }
       }
     },
     "responses": {
       "BadRequest": {
-        "description": "Bad request \u2014 validation failed",
+        "description": "Bad request — validation failed",
         "content": {
           "application/json": {
             "schema": {
@@ -2012,7 +3165,7 @@
         }
       },
       "SidecarUnavailable": {
-        "description": "WS2-3. PII detection coverage was unavailable for this request - the ML sidecar produced no detections, or scanned only part of a long prompt - and the workspace's `sidecar_unavailable` policy is `block`, so the prompt was NOT forwarded to the provider. Retry once the sidecar is healthy, or set `sidecar_unavailable` to `degrade_with_alert` (via `PUT /v1/secure-mode`) to accept answers produced with the deterministic detection floor only.",
+        "description": "WS2-3. PII detection coverage was unavailable for this request — the ML sidecar produced no detections, or scanned only part of a long prompt — and the workspace's `sidecar_unavailable` policy is `block`, so the prompt was NOT forwarded to the provider. Retry once the sidecar is healthy, or set `sidecar_unavailable` to `degrade_with_alert` (via `PUT /v1/secure-mode`) to accept answers produced with the deterministic detection floor only.",
         "content": {
           "application/json": {
             "schema": {
@@ -2041,6 +3194,35 @@
           }
         }
       },
+      "RegisterRequest": {
+        "type": "object",
+        "required": [
+          "email",
+          "password",
+          "workspace_name"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 255,
+            "description": "Globally unique across all workspaces."
+          },
+          "password": {
+            "type": "string",
+            "format": "password",
+            "minLength": 8,
+            "maxLength": 128,
+            "writeOnly": true,
+            "description": "Argon2id-hashed server-side; never persisted in the clear."
+          },
+          "workspace_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        }
+      },
       "RefreshRequest": {
         "type": "object",
         "required": [
@@ -2049,31 +3231,6 @@
         "properties": {
           "refresh_token": {
             "type": "string"
-          }
-        }
-      },
-      "RegisterRequest": {
-        "type": "object",
-        "required": ["email", "password", "workspace_name"],
-        "properties": {
-          "email": {
-            "type": "string",
-            "format": "email",
-            "maxLength": 255,
-            "description": "Primary email for the new owner user. Must be globally unique across all workspaces."
-          },
-          "password": {
-            "type": "string",
-            "minLength": 8,
-            "maxLength": 128,
-            "writeOnly": true,
-            "description": "Plaintext password. Argon2id-hashed server-side; never persisted in the clear."
-          },
-          "workspace_name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100,
-            "description": "Display name for the new workspace."
           }
         }
       },
@@ -2129,6 +3286,7 @@
               "owner",
               "admin",
               "developer",
+              "employee",
               "viewer"
             ]
           }
@@ -2571,6 +3729,80 @@
             "items": {
               "$ref": "#/components/schemas/PolicyEventSummary"
             }
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "user_email": {
+            "type": "string",
+            "nullable": true,
+            "description": "Looked up from `users` at read time."
+          },
+          "api_key_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "api_key_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "ip_address": {
+            "type": "string",
+            "nullable": true
+          },
+          "user_agent": {
+            "type": "string",
+            "nullable": true
+          },
+          "redacted_prompt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The latest user message post-redaction, placeholders substituted in."
+          },
+          "restored_response": {
+            "type": "string",
+            "nullable": true,
+            "description": "What was returned to the client after placeholder restoration."
+          },
+          "raw_prompt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Raw user input pre-redaction. Present only for workspaces that opted into `capture_raw_content`."
+          },
+          "raw_response": {
+            "type": "string",
+            "nullable": true
+          },
+          "user_first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "user_last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "user_position": {
+            "type": "string",
+            "nullable": true
+          },
+          "user_device_mac": {
+            "type": "string",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "nullable": true,
+            "description": "Coarse origin classifier derived from the user-agent."
+          },
+          "engines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "WS2-4 — which detection engines produced coverage for this request's prompt. EMPTY for rows written before ClickHouse migration 009: that means \"not recorded\", NOT \"no engine ran\" — the deterministic floor is unconditional."
           }
         }
       },
@@ -2582,6 +3814,12 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "When present the key is assigned to that workspace member and its plaintext is encrypted at rest so the chat backend can fetch it server-to-server. Omit for a legacy unassigned workspace-scoped key."
           }
         }
       },
@@ -2613,6 +3851,12 @@
             "type": "string",
             "format": "date-time",
             "nullable": true
+          },
+          "assigned_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Workspace member this key belongs to. Absent (not null) for legacy unassigned workspace-scoped keys — the handler skips the field."
           }
         }
       },
@@ -2635,7 +3879,7 @@
           },
           "api_key": {
             "type": "string",
-            "description": "Full plaintext key \u2014 shown once, never stored"
+            "description": "Full plaintext key — shown once, never stored"
           },
           "prefix": {
             "type": "string"
@@ -2643,6 +3887,11 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "assigned_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
           }
         }
       },
@@ -2655,7 +3904,7 @@
         "properties": {
           "new_key": {
             "type": "string",
-            "description": "Plaintext replacement key \u2014 shown once"
+            "description": "Plaintext replacement key — shown once"
           },
           "grace_expires_at": {
             "type": "string",
@@ -2701,7 +3950,14 @@
           "config": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Provider-type-specific settings (Vertex: {region, project})."
+            "description": "Provider-type-specific settings. Vertex AI uses `{ region, project }`; every other provider type ignores it."
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelSummary"
+            },
+            "description": "Models registered for this provider. Empty means the caller should fall back to the per-type defaults."
           }
         }
       },
@@ -2722,12 +3978,13 @@
           "credential": {
             "type": "string",
             "nullable": true,
-            "description": "Plaintext API key \u2014 encrypted before storage"
+            "description": "Plaintext API key — encrypted before storage"
           },
           "config": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Provider-type-specific settings (Vertex: {region, project})."
+            "nullable": true,
+            "description": "Provider-type-specific settings (Vertex AI's `{ region, project }`)."
           }
         }
       },
@@ -2750,7 +4007,8 @@
           "config": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Provider-type-specific settings (Vertex: {region, project})."
+            "nullable": true,
+            "description": "Provider-type-specific settings (Vertex AI's `{ region, project }`)."
           }
         }
       },
@@ -2957,7 +4215,7 @@
           "warn",
           "flag"
         ],
-        "description": "`block` \u2192 HTTP 402. `warn` \u2192 200 + `X-SecurePrompt-Budget-Warning` header. `flag` \u2192 200, analytics-only.\n"
+        "description": "`block` → HTTP 402. `warn` → 200 + `X-SecurePrompt-Budget-Warning` header. `flag` → 200, analytics-only.\n"
       },
       "BudgetResponse": {
         "type": "object",
@@ -3203,169 +4461,6 @@
           }
         }
       },
-      "BillingUsage": {
-        "type": "object",
-        "required": [
-          "period_start",
-          "period_end",
-          "total_tokens",
-          "total_cost_usd",
-          "requests_count"
-        ],
-        "properties": {
-          "period_start": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "period_end": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "total_tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "total_cost_usd": {
-            "type": "number",
-            "format": "double",
-            "minimum": 0
-          },
-          "requests_count": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "BillingLimits": {
-        "type": "object",
-        "required": [
-          "limit_enforcement"
-        ],
-        "properties": {
-          "monthly_token_limit": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true,
-            "minimum": 0
-          },
-          "monthly_cost_limit_usd": {
-            "type": "number",
-            "nullable": true,
-            "minimum": 0
-          },
-          "tokens_remaining": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true,
-            "minimum": 0
-          },
-          "cost_remaining_usd": {
-            "type": "number",
-            "nullable": true,
-            "minimum": 0
-          },
-          "limit_enforcement": {
-            "type": "string",
-            "enum": [
-              "soft",
-              "hard"
-            ]
-          }
-        }
-      },
-      "BillingBreakdownItem": {
-        "type": "object",
-        "required": [
-          "provider",
-          "model",
-          "tokens",
-          "cost_usd",
-          "requests"
-        ],
-        "properties": {
-          "provider": {
-            "type": "string"
-          },
-          "model": {
-            "type": "string"
-          },
-          "tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "cost_usd": {
-            "type": "number",
-            "format": "double",
-            "minimum": 0
-          },
-          "requests": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "BillingBreakdown": {
-        "type": "object",
-        "required": [
-          "by_provider"
-        ],
-        "properties": {
-          "by_provider": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BillingBreakdownItem"
-            }
-          }
-        }
-      },
-      "BillingTrendItem": {
-        "type": "object",
-        "required": [
-          "date",
-          "tokens",
-          "cost_usd",
-          "requests"
-        ],
-        "properties": {
-          "date": {
-            "type": "string",
-            "format": "date"
-          },
-          "tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "cost_usd": {
-            "type": "number",
-            "format": "double",
-            "minimum": 0
-          },
-          "requests": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "BillingTrends": {
-        "type": "object",
-        "required": [
-          "days"
-        ],
-        "properties": {
-          "days": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BillingTrendItem"
-            }
-          }
-        }
-      },
       "SecureMode": {
         "type": "object",
         "required": [
@@ -3398,6 +4493,10 @@
           "redact_pii_in_responses": {
             "type": "boolean"
           },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
           "sidecar_unavailable": {
             "type": "string",
             "enum": [
@@ -3405,6 +4504,15 @@
               "degrade_with_alert"
             ],
             "description": "WS2-3. What to do when the ML sidecar produces no detection coverage for a request. `block` (the default for any workspace that has not chosen) rejects the request with 503 rather than forward a prompt the PII detector never saw; `degrade_with_alert` proceeds on the deterministic detection floor, emits an alert, sets the `x-secureprompt-sidecar-degraded` response header, and marks the audit row `floor_only = true`."
+          },
+          "capture_raw_content": {
+            "type": "boolean",
+            "description": "WS3-1 — whether this workspace retains RAW request content (the un-redacted prompt, the un-restored upstream reply, and the reply with PII restored). False for every workspace that has not explicitly opted in."
+          },
+          "raw_capture_retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "WS3-2 — days captured content is retained. Meaningless while `capture_raw_content` is false, but round-tripped so an admin can set the window before switching capture on."
           },
           "updated_at": {
             "type": "string",
@@ -3441,77 +4549,1414 @@
               "block",
               "degrade_with_alert"
             ]
+          },
+          "capture_raw_content": {
+            "type": "boolean"
+          },
+          "raw_capture_retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clamped to [1, 3650] server-side rather than rejected."
           }
         }
       },
-      "Webhook": {
+      "TwoFactorPending": {
+        "type": "object",
+        "description": "The 202 body of `POST /v1/auth/token` (and of the OIDC callback) when the account needs a second factor. Exactly one of the two token fields is present: `challenge_token` for an enrolled account, `enrollment_token` for one that must enroll before it can log in.",
+        "properties": {
+          "twofa_required": {
+            "type": "boolean"
+          },
+          "challenge_token": {
+            "type": "string",
+            "nullable": true
+          },
+          "enroll_required": {
+            "type": "boolean"
+          },
+          "enrollment_token": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "TwoFactorCodeRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "A 6-digit TOTP code, or a backup code (dashes optional)."
+          }
+        }
+      },
+      "TwoFactorEnrollResponse": {
+        "type": "object",
+        "required": [
+          "provisioning_uri",
+          "secret_b32",
+          "backup_codes"
+        ],
+        "properties": {
+          "provisioning_uri": {
+            "type": "string",
+            "description": "`otpauth://` URI for the QR code."
+          },
+          "secret_b32": {
+            "type": "string",
+            "description": "Base32 TOTP secret, for manual entry."
+          },
+          "backup_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Single-use recovery codes. Shown once and never again."
+          }
+        }
+      },
+      "TwoFactorDisableResponse": {
+        "type": "object",
+        "required": [
+          "disabled"
+        ],
+        "properties": {
+          "disabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MyProfile": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "workspace_id",
+          "email",
+          "role",
+          "display_name"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "position": {
+            "type": "string",
+            "nullable": true
+          },
+          "display_name": {
+            "type": "string",
+            "description": "\"First Last\", or the local part of the email while the profile is empty. Computed server-side so every surface shows the same name."
+          },
+          "device_mac": {
+            "type": "string",
+            "nullable": true,
+            "description": "Self-reported MAC from the Electron desktop wrapper; null for browser users."
+          }
+        }
+      },
+      "UpdateProfileRequest": {
+        "type": "object",
+        "properties": {
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "position": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "MyApiKey": {
+        "type": "object",
+        "required": [
+          "api_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "Live plaintext credential. Do not log or cache."
+          }
+        }
+      },
+      "UserResponse": {
         "type": "object",
         "required": [
           "id",
-          "url",
-          "events",
-          "enabled",
-          "created_at"
+          "workspace_id",
+          "email",
+          "role",
+          "created_at",
+          "updated_at"
         ],
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid"
           },
-          "url": {
+          "workspace_id": {
             "type": "string",
-            "format": "uri"
+            "format": "uuid"
           },
-          "events": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+          "email": {
+            "type": "string"
           },
-          "enabled": {
-            "type": "boolean"
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "admin",
+              "developer",
+              "employee",
+              "viewer"
+            ]
           },
           "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
             "type": "string",
             "format": "date-time"
           }
         }
       },
-      "WebhookRequest": {
+      "CreateUserRequest": {
         "type": "object",
         "required": [
-          "url",
-          "events"
+          "email",
+          "password",
+          "role"
         ],
         "properties": {
-          "url": {
-            "type": "string",
-            "format": "uri"
+          "email": {
+            "type": "string"
           },
-          "events": {
+          "password": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "admin",
+              "developer",
+              "employee",
+              "viewer"
+            ]
+          }
+        }
+      },
+      "SessionDto": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "started_at",
+          "last_seen_at",
+          "expires_at",
+          "is_current"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The last refresh-token rotation. An access token is spent without touching Postgres, so this is the freshest evidence of use that exists — it is NOT a last-request timestamp."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "client_ip": {
+            "type": "string",
+            "nullable": true
+          },
+          "client": {
+            "type": "string",
+            "nullable": true
+          },
+          "is_current": {
+            "type": "boolean",
+            "description": "True for the session whose access token made this request."
+          }
+        }
+      },
+      "SessionListResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "sessions"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionDto"
+            }
+          }
+        }
+      },
+      "RevokeSessionsResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "revoked_before",
+          "refresh_tokens_revoked",
+          "audit_id",
+          "revoked_at"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revoked_before": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds. Every access token for this user minted at or before this second is refused from its next request onward."
+          },
+          "refresh_tokens_revoked": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "audit_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "EndSessionResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "session_id",
+          "refresh_tokens_revoked",
+          "access_tokens_blacklisted",
+          "audit_id",
+          "revoked_at"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "refresh_tokens_revoked": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "access_tokens_blacklisted": {
+            "type": "integer",
+            "description": "Already-minted access tokens blacklisted. Zero for a session that predates migration 027 and recorded no `jti`; such a session still dies, at its own access token's expiry rather than instantly, and this number is how a caller can tell."
+          },
+          "audit_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "LicenseStatus": {
+        "type": "object",
+        "required": [
+          "features",
+          "status",
+          "source"
+        ],
+        "properties": {
+          "customer_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "lic_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "string",
+            "nullable": true
+          },
+          "features": {
             "type": "array",
             "items": {
               "type": "string"
             }
           },
-          "secret": {
+          "status": {
+            "type": "string"
+          },
+          "source": {
             "type": "string",
-            "nullable": true,
-            "description": "Optional HMAC secret"
+            "enum": [
+              "db",
+              "env",
+              "none"
+            ],
+            "description": "Where the active token came from. `db` wins over `env`."
           }
         }
       },
-      "WebhookList": {
+      "ActivateLicenseRequest": {
         "type": "object",
         "required": [
-          "webhooks"
+          "token"
         ],
         "properties": {
-          "webhooks": {
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "Retention": {
+        "type": "object",
+        "required": [
+          "window",
+          "mechanism",
+          "mechanism_detail"
+        ],
+        "properties": {
+          "days": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Whole days when the window is whole days. Null when there is no deletion window at all, or when it is sub-day — `window` always carries the human form."
+          },
+          "window": {
+            "type": "string"
+          },
+          "mechanism": {
+            "type": "string"
+          },
+          "mechanism_detail": {
+            "type": "string"
+          }
+        }
+      },
+      "ShapeVerification": {
+        "type": "object",
+        "required": [
+          "predicate",
+          "rows_matching",
+          "rows_not_matching"
+        ],
+        "properties": {
+          "predicate": {
+            "type": "string",
+            "description": "The predicate that was actually run, in words."
+          },
+          "rows_matching": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rows_not_matching": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Encryption": {
+        "type": "object",
+        "required": [
+          "at_rest",
+          "basis"
+        ],
+        "properties": {
+          "at_rest": {
+            "type": "string"
+          },
+          "basis": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Webhook"
+              "type": "string"
             }
+          },
+          "verification": {
+            "$ref": "#/components/schemas/ShapeVerification"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      },
+      "GovernedBy": {
+        "type": "object",
+        "required": [
+          "endpoint",
+          "field",
+          "role_required",
+          "audit_table"
+        ],
+        "properties": {
+          "endpoint": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "role_required": {
+            "type": "string"
+          },
+          "audit_table": {
+            "type": "string"
+          }
+        }
+      },
+      "ArtifactClass": {
+        "type": "object",
+        "required": [
+          "class",
+          "store",
+          "location",
+          "description",
+          "sensitivity",
+          "row_count",
+          "row_count_status",
+          "encryption",
+          "retention"
+        ],
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "sensitivity": {
+            "type": "string",
+            "enum": [
+              "user_content",
+              "derived_metadata",
+              "credential_material",
+              "audit_trail",
+              "configuration",
+              "operational"
+            ]
+          },
+          "row_count": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Live count for this workspace. Null only when the store could not answer, in which case `row_count_status` says why — never a guess."
+          },
+          "row_count_status": {
+            "type": "string",
+            "enum": [
+              "counted",
+              "unavailable"
+            ]
+          },
+          "row_count_detail": {
+            "type": "string"
+          },
+          "encryption": {
+            "$ref": "#/components/schemas/Encryption"
+          },
+          "retention": {
+            "$ref": "#/components/schemas/Retention"
+          },
+          "governed_by": {
+            "$ref": "#/components/schemas/GovernedBy"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "UnenumerableClass": {
+        "type": "object",
+        "required": [
+          "class",
+          "store",
+          "location",
+          "description",
+          "reason",
+          "per_workspace_erasure",
+          "row_count",
+          "encryption",
+          "retention"
+        ],
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "WHY no per-workspace count is possible — names the mechanism, not just the fact."
+          },
+          "per_workspace_erasure": {
+            "type": "string",
+            "enum": [
+              "not_possible",
+              "whole_store_only",
+              "not_applicable"
+            ]
+          },
+          "row_count": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Always null. Present rather than omitted so its absence is never mistaken for a count of zero."
+          },
+          "encryption": {
+            "$ref": "#/components/schemas/Encryption"
+          },
+          "retention": {
+            "$ref": "#/components/schemas/Retention"
+          }
+        }
+      },
+      "EncryptionBasis": {
+        "type": "object",
+        "required": [
+          "kms_backend",
+          "kms_self_test",
+          "kms_self_test_detail",
+          "provider_key_self_test",
+          "provider_key_self_test_detail",
+          "ciphertext_shape_claim"
+        ],
+        "properties": {
+          "kms_backend": {
+            "type": "string"
+          },
+          "kms_self_test": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "failed"
+            ]
+          },
+          "kms_self_test_detail": {
+            "type": "string"
+          },
+          "provider_key_self_test": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "failed"
+            ]
+          },
+          "provider_key_self_test_detail": {
+            "type": "string"
+          },
+          "ciphertext_shape_claim": {
+            "type": "string"
+          }
+        }
+      },
+      "DataInventory": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "workspace_id",
+          "generated_at",
+          "encryption_basis",
+          "artifacts",
+          "not_enumerable",
+          "caveats"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "encryption_basis": {
+            "$ref": "#/components/schemas/EncryptionBasis"
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactClass"
+            }
+          },
+          "not_enumerable": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnenumerableClass"
+            }
+          },
+          "caveats": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "LeakWindow": {
+        "type": "object",
+        "required": [
+          "from",
+          "to",
+          "interpretation"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date"
+          },
+          "to": {
+            "type": "string",
+            "format": "date"
+          },
+          "interpretation": {
+            "type": "string"
+          }
+        }
+      },
+      "LeakTotals": {
+        "type": "object",
+        "required": [
+          "requests_in_window",
+          "requests_with_detections",
+          "entities_detected",
+          "distinct_classes"
+        ],
+        "properties": {
+          "requests_in_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The DENOMINATOR — every request in the window, detections or not. A numerator alone reads as either alarming or trivial."
+          },
+          "requests_with_detections": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "entities_detected": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "distinct_classes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ClassCount": {
+        "type": "object",
+        "required": [
+          "entity_class",
+          "entities",
+          "requests"
+        ],
+        "properties": {
+          "entity_class": {
+            "type": "string"
+          },
+          "entities": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ModelBreakdown": {
+        "type": "object",
+        "required": [
+          "model",
+          "entities",
+          "requests",
+          "by_class"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "entities": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "by_class": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClassCount"
+            }
+          }
+        }
+      },
+      "ActorBreakdown": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "api_key_name",
+          "entities",
+          "requests",
+          "by_class"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Null for a workspace-scoped key never assigned to a member — reported as null rather than folded into an \"unknown\" bucket."
+          },
+          "api_key_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "entities": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "by_class": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClassCount"
+            }
+          }
+        }
+      },
+      "LeakPlaceholders": {
+        "type": "object",
+        "required": [
+          "count",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Always null today. Present rather than omitted so its absence is never read as a count of zero."
+          },
+          "status": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "AvailableDimension": {
+        "type": "object",
+        "required": [
+          "dimension",
+          "source",
+          "caveat"
+        ],
+        "properties": {
+          "dimension": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "caveat": {
+            "type": "string"
+          }
+        }
+      },
+      "UnavailableDimension": {
+        "type": "object",
+        "required": [
+          "dimension",
+          "reason"
+        ],
+        "properties": {
+          "dimension": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "LeakAttribution": {
+        "type": "object",
+        "required": [
+          "available",
+          "unavailable"
+        ],
+        "properties": {
+          "available": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AvailableDimension"
+            }
+          },
+          "unavailable": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnavailableDimension"
+            }
+          }
+        }
+      },
+      "LeakReport": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "workspace_id",
+          "generated_at",
+          "window",
+          "totals",
+          "coverage",
+          "counting_rule",
+          "placeholders",
+          "by_class",
+          "by_model",
+          "by_actor",
+          "attribution",
+          "labels",
+          "content_policy"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window": {
+            "$ref": "#/components/schemas/LeakWindow"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/LeakTotals"
+          },
+          "coverage": {
+            "type": "string"
+          },
+          "counting_rule": {
+            "type": "string"
+          },
+          "placeholders": {
+            "$ref": "#/components/schemas/LeakPlaceholders"
+          },
+          "by_class": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClassCount"
+            }
+          },
+          "by_model": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelBreakdown"
+            }
+          },
+          "by_actor": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActorBreakdown"
+            }
+          },
+          "attribution": {
+            "$ref": "#/components/schemas/LeakAttribution"
+          },
+          "labels": {
+            "type": "object",
+            "description": "`locale -> entity_class -> label`, covering exactly the classes in `by_class`.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "content_policy": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateAuditExportRequest": {
+        "type": "object",
+        "required": [
+          "from",
+          "to",
+          "format"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Inclusive lower bound."
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "EXCLUSIVE upper bound."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "csv",
+              "jsonl"
+            ]
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          }
+        }
+      },
+      "CreateAuditExportResponse": {
+        "type": "object",
+        "required": [
+          "export_id",
+          "status",
+          "status_url",
+          "note"
+        ],
+        "properties": {
+          "export_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "status_url": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      },
+      "AuditExportSummary": {
+        "type": "object",
+        "required": [
+          "export_id",
+          "status",
+          "format",
+          "window_from",
+          "window_to",
+          "created_at"
+        ],
+        "properties": {
+          "export_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          },
+          "window_from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "total_rows": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "total_pages": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "AuditExportDetail": {
+        "type": "object",
+        "required": [
+          "export_id",
+          "workspace_id",
+          "status",
+          "format",
+          "page_size",
+          "window_from",
+          "window_to",
+          "created_at",
+          "signature_note"
+        ],
+        "properties": {
+          "export_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "window_from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "total_rows": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "total_pages": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "manifest_json": {
+            "type": "string",
+            "nullable": true,
+            "description": "The exact bytes the signature covers. Null until the export completes."
+          },
+          "signature_b64": {
+            "type": "string",
+            "nullable": true
+          },
+          "public_key_b64": {
+            "type": "string",
+            "nullable": true
+          },
+          "signing_key_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "page_url_template": {
+            "type": "string",
+            "nullable": true
+          },
+          "signature_note": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "AddModelRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "TestConnectionRequest": {
+        "type": "object",
+        "required": [
+          "provider_type",
+          "credential"
+        ],
+        "properties": {
+          "provider_type": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Plaintext credential to test. Never logged, never persisted — only sent to the upstream provider's list-models endpoint."
+          },
+          "base_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true,
+            "description": "Same shape as `CreateProviderRequest.config`. Only Vertex reads it today."
+          }
+        }
+      },
+      "TestConnectionResult": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "model_count": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SyncModelsResponse": {
+        "type": "object",
+        "required": [
+          "added",
+          "kept",
+          "total"
+        ],
+        "properties": {
+          "added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "kept": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "BulkDeleteModelsRequest": {
+        "type": "object",
+        "required": [
+          "names"
+        ],
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BulkDeleteModelsResponse": {
+        "type": "object",
+        "required": [
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TokenizeRequest": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "entity_labels": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "type": "string"
+            },
+            "description": "When present, only detections whose class (case-insensitive) appears here are tokenized."
+          }
+        }
+      },
+      "TokenizeResponse": {
+        "type": "object",
+        "required": [
+          "tokenized_text",
+          "token_vault_id",
+          "entity_counts"
+        ],
+        "properties": {
+          "tokenized_text": {
+            "type": "string"
+          },
+          "token_vault_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "entity_counts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        }
+      },
+      "DetokenizeRequest": {
+        "type": "object",
+        "required": [
+          "token_vault_id",
+          "text"
+        ],
+        "properties": {
+          "token_vault_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "DetokenizeResponse": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "VaultStashRequest": {
+        "type": "object",
+        "required": [
+          "token_map"
+        ],
+        "properties": {
+          "token_map": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "VaultStashResponse": {
+        "type": "object",
+        "required": [
+          "vault_ref"
+        ],
+        "properties": {
+          "vault_ref": {
+            "type": "string"
           }
         }
       },
