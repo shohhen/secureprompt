@@ -1,4 +1,5 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { screen, fireEvent } from "@testing-library/react";
+import { renderWithIntl as render } from "../utils/intl";
 import { describe, test, expect, vi } from "vitest";
 import { Sidebar } from "@/components/layout/sidebar";
 

@@ -1296,6 +1296,7 @@ async fn every_redis_key_class_the_gateway_writes_is_accounted_for(pool: PgPool)
         ("redis:oidc_state", "redis/mod.rs store_oidc_state"),
         ("redis:budget", "dashboard/budgets.rs daily_key/monthly_key"),
         ("redis:queues", "redis/mod.rs enqueue_task"),
+        ("redis:scan_task", "redis/mod.rs bind_scan_task (WS4-2)"),
     ] {
         assert!(
             declared.contains(class),

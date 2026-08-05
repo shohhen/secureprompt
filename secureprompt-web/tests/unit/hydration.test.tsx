@@ -7,7 +7,8 @@
  *   2. No network fetch was made (dehydrated data short-circuits the fetch).
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
+import { renderWithIntl as render } from "../utils/intl";
 import {
   QueryClient,
   QueryClientProvider,

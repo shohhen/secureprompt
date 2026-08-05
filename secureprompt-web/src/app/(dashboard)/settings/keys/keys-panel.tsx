@@ -8,6 +8,7 @@
  */
 
 import { useCallback, useMemo } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -25,6 +26,7 @@ interface KeysPanelProps {
 
 export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
   const { data: session } = useSession();
+  const t = useTranslations("keys");
   const writable = canWrite(session?.role);
   const { data: keys, isLoading } = useKeys();
   const { data: users } = useUsers();
@@ -37,26 +39,26 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
 
   const handleRevoke = useCallback(
     (id: string, name: string) => {
-      if (!window.confirm(`Revoke key "${name}"? This cannot be undone.`)) return;
+      if (!window.confirm(t("revokeConfirm", { name }))) return;
       revoke.mutate(id, {
-        onSuccess: () => toast.success("Key revoked."),
-        onError: () => toast.error("Failed to revoke key."),
+        onSuccess: () => toast.success(t("revoked")),
+        onError: () => toast.error(t("revokeFailed")),
       });
     },
-    [revoke],
+    [revoke, t],
   );
 
   const columns: ColumnDef<KeyResponse>[] = [
     {
       accessorKey: "name",
-      header: "Name",
+      header: t("colName"),
       cell: ({ getValue }) => (
         <span className="font-medium">{getValue<string>()}</span>
       ),
     },
     {
       accessorKey: "prefix",
-      header: "Prefix",
+      header: t("colPrefix"),
       cell: ({ getValue }) => (
         <span className="font-mono text-xs text-muted-foreground">
           {getValue<string>()}...
@@ -65,7 +67,7 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
     },
     {
       accessorKey: "assigned_user_id",
-      header: "Assignee",
+      header: t("colAssignee"),
       cell: ({ getValue }) => {
         const id = getValue<string | null | undefined>();
         if (!id) {
@@ -74,14 +76,14 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
         const email = userEmailById.get(id);
         return (
           <span className="text-xs">
-            {email ?? <span className="text-muted-foreground">user {id.slice(0, 8)}…</span>}
+            {email ?? <span className="text-muted-foreground">{t("unnamedUser", { id: id.slice(0, 8) })}</span>}
           </span>
         );
       },
     },
     {
       accessorKey: "created_at",
-      header: "Created",
+      header: t("colCreated"),
       cell: ({ getValue }) => (
         <span className="text-xs text-muted-foreground">
           {new Date(getValue<string>()).toLocaleDateString()}
@@ -90,12 +92,12 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
     },
     {
       accessorKey: "revoked_at",
-      header: "Status",
+      header: t("colStatus"),
       cell: ({ getValue }) =>
         getValue<string | null>() ? (
-          <Badge variant="destructive">Revoked</Badge>
+          <Badge variant="destructive">{t("statusRevoked")}</Badge>
         ) : (
-          <Badge variant="secondary">Active</Badge>
+          <Badge variant="secondary">{t("statusActive")}</Badge>
         ),
     },
     {
@@ -111,7 +113,7 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
             onClick={() => handleRevoke(key.id, key.name)}
             disabled={revoke.isPending}
           >
-            Revoke
+            {t("revoke")}
           </Button>
         );
       },
@@ -122,14 +124,11 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-medium">API Keys</h2>
+          <h2 className="text-lg font-medium">{t("title")}</h2>
           <p className="text-sm text-muted-foreground">
-            Keys are shown with prefix only — the full key is revealed once at
-            creation.
+            {t("description")}
             {!writable && (
-              <span className="block mt-1 text-xs">
-                Only owners and admins can create or revoke keys.
-              </span>
+              <span className="block mt-1 text-xs">{t("readOnlyNotice")}</span>
             )}
           </p>
         </div>
@@ -140,7 +139,7 @@ export function KeysPanel({ workspaceId: _workspaceId }: KeysPanelProps) {
         columns={columns}
         data={keys ?? []}
         isLoading={isLoading}
-        emptyMessage="No API keys yet. Create one to get started."
+        emptyMessage={t("empty")}
       />
     </div>
   );

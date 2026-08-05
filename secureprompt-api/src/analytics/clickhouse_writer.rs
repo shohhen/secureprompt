@@ -114,12 +114,47 @@ const INSERT_SEND_TIMEOUT_SECS: u64 = 20;
 /// task for the lifetime of the process.
 const SCHEMA_PROBE_TIMEOUT_SECS: u64 = 10;
 
+/// Apply `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` to a client, if set.
+///
+/// WHY THIS IS NOT PART OF THE URL (WS6-5)
+/// ---------------------------------------
+/// `clickhouse` 0.15 does NOT read credentials out of the URL. Read from the
+/// crate, not assumed: `Query::do_execute` does `Url::parse(&self.client.url)`
+/// and passes `url.as_str()` to `Request::uri()`, and auth is applied
+/// separately by `headers::with_authentication`, which emits
+/// `X-ClickHouse-User` / `X-ClickHouse-Key` from `Client::with_user` /
+/// `with_password`. A DSN of the form `http://user:pass@host:8123` therefore
+/// authenticates NOTHING — it silently connects as the default user, which is
+/// the failure mode this function exists to avoid.
+///
+/// Both are optional, and unset means "send no auth headers", i.e. byte-for-byte
+/// what this code did before. That is deliberate: the CI service container and
+/// every existing deployment run an unauthenticated ClickHouse, and a required
+/// credential here would have turned this into a breaking change for them.
+/// docker-compose.yml sets both.
+fn with_env_credentials(client: Client) -> Client {
+    let mut client = client;
+    if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+        if !user.is_empty() {
+            client = client.with_user(user);
+        }
+    }
+    if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+        if !password.is_empty() {
+            client = client.with_password(password);
+        }
+    }
+    client
+}
+
 pub fn build_clickhouse_client(url: &str, database: &str) -> Client {
-    Client::default()
-        .with_url(url)
-        .with_database(database)
-        .with_setting("async_insert", "1")
-        .with_setting("wait_for_async_insert", "1")
+    with_env_credentials(
+        Client::default()
+            .with_url(url)
+            .with_database(database)
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "1"),
+    )
 }
 
 #[derive(Debug, Clone)]

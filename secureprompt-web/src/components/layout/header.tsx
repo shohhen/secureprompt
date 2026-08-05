@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 import { useRouter } from "next/navigation";
 import { signOut } from "next-auth/react";
 import { ChevronsUpDown, LogOut, Menu, Moon, Sun, User } from "lucide-react";
@@ -16,6 +17,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
 import { useMyProfile } from "@/lib/hooks/use-profile";
+import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 
 interface HeaderProps {
   onToggleSidebar: () => void;
@@ -24,9 +26,10 @@ interface HeaderProps {
 
 export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
   const router = useRouter();
+  const t = useTranslations("header");
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const { data: profile } = useMyProfile();
-  const displayName = profile?.display_name ?? "Account";
+  const displayName = profile?.display_name ?? t("account");
   const initials = profile
     ? (profile.first_name?.[0] ?? profile.email[0] ?? "U") +
       (profile.last_name?.[0] ?? "")
@@ -60,7 +63,7 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
   return (
     <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border/80 px-3 md:px-4">
       <div className="flex items-center gap-2">
-        <Button variant="ghost" size="icon" onClick={onToggleSidebar} aria-label="Toggle sidebar">
+        <Button variant="ghost" size="icon" onClick={onToggleSidebar} aria-label={t("toggleSidebar")}>
           <Menu className="size-4" />
         </Button>
         <Separator orientation="vertical" className="h-4" />
@@ -68,10 +71,13 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
 
       <div className="ml-auto flex items-center gap-2">
         <span className="hidden rounded-md border border-border px-2.5 py-1 font-mono text-xs text-muted-foreground md:inline">
+          {/* i18n-exempt: "ws:" is an identifier prefix, not prose */}
           ws:{workspaceId.slice(0, 8)}
         </span>
 
-        <Button variant="outline" size="icon" onClick={toggleTheme} aria-label="Toggle theme">
+        <LocaleSwitcher />
+
+        <Button variant="outline" size="icon" onClick={toggleTheme} aria-label={t("toggleTheme")}>
           {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
         </Button>
 
@@ -106,7 +112,7 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
                     {profile.email}
                   </span>
                   <span className="text-[11px] text-muted-foreground">
-                    Role: {profile.role}
+                    {t("role", { role: profile.role })}
                     {profile.position ? ` · ${profile.position}` : ""}
                   </span>
                 </div>
@@ -118,7 +124,7 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
               className="cursor-pointer gap-2"
             >
               <User className="size-4" />
-              Profile
+              {t("profile")}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
@@ -126,7 +132,7 @@ export function Header({ onToggleSidebar, workspaceId }: HeaderProps) {
               className="cursor-pointer gap-2 text-destructive hover:text-destructive"
             >
               <LogOut className="size-4" />
-              Sign out
+              {t("signOut")}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

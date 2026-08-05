@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useTranslations } from "next-intl";
 import * as LabelPrimitive from "@radix-ui/react-label";
 import { Slot } from "@radix-ui/react-slot";
 import {
@@ -50,6 +51,7 @@ const useFormField = () => {
   const fieldState = getFieldState(fieldContext.name, formState);
 
   if (!fieldContext) {
+    // i18n-exempt: developer error, thrown at render time and never shown to a user
     throw new Error("useFormField should be used within <FormField>");
   }
 
@@ -149,7 +151,14 @@ const FormMessage = React.forwardRef<
   React.HTMLAttributes<HTMLParagraphElement>
 >(({ className, children, ...props }, ref) => {
   const { error, formMessageId } = useFormField();
-  const body = error ? String(error?.message ?? "") : children;
+  // Schema validators carry catalogue keys ("validation.nameRequired"), not
+  // English, so that a module-scope zod schema needs no hook. Resolve them
+  // against the root translator; anything that is not a key renders verbatim,
+  // which is what a message forwarded from the gateway needs.
+  const t = useTranslations();
+  const raw = error ? String(error?.message ?? "") : children;
+  const body =
+    typeof raw === "string" && raw.length > 0 && t.has(raw) ? t(raw) : raw;
 
   if (!body) {
     return null;

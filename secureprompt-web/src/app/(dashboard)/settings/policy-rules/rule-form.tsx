@@ -5,6 +5,7 @@
  */
 
 import { useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -22,7 +23,7 @@ import { Label } from "@/components/ui/label";
 const ACTIONS = ["allow", "deny", "redact", "transform", "flag"] as const;
 
 const schema = z.object({
-  name: z.string().min(1, "Name is required").max(200),
+  name: z.string().min(1, "validation.nameRequired").max(200),
   priority: z.coerce.number().int().min(0).max(10000),
   action: z.enum(ACTIONS),
   enabled: z.boolean(),
@@ -37,6 +38,7 @@ interface RuleFormProps {
 }
 
 export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
+  const t = useTranslations("policyRules");
   const isEdit = Boolean(rule);
   const create = useCreatePolicyRule();
   const update = useUpdatePolicyRule();
@@ -72,10 +74,10 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
           id: rule.id,
           ...data,
         });
-        toast.success("Rule updated.");
+        toast.success(t("updated"));
       } else {
         await create.mutateAsync(data);
-        toast.success("Rule created.");
+        toast.success(t("created"));
       }
       onOpenChange(false);
     } catch (err: unknown) {
@@ -84,9 +86,9 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
           ? (err as { code: string }).code
           : "";
       if (code === "priority_conflict") {
-        toast.error("Priority already in use. Choose a different value.");
+        toast.error(t("priorityConflict"));
       } else {
-        toast.error(isEdit ? "Failed to update rule." : "Failed to create rule.");
+        toast.error(isEdit ? t("updateFailed") : t("createFailed"));
       }
     }
   }
@@ -97,15 +99,15 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
         <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg bg-background border shadow-lg p-6 space-y-4">
           <Dialog.Title className="text-lg font-semibold">
-            {isEdit ? "Edit Rule" : "New Policy Rule"}
+            {isEdit ? t("editTitle") : t("newTitle")}
           </Dialog.Title>
 
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
             <div className="space-y-1.5">
-              <Label htmlFor="rule-name">Name</Label>
+              <Label htmlFor="rule-name">{t("fieldName")}</Label>
               <Input
                 id="rule-name"
-                placeholder="e.g. Block credit card numbers"
+                placeholder={t("fieldNamePlaceholder")}
                 {...form.register("name")}
               />
               {form.formState.errors.name && (
@@ -117,7 +119,7 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
 
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
-                <Label htmlFor="rule-priority">Priority</Label>
+                <Label htmlFor="rule-priority">{t("fieldPriority")}</Label>
                 <Input
                   id="rule-priority"
                   type="number"
@@ -133,7 +135,7 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
               </div>
 
               <div className="space-y-1.5">
-                <Label htmlFor="rule-action">Action</Label>
+                <Label htmlFor="rule-action">{t("fieldAction")}</Label>
                 <select
                   id="rule-action"
                   {...form.register("action")}
@@ -151,22 +153,22 @@ export function RuleForm({ rule, open, onOpenChange }: RuleFormProps) {
             <div className="flex gap-6">
               <label className="flex items-center gap-2 text-sm cursor-pointer">
                 <input type="checkbox" {...form.register("enabled")} />
-                Enabled
+                {t("fieldEnabled")}
               </label>
               <label className="flex items-center gap-2 text-sm cursor-pointer">
                 <input type="checkbox" {...form.register("dry_run")} />
-                Dry Run
+                {t("fieldDryRun")}
               </label>
             </div>
 
             <div className="flex justify-end gap-2">
               <Dialog.Close asChild>
                 <Button variant="outline" size="sm" type="button">
-                  Cancel
+                  {t("cancel")}
                 </Button>
               </Dialog.Close>
               <Button size="sm" type="submit" disabled={isPending}>
-                {isPending ? "Saving…" : isEdit ? "Save" : "Create"}
+                {isPending ? t("saving") : isEdit ? t("save") : t("create")}
               </Button>
             </div>
           </form>

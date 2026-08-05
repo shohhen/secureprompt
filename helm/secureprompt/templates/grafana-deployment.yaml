@@ -45,6 +45,8 @@ spec:
             - name: CLICKHOUSE_PORT
               value: "8123"
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: data
               mountPath: /var/lib/grafana
             - name: datasources
@@ -64,7 +66,18 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.grafana.resources | nindent 12 }}
+          # MEASURED, and the failure is not where you would look for it: with
+          # GF_INSTALL_PLUGINS set (which this deployment does set, for the
+          # ClickHouse datasource) a read-only rootfs kills grafana at BOOT --
+          #   Error: failed to create temporary file: open /tmp/64192443.zip:
+          #   read-only file system
+          # -- because the plugin installer downloads to /tmp. With the emptyDir
+          # above: "Plugin successfully installed" and "HTTP Server Listen".
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 472 "gid" 472 "readOnly" true) | nindent 12 }}
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: data
           {{- if .Values.grafana.persistence.enabled }}
           persistentVolumeClaim:

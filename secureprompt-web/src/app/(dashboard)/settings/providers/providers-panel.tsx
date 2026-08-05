@@ -5,6 +5,7 @@
  */
 
 import { useState, useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -22,6 +23,7 @@ import { canWrite } from "@/lib/roles";
 export function ProvidersPanel() {
   const { data: session } = useSession();
   const writable = canWrite(session?.role);
+  const t = useTranslations("providers");
   const { data: providers, isLoading } = useProviders();
   const deleteProvider = useDeleteProvider();
   const [editTarget, setEditTarget] = useState<ProviderResponse | undefined>();
@@ -29,48 +31,48 @@ export function ProvidersPanel() {
 
   const handleDelete = useCallback(
     (id: string, name: string) => {
-      if (!window.confirm(`Delete provider "${name}"?`)) return;
+      if (!window.confirm(t("deleteConfirm", { name }))) return;
       deleteProvider.mutate(id, {
-        onSuccess: () => toast.success("Provider deleted."),
-        onError: () => toast.error("Failed to delete provider."),
+        onSuccess: () => toast.success(t("deleted")),
+        onError: () => toast.error(t("deleteFailed")),
       });
     },
-    [deleteProvider],
+    [deleteProvider, t],
   );
 
   const columns: ColumnDef<ProviderResponse>[] = [
     {
       accessorKey: "name",
-      header: "Name",
+      header: t("colName"),
       cell: ({ getValue }) => (
         <span className="font-medium">{getValue<string>()}</span>
       ),
     },
     {
       accessorKey: "provider_type",
-      header: "Type",
+      header: t("colType"),
       cell: ({ getValue }) => (
         <span className="font-mono text-xs">{getValue<string>()}</span>
       ),
     },
     {
       accessorKey: "has_credential",
-      header: "Credential",
+      header: t("colCredential"),
       cell: ({ getValue }) =>
         getValue<boolean>() ? (
-          <Badge variant="secondary">Set</Badge>
+          <Badge variant="secondary">{t("credentialSet")}</Badge>
         ) : (
-          <Badge variant="outline">Not set</Badge>
+          <Badge variant="outline">{t("credentialNotSet")}</Badge>
         ),
     },
     {
       accessorKey: "last_rotated_at",
-      header: "Last Rotated",
+      header: t("colLastRotated"),
       cell: ({ getValue }) => {
         const v = getValue<string>();
         return (
           <span className="text-xs text-muted-foreground">
-            {v ? new Date(v).toLocaleDateString() : "Never"}
+            {v ? new Date(v).toLocaleDateString() : t("never")}
           </span>
         );
       },
@@ -88,7 +90,7 @@ export function ProvidersPanel() {
               variant="outline"
               onClick={() => setEditTarget(prov)}
             >
-              Edit
+              {t("edit")}
             </Button>
             <Button
               size="sm"
@@ -96,7 +98,7 @@ export function ProvidersPanel() {
               onClick={() => handleDelete(prov.id, prov.name)}
               disabled={deleteProvider.isPending}
             >
-              Delete
+              {t("delete")}
             </Button>
           </div>
         );
@@ -108,20 +110,17 @@ export function ProvidersPanel() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-medium">AI Providers</h2>
+          <h2 className="text-lg font-medium">{t("title")}</h2>
           <p className="text-sm text-muted-foreground">
-            Manage provider credentials. Credentials are stored encrypted and
-            are never exposed in API responses.
+            {t("description")}
             {!writable && (
-              <span className="block mt-1 text-xs">
-                Only owners and admins can add or edit providers.
-              </span>
+              <span className="block mt-1 text-xs">{t("readOnlyNotice")}</span>
             )}
           </p>
         </div>
         {writable && (
           <Button size="sm" onClick={() => setAddOpen(true)}>
-            Add Provider
+            {t("addProvider")}
           </Button>
         )}
       </div>
@@ -130,7 +129,7 @@ export function ProvidersPanel() {
         columns={columns}
         data={providers ?? []}
         isLoading={isLoading}
-        emptyMessage="No providers configured."
+        emptyMessage={t("empty")}
       />
 
       {/* Add dialog */}

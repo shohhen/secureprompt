@@ -70,3 +70,9 @@ spec:
             limits:
               memory: {{ .Values.web.resources.limits.memory }}
               cpu: {{ .Values.web.resources.limits.cpu }}
+          # node:22-alpine, USER nextjs = uid 1001, gid 65533 (nogroup) -- read
+          # off the image with `id nextjs`, not guessed. MEASURED: starts
+          # read-only at that uid, "Ready in 0ms". Next.js standalone writes
+          # nothing at runtime.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 1001 "gid" 65533 "readOnly" .Values.web.security.readOnlyRootFilesystem) | nindent 12 }}

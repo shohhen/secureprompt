@@ -153,15 +153,58 @@ fn build_app_with_state(pool: PgPool) -> (AppState, axum::Router) {
 /// A router whose configured vendor public key matches `sk`, so a token this
 /// suite signs verifies. Mirrors `tests/license_routes.rs::build_app_with_keys`.
 fn build_app_with_license_key(pool: PgPool, sk: &SigningKey) -> axum::Router {
+    build_app_with_license_key_and_sidecar(pool, sk, "")
+}
+
+/// As [`build_app_with_license_key`], plus a reachable ML sidecar.
+///
+/// WS4-2 needs one: `file_scan.requested` is written by `POST /v1/scan-file`,
+/// which forwards to the sidecar, and every other app in this file is built
+/// with `MlSidecarClient::new(String::new(), _)` — an UNCONFIGURED client that
+/// answers "not configured" without a network call. Driving the scan action
+/// against that app would measure a 503 rather than an audit row.
+fn build_app_with_license_key_and_sidecar(
+    pool: PgPool,
+    sk: &SigningKey,
+    sidecar_url: &str,
+) -> axum::Router {
     let mut config = test_config();
     config.license.pubkey_b64 = B64.encode(sk.verifying_key().to_bytes());
-    let ml = Arc::new(MlSidecarClient::new(String::new(), 100));
+    let ml = Arc::new(MlSidecarClient::new(sidecar_url.to_owned(), 5_000));
     build_router(AppState::new(
         pool,
         config,
         ml,
         Arc::new(secureprompt_api::license::LicenseState::unlicensed()),
     ))
+}
+
+/// A loopback HTTP server that answers `POST /v1/scan-file` with the sidecar's
+/// success shape, so the gateway's scan route reaches its audit write.
+///
+/// Deliberately minimal: this file is about what the trail RECORDS, and the
+/// scan route's own behaviour — the role gate, the body ceiling, the
+/// cross-tenant task binding — is `tests/file_scan_routing.rs`.
+fn spawn_scan_sidecar() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 65536];
+            // Drain until the request head is complete, then answer. The body
+            // is short here, so one pass over the socket is enough.
+            let _ = stream.read(&mut buf);
+            let body = br#"{"redacted_text":"<PERSON>","original_filename":"a.txt","mime_type":"text/plain"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{addr}")
 }
 
 /// Sign a license token for `customer_name`. Copied in shape from
@@ -1455,7 +1498,10 @@ async fn every_audited_action_writes_the_detail_keys_the_auditors_document_promi
 
     let ws = seed_workspace(&pool).await;
     let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-    let app = build_app_with_license_key(pool.clone(), &signing_key);
+    // WS4-2 — a reachable sidecar, because `file_scan.requested` is written by
+    // a route that forwards to one.
+    let app =
+        build_app_with_license_key_and_sidecar(pool.clone(), &signing_key, &spawn_scan_sidecar());
     let admin = make_jwt(ws.id, ws.admin, "admin");
     let viewer = make_jwt(ws.id, ws.viewer, "viewer");
     assert_no_audit_yet(&pool, ws.id).await;
@@ -1763,6 +1809,41 @@ async fn drive_every_audited_action(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "disable 2fa: {body}");
+
+    // ── WS4-2 — a file scan. Not a JWT route: `POST /v1/scan-file`
+    // authenticates an API KEY assigned to a member, which is the shape the
+    // chat backend holds, so the key is created through the API first and its
+    // plaintext (returned exactly once) is used as the bearer.
+    let (status, key) = send(
+        app,
+        "POST",
+        "/v1/keys",
+        admin,
+        Some(json!({"name": "i4-scan", "user_id": ws.admin})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create scan key: {key}");
+    let scan_key = key["api_key"].as_str().expect("plaintext key").to_owned();
+    let multipart = "--b\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b--\r\n";
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/scan-file")
+        .header("content-type", "multipart/form-data; boundary=b")
+        .header("authorization", format!("Bearer {scan_key}"))
+        .body(Body::from(multipart))
+        .expect("request builds");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router must respond");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "file scan must succeed, or `file_scan.requested` is unreachable and \
+         the caller's coverage check would blame the vocabulary"
+    );
 }
 
 // ── RLS, proved from a role that cannot bypass it ─────────────────────────

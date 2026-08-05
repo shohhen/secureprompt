@@ -9,6 +9,7 @@
  */
 
 import { useState, useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { useBudget, useUpdateBudget } from "@/lib/hooks/use-budget";
 import { BudgetMeter } from "@/components/budget/budget-meter";
@@ -21,23 +22,8 @@ interface BudgetFormProps {
   workspaceId: string;
 }
 
-const BEHAVIOR_OPTIONS: { value: BudgetBehavior; label: string; description: string }[] = [
-  {
-    value: "block",
-    label: "Block",
-    description: "Return HTTP 402 when the limit is exceeded.",
-  },
-  {
-    value: "warn",
-    label: "Warn",
-    description: "Allow through but add X-SecurePrompt-Budget-Warning header.",
-  },
-  {
-    value: "flag",
-    label: "Flag",
-    description: "Allow through silently; flag in analytics only.",
-  },
-];
+/** Values only; label and description come from the `budgetSettings` namespace. */
+const BEHAVIOR_OPTIONS: BudgetBehavior[] = ["block", "warn", "flag"];
 
 function parseLimitInput(value: string): number | null {
   const trimmed = value.trim();
@@ -51,6 +37,7 @@ function formatLimitInput(limit: number | null): string {
 }
 
 export function BudgetForm({ workspaceId }: BudgetFormProps) {
+  const t = useTranslations("budgetSettings");
   const { data: budget, isLoading } = useBudget(workspaceId);
   const update = useUpdateBudget(workspaceId);
 
@@ -84,15 +71,15 @@ export function BudgetForm({ workspaceId }: BudgetFormProps) {
         behavior,
       });
       setDirty(false);
-      toast.success("Budget settings saved.");
+      toast.success(t("saved"));
     } catch {
-      toast.error("Failed to save budget settings.");
+      toast.error(t("saveFailed"));
     }
   }
 
   if (isLoading) {
     return (
-      <div className="text-sm text-muted-foreground animate-pulse">Loading budget…</div>
+      <div className="text-sm text-muted-foreground animate-pulse">{t("loading")}</div>
     );
   }
 
@@ -100,15 +87,15 @@ export function BudgetForm({ workspaceId }: BudgetFormProps) {
     <form onSubmit={handleSave} className="space-y-6">
       {/* Current usage meters */}
       <div className="space-y-3">
-        <h3 className="text-sm font-medium">Current Usage</h3>
+        <h3 className="text-sm font-medium">{t("currentUsage")}</h3>
         <BudgetMeter
-          label="Daily"
+          label={t("daily")}
           used={budget?.daily_used ?? 0}
           limit={budget?.daily_token_limit ?? null}
           behavior={behavior}
         />
         <BudgetMeter
-          label="Monthly"
+          label={t("monthly")}
           used={budget?.monthly_used ?? 0}
           limit={budget?.monthly_token_limit ?? null}
           behavior={behavior}
@@ -118,47 +105,49 @@ export function BudgetForm({ workspaceId }: BudgetFormProps) {
       {/* Limit inputs */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <Label htmlFor="daily-limit">Daily token limit</Label>
+          <Label htmlFor="daily-limit">{t("dailyLimit")}</Label>
           <Input
             id="daily-limit"
-            placeholder="Unlimited"
+            placeholder={t("unlimited")}
             value={dailyInput}
             onChange={(e) => handleChange(setDailyInput)(e.target.value)}
           />
-          <p className="text-xs text-muted-foreground">Leave blank for no daily limit.</p>
+          <p className="text-xs text-muted-foreground">{t("dailyLimitHint")}</p>
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="monthly-limit">Monthly token limit</Label>
+          <Label htmlFor="monthly-limit">{t("monthlyLimit")}</Label>
           <Input
             id="monthly-limit"
-            placeholder="Unlimited"
+            placeholder={t("unlimited")}
             value={monthlyInput}
             onChange={(e) => handleChange(setMonthlyInput)(e.target.value)}
           />
-          <p className="text-xs text-muted-foreground">Leave blank for no monthly limit.</p>
+          <p className="text-xs text-muted-foreground">{t("monthlyLimitHint")}</p>
         </div>
       </div>
 
       {/* Behavior selector */}
       <div className="space-y-2">
-        <Label>Enforcement behavior</Label>
+        <Label>{t("behavior")}</Label>
         <div className="space-y-2">
           {BEHAVIOR_OPTIONS.map((opt) => (
             <label
-              key={opt.value}
+              key={opt}
               className="flex items-start gap-3 cursor-pointer rounded-md border p-3 hover:bg-muted/50 transition-colors"
             >
               <input
                 type="radio"
                 name="behavior"
-                value={opt.value}
-                checked={behavior === opt.value}
-                onChange={() => handleChange(setBehavior)(opt.value)}
+                value={opt}
+                checked={behavior === opt}
+                onChange={() => handleChange(setBehavior)(opt)}
                 className="mt-0.5"
               />
               <div>
-                <div className="text-sm font-medium">{opt.label}</div>
-                <div className="text-xs text-muted-foreground">{opt.description}</div>
+                <div className="text-sm font-medium">{t(`behavior_${opt}`)}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t(`behavior_${opt}_description`)}
+                </div>
               </div>
             </label>
           ))}
@@ -167,7 +156,7 @@ export function BudgetForm({ workspaceId }: BudgetFormProps) {
 
       <div className="flex justify-end">
         <Button type="submit" disabled={update.isPending || !dirty}>
-          {update.isPending ? "Saving…" : "Save budget settings"}
+          {update.isPending ? t("saving") : t("save")}
         </Button>
       </div>
     </form>

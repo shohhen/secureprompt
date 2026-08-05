@@ -7,7 +7,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { screen, fireEvent, waitFor } from "@testing-library/react";
+import { renderWithIntl as render } from "../utils/intl";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -184,6 +185,12 @@ describe("License source audit", () => {
       "utf-8",
     );
     expect(src).toContain("/settings/license");
-    expect(src).toContain("License");
+    // WS6-3 moved the tab label into the catalogue, so the layout carries the
+    // key and settingsNav carries the words. Both halves are asserted.
+    expect(src).toContain('key: "license"');
+    const nav = JSON.parse(
+      readFileSync(resolve(process.cwd(), "src/i18n/messages/en.json"), "utf-8"),
+    ) as { settingsNav: Record<string, string> };
+    expect(nav.settingsNav.license).toBe("License");
   });
 });

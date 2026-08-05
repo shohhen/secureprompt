@@ -505,7 +505,12 @@ helm-render:
     name: alpine/helm:3.16.2
     entrypoint: [""]
   before_script:
-    - apk add --no-cache bash >/dev/null
+    # python3 alongside bash: two of the four checks below PARSE the rendered
+    # YAML rather than grepping it. That is not fastidiousness — the defect
+    # check-helm-sidecar-token.sh exists for was a grep that could not see an
+    # enclosing `{{- if }}`, and "does every container have a limit and a
+    # securityContext" is a question about structure, not text.
+    - apk add --no-cache bash python3 py3-yaml >/dev/null
   script:
     - bash scripts/ci/check-helm-migration-initcontainer.sh
     # MR1 C4. The reviewer first recorded the sidecar-token wiring as SOUND —
@@ -514,6 +519,36 @@ helm-render:
     # guard whose chart default is false. Same lesson as the check above, so
     # it runs in the same job.
     - bash scripts/ci/check-helm-sidecar-token.sh
+    # WS6-5. The chart rendered `networking.gke.io/v1 ManagedCertificate` at
+    # DEFAULTS and in the AIRGAP values file — a GKE CRD, so `kubectl apply`
+    # anywhere else fails the whole release with `no matches for kind`. Renders
+    # five portable modes, plus values-gke.yaml as a positive control.
+    - bash scripts/ci/check-helm-portability.sh
+    # WS6-5. Of 13 rendered containers exactly 2 were hardened, and valkey and
+    # qdrant had no resources block at all despite values.yaml carrying one.
+    - bash scripts/ci/check-pod-hardening.sh
+
+# ---------------------------------------------------------------------------
+# compose-render — WS6-5. Nothing in this pipeline had ever rendered a compose
+# file, and the Compose single-VM appliance is the PRIMARY documented install
+# path (docs/deployment/compose-appliance.md). `${VAR:-default}` interpolation
+# and the docker-compose.onprem.yml OVERLAY are the same class of thing a
+# Helm conditional is: invisible in the source, decisive in the result.
+#
+# IMAGE: docker:27-cli, VERIFIED BY RUNNING IT rather than assumed — it ships
+# the compose plugin (`docker compose version` -> v2.33.0) and `docker compose
+# config` needs no daemon at all (checked with DOCKER_HOST pointed at a
+# nonexistent socket: exit 0). So this job needs no dind and no services.
+# ---------------------------------------------------------------------------
+compose-render:
+  stage: lint
+  image:
+    name: docker:27-cli
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache bash python3 py3-yaml >/dev/null
+  script:
+    - bash scripts/ci/check-compose-appliance.sh
 
 # ===========================================================================
 # Stage: test
@@ -524,6 +559,35 @@ test:
   # Service versions are pinned to match docker-compose.yml exactly. Testing
   # against a different Postgres/ClickHouse than you ship is how schema bugs
   # reach production green.
+  #
+  # WS6-5 — A DELIBERATE DIVERGENCE, STATED RATHER THAN HIDDEN.
+  # docker-compose.yml now runs Redis under --requirepass and ClickHouse with a
+  # password on the `default` user. These service containers do NOT, and are
+  # not going to in this change:
+  #
+  #   MEASURED: 10 test files reach ClickHouse from `CLICKHOUSE_URL` WITHOUT
+  #   going through `build_clickhouse_client` -- they build their own
+  #   `clickhouse::Client::default()` or a raw `reqwest` POST (e.g.
+  #   secureprompt-worker/src/tasks/retention_purge/tests.rs:29,
+  #   secureprompt-api/tests/clickhouse_schema_probe.rs,
+  #   .../raw_content_capture.rs, .../leak_report.rs). Putting a password on
+  #   this service container reddens every one of them, and .github/workflows-
+  #   retired/README records four workflows abandoned once they went
+  #   permanently red. That is not a trade worth making for a service container
+  #   that lives for the duration of one job on an isolated network.
+  #
+  # What makes this safe rather than a hole: the credentials are OPTIONAL by
+  # construction. `with_env_credentials` (api) and the matching block in the
+  # worker send no auth headers when the vars are unset, so this job exercises
+  # exactly the code path it exercised before. The AUTHENTICATED path was
+  # proven by execution against the real images instead -- see the WS6-5 report
+  # for the transcripts (HTTP 403 `Code: 516 Authentication failed`
+  # unauthenticated vs 200 authenticated; `NOAUTH Authentication required.` vs
+  # PONG).
+  #
+  # To close it: give the clickhouse service CLICKHOUSE_PASSWORD, set
+  # CLICKHOUSE_USER/CLICKHOUSE_PASSWORD in variables, teach
+  # scripts/ci/clickhouse-migrate.sh to send them, and fix those 10 files.
   services:
     - name: postgres:16-alpine
       alias: postgres
@@ -565,6 +629,43 @@ test:
       #      processes: 2.00s passing alone vs 60.03s failing under
       #      contention, with Postgres at 6/100 connections.
       bash scripts/ci/rust-test-gate.sh
+
+# ---------------------------------------------------------------------------
+# WS6-3 — the console i18n gates.
+#
+# Deliberately NOT `pnpm test`. The full web suite is red today (3 failures in
+# keys.test.tsx > CreateKeyDialog, tracked as WS6-1-FU4) and a job that is red
+# on the day it lands gets ignored and then deleted — four .github workflows
+# in this repo died that way. This runs the two i18n files only, which are
+# green, so a failure here always means someone broke i18n.
+#
+# What it actually enforces:
+#   - i18n-no-hardcoded-strings walks src/app and src/components on disk and
+#     parses each .ts/.tsx with the TypeScript AST, so a component added in a
+#     later commit is scanned without anyone editing the test;
+#   - i18n-key-parity asserts ru has exactly the keys en has (missing OR
+#     orphan both fail), that a missing key throws rather than falling back,
+#     and that every t() key the console asks for exists in en.
+# ---------------------------------------------------------------------------
+web-i18n:
+  stage: test
+  image: node:22-alpine
+  needs: []
+  before_script:
+    # Pinned, not bare `corepack enable`: corepack otherwise activates the
+    # latest pnpm (11.x), whose stricter lockfile policy rejects the v10
+    # lockfile in this repo outright. Verified by running this job in
+    # node:22-alpine — unpinned it fails before a single test executes.
+    - corepack enable
+    - corepack prepare pnpm@10.6.3 --activate
+    - cd secureprompt-web
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm vitest run tests/unit/i18n-no-hardcoded-strings.test.ts tests/unit/i18n-key-parity.test.ts
+  rules:
+    - changes:
+        - secureprompt-web/**/*
+        - .gitlab-ci.yml
 
 # ---------------------------------------------------------------------------
 # WS2-5 — the deterministic detection floor's latency budget.

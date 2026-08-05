@@ -21,6 +21,12 @@ spec:
           imagePullPolicy: {{ .Values.alertmanager.image.pullPolicy }}
           args:
             - "--config.file=/etc/alertmanager/alertmanager.yml"
+            # Default is a relative `data/`, i.e. inside the (now read-only)
+            # image. Point it at the emptyDir below. MEASURED: read-only +
+            # this flag -> "Listening on [::]:9093"; read-only without a
+            # writable storage path is a silence/nflog failure the first time
+            # anything is silenced, not at boot.
+            - "--storage.path=/alertmanager"
           ports:
             - containerPort: 9093
               name: http
@@ -28,6 +34,8 @@ spec:
             - name: config
               mountPath: /etc/alertmanager
               readOnly: true
+            - name: storage
+              mountPath: /alertmanager
           readinessProbe:
             httpGet:
               path: /-/ready
@@ -42,7 +50,18 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.alertmanager.resources | nindent 12 }}
+          # prom/alertmanager runs as `nobody` = uid 65534. MEASURED: starts
+          # read-only.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 65534 "gid" 65534 "readOnly" true) | nindent 12 }}
+      securityContext:
+        fsGroup: 65534
       volumes:
+        - name: storage
+          # Notification state (silences, nflog). emptyDir on purpose: it is
+          # gossip-replicated and cheap to lose, and a PVC here would pin the
+          # pod to a node for data nobody reads twice.
+          emptyDir: {}
         - name: config
           configMap:
             name: {{ include "secureprompt.fullname" . }}-alertmanager-config

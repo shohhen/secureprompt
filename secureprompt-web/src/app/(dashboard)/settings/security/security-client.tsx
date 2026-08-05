@@ -47,6 +47,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -69,6 +70,8 @@ import {
 type Status = "idle" | "enrolling" | "known_enabled";
 
 export function SecurityClient() {
+  const t = useTranslations("securitySettings");
+  const tf = useTranslations("twoFactor");
   const [status, setStatus] = useState<Status>("idle");
   const [enrollment, setEnrollment] = useState<EnrollResult | null>(null);
   const [verifyCode, setVerifyCode] = useState("");
@@ -89,17 +92,17 @@ export function SecurityClient() {
         setEnrollment(data);
         setStatus("enrolling");
       } else {
-        toast.error("Couldn't start setup. Please try again.");
+        toast.error(t("startSetupFailed"));
       }
     } catch (err) {
       if (err instanceof TwoFaAlreadyEnabledError) {
         // No side effect on this path -- the backend rejected before
         // touching the account. Inform the user; the Disable form (always
         // visible on the idle view) is how they'd turn it off.
-        toast("Two-factor authentication is already enabled.");
+        toast(t("alreadyEnabled"));
         setStatus("known_enabled");
       } else {
-        toast.error("Something went wrong. Please try again.");
+        toast.error(t("unexpected"));
       }
     }
   }
@@ -110,12 +113,13 @@ export function SecurityClient() {
     setStatus("idle");
   }
 
-  async function copy(value: string, label: string) {
+  /** `what` is a `twoFactor` key naming the thing copied, not copy itself. */
+  async function copy(value: string, what: "secretKey" | "backupCodes") {
     try {
       await navigator.clipboard.writeText(value);
-      toast.success(`${label} copied to clipboard.`);
+      toast.success(tf("copiedToClipboard", { what: tf(what) }));
     } catch {
-      toast.error("Couldn't copy — select the text manually.");
+      toast.error(tf("copyFailed"));
     }
   }
 
@@ -126,7 +130,7 @@ export function SecurityClient() {
       const tokens = await verifyMutation.mutateAsync(verifyCode);
       if (!tokens) {
         // Intentionally generic — parity with the login flow's wording.
-        toast.error("Invalid code. Please try again.");
+        toast.error(tf("invalidCode"));
         setVerifyCode("");
         return;
       }
@@ -134,12 +138,12 @@ export function SecurityClient() {
       // dashboard session (NextAuth), so there's nothing to swap in — the
       // verify call's only purpose on this page is to flip the account to
       // "confirmed" server-side.
-      toast.success("Two-factor authentication enabled.");
+      toast.success(t("enabledToast"));
       setEnrollment(null);
       setVerifyCode("");
       setStatus("known_enabled");
     } catch {
-      toast.error("Something went wrong. Please try again.");
+      toast.error(t("unexpected"));
       setVerifyCode("");
     }
   }
@@ -150,18 +154,18 @@ export function SecurityClient() {
     try {
       const ok = await disableMutation.mutateAsync(disableCode);
       if (!ok) {
-        toast.error("Invalid code. Please try again.");
+        toast.error(tf("invalidCode"));
         setDisableCode("");
         return;
       }
-      toast.success("Two-factor authentication disabled.");
+      toast.success(t("disabledToast"));
       setDisableCode("");
       // Return to the neutral view -- do NOT call enroll() here. A fresh
       // enrollment (and its fresh QR/backup codes) only happens if the
       // user explicitly clicks "Enable 2FA" again.
       setStatus("idle");
     } catch {
-      toast.error("Something went wrong. Please try again.");
+      toast.error(t("unexpected"));
       setDisableCode("");
     }
   }
@@ -171,10 +175,9 @@ export function SecurityClient() {
       {status === "idle" && (
         <div className="rounded-lg border p-5 space-y-4">
           <div>
-            <p className="font-medium text-sm">Two-factor authentication</p>
+            <p className="font-medium text-sm">{t("title")}</p>
             <p className="text-sm text-muted-foreground mt-1">
-              Add an extra layer of protection with an authenticator app, or
-              turn it off below if you already have it enabled.
+              {t("description")}
             </p>
           </div>
           <Button
@@ -182,9 +185,7 @@ export function SecurityClient() {
             onClick={handleEnableClick}
             disabled={enrollMutation.isPending}
           >
-            {enrollMutation.isPending
-              ? "Starting setup…"
-              : "Enable two-factor authentication"}
+            {enrollMutation.isPending ? t("startingSetup") : t("enable")}
           </Button>
           <div className="pt-2 border-t">
             <DisableForm
@@ -200,10 +201,8 @@ export function SecurityClient() {
       {status === "known_enabled" && (
         <div className="rounded-lg border p-5 space-y-4">
           <div className="flex items-center gap-3">
-            <Badge>Enabled</Badge>
-            <p className="text-sm text-muted-foreground">
-              Two-factor authentication is protecting your account.
-            </p>
+            <Badge>{t("badgeEnabled")}</Badge>
+            <p className="text-sm text-muted-foreground">{t("protecting")}</p>
           </div>
           <DisableForm
             code={disableCode}
@@ -218,12 +217,10 @@ export function SecurityClient() {
         <div className="rounded-lg border p-5 space-y-4">
           <div>
             <p className="font-medium text-sm">
-              Set up two-factor authentication
+              {t("setupTitle")}
             </p>
             <p className="text-sm text-muted-foreground mt-1">
-              Scan the QR code below with an authenticator app (Google
-              Authenticator, 1Password, Authy, etc.), then enter the
-              6-digit code it generates to turn it on.
+              {t("setupHint")}
             </p>
           </div>
 
@@ -231,7 +228,7 @@ export function SecurityClient() {
 
           <div className="space-y-1">
             <p className="text-xs font-medium text-muted-foreground">
-              Can&apos;t scan? Enter this key manually
+              {tf("manualKeyHint")}
             </p>
             <div className="flex items-center gap-2">
               <code className="block flex-1 select-all break-all rounded-md border bg-muted px-3 py-2 text-sm">
@@ -241,9 +238,9 @@ export function SecurityClient() {
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => copy(enrollment.secretB32, "Secret key")}
+                onClick={() => copy(enrollment.secretB32, "secretKey")}
               >
-                Copy
+                {tf("copy")}
               </Button>
             </div>
           </div>
@@ -251,7 +248,7 @@ export function SecurityClient() {
           <div className="space-y-2 rounded-lg border border-warning/50 bg-warning/10 p-3">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs font-semibold text-warning">
-                Save these backup codes now — shown only once
+                {tf("backupCodesTitle")}
               </p>
               <Button
                 type="button"
@@ -259,16 +256,14 @@ export function SecurityClient() {
                 size="sm"
                 className="h-auto shrink-0 px-2 py-1 text-xs"
                 onClick={() =>
-                  copy(enrollment.backupCodes.join("\n"), "Backup codes")
+                  copy(enrollment.backupCodes.join("\n"), "backupCodes")
                 }
               >
-                Copy all
+                {tf("copyAll")}
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              If you lose access to your authenticator app, each code can
-              be used once in its place. They won&apos;t be shown again
-              after this screen.
+              {t("backupCodesHint")}
             </p>
             <ul className="grid grid-cols-2 gap-1 rounded-md border bg-muted p-3 font-mono text-sm">
               {enrollment.backupCodes.map((backupCode) => (
@@ -281,7 +276,7 @@ export function SecurityClient() {
 
           <form onSubmit={handleVerify} className="space-y-2">
             <Label htmlFor="twofa-settings-verify-code">
-              Authentication code
+              {tf("code")}
             </Label>
             <Input
               id="twofa-settings-verify-code"
@@ -299,9 +294,7 @@ export function SecurityClient() {
                 className="flex-1"
                 disabled={verifyMutation.isPending || !verifyCode}
               >
-                {verifyMutation.isPending
-                  ? "Verifying…"
-                  : "Verify & enable two-factor authentication"}
+                {verifyMutation.isPending ? tf("verifying") : t("verifyAndEnable")}
               </Button>
               <Button
                 type="button"
@@ -309,7 +302,7 @@ export function SecurityClient() {
                 onClick={handleCancelEnroll}
                 disabled={verifyMutation.isPending}
               >
-                Cancel
+                {t("cancel")}
               </Button>
             </div>
           </form>
@@ -330,14 +323,13 @@ function DisableForm({
   onSubmit: (e: React.FormEvent<HTMLFormElement>) => void;
   submitting: boolean;
 }) {
+  const t = useTranslations("securitySettings");
   return (
     <form onSubmit={onSubmit} className="space-y-2">
-      <Label htmlFor="twofa-settings-disable-code">
-        Turn off two-factor authentication
-      </Label>
-      <p className="text-xs text-muted-foreground">
-        Enter a current authenticator code or a backup code to confirm.
-      </p>
+      <Label htmlFor="twofa-settings-disable-code">{t("disableTitle")}</Label>
+      {/* Destructive: turning 2FA off weakens the account, so the confirmation
+          wording is translated, not machine-guessed. */}
+      <p className="text-xs text-muted-foreground">{t("disableHint")}</p>
       <Input
         id="twofa-settings-disable-code"
         name="code"
@@ -354,7 +346,7 @@ function DisableForm({
         size="sm"
         disabled={submitting || !code}
       >
-        {submitting ? "Disabling…" : "Disable two-factor authentication"}
+        {submitting ? t("disabling") : t("disable")}
       </Button>
     </form>
   );

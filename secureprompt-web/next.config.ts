@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import createNextIntlPlugin from "next-intl/plugin";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
@@ -16,4 +17,9 @@ const nextConfig: NextConfig = {
   // are cache-controlled by Next.js itself and carry no sensitive data.
 };
 
-export default nextConfig;
+// WS6-3 — points next-intl at the per-request locale/message resolver.
+// No i18n routing is configured: the locale comes from the `sp_locale` cookie,
+// so no URL in the console gains a locale prefix.
+const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
+
+export default withNextIntl(nextConfig);

@@ -10,6 +10,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+// WS6-3: FileScanError carries a catalogue key rather than an English
+// sentence, so these assert the classification directly instead of
+// regex-matching wording that now lives in src/i18n/messages/*.json.
 
 import {
   scanFile,
@@ -91,7 +94,7 @@ describe("scanFile — async submit + poll", () => {
     const err: unknown = await scanFile(file(), FAST).catch((e) => e);
     expect(err).toBeInstanceOf(FileScanError);
     expect((err as FileScanError).status).toBe(413);
-    expect((err as FileScanError).message).toMatch(/too large|15 ?MB/i);
+    expect((err as FileScanError).code).toBe("fileTooLarge");
   });
 
   it("maps a 429 submit to a 'too many' message", async () => {
@@ -100,14 +103,14 @@ describe("scanFile — async submit + poll", () => {
     );
     const err = (await scanFile(file(), FAST).catch((e) => e)) as FileScanError;
     expect(err.status).toBe(429);
-    expect(err.message).toMatch(/too many|in progress|try again/i);
+    expect(err.code).toBe("tooManyScans");
   });
 
   it("maps a 503 submit to a 'still loading' message", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ detail: "loading" }, 503));
     const err = (await scanFile(file(), FAST).catch((e) => e)) as FileScanError;
     expect(err.status).toBe(503);
-    expect(err.message).toMatch(/loading/i);
+    expect(err.code).toBe("modelLoading");
   });
 
   it("throws when the polled task reports status=error", async () => {
@@ -118,7 +121,7 @@ describe("scanFile — async submit + poll", () => {
       );
     const err = (await scanFile(file(), FAST).catch((e) => e)) as FileScanError;
     expect(err).toBeInstanceOf(FileScanError);
-    expect(err.message).toMatch(/failed|boom|scan/i);
+    expect(err.code).toBe("scanFailed");
   });
 
   it("times out (throws) if the task never leaves running before maxWaitMs", async () => {
@@ -129,7 +132,7 @@ describe("scanFile — async submit + poll", () => {
       (e) => e,
     )) as FileScanError;
     expect(err).toBeInstanceOf(FileScanError);
-    expect(err.message).toMatch(/timed out|too large|still/i);
+    expect(err.code).toBe("scanTimedOut");
   });
 });
 
@@ -188,6 +191,6 @@ describe("secureFile — async submit + poll + download", () => {
       );
     const err = (await secureFile(file("x.exe"), FAST).catch((e) => e)) as FileScanError;
     expect(err).toBeInstanceOf(FileScanError);
-    expect(err.message).toMatch(/unsupported|type/i);
+    expect(err.code).toBe("unsupportedType");
   });
 });

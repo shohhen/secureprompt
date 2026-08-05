@@ -9,6 +9,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useQueryState, parseAsString, parseAsBoolean } from "nuqs";
 import { format, subDays } from "date-fns";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -23,10 +24,17 @@ interface RequestsTableProps {
   workspaceId: string;
 }
 
-const columns: ColumnDef<RequestListItem>[] = [
+/**
+ * Built inside the component rather than at module scope: the header strings
+ * have to be resolved per render so a locale switch relabels the table.
+ */
+function useColumns(): ColumnDef<RequestListItem>[] {
+  const t = useTranslations("requests");
+  const tc = useTranslations("common");
+  return [
   {
     accessorKey: "created_at",
-    header: "Time",
+    header: t("colTime"),
     cell: ({ getValue }) => {
       const v = getValue<string>();
       return (
@@ -38,21 +46,21 @@ const columns: ColumnDef<RequestListItem>[] = [
   },
   {
     accessorKey: "provider",
-    header: "Provider",
+    header: t("colProvider"),
     cell: ({ getValue }) => (
       <span className="font-mono text-xs">{getValue<string>()}</span>
     ),
   },
   {
     accessorKey: "model",
-    header: "Model",
+    header: t("colModel"),
     cell: ({ getValue }) => (
       <span className="font-mono text-xs">{getValue<string>()}</span>
     ),
   },
   {
     accessorKey: "final_action",
-    header: "Action",
+    header: t("colAction"),
     cell: ({ getValue }) => {
       const action = getValue<string>();
       const variant =
@@ -66,19 +74,19 @@ const columns: ColumnDef<RequestListItem>[] = [
   },
   {
     accessorKey: "cost_usd",
-    header: "Cost (USD)",
+    header: t("colCost"),
     cell: ({ getValue }) => (
       <span className="tabular-nums text-xs">${getValue<number>().toFixed(4)}</span>
     ),
   },
   {
     accessorKey: "has_violation",
-    header: "Violation",
+    header: t("colViolation"),
     cell: ({ getValue }) =>
       getValue<boolean>() ? (
-        <Badge variant="destructive">Yes</Badge>
+        <Badge variant="destructive">{tc("yes")}</Badge>
       ) : (
-        <span className="text-muted-foreground text-xs">No</span>
+        <span className="text-muted-foreground text-xs">{tc("no")}</span>
       ),
   },
   {
@@ -89,13 +97,17 @@ const columns: ColumnDef<RequestListItem>[] = [
         href={`/requests/${getValue<string>()}`}
         className="text-xs text-primary underline-offset-2 hover:underline"
       >
-        Details
+        {t("details")}
       </Link>
     ),
   },
-];
+  ];
+}
 
 export function RequestsTable({ workspaceId }: RequestsTableProps) {
+  const t = useTranslations("requests");
+  const tc = useTranslations("common");
+  const columns = useColumns();
   const [from] = useQueryState(
     "from",
     parseAsString.withDefault(format(subDays(new Date(), 7), DATE_FMT)),
@@ -136,14 +148,14 @@ export function RequestsTable({ workspaceId }: RequestsTableProps) {
     <div className="space-y-4">
       {error && (
         <p className="text-sm text-destructive">
-          Failed to load requests. The API may be unavailable.
+          {t("loadFailed")}
         </p>
       )}
       <DataTable
         columns={columns}
         data={rows}
         isLoading={isLoading}
-        emptyMessage="No requests found for the selected filters."
+        emptyMessage={t("empty")}
       />
       {(hasPrev || hasNextPage) && (
         <div className="flex items-center justify-between pt-2">
@@ -152,14 +164,14 @@ export function RequestsTable({ workspaceId }: RequestsTableProps) {
             disabled={!hasPrev || isFetchingNextPage}
             className="text-sm text-primary hover:underline disabled:opacity-50"
           >
-            ← Previous
+            {t("previous")}
           </button>
           <button
             onClick={handleLoadMore}
             disabled={!hasNextPage || isFetchingNextPage}
             className="text-sm text-primary hover:underline disabled:opacity-50"
           >
-            {isFetchingNextPage ? "Loading…" : "Next →"}
+            {isFetchingNextPage ? tc("loading") : t("next")}
           </button>
         </div>
       )}

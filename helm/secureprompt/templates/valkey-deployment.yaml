@@ -31,3 +31,15 @@ spec:
               command: ["redis-cli", "ping"]
             initialDelaySeconds: 5
             periodSeconds: 5
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+          # valkey.resources existed in values.yaml since the chart was written
+          # and was referenced by NOTHING: the rendered container had no
+          # requests and no limits at all, so the scheduler treated it as
+          # BestEffort and it was first in line for eviction under node
+          # pressure. Same for qdrant.
+          #
+          # uid 999 / gid 1000 -- `id valkey` inside the pinned image.
+          # MEASURED: starts read-only at that uid.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 999 "gid" 1000 "readOnly" true) | nindent 12 }}

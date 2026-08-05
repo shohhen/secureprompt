@@ -14,6 +14,7 @@
  */
 
 import { cn } from "@/lib/utils";
+import { useTranslations } from "next-intl";
 
 interface BudgetMeterProps {
   label: string;
@@ -36,6 +37,7 @@ export function BudgetMeter({
   behavior = "warn",
   className,
 }: BudgetMeterProps) {
+  const t = useTranslations("budget");
   const pct = limit !== null && limit > 0 ? Math.min((used / limit) * 100, 100) : null;
 
   const barColor =
@@ -53,10 +55,10 @@ export function BudgetMeter({
         <span>{label}</span>
         {limit !== null ? (
           <span>
-            {formatTokens(used)} / {formatTokens(limit)} tokens
+            {t("usedOfLimit", { used: formatTokens(used), limit: formatTokens(limit) })}
           </span>
         ) : (
-          <span>{formatTokens(used)} tokens (unlimited)</span>
+          <span>{t("usedUnlimited", { used: formatTokens(used) })}</span>
         )}
       </div>
       <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
@@ -67,13 +69,13 @@ export function BudgetMeter({
             role="progressbar"
             aria-valuenow={used}
             aria-valuemax={limit ?? undefined}
-            aria-label={`${label} token usage`}
+            aria-label={t("meterLabel", { label })}
           />
         ) : (
           <div
             className="h-full w-full rounded-full bg-muted-foreground/20"
             role="progressbar"
-            aria-label={`${label} token usage (no limit)`}
+            aria-label={t("meterLabelNoLimit", { label })}
           />
         )}
       </div>

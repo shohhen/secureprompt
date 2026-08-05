@@ -7,6 +7,7 @@
  */
 
 import { useState, useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -25,6 +26,7 @@ import { canWrite } from "@/lib/roles";
 
 export function PolicyRulesPanel() {
   const { data: session } = useSession();
+  const t = useTranslations("policyRules");
   const writable = canWrite(session?.role);
   const { data: rules, isLoading } = usePolicyRules();
   const deleteRule = useDeletePolicyRule();
@@ -35,33 +37,33 @@ export function PolicyRulesPanel() {
 
   const handleDelete = useCallback(
     (id: string, name: string) => {
-      if (!window.confirm(`Delete rule "${name}"?`)) return;
+      if (!window.confirm(t("deleteConfirm", { name }))) return;
       deleteRule.mutate(id, {
-        onSuccess: () => toast.success("Rule deleted."),
-        onError: () => toast.error("Failed to delete rule."),
+        onSuccess: () => toast.success(t("deleted")),
+        onError: () => toast.error(t("deleteFailed")),
       });
     },
-    [deleteRule],
+    [deleteRule, t],
   );
 
   const columns: ColumnDef<PolicyRuleResponse>[] = [
     {
       accessorKey: "priority",
-      header: "Priority",
+      header: t("colPriority"),
       cell: ({ getValue }) => (
         <span className="tabular-nums text-xs font-mono">{getValue<number>()}</span>
       ),
     },
     {
       accessorKey: "name",
-      header: "Name",
+      header: t("colName"),
       cell: ({ getValue }) => (
         <span className="font-medium">{getValue<string>()}</span>
       ),
     },
     {
       accessorKey: "action",
-      header: "Action",
+      header: t("colAction"),
       cell: ({ getValue }) => {
         const action = getValue<string>();
         const variant =
@@ -75,7 +77,7 @@ export function PolicyRulesPanel() {
     },
     {
       accessorKey: "enabled",
-      header: "Enabled",
+      header: t("colEnabled"),
       cell: ({ row }) => {
         const rule = row.original;
         return (
@@ -86,20 +88,20 @@ export function PolicyRulesPanel() {
               toggleEnabled.mutate(
                 { id: rule.id, value: e.target.checked },
                 {
-                  onError: () => toast.error("Failed to toggle rule."),
+                  onError: () => toast.error(t("toggleFailed")),
                 },
               );
             }}
             disabled={!writable}
             className="cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label={`Toggle enabled for ${rule.name}`}
+            aria-label={t("toggleEnabledAria", { name: rule.name })}
           />
         );
       },
     },
     {
       accessorKey: "dry_run",
-      header: "Dry Run",
+      header: t("colDryRun"),
       cell: ({ row }) => {
         const rule = row.original;
         return (
@@ -110,13 +112,13 @@ export function PolicyRulesPanel() {
               toggleDryRun.mutate(
                 { id: rule.id, value: e.target.checked },
                 {
-                  onError: () => toast.error("Failed to toggle dry-run."),
+                  onError: () => toast.error(t("toggleDryRunFailed")),
                 },
               );
             }}
             disabled={!writable}
             className="cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label={`Toggle dry-run for ${rule.name}`}
+            aria-label={t("toggleDryRunAria", { name: rule.name })}
           />
         );
       },
@@ -134,7 +136,7 @@ export function PolicyRulesPanel() {
               variant="outline"
               onClick={() => setEditTarget(rule)}
             >
-              Edit
+              {t("edit")}
             </Button>
             <Button
               size="sm"
@@ -142,7 +144,7 @@ export function PolicyRulesPanel() {
               onClick={() => handleDelete(rule.id, rule.name)}
               disabled={deleteRule.isPending}
             >
-              Delete
+              {t("delete")}
             </Button>
           </div>
         );
@@ -154,20 +156,17 @@ export function PolicyRulesPanel() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-medium">Policy Rules</h2>
+          <h2 className="text-lg font-medium">{t("title")}</h2>
           <p className="text-sm text-muted-foreground">
-            Rules are evaluated in priority order (lower number = higher
-            priority). Use dry-run to test without enforcement.
+            {t("description")}
             {!writable && (
-              <span className="block mt-1 text-xs">
-                Only owners and admins can add or edit policy rules.
-              </span>
+              <span className="block mt-1 text-xs">{t("readOnlyNotice")}</span>
             )}
           </p>
         </div>
         {writable && (
           <Button size="sm" onClick={() => setAddOpen(true)}>
-            Add Rule
+            {t("addRule")}
           </Button>
         )}
       </div>
@@ -176,7 +175,7 @@ export function PolicyRulesPanel() {
         columns={columns}
         data={rules ?? []}
         isLoading={isLoading}
-        emptyMessage="No policy rules. Create one to start enforcing policies."
+        emptyMessage={t("empty")}
       />
 
       {/* Add dialog */}

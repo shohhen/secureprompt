@@ -35,6 +35,19 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/clickhouse
+            # MEASURED, in this order, by removing them one at a time:
+            #   cp: cannot create regular file '/tmp/users.xml'          -> /tmp
+            #   /entrypoint.sh: line 131:
+            #     /etc/clickhouse-server/users.d/default-user.xml        -> users.d
+            #   (the entrypoint writes default-user.xml on EVERY boot, with or
+            #    without CLICKHOUSE_PASSWORD -- only the branch differs)
+            #   Logging trace to /var/log/clickhouse-server/...           -> logs
+            - name: tmp
+              mountPath: /tmp
+            - name: logs
+              mountPath: /var/log/clickhouse-server
+            - name: usersd
+              mountPath: /etc/clickhouse-server/users.d
           readinessProbe:
             httpGet:
               path: /ping
@@ -49,6 +62,20 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+          # uid 101 -- `id clickhouse` inside the pinned image. MEASURED at that
+          # uid, read-only, with the three emptyDirs above: server up, /ping
+          # returns Ok.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 101 "gid" 101 "readOnly" true) | nindent 12 }}
+      securityContext:
+        fsGroup: 101
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: usersd
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

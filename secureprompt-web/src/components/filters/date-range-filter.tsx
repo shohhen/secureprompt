@@ -8,6 +8,7 @@
  */
 
 import { useQueryState } from "nuqs";
+import { useTranslations } from "next-intl";
 import { format, subDays } from "date-fns";
 
 const FORMAT = "yyyy-MM-dd";
@@ -21,12 +22,13 @@ function daysAgo(n: number): string {
 }
 
 export function DateRangeFilter() {
+  const t = useTranslations("filters");
   const [from, setFrom] = useQueryState("from", { defaultValue: daysAgo(7) });
   const [to, setTo] = useQueryState("to", { defaultValue: today() });
 
   return (
     <div className="flex items-center gap-2 flex-wrap">
-      <label className="text-sm font-medium text-foreground/80">From</label>
+      <label className="text-sm font-medium text-foreground/80">{t("from")}</label>
       <input
         type="date"
         value={from}
@@ -34,7 +36,7 @@ export function DateRangeFilter() {
         onChange={(e) => setFrom(e.target.value)}
         className="border rounded px-2 py-1 text-sm bg-background"
       />
-      <label className="text-sm font-medium text-foreground/80">To</label>
+      <label className="text-sm font-medium text-foreground/80">{t("to")}</label>
       <input
         type="date"
         value={to}

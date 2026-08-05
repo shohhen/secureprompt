@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -35,6 +36,7 @@ interface TwoFactorEnrollProps {
  * deliberate "save this now" callout for the secret + backup codes.
  */
 export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
+  const t = useTranslations("twoFactor");
   const [enrollment, setEnrollment] = useState<EnrollResult | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [code, setCode] = useState("");
@@ -70,12 +72,13 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
     };
   }, [bearer]);
 
-  async function copy(value: string, label: string) {
+  /** `what` is a `twoFactor` key naming the thing copied, not copy itself. */
+  async function copy(value: string, what: "secretKey" | "backupCodes") {
     try {
       await navigator.clipboard.writeText(value);
-      toast.success(`${label} copied to clipboard.`);
+      toast.success(t("copiedToClipboard", { what: t(what) }));
     } catch {
-      toast.error("Couldn't copy — select the text manually.");
+      toast.error(t("copyFailed"));
     }
   }
 
@@ -89,13 +92,13 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
       if (!tokens) {
         // Intentionally generic — parity with the login form's "Invalid
         // credentials" / the challenge screen's "Invalid code" wording.
-        toast.error("Invalid code. Please try again.");
+        toast.error(t("invalidCode"));
         setCode("");
         return;
       }
       onSuccess(tokens);
     } catch {
-      toast.error("Something went wrong. Please try again.");
+      toast.error(t("unexpected"));
       setCode("");
     } finally {
       setSubmitting(false);
@@ -105,8 +108,7 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
   if (loadError) {
     return (
       <p role="alert" className="text-sm text-destructive">
-        Something went wrong setting up two-factor authentication. Please
-        refresh and try again.
+        {t("enrollLoadFailed")}
       </p>
     );
   }
@@ -114,7 +116,7 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
   if (!enrollment) {
     return (
       <p aria-live="polite" className="text-sm text-muted-foreground">
-        Setting up two-factor authentication…
+        {t("enrollLoading")}
       </p>
     );
   }
@@ -122,16 +124,14 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <p id="twofa-enroll-hint" className="text-sm text-muted-foreground">
-        Two-factor authentication is required for this account. Scan the QR
-        code below with an authenticator app (Google Authenticator, 1Password,
-        Authy, etc.), then enter the 6-digit code it generates to continue.
+        {t("enrollHint")}
       </p>
 
       <TwoFactorQr value={enrollment.provisioningUri} />
 
       <div className="space-y-1">
         <p className="text-xs font-medium text-muted-foreground">
-          Can&apos;t scan? Enter this key manually
+          {t("manualKeyHint")}
         </p>
         <div className="flex items-center gap-2">
           <code className="block flex-1 select-all break-all rounded-md border bg-muted px-3 py-2 text-sm">
@@ -141,9 +141,9 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => copy(enrollment.secretB32, "Secret key")}
+            onClick={() => copy(enrollment.secretB32, "secretKey")}
           >
-            Copy
+            {t("copy")}
           </Button>
         </div>
       </div>
@@ -151,7 +151,7 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
       <div className="space-y-2 rounded-lg border border-warning/50 bg-warning/10 p-3">
         <div className="flex items-center justify-between gap-2">
           <p className="text-xs font-semibold text-warning">
-            Save these backup codes now — shown only once
+            {t("backupCodesTitle")}
           </p>
           <Button
             type="button"
@@ -159,16 +159,14 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
             size="sm"
             className="h-auto shrink-0 px-2 py-1 text-xs"
             onClick={() =>
-              copy(enrollment.backupCodes.join("\n"), "Backup codes")
+              copy(enrollment.backupCodes.join("\n"), "backupCodes")
             }
           >
-            Copy all
+            {t("copyAll")}
           </Button>
         </div>
         <p className="text-xs text-muted-foreground">
-          If you lose access to your authenticator app, each code can be used
-          once in its place. Store them somewhere safe — they won&apos;t be
-          shown again after this screen.
+          {t("backupCodesHint")}
         </p>
         <ul className="grid grid-cols-2 gap-1 rounded-md border bg-muted p-3 font-mono text-sm">
           {enrollment.backupCodes.map((backupCode) => (
@@ -180,7 +178,7 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="twofa-enroll-code">Authentication code</Label>
+        <Label htmlFor="twofa-enroll-code">{t("code")}</Label>
         <Input
           id="twofa-enroll-code"
           name="code"
@@ -196,7 +194,7 @@ export function TwoFactorEnroll({ bearer, onSuccess }: TwoFactorEnrollProps) {
       </div>
 
       <Button type="submit" className="w-full" disabled={submitting || !code}>
-        {submitting ? "Verifying…" : "Verify & continue"}
+        {submitting ? t("verifying") : t("verifyAndContinue")}
       </Button>
     </form>
   );

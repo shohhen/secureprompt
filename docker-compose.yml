@@ -7,13 +7,29 @@ services:
       POSTGRES_DB: secureprompt
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # WS6-5: 127.0.0.1 only. Postgres holds the token vault, the audit trail and
+    # every workspace's data; on an appliance VM there is no reason for it to
+    # answer on the LAN interface. Host-run `cargo test` still reaches it —
+    # `#[sqlx::test]` connects to localhost.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U secureprompt"]
       interval: 5s
       timeout: 5s
       retries: 10
+    # WS6-5 resource limits. 0 of 16 services carried one; on a single-VM
+    # appliance every container shares the same RAM, so one runaway process
+    # -- the ML sidecar peaks near 5 GB loading four models -- takes the whole
+    # install down instead of just itself.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          cpus: "0.10"
+          memory: 256m
 
   # ---------------------------------------------------------------------------
   # DB ROLE SPLIT (WS1-P0). One-shot: applies the Postgres schema as the
@@ -66,21 +82,68 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+        reservations:
+          cpus: "0.05"
+          memory: 64m
 
   redis:
     image: valkey/valkey:8.1.6-alpine
+    # WS6-5. Valkey was unauthenticated AND published on host 6379, so anything
+    # that could reach the VM's port could read the rate-limit counters, the
+    # task queues and the session state. `--requirepass` is the whole fix;
+    # `--save ''` keeps the appliance from writing an RDB it never reads back.
+    #
+    # MEASURED against valkey/valkey:8.1.6-alpine: with --requirepass, an
+    # unauthenticated `PING` answers `NOAUTH Authentication required.`
+    command:
+      - valkey-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
+      - --save
+      - ""
+    # 127.0.0.1 only. The password is the control; not publishing the port to
+    # every interface is the reason a mistake in the password is survivable.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    # NOT `redis-cli ping`. MEASURED: under --requirepass that command prints
+    # `NOAUTH Authentication required.` and EXITS 0, so the healthcheck this
+    # file used to carry would have reported a Redis nobody can talk to as
+    # healthy. Grep for PONG, which only an authenticated reply contains.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG",
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+        reservations:
+          cpus: "0.05"
+          memory: 64m
 
   qdrant:
     image: qdrant/qdrant:v1.17.1
+    # WS6-5: 127.0.0.1 only. helm/secureprompt/templates/qdrant-deployment.yaml
+    # opens with "SECURITY: Qdrant is cluster-internal only. Never change
+    # Service type from ClusterIP" — compose was publishing it on every
+    # interface, unauthenticated.
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -88,6 +151,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          cpus: "0.10"
+          memory: 256m
 
   secureprompt-ml:
     build:
@@ -153,6 +225,15 @@ services:
     depends_on:
       qdrant:
         condition: service_healthy
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8g
+        reservations:
+          cpus: "0.50"
+          memory: 2g
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -160,18 +241,37 @@ services:
       CLICKHOUSE_DB: secureprompt
       CLICKHOUSE_USER: default
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # WS6-5. Without this the `default` user has no password and the HTTP
+      # interface answers anyone. MEASURED against clickhouse-server:24.8 --
+      # with it set, `curl --data 'SELECT 1' http://localhost:8123/` returns
+      # HTTP 403 `Code: 516 ... Authentication failed`, while the same query
+      # with credentials returns 200 and `1`. `/ping` stays open, which is what
+      # keeps the healthcheck below working.
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./docker/clickhouse/config.d/backup_disk.xml:/etc/clickhouse-server/config.d/backup_disk.xml:ro
       - clickhouse_backups:/var/lib/clickhouse/backups
+    # 127.0.0.1 only, same reasoning as redis: the password is the control,
+    # the bind is what makes a bad password survivable. The native protocol on
+    # 9000 has no business being on a bank's LAN at all.
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+        reservations:
+          cpus: "0.20"
+          memory: 1g
 
   backup:
     build:
@@ -182,11 +282,22 @@ services:
       SECUREPROMPT_BACKUP_KEY: ${SECUREPROMPT_BACKUP_KEY:-dev-backup-key-change-me}
       PGHOST: postgres
       CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       QDRANT_URL: http://qdrant:6333
       CH_BACKUP_MOUNT: /var/lib/clickhouse/backups
     volumes:
       - ./backups:/backups
       - clickhouse_backups:/var/lib/clickhouse/backups
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+        reservations:
+          cpus: "0.05"
+          memory: 128m
 
   api:
     build:
@@ -201,7 +312,16 @@ services:
       # actually apply to it. Migrations are applied by `db-migrate` above,
       # which is the only service holding the owner credential.
       DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
-      REDIS_URL: redis://redis:6379
+      # WS6-5: the password goes in the URL, WITH the `default` username spelled
+      # out. Both forms work for the Rust client -- redis 1.2.0's
+      # `ConnectionInfo::from_url` maps an empty username to None and
+      # `authenticate_cmd` then sends single-arg `AUTH <pw>`, which is what
+      # requirepass wants. `default:` is used anyway because it is the form that
+      # ALSO works for anyone debugging with a CLI: MEASURED against valkey
+      # 8.1.6, `valkey-cli -u redis://:hunter2@host PING` answers
+      # `AUTH failed: WRONGPASS` (it sends two-arg AUTH with an empty user),
+      # while `redis://default:hunter2@host` answers PONG.
+      REDIS_URL: redis://default:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@redis:6379
       LOG_LEVEL: info
       ML_SIDECAR_URL: http://secureprompt-ml:8080
       # NER on document-scale input (multi-page résumé/scan) legitimately takes
@@ -210,6 +330,15 @@ services:
       ML_SIDECAR_TIMEOUT_MS: ${ML_SIDECAR_TIMEOUT_MS:-30000}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
+      # WS6-5. NOT folded into CLICKHOUSE_URL, and that is not a style choice:
+      # the `clickhouse` 0.15 crate parses the URL and hands it to
+      # `Request::uri()`, then applies auth SEPARATELY as `X-ClickHouse-User` /
+      # `X-ClickHouse-Key` headers built from `with_user`/`with_password`. A
+      # `http://user:pass@host:8123` DSN would connect as the default user and
+      # authenticate nothing. See
+      # secureprompt-api/src/analytics/clickhouse_writer.rs::with_env_credentials.
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       SECUREPROMPT_JWT_SECRET: ${SECUREPROMPT_JWT_SECRET:?SECUREPROMPT_JWT_SECRET must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       SECUREPROMPT_PROVIDER_KEY: ${SECUREPROMPT_PROVIDER_KEY:?SECUREPROMPT_PROVIDER_KEY must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       # Browser-facing CORS allowlist. Dashboard runs on host port 3003; the
@@ -252,6 +381,15 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          cpus: "0.10"
+          memory: 192m
 
   worker:
     build:
@@ -266,10 +404,13 @@ services:
       # actually apply to it. Migrations are applied by `db-migrate` above,
       # which is the only service holding the owner credential.
       DATABASE_URL: postgres://secureprompt_app:${SECUREPROMPT_APP_DB_PASSWORD:?SECUREPROMPT_APP_DB_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@postgres:5432/secureprompt
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://default:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}@redis:6379
       LOG_LEVEL: info
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: secureprompt
+      # See the api service above for why these are headers and not a DSN.
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
       CLICKHOUSE_MIGRATIONS_DIR: /clickhouse/migrations
       QDRANT_URL: http://qdrant:6333
       ML_SIDECAR_URL: http://secureprompt-ml:8080
@@ -288,6 +429,15 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+        reservations:
+          cpus: "0.05"
+          memory: 128m
 
   web:
     build:
@@ -315,6 +465,15 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+        reservations:
+          cpus: "0.05"
+          memory: 256m
 
   grafana:
     image: grafana/grafana:11.4.0
@@ -325,7 +484,7 @@ services:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set in .env -- run scripts/init-env.sh, or e.g. openssl rand -hex 32}
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
@@ -335,6 +494,15 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+        reservations:
+          cpus: "0.05"
+          memory: 128m
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -348,6 +516,15 @@ services:
     ports:
       - "9090:9090"
     restart: unless-stopped
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          cpus: "0.10"
+          memory: 256m
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
@@ -358,6 +535,15 @@ services:
     ports:
       - "9093:9093"
     restart: unless-stopped
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256m
+        reservations:
+          cpus: "0.05"
+          memory: 64m
 
   # ---------------------------------------------------------------------------
   # LibreChat stack (task 30) — chat UI + its own MongoDB + an nginx that
@@ -381,6 +567,15 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          cpus: "0.05"
+          memory: 256m
 
   librechat:
     # Build from the SP-modified fork so the auth/strategies, model
@@ -413,17 +608,21 @@ services:
       # provider request reverses through `/v1/chat/completions`; every file
       # upload routes through `/v1/scan-file`.
       SECUREPROMPT_API_URL: http://api:8080
-      # SP: `/v1/scan-file` lives on the ML sidecar (Python FastAPI), not
-      # SP: on the Rust SP API. Phase 1: librechat hits the sidecar directly
-      # SP: over the docker bridge network. Phase 2 will replace this with a
-      # SP: SP-side proxy at /v1/scan-file that does API-key auth + audit.
-      SECUREPROMPT_ML_URL: http://secureprompt-ml:8080
-      # WS1-5: the fork's secureprompt-scan.js sends this as
-      # Authorization: Bearer <value> when it calls the ML sidecar's
-      # /v1/scan-file(/async) directly. MUST equal the secureprompt-ml
-      # service's value above — see that comment for why there is no
-      # insecure default here.
-      ML_SIDECAR_INTERNAL_TOKEN: ${ML_SIDECAR_INTERNAL_TOKEN:?ML_SIDECAR_INTERNAL_TOKEN must be set in .env -- e.g. openssl rand -hex 32}
+      # WS4-2 — NEITHER SECUREPROMPT_ML_URL NOR ML_SIDECAR_INTERNAL_TOKEN IS
+      # PASSED TO THIS SERVICE ANY MORE, and their absence is the change.
+      #
+      # Until WS4-2 this container held the sidecar's service-to-service secret
+      # and POSTed uploads straight to `secureprompt-ml:8080/v1/scan-file`. That
+      # secret authenticates a SERVICE, so no scan named a user and no scan was
+      # audited, and the same value also opens the sidecar's
+      # /internal/model-key. `/v1/scan-file` now lives on the gateway
+      # (SECUREPROMPT_API_URL above): it authenticates the uploading user's own
+      # SecurePrompt API key, refuses a viewer, writes a `file_scan.requested`
+      # audit row, and forwards the bytes with the sidecar's credential itself.
+      #
+      # secureprompt-scan.js deliberately does NOT read SECUREPROMPT_ML_URL, so
+      # a leftover value in an upgraded .env cannot route an upload back around
+      # the audit trail.
       SECUREPROMPT_SCAN_FILES_ENABLED: ${SECUREPROMPT_SCAN_FILES_ENABLED:-true}
       ALLOW_REGISTRATION: "false"
       ALLOW_EMAIL_LOGIN: "true"
@@ -432,6 +631,15 @@ services:
       - ./secureprompt-chat-config/librechat.yaml:/app/librechat.yaml:ro
     ports:
       - "3080:3080"
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          cpus: "0.10"
+          memory: 512m
 
   librechat-nginx:
     image: nginx:1.27-alpine
@@ -458,7 +666,15 @@ services:
           echo "[librechat-nginx] cert generated."
         fi
         exec nginx -g 'daemon off;'
-
+    # WS6-5 resource limits — see the `postgres` service for the rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+        reservations:
+          cpus: "0.05"
+          memory: 32m
 
 volumes:
   postgres_data:

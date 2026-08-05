@@ -7,6 +7,7 @@
  */
 
 import { useRequestDetail } from "@/lib/hooks/use-requests";
+import { useTranslations } from "next-intl";
 import { DetectionsDrawer } from "./detections-drawer";
 import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
@@ -31,16 +32,17 @@ export function RequestDetailView({
   requestId,
   workspaceId,
 }: RequestDetailViewProps) {
+  const t = useTranslations("requestDetail");
   const { data, isLoading, error } = useRequestDetail(requestId, workspaceId);
 
   if (isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading…</p>;
+    return <p className="text-sm text-muted-foreground">{t("loading")}</p>;
   }
 
   if (error) {
     return (
       <p className="text-sm text-destructive">
-        Failed to load request detail.
+        {t("loadFailed")}
       </p>
     );
   }
@@ -61,49 +63,49 @@ export function RequestDetailView({
         href="/requests"
         className="text-xs text-primary hover:underline underline-offset-2"
       >
-        Back to requests
+        {t("backToRequests")}
       </Link>
 
       {/* Metadata card */}
       <div className="rounded-md border p-4 space-y-0">
-        <MetaRow label="Request ID">
+        <MetaRow label={t("fieldRequestId")}>
           <span className="font-mono text-xs">{data.request_id}</span>
         </MetaRow>
-        <MetaRow label="Time">
+        <MetaRow label={t("fieldTime")}>
           {new Date(data.created_at).toLocaleString()}
         </MetaRow>
-        <MetaRow label="Provider">
+        <MetaRow label={t("fieldProvider")}>
           <span className="font-mono">{data.provider}</span>
         </MetaRow>
-        <MetaRow label="Model">
+        <MetaRow label={t("fieldModel")}>
           <span className="font-mono">{data.model}</span>
         </MetaRow>
-        <MetaRow label="Final Action">
+        <MetaRow label={t("fieldFinalAction")}>
           <Badge variant={actionVariant}>{data.final_action}</Badge>
         </MetaRow>
-        <MetaRow label="Cost (USD)">${data.cost_usd.toFixed(6)}</MetaRow>
+        <MetaRow label={t("fieldCost")}>${data.cost_usd.toFixed(6)}</MetaRow>
         {data.input_tokens != null && (
-          <MetaRow label="Input Tokens">
+          <MetaRow label={t("fieldInputTokens")}>
             {data.input_tokens.toLocaleString()}
           </MetaRow>
         )}
         {data.output_tokens != null && (
-          <MetaRow label="Output Tokens">
+          <MetaRow label={t("fieldOutputTokens")}>
             {data.output_tokens.toLocaleString()}
           </MetaRow>
         )}
         {data.reasoning_tokens != null && (
-          <MetaRow label="Reasoning Tokens">
+          <MetaRow label={t("fieldReasoningTokens")}>
             {data.reasoning_tokens.toLocaleString()}
           </MetaRow>
         )}
         {data.cache_read_tokens != null && (
-          <MetaRow label="Cache Read">
+          <MetaRow label={t("fieldCacheRead")}>
             {data.cache_read_tokens.toLocaleString()}
           </MetaRow>
         )}
         {data.cache_write_tokens != null && (
-          <MetaRow label="Cache Write">
+          <MetaRow label={t("fieldCacheWrite")}>
             {data.cache_write_tokens.toLocaleString()}
           </MetaRow>
         )}

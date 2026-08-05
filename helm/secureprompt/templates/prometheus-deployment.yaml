@@ -55,6 +55,13 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.prometheus.resources | nindent 12 }}
+          # MEASURED: `docker run --read-only` with /prometheus on a volume
+          # chowned 65534 -> "Server is ready to receive web requests." The same
+          # run against a root-owned tmpfs panics with
+          # `open /prometheus/queries.active: permission denied`, which is what
+          # the pod-level fsGroup above prevents.
+          securityContext:
+            {{- include "secureprompt.containerSecurityContext" (dict "uid" 65534 "gid" 65534 "readOnly" true) | nindent 12 }}
       volumes:
         - name: config
           configMap:

@@ -14,6 +14,7 @@
  */
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -26,7 +27,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
 const schema = z.object({
-  name: z.string().min(1, "Name is required").max(120),
+  name: z.string().min(1, "validation.nameRequired").max(120),
   user_id: z.string().optional(),
 });
 type FormData = z.infer<typeof schema>;
@@ -36,6 +37,7 @@ interface CreateKeyDialogProps {
 }
 
 export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
+  const t = useTranslations("keys");
   const [open, setOpen] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const { mutateAsync, isPending } = useCreateKey();
@@ -66,27 +68,27 @@ export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
       setCreatedKey(result.api_key);
       onCreated?.();
     } catch {
-      toast.error("Failed to create API key.");
+      toast.error(t("createFailed"));
     }
   }
 
   return (
     <Dialog.Root open={open} onOpenChange={handleOpenChange}>
       <Dialog.Trigger asChild>
-        <Button size="sm">Create Key</Button>
+        <Button size="sm">{t("createKey")}</Button>
       </Dialog.Trigger>
 
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg bg-background border shadow-lg p-6 space-y-4">
           <Dialog.Title className="text-lg font-semibold">
-            {createdKey ? "Key Created" : "Create API Key"}
+            {createdKey ? t("keyCreatedTitle") : t("createKeyTitle")}
           </Dialog.Title>
 
           {createdKey ? (
             <div className="space-y-3">
               <p className="text-sm text-muted-foreground">
-                Copy this key now — it will not be shown again.
+                {t("copyNowWarning")}
               </p>
               <div className="relative">
                 <Input
@@ -99,17 +101,17 @@ export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
                   type="button"
                   onClick={() => {
                     void navigator.clipboard.writeText(createdKey);
-                    toast.success("Copied to clipboard.");
+                    toast.success(t("copiedToClipboard"));
                   }}
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-primary hover:underline"
                 >
-                  Copy
+                  {t("copy")}
                 </button>
               </div>
               <div className="flex justify-end">
                 <Dialog.Close asChild>
                   <Button variant="outline" size="sm">
-                    Done
+                    {t("done")}
                   </Button>
                 </Dialog.Close>
               </div>
@@ -117,10 +119,10 @@ export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
           ) : (
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
               <div className="space-y-1.5">
-                <Label htmlFor="key-name">Key Name</Label>
+                <Label htmlFor="key-name">{t("keyName")}</Label>
                 <Input
                   id="key-name"
-                  placeholder="e.g. production-backend"
+                  placeholder={t("keyNamePlaceholder")}
                   {...form.register("name")}
                 />
                 {form.formState.errors.name && (
@@ -131,14 +133,14 @@ export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
               </div>
 
               <div className="space-y-1.5">
-                <Label htmlFor="key-assignee">Assign to member (optional)</Label>
+                <Label htmlFor="key-assignee">{t("assignee")}</Label>
                 <select
                   id="key-assignee"
                   className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                   {...form.register("user_id")}
                   disabled={usersLoading}
                 >
-                  <option value="">— Unassigned (workspace-scoped) —</option>
+                  <option value="">{t("assigneeUnassigned")}</option>
                   {(users ?? []).map((u) => (
                     <option key={u.id} value={u.id}>
                       {u.email} ({u.role})
@@ -146,20 +148,18 @@ export function CreateKeyDialog({ onCreated }: CreateKeyDialogProps) {
                   ))}
                 </select>
                 <p className="text-xs text-muted-foreground">
-                  Assigned keys are encrypted at rest; the chat client fetches
-                  them server-to-server when the member logs in. The member
-                  never types or sees the raw key.
+                  {t("assigneeHint")}
                 </p>
               </div>
 
               <div className="flex justify-end gap-2">
                 <Dialog.Close asChild>
                   <Button variant="outline" size="sm" type="button">
-                    Cancel
+                    {t("cancel")}
                   </Button>
                 </Dialog.Close>
                 <Button size="sm" type="submit" disabled={isPending}>
-                  {isPending ? "Creating…" : "Create"}
+                  {isPending ? t("creating") : t("create")}
                 </Button>
               </div>
             </form>

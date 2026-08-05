@@ -76,6 +76,32 @@ const DEFAULT_NER_CHUNK_CHARS: usize = 24_000;
 /// chat request path for minutes on an oversized prompt (Finding 2).
 const DEFAULT_NER_TOTAL_BUDGET_MS: u64 = 30_000;
 
+/// WS4-2 — default wall-clock budget (ms) for ONE forwarded file-scan call.
+///
+/// 120 s, chosen to sit ABOVE `secureprompt-chat`'s own
+/// `SECUREPROMPT_SCAN_TIMEOUT_MS` (60 s) so the chat backend's budget stays the
+/// binding one and routing a scan through the gateway does not shorten it.
+pub const DEFAULT_SCAN_TIMEOUT_MS: u64 = 120_000;
+
+/// Which verb a forwarded scan call uses. Only the two the sidecar's scan
+/// surface serves: `POST` for the two kickoffs, `GET` for the status poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMethod {
+    Get,
+    Post,
+}
+
+/// One sidecar answer, kept as bytes so the gateway hands back exactly what the
+/// sidecar said. Deliberately NOT deserialised into a typed scan result: the
+/// gateway has no use for the redacted text, and parsing it would put a second
+/// copy of the response contract here to drift from the sidecar's.
+#[derive(Debug, Clone)]
+pub struct SidecarProxyResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: bytes::Bytes,
+}
+
 #[derive(Debug, Clone)]
 pub struct MlSidecarClient {
     pub base_url: String,
@@ -525,6 +551,100 @@ impl MlSidecarClient {
         } else {
             Err(format!("sidecar returned {}", resp.status()))
         }
+    }
+
+    /// WS4-2 — forward one file-scan request to the sidecar, verbatim.
+    ///
+    /// The gateway does not parse the multipart body. It authenticates the
+    /// caller, role-gates them, records the scan, and hands the SAME bytes on
+    /// with the sidecar's own credential attached — so the sidecar's request
+    /// contract, its 15 MiB file ceiling, its 413/429/503 answers and its
+    /// response shape all stay exactly as `secureprompt-chat` already expects
+    /// them. Anything this gateway re-encoded would be a second place for the
+    /// upload contract to drift.
+    ///
+    /// # Its own client, and why
+    ///
+    /// Two reasons, both deliberate:
+    ///
+    ///   * **Timeout.** `self.http` is built with `ML_SIDECAR_TIMEOUT_MS`
+    ///     (30 s by default) because a chat request cannot wait longer for a
+    ///     detection call. An OCR pass over a scanned PDF can. This client is
+    ///     built with [`Self::scan_timeout`] instead, defaulting to 120 s so
+    ///     the chat backend's own 60 s budget stays the binding one — routing
+    ///     through the gateway must not shorten a scan that worked before.
+    ///   * **The circuit breaker.** `self.circuit` guards the detection path
+    ///     that every chat request runs through. A slow or failing file scan
+    ///     must not open it, because that would degrade every prompt in the
+    ///     deployment to the deterministic floor. Same reasoning
+    ///     [`Self::push_wrapped_model_key`] states for the same choice.
+    ///
+    /// The client is built per call, as `push_wrapped_model_key` does. Scans
+    /// are human-paced (one per uploaded file), so a fresh connection per scan
+    /// costs a TCP handshake against a scan that already takes seconds.
+    ///
+    /// # Errors
+    /// `Err(String)` when the sidecar is unconfigured, the request cannot be
+    /// built, or the transport fails. A non-2xx from the sidecar is NOT an
+    /// error here — it is returned as [`SidecarProxyResponse`] so the caller
+    /// can hand the sidecar's own status and body back to the uploader.
+    pub async fn proxy_scan(
+        &self,
+        method: ProxyMethod,
+        path: &str,
+        content_type: Option<&str>,
+        body: bytes::Bytes,
+    ) -> Result<SidecarProxyResponse, String> {
+        if !self.enabled {
+            return Err("ML sidecar is not configured".to_owned());
+        }
+        let url = format!("{}{}", self.base_url, path);
+        let client = Client::builder()
+            .timeout(Self::scan_timeout())
+            .use_rustls_tls()
+            .build()
+            .map_err(|e| format!("failed to build scan client: {e}"))?;
+
+        let mut request = match method {
+            ProxyMethod::Get => client.get(&url),
+            ProxyMethod::Post => client.post(&url).body(body),
+        };
+        request = request.header("Authorization", format!("Bearer {}", self.token));
+        if let Some(value) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, value);
+        }
+
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let response_content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = response.bytes().await.map_err(|e| e.to_string())?;
+        Ok(SidecarProxyResponse {
+            status,
+            content_type: response_content_type,
+            body,
+        })
+    }
+
+    /// Wall-clock budget for one forwarded scan call.
+    ///
+    /// `ML_SIDECAR_SCAN_TIMEOUT_MS`, defaulting to
+    /// [`DEFAULT_SCAN_TIMEOUT_MS`]. A zero or unparseable value falls back to
+    /// the default rather than to "no timeout", the same rule
+    /// `request_hygiene::parse_request_deadline` follows: a zero deadline
+    /// would abort every scan instantly.
+    fn scan_timeout() -> Duration {
+        std::env::var("ML_SIDECAR_SCAN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map_or(
+                Duration::from_millis(DEFAULT_SCAN_TIMEOUT_MS),
+                Duration::from_millis,
+            )
     }
 
     /// Prometheus metrics for the ML sidecar client.

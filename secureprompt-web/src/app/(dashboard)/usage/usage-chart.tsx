@@ -8,6 +8,7 @@
  */
 
 import { useQueryState } from "nuqs";
+import { useTranslations } from "next-intl";
 import { format, subDays } from "date-fns";
 import { useUsageDaily } from "@/lib/hooks/use-analytics";
 import { LineChart } from "@/components/charts/line-chart";
@@ -29,6 +30,7 @@ export function UsageChart({ workspaceId }: UsageChartProps) {
   const [to] = useQueryState("to", { defaultValue: format(new Date(), FORMAT) });
   const [model] = useQueryState("model");
 
+  const t = useTranslations("usage");
   const { data, isLoading, error } = useUsageDaily({
     from,
     to,
@@ -44,11 +46,11 @@ export function UsageChart({ workspaceId }: UsageChartProps) {
       </div>
 
       {isLoading && (
-        <p className="text-sm text-muted-foreground">Loading usage data…</p>
+        <p className="text-sm text-muted-foreground">{t("loading")}</p>
       )}
       {error && (
         <p className="text-sm text-destructive">
-          Failed to load usage data. Marts may not be populated yet.
+          {t("loadFailed")}
         </p>
       )}
 
@@ -80,7 +82,7 @@ export function UsageChart({ workspaceId }: UsageChartProps) {
           />
           {data && data.length === 0 && !isLoading && (
             <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground pointer-events-none">
-              No usage recorded for the selected period.
+              {t("empty")}
             </p>
           )}
         </div>

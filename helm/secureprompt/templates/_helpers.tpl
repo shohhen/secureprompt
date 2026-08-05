@@ -156,3 +156,56 @@ the runbook documents, `lookup` finds the existing Secret and both are stable.
 {{- define "secureprompt.secretChecksumAnnotation" -}}
 checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
 {{- end }}
+
+{{/*
+WS6-5 — container securityContext.
+
+Every field here is the same for every container; only the identity and the
+readOnlyRootFilesystem verdict differ, so they are the arguments.
+
+MEASURED, NOT ASSUMED. Each workload below was started under
+`docker run --read-only` (and, where an explicit uid is imposed, under
+`--user <uid>:<gid>`) against the exact pinned image on 2026-08-05. The
+writable paths the chart mounts as emptyDirs are the ones those runs demanded,
+by name, from the failure they produced:
+
+  postgres:16-alpine       FATAL: could not create lock file
+                           "/var/run/postgresql/.s.PGSQL.5432.lock":
+                           Read-only file system     -> emptyDir /var/run/postgresql, /tmp
+  clickhouse-server:24.8   cp: cannot create regular file '/tmp/users.xml'
+                           then /etc/clickhouse-server/users.d/default-user.xml
+                                                     -> emptyDir /tmp, /var/log/clickhouse-server,
+                                                        /etc/clickhouse-server/users.d
+  qdrant:v1.17.1           Error: failed to create directory `./storage`:
+                           Read-only file system     -> PVC /qdrant/storage + emptyDir /qdrant/snapshots
+  grafana:11.4.0           failed to create temporary file:
+                           open /tmp/64192443.zip: read-only file system
+                           (GF_INSTALL_PLUGINS)      -> emptyDir /tmp
+  alertmanager:v0.27.0     starts read-only, but --storage.path must point at
+                           something writable        -> emptyDir /alertmanager
+  prometheus:v2.55.1       starts read-only with its PVC at /prometheus
+  valkey:8.1.6-alpine      starts read-only bare
+  api, worker (distroless
+    cc-debian12:nonroot)   start read-only bare
+  web (node:22-alpine)     starts read-only bare ("Ready in 0ms")
+
+Usage:
+  {{- include "secureprompt.containerSecurityContext" (dict "uid" 70 "gid" 70 "readOnly" true) | nindent 12 }}
+Pass "nonRoot" false to emit the hardening WITHOUT runAsNonRoot (for an image
+whose behaviour under a forced uid has not been executed here).
+*/}}
+{{- define "secureprompt.containerSecurityContext" -}}
+allowPrivilegeEscalation: false
+capabilities:
+  drop: ["ALL"]
+seccompProfile:
+  type: RuntimeDefault
+{{- if ne (.nonRoot | toString) "false" }}
+runAsNonRoot: true
+{{- if .uid }}
+runAsUser: {{ .uid }}
+runAsGroup: {{ .gid | default .uid }}
+{{- end }}
+{{- end }}
+readOnlyRootFilesystem: {{ .readOnly }}
+{{- end }}

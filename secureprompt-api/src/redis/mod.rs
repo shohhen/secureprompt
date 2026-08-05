@@ -446,6 +446,80 @@ pub async fn enqueue_task(pool: &Pool, queue: &str, payload: &str) -> Result<(),
     Ok(())
 }
 
+// ── WS4-2 — scan-task ownership ──────────────────────────────────────────
+
+/// Remember which workspace started an async file scan.
+///
+/// The ML sidecar has no notion of a tenant: `POST /v1/scan-file/async` mints a
+/// task id, `GET /v1/scan-file/tasks/{id}` serves whoever asks for it, and the
+/// result carries the document's redacted text. The gateway is the only layer
+/// that knows whose scan it was, so it writes the binding here and refuses any
+/// poll it cannot match — see `routes::scan_file`.
+///
+/// FAIL-CLOSED, and that direction is chosen rather than defaulted: a poll for
+/// a task id with NO binding is refused, so a Redis outage costs the RESULT of
+/// an in-flight scan (the caller retries the upload) instead of opening every
+/// other tenant's scan to anyone holding a task id.
+///
+/// # Errors
+/// `ApiError::Internal` on Redis checkout or command failure. The caller must
+/// propagate it: a kickoff whose binding did not store is a task nobody can
+/// poll, and answering 200 with its id would promise otherwise.
+pub async fn bind_scan_task(
+    pool: &Pool,
+    task_id: &str,
+    workspace_id: uuid::Uuid,
+    ttl_secs: u64,
+) -> Result<(), ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("redis checkout failed: {e}")))?;
+    cmd("SET")
+        .arg(scan_task_key(task_id))
+        .arg(workspace_id.to_string())
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async::<()>(&mut conn)
+        .await
+        .map_err(|e| redis_error(&e))?;
+    Ok(())
+}
+
+/// The workspace an async scan task belongs to, or `None` when there is no
+/// binding (never stored, or expired).
+///
+/// A plain GET rather than the GETDEL [`consume_oidc_state`] uses: a scan is
+/// polled repeatedly until it reports `done`, so consuming the binding on the
+/// first poll would lock the caller out of its own result on the second.
+///
+/// # Errors
+/// `ApiError::Internal` on Redis failure. Distinct from `Ok(None)` on purpose —
+/// "I cannot tell you who owns this" and "nobody owns this" are the same
+/// refusal to the caller but not the same event in the log.
+pub async fn scan_task_owner(pool: &Pool, task_id: &str) -> Result<Option<String>, ApiError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| ApiError::Internal(format!("redis checkout failed: {e}")))?;
+    let value: Option<String> = cmd("GET")
+        .arg(scan_task_key(task_id))
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| redis_error(&e))?;
+    Ok(value)
+}
+
+/// Private, like [`oidc_state_key`]. The literal shape is restated in
+/// `dashboard::data_inventory`'s `redis:scan_task` declaration — the convention
+/// that module states for `redis:budget`: the inventory duplicates key shapes
+/// rather than importing them so it cannot widen another module's surface, and
+/// `tests/data_inventory.rs::every_redis_key_class_the_gateway_writes_is_
+/// accounted_for` names this function so the pairing is findable from there.
+fn scan_task_key(task_id: &str) -> String {
+    format!("scan_task:{task_id}")
+}
+
 // Private key derivation helper.
 fn oidc_state_key(state_id: &str) -> String {
     format!("oidc_state:{state_id}")

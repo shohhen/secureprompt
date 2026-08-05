@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,6 +29,7 @@ export function TwoFactorChallenge({
   challengeToken,
   onSuccess,
 }: TwoFactorChallengeProps) {
+  const t = useTranslations("twoFactor");
   const [code, setCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   // Set only on a 429 (`TwoFaLockedError`) — a persistent inline banner is
@@ -48,7 +50,7 @@ export function TwoFactorChallenge({
       if (!tokens) {
         // Intentionally generic — parity with the login form's "Invalid
         // credentials" wording (no hint re: TOTP vs. backup code).
-        toast.error("Invalid code. Please try again.");
+        toast.error(t("invalidCode"));
         setCode("");
         return;
       }
@@ -57,7 +59,7 @@ export function TwoFactorChallenge({
       if (err instanceof TwoFaLockedError) {
         setLockedMessage(err.message);
       } else {
-        toast.error("Something went wrong. Please try again.");
+        toast.error(t("unexpected"));
       }
       setCode("");
     } finally {
@@ -68,12 +70,11 @@ export function TwoFactorChallenge({
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <p id="twofa-challenge-hint" className="text-sm text-muted-foreground">
-        Enter the 6-digit code from your authenticator app, or one of your
-        saved backup codes.
+        {t("challengeHint")}
       </p>
 
       <div className="space-y-2">
-        <Label htmlFor="twofa-challenge-code">Authentication code</Label>
+        <Label htmlFor="twofa-challenge-code">{t("code")}</Label>
         <Input
           id="twofa-challenge-code"
           name="code"
@@ -111,7 +112,7 @@ export function TwoFactorChallenge({
         className="w-full"
         disabled={submitting || !code || !!lockedMessage}
       >
-        {submitting ? "Verifying…" : "Verify"}
+        {submitting ? t("verifying") : t("verify")}
       </Button>
     </form>
   );

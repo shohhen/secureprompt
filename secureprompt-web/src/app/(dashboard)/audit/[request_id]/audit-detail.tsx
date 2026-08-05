@@ -9,6 +9,7 @@
  */
 
 import Link from "next/link";
+import { useTranslations } from "next-intl";
 import { useRequestDetail } from "@/lib/hooks/use-requests";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -35,11 +36,12 @@ const ACTION_VARIANT: Record<
 };
 
 export function AuditDetail({ requestId, workspaceId }: Props) {
+  const t = useTranslations("auditDetail");
   const { data, isLoading, error } = useRequestDetail(requestId, workspaceId);
 
   if (isLoading) {
     return (
-      <p className="text-sm text-muted-foreground">Loading request detail…</p>
+      <p className="text-sm text-muted-foreground">{t("loading")}</p>
     );
   }
 
@@ -48,8 +50,7 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
       <div className="space-y-4">
         <BackLink />
         <p className="text-sm text-destructive">
-          Failed to load request detail. The request may have been purged
-          (90-day TTL) or the ID is invalid.
+          {t("loadFailed")}
         </p>
       </div>
     );
@@ -63,7 +64,7 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
       <div className="flex items-start justify-between gap-4">
         <div>
           <BackLink />
-          <h1 className="mt-2 text-2xl font-semibold">Request Detail</h1>
+          <h1 className="mt-2 text-2xl font-semibold">{t("title")}</h1>
           <p className="text-xs font-mono text-muted-foreground mt-1 break-all">
             {data.request_id}
           </p>
@@ -79,31 +80,31 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Who</CardTitle>
-            <CardDescription>Workspace member that issued this request.</CardDescription>
+            <CardTitle className="text-base">{t("whoTitle")}</CardTitle>
+            <CardDescription>{t("whoDescription")}</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
             <Field
-              label="Name"
+              label={t("fieldName")}
               value={
                 [data.user_first_name, data.user_last_name]
                   .filter(Boolean)
                   .join(" ") || "—"
               }
             />
-            <Field label="Position" value={data.user_position ?? "—"} />
-            <Field label="Email" value={data.user_email ?? "—"} />
+            <Field label={t("fieldPosition")} value={data.user_position ?? "—"} />
+            <Field label={t("fieldEmail")} value={data.user_email ?? "—"} />
             <Field
-              label="User ID"
+              label={t("fieldUserId")}
               value={data.user_id ?? "—"}
               mono
             />
             <Field
-              label="API key"
+              label={t("fieldApiKey")}
               value={data.api_key_name ?? "—"}
             />
             <Field
-              label="API key ID"
+              label={t("fieldApiKeyId")}
               value={data.api_key_id ?? "—"}
               mono
             />
@@ -112,24 +113,24 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">From</CardTitle>
-            <CardDescription>Transport — source, IP, device that sent it.</CardDescription>
+            <CardTitle className="text-base">{t("fromTitle")}</CardTitle>
+            <CardDescription>{t("fromDescription")}</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
-            <Field label="Source" value={data.source ?? "Unknown"} />
+            <Field label={t("fieldSource")} value={data.source ?? t("unknown")} />
             <Field
-              label="IP address"
+              label={t("fieldIpAddress")}
               value={data.ip_address ?? "unknown"}
               mono
             />
-            <Field label="Device" value={device} />
+            <Field label={t("fieldDevice")} value={device} />
             <Field
-              label="MAC (self-reported, desktop)"
+              label={t("fieldMac")}
               value={data.user_device_mac ?? "—"}
               mono
             />
             <Field
-              label="User-Agent"
+              label={t("fieldUserAgent")}
               value={data.user_agent ?? "—"}
               mono
               wrap
@@ -139,12 +140,12 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">When</CardTitle>
+            <CardTitle className="text-base">{t("whenTitle")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
-            <Field label="Local time" value={created.toLocaleString()} />
+            <Field label={t("fieldLocalTime")} value={created.toLocaleString()} />
             <Field
-              label="UTC"
+              label={t("fieldUtc")}
               value={created.toISOString()}
               mono
             />
@@ -153,16 +154,16 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Routing & cost</CardTitle>
+            <CardTitle className="text-base">{t("routingTitle")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
-            <Field label="Provider" value={data.provider} mono />
-            <Field label="Model" value={data.model} mono />
+            <Field label={t("fieldProvider")} value={data.provider} mono />
+            <Field label={t("fieldModel")} value={data.model} mono />
             <div className="grid grid-cols-3 gap-3 pt-1">
-              <Stat label="Input" value={data.input_tokens ?? "—"} />
-              <Stat label="Output" value={data.output_tokens ?? "—"} />
+              <Stat label={t("statInput")} value={data.input_tokens ?? "—"} />
+              <Stat label={t("statOutput")} value={data.output_tokens ?? "—"} />
               <Stat
-                label="Cost"
+                label={t("statCost")}
                 value={`$${data.cost_usd.toFixed(4)}`}
               />
             </div>
@@ -172,16 +173,13 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Policy violations</CardTitle>
-          <CardDescription>
-            Rules that fired against this request. Empty when no policy
-            triggered.
-          </CardDescription>
+          <CardTitle className="text-base">{t("policyTitle")}</CardTitle>
+          <CardDescription>{t("policyDescription")}</CardDescription>
         </CardHeader>
         <CardContent>
           {data.policy_events.length === 0 ? (
             <p className="text-sm text-muted-foreground italic">
-              No policy violations recorded.
+              {t("policyEmpty")}
             </p>
           ) : (
             <ul className="space-y-2">
@@ -199,7 +197,7 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
                   <div className="flex items-center gap-2">
                     {pe.dry_run && (
                       <Badge variant="outline" className="text-xs">
-                        dry-run
+                        {t("dryRun")}
                       </Badge>
                     )}
                     <Badge
@@ -219,53 +217,46 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">User message</CardTitle>
-          <CardDescription>
-            What the user typed (raw) and what the gateway forwarded
-            upstream (redacted). Only the latest turn — prior conversation
-            history is intentionally excluded.
-          </CardDescription>
+          <CardTitle className="text-base">{t("userMessageTitle")}</CardTitle>
+          <CardDescription>{t("userMessageDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-2">
           <MessagePanel
-            label="Raw"
+            label={t("panelRaw")}
             badgeVariant="destructive"
-            description="As typed — PII intact."
+            description={t("panelRawPromptDescription")}
             content={data.raw_prompt}
-            emptyMessage="No raw user message captured."
+            emptyMessage={t("panelRawPromptEmpty")}
           />
           <MessagePanel
-            label="Redacted"
+            label={t("panelRedacted")}
             badgeVariant="secondary"
-            description="Forwarded upstream — PII replaced with {{Class_N}} placeholders."
+            description={t("panelRedactedPromptDescription")}
             content={data.redacted_prompt}
-            emptyMessage="No redacted output (request didn't reach redaction)."
+            emptyMessage={t("panelRedactedPromptEmpty")}
           />
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">AI response</CardTitle>
-          <CardDescription>
-            What the upstream model emitted (raw, placeholders intact)
-            and what the client received (after placeholder restoration).
-          </CardDescription>
+          <CardTitle className="text-base">{t("aiResponseTitle")}</CardTitle>
+          <CardDescription>{t("aiResponseDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-2">
           <MessagePanel
-            label="Raw"
+            label={t("panelRaw")}
             badgeVariant="outline"
-            description="Direct from the upstream model — placeholders not yet restored."
+            description={t("panelRawResponseDescription")}
             content={data.raw_response}
-            emptyMessage="No upstream response (denied, embedding-only, or pre-migration row)."
+            emptyMessage={t("panelRawResponseEmpty")}
           />
           <MessagePanel
-            label="Restored"
+            label={t("panelRestored")}
             badgeVariant="secondary"
-            description="What the client saw — placeholders mapped back to original PII."
+            description={t("panelRestoredResponseDescription")}
             content={data.restored_response}
-            emptyMessage="No restored response."
+            emptyMessage={t("panelRestoredResponseEmpty")}
           />
         </CardContent>
       </Card>
@@ -306,12 +297,13 @@ function MessagePanel({
 }
 
 function BackLink() {
+  const t = useTranslations("auditDetail");
   return (
     <Link
       href="/audit"
       className="text-xs text-muted-foreground hover:underline"
     >
-      ← Back to audit log
+      {t("backToAuditLog")}
     </Link>
   );
 }

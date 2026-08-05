@@ -119,11 +119,22 @@ fi
 # keep their public repos and pull from Docker Hub. (Setting global.imageRegistry
 # to the AR repo would both double-prefix the app repos and wrongly route the
 # public images into AR.)
+# WS6-5. `-f values-gke.yaml` is now REQUIRED here, not optional garnish.
+# The chart defaults used to BE the GKE settings (ManagedCertificate, the
+# `gce` ingress class, `standard-rwo` StorageClasses), which is what made the
+# chart unusable anywhere else. They moved into that overlay unchanged, so
+# this deploy renders exactly what it rendered before -- drop the flag and the
+# GKE cert and PD StorageClasses silently disappear.
+#
+# It goes BEFORE the --set flags on purpose: --set wins over -f, so
+# HELM_TLS_ARGS's `--set ingress.managedCertificate.enabled=false` still turns
+# the managed cert off when a Cloudflare origin cert is present.
 echo "==> Helm upgrade --install ${RELEASE} (ns=${NAMESPACE})"
 helm upgrade --install "${RELEASE}" helm/secureprompt \
   --namespace "${NAMESPACE}" \
   --create-namespace \
   --take-ownership \
+  -f helm/secureprompt/values-gke.yaml \
   --set global.imageRegistry="" \
   --set api.image.repository="${IMAGE_PREFIX}/api"             --set api.image.tag="${IMAGE_TAG}" \
   --set worker.image.repository="${IMAGE_PREFIX}/worker"       --set worker.image.tag="${IMAGE_TAG}" \
