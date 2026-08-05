@@ -2209,6 +2209,35 @@ async fn get_data_inventory(
             },
         },
         UnenumerableClass {
+            class: "redis:scan_task",
+            store: "redis",
+            location: "scan_task:{task_id}",
+            description: "WS4-2 — which workspace started an in-flight async file scan, so a \
+                          poll for its result can be refused to every other tenant. The value \
+                          is a workspace id and nothing else: no filename, no document bytes, \
+                          no scan result.",
+            reason: "Keyed by the ML sidecar's task id, which carries no workspace, so this \
+                     endpoint cannot select this workspace's keys without scanning every \
+                     tenant's.",
+            per_workspace_erasure: "whole_store_only",
+            row_count: None,
+            encryption: Encryption::plain(
+                "A workspace UUID, stored as written. It identifies a tenant of this \
+                 deployment and is not a secret about anyone.",
+            ),
+            retention: Retention {
+                days: None,
+                window: "1 hour".to_owned(),
+                mechanism: mechanism::REDIS_TTL,
+                mechanism_detail: "Redis key TTL, set when the scan is started \
+                                   (`redis::bind_scan_task`). Sized to outlive the longest \
+                                   scan a caller will wait for; the binding is not deleted \
+                                   when the scan finishes, because a caller may poll a \
+                                   completed task more than once."
+                    .to_owned(),
+            },
+        },
+        UnenumerableClass {
             class: "redis:queues",
             store: "redis",
             location: "queue:analytics | queue:audit_export | queue:retention | queue:policy_index",
