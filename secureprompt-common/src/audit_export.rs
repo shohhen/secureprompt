@@ -555,7 +555,7 @@ pub const CONTROL_COVERAGE: &str =
     "AUDITED ADMINISTRATIVE ACTIONS ONLY. This section carries every row of \
      `raw_capture_audit` (WS3-1), `retention_purge_audit` (WS3-4), \
      `session_revocation_audit` (WS4-3) and `admin_audit` (FU5, extended by \
-     P1A) whose instant \
+     P1A and WS4-2) whose instant \
      falls in the window and whose `workspace_id` is this workspace's. The \
      audited actions are, in full: `raw_capture.changed`, `retention.purge`, \
      `session.revoked`, `api_key.created`, `api_key.revoked`, \
@@ -566,7 +566,8 @@ pub const CONTROL_COVERAGE: &str =
      `user.created`, `two_factor.enrollment_started`, `two_factor.enabled`, \
      `two_factor.disabled`, `license.activated`, `license.cleared`, \
      `budget.updated`, `secure_mode.updated`, `sidecar_policy.updated`, \
-     `auth.login_succeeded` and `auth.second_factor_verified`. It is NOT a \
+     `auth.login_succeeded`, `auth.second_factor_verified` and \
+     `file_scan.requested`. It is NOT a \
      complete record of administrative activity, \
      and must not be read as one. The following are NOT audited into any table \
      and therefore appear NOWHERE in this export: every FAILED or refused \
@@ -601,15 +602,28 @@ pub const CONTROL_COVERAGE: &str =
      form submissions; and a failed or \
      refused action — a 403, or a 404 for an object that does not exist — is \
      never recorded, so this section describes actions that TOOK EFFECT rather \
-     than attempts. `auth.login_succeeded` is the one exception to `took \
-     effect` and says so in its own `outcome` field: it is written when the \
+     than attempts. There are TWO exceptions and both are written down. \
+     `auth.login_succeeded` is the first and says so in its own `outcome` \
+     field: it is written when the \
      FIRST factor verified, and `second_factor_required` or \
      `enrolment_required` mean the password was correct and no session was \
      issued. That row COMMITS BEFORE the session it precedes, so no session is \
      ever issued without one; the residual is the other direction, and it is \
      stated rather than hidden — if session issuance then fails on an \
      infrastructure error, an `outcome` of `session_issued` describes a login \
-     that produced no session. Rows of `retention_purge_audit` whose \
+     that produced no session. `file_scan.requested` (WS4-2) is the second, \
+     and its verb is the warning: the row COMMITS BEFORE the document's bytes \
+     leave the gateway, so no file reaches the scanner without a record of who \
+     sent it, and a scan the scanner then refused — too large, unavailable, \
+     timed out — still has a row. READ THIS SECTION FOR WHAT IT DOES NOT SAY \
+     ABOUT FILE SCANS: the row names the person, the workspace, the API key, \
+     the endpoint and the byte count, and it deliberately carries NEITHER THE \
+     UPLOADED FILENAME NOR ANYTHING ABOUT WHAT WAS FOUND IN THE DOCUMENT. \
+     Filenames are end-user content and this table is never purged; detection \
+     results are a summary of the document itself. If your control objective \
+     is `which documents were scanned` or `what personal data they contained`, \
+     this artifact does not meet it — it answers `who scanned, when, and how \
+     much`. Rows of `retention_purge_audit` whose \
      `workspace_id` is NULL — \
      purge scopes that are not per-workspace, such as the token vault — are \
      excluded because they are not this tenant's records; the section's source \

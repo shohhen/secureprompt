@@ -168,6 +168,11 @@ admin_audit_vocabulary! {
     SidecarPolicyUpdated => "sidecar_policy.updated",
     LoginSucceeded => "auth.login_succeeded",
     SecondFactorVerified => "auth.second_factor_verified",
+    /// WS4-2 — migration 040. A user handed a document to the gateway's
+    /// `/v1/scan-file`, which forwarded it to the ML sidecar. Written BEFORE
+    /// the bytes are forwarded; see migration 040 for why the verb is
+    /// `requested`.
+    FileScanRequested => "file_scan.requested",
 }
 
 impl AdminAuditAction {
@@ -205,6 +210,11 @@ impl AdminAuditAction {
             Self::BudgetUpdated | Self::SecureModeUpdated | Self::SidecarPolicyUpdated => {
                 "workspace"
             }
+            // WS4-2 — the object is the scan itself, and `target_id` is the
+            // gateway request id that ran it. NOT the uploaded file: naming a
+            // file would mean storing an end user's filename in a table that is
+            // never purged (migration 040 states the decision in full).
+            Self::FileScanRequested => "file_scan",
         }
     }
 }

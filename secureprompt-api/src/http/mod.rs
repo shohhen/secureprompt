@@ -24,7 +24,95 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+/// The gateway's HTTP surface.
+///
+/// # Why this is two routers and not one
+///
+/// WS4-5's `RequestBodyLimitLayer` refuses on `Content-Length` before a byte is
+/// read, which is the whole point of a body limit — but it is a LAYER, so
+/// whatever number it is built with applies to every route beneath it. That
+/// number is sized for a chat request (2 MiB). WS4-2 added `/v1/scan-file`,
+/// which carries an uploaded PDF and whose real ceiling is the ML sidecar's
+/// 15 MiB file cap.
+///
+/// One router cannot hold both: a per-route `route_layer` runs INSIDE the
+/// outer limit, so it can only lower the ceiling, never raise it. Raising the
+/// single global number instead would let `/v1/chat/completions` accept 16 MiB
+/// as well, which is the opposite of what the hygiene layer is for.
+///
+/// So the two are layered separately and merged afterwards. `Router::layer`
+/// applies to the routes present at the time of the call, and merging preserves
+/// each side's layers, so each half keeps its own ceiling.
+/// `tests/file_scan_routing.rs::the_scan_route_carries_a_bigger_body_than_the_rest_of_the_gateway`
+/// asserts BOTH directions — a 3 MiB body accepted on the scan route and
+/// refused on `/metrics` — because a one-directional version of that test
+/// passes on a gateway with no limit at all.
+///
+/// Everything outside the two body limits — the inbound deadline, tracing, the
+/// request id and CORS — is applied once, above the merge, so both halves get
+/// it.
 pub fn build_router(state: AppState) -> Router {
+    let core = core_router(state.clone())
+        // INNERMOST FIRST: `RequestBodyLimitLayer` refuses on `Content-Length`
+        // before any byte is read; `DefaultBodyLimit` keeps axum's
+        // per-extractor limit in agreement so a chunked body with no
+        // `Content-Length` is cut at the same number.
+        .layer(RequestBodyLimitLayer::new(max_body_bytes()))
+        .layer(DefaultBodyLimit::max(max_body_bytes()));
+
+    // WS4-2 — the file-scan routes, with the sidecar-sized ceiling. The license
+    // gate is applied here too: this half is merged AFTER `core_router` has
+    // already been wrapped, so it does not inherit that layer.
+    let scan = routes::scan_file::routes()
+        .layer(from_fn_with_state(
+            state.clone(),
+            middleware::license_gate::enforce,
+        ))
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(
+            routes::scan_file::scan_max_body_bytes(),
+        ))
+        .layer(DefaultBodyLimit::max(routes::scan_file::scan_max_body_bytes()));
+
+    core.merge(scan)
+        // ── WS4-5 — request-path hygiene, above BOTH halves ───────────────
+        //
+        // Applied as separate `.layer()` calls, not one `ServiceBuilder`, and
+        // that is load-bearing rather than stylistic: `RequestBodyLimitLayer`
+        // rewrites the request body type to `Limited<Body>` and the response
+        // type to `ResponseBody<_>`, which `axum::middleware::from_fn` (whose
+        // `Next` is typed on `Request<Body>`/`Response<Body>`) will not accept
+        // on either side. `Router::layer` re-normalizes through `IntoResponse`
+        // after every call, so each layer composes with the router instead of
+        // with its neighbour.
+        //
+        // INNERMOST FIRST — the last `.layer()` is the outermost:
+        //
+        //   1. inbound deadline   — backstop; see `request_hygiene` for why it
+        //                           is set ABOVE the upstream deadline.
+        //   2. TraceLayer         — inside the span made below, so a 413 and a
+        //                           504 are both logged WITH their request id.
+        //   3. request id         — outermost hygiene layer on purpose: every
+        //                           response, including the two rejections
+        //                           above, carries `x-request-id`.
+        //   4. CORS               — unchanged, still outermost overall. A
+        //                           rejection a browser cannot read is not
+        //                           useful to the dashboard.
+        //
+        // All of these sit ABOVE the license gate, and above authentication and
+        // rate-limiting (which run inside the handlers). That is the whole
+        // point of a body limit: a limit that runs after the expensive work is
+        // not a limit.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            inbound_deadline(),
+        ))
+        .layer(TraceLayer::new_for_http().make_span_with(middleware::request_hygiene::make_span))
+        .layer(from_fn(middleware::request_hygiene::propagate))
+        .layer(cors_layer())
+}
+
+fn core_router(state: AppState) -> Router {
     // MCP utility routes — registered below the OpenAI compat routes.
     // Phase 5 / Plan 05-01 — dashboard auth routes nest under `/v1/auth`.
     // `/token` and `/refresh` are public; `/logout` gets the JWT middleware
@@ -190,48 +278,6 @@ pub fn build_router(state: AppState) -> Router {
             middleware::license_gate::enforce,
         ))
         .with_state(state)
-        // ── WS4-5 — request-path hygiene ──────────────────────────────────
-        //
-        // Applied as separate `.layer()` calls, not one `ServiceBuilder`, and
-        // that is load-bearing rather than stylistic: `RequestBodyLimitLayer`
-        // rewrites the request body type to `Limited<Body>` and the response
-        // type to `ResponseBody<_>`, which `axum::middleware::from_fn` (whose
-        // `Next` is typed on `Request<Body>`/`Response<Body>`) will not accept
-        // on either side. `Router::layer` re-normalizes through `IntoResponse`
-        // after every call, so each layer composes with the router instead of
-        // with its neighbour.
-        //
-        // INNERMOST FIRST — the last `.layer()` is the outermost:
-        //
-        //   1. inbound deadline   — backstop; see `request_hygiene` for why it
-        //                           is set ABOVE the upstream deadline.
-        //   2. body limit         — refuses on `Content-Length` before any
-        //                           byte is read; `DefaultBodyLimit` keeps
-        //                           axum's per-extractor limit in agreement so
-        //                           a chunked body with no `Content-Length` is
-        //                           cut at the same number.
-        //   3. TraceLayer         — inside the span made below, so a 413 and a
-        //                           504 are both logged WITH their request id.
-        //   4. request id         — outermost hygiene layer on purpose: every
-        //                           response, including the two rejections
-        //                           above, carries `x-request-id`.
-        //   5. CORS               — unchanged, still outermost overall. A
-        //                           rejection a browser cannot read is not
-        //                           useful to the dashboard.
-        //
-        // All five sit ABOVE the license gate, and above authentication and
-        // rate-limiting (which run inside the handlers). That is the whole
-        // point of a body limit: a limit that runs after the expensive work is
-        // not a limit.
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            inbound_deadline(),
-        ))
-        .layer(RequestBodyLimitLayer::new(max_body_bytes()))
-        .layer(DefaultBodyLimit::max(max_body_bytes()))
-        .layer(TraceLayer::new_for_http().make_span_with(middleware::request_hygiene::make_span))
-        .layer(from_fn(middleware::request_hygiene::propagate))
-        .layer(cors_layer())
 }
 
 /// Operator-configured maximum request body.

@@ -396,11 +396,7 @@ async fn an_unauthenticated_scan_is_refused_before_the_sidecar_sees_a_byte(pool:
 
     // POSITIVE CONTROL — the same request, one dimension changed.
     let ok = app
-        .oneshot(scan_request(
-            "/v1/scan-file",
-            Some(&member.api_key),
-            64,
-        ))
+        .oneshot(scan_request("/v1/scan-file", Some(&member.api_key), 64))
         .await
         .expect("router responds");
     assert_eq!(
@@ -489,11 +485,7 @@ async fn a_viewer_may_not_scan_where_an_employee_may(pool: PgPool) {
 
     // POSITIVE CONTROL — same call, role changed, and it must DIFFER.
     let served = app
-        .oneshot(scan_request(
-            "/v1/scan-file",
-            Some(&employee.api_key),
-            64,
-        ))
+        .oneshot(scan_request("/v1/scan-file", Some(&employee.api_key), 64))
         .await
         .expect("router responds");
     assert_ne!(
@@ -517,6 +509,19 @@ async fn a_viewer_may_not_scan_where_an_employee_may(pool: PgPool) {
 /// PERSON. An unassigned key names no member, so a row written for it would
 /// carry a NULL actor — an audit record that cannot answer the question it
 /// exists for. Refused instead.
+///
+/// # What mutation testing showed about THIS test, stated because it surprised
+///
+/// Replacing `authorize_scan`'s `auth.user_id.ok_or_else(...)` with
+/// `unwrap_or_else(Uuid::nil)` — deleting the guard this test is named after —
+/// left it GREEN. The property is defended TWICE and independently: with a nil
+/// user id the member lookup one line below finds no row and the fail-closed
+/// `ok_or_else` there refuses instead. Removing BOTH (measured: the second
+/// mutant returned a fabricated `("nobody@example.invalid", "admin")` for a
+/// missing row) does fail this test, so it is not vacuous — but its name
+/// describes the OUTCOME, not one line of code, and no single-line mutant will
+/// falsify it. `a_key_assigned_outside_its_own_workspace_cannot_scan` below
+/// isolates the second guard.
 #[sqlx::test]
 async fn an_unassigned_workspace_key_cannot_scan(pool: PgPool) {
     let sidecar = MockScanSidecar::spawn();
@@ -546,6 +551,75 @@ async fn an_unassigned_workspace_key_cannot_scan(pool: PgPool) {
     assert_eq!(ok.status(), StatusCode::OK, "positive control");
 }
 
+/// A key assigned to somebody in ANOTHER workspace cannot scan.
+///
+/// This isolates the guard the previous test cannot: the member lookup carries
+/// `AND workspace_id = $2` and then FAILS CLOSED on no row.
+///
+/// The state is reachable rather than contrived. `api_keys.assigned_user_id`
+/// has a foreign key to `users(id)` and no cross-check against the key's own
+/// `workspace_id` (migration 009), so a row assigning a workspace-A key to a
+/// workspace-B member satisfies every constraint the database has —
+/// MEASURED: the "departed member" variant of this test was written first and
+/// Postgres refused it with `api_keys_assigned_user_id_fkey`, which is what
+/// sent this one down the cross-workspace route instead.
+///
+/// Without the workspace predicate the lookup would find the OTHER tenant's
+/// member and gate on THEIR role; without the fail-closed `ok_or_else` a
+/// missing row would have to be defaulted, and any default is a role decision
+/// taken on data that is not there. `AdminActor::resolve` tolerates exactly
+/// this lookup failing, because a missing display name must not stop a security
+/// action from being RECORDED — here the same lookup carries the ROLE, and the
+/// opposite rule applies.
+#[sqlx::test]
+async fn a_key_assigned_outside_its_own_workspace_cannot_scan(pool: PgPool) {
+    let sidecar = MockScanSidecar::spawn();
+    let ws_a = seed_workspace(&pool).await;
+    let ws_b = seed_workspace(&pool).await;
+    let stranger = seed_member(&pool, ws_b, "owner").await;
+    let native = seed_member(&pool, ws_a, "admin").await;
+
+    // A key in workspace A, assigned to workspace B's owner.
+    let crossed = format!("sp_ws42_crossed_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO api_keys (id, workspace_id, name, key_hash, assigned_user_id, created_at)
+         VALUES ($1, $2, 'crossed', $3, $4, NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws_a)
+    .bind(hash_api_key(&crossed))
+    .bind(stranger.user_id)
+    .execute(&pool)
+    .await
+    .expect("premise: the schema permits a cross-workspace assignment");
+
+    let app = app_with_sidecar(pool.clone(), &sidecar.url());
+    let refused = app
+        .clone()
+        .oneshot(scan_request("/v1/scan-file", Some(&crossed), 32))
+        .await
+        .expect("router responds");
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "the assigned member is not a member of this key's workspace, so no \
+         role of theirs may be read and no scan may run"
+    );
+    assert!(sidecar.seen().is_empty());
+    assert!(
+        audit_rows(&pool, ws_a).await.is_empty() && audit_rows(&pool, ws_b).await.is_empty(),
+        "a refused scan writes nothing, in either workspace"
+    );
+
+    // POSITIVE CONTROL — a key assigned INSIDE its own workspace is served, so
+    // the 403 above is about the assignment and not about the fixture.
+    let ok = app
+        .oneshot(scan_request("/v1/scan-file", Some(&native.api_key), 32))
+        .await
+        .expect("router responds");
+    assert_eq!(ok.status(), StatusCode::OK, "positive control");
+}
+
 // ── Criterion: every scan produces an audit record ───────────────────────
 
 /// The row reads alone: who scanned, in which workspace, through which key,
@@ -564,11 +638,7 @@ async fn a_scan_writes_one_audit_row_that_names_the_person_who_ran_it(pool: PgPo
 
     let response = app
         .clone()
-        .oneshot(scan_request(
-            "/v1/scan-file",
-            Some(&member.api_key),
-            128,
-        ))
+        .oneshot(scan_request("/v1/scan-file", Some(&member.api_key), 128))
         .await
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::OK);
@@ -632,11 +702,7 @@ async fn the_uploaded_filename_never_reaches_the_audit_trail(pool: PgPool) {
     // The multipart body names the file `a.txt` (see `multipart_body`) and
     // carries a run of `x` as its content. Both are searched for below.
     let response = app
-        .oneshot(scan_request(
-            "/v1/scan-file",
-            Some(&member.api_key),
-            64,
-        ))
+        .oneshot(scan_request("/v1/scan-file", Some(&member.api_key), 64))
         .await
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::OK);
@@ -649,7 +715,11 @@ async fn the_uploaded_filename_never_reaches_the_audit_trail(pool: PgPool) {
         "`target_label` carries an administrator's object name; an uploaded \
          filename is a chat user's content"
     );
-    let haystack = format!("{}{}", row.detail, row.target_label.clone().unwrap_or_default());
+    let haystack = format!(
+        "{}{}",
+        row.detail,
+        row.target_label.clone().unwrap_or_default()
+    );
     assert!(
         !haystack.contains("a.txt"),
         "the uploaded filename must not reach the audit trail: {haystack}"
@@ -679,11 +749,7 @@ async fn an_async_scan_is_audited_and_its_task_belongs_to_one_workspace(pool: Pg
 
     let kickoff = app
         .clone()
-        .oneshot(scan_request(
-            "/v1/scan-file/async",
-            Some(&a.api_key),
-            256,
-        ))
+        .oneshot(scan_request("/v1/scan-file/async", Some(&a.api_key), 256))
         .await
         .expect("router responds");
     assert_eq!(kickoff.status(), StatusCode::OK);
@@ -809,11 +875,7 @@ async fn the_scan_route_carries_a_bigger_body_than_the_rest_of_the_gateway(pool:
         .header(header::CONTENT_LENGTH, over_general.to_string())
         .body(Body::from(vec![b'x'; over_general]))
         .expect("request builds");
-    let refused = app
-        .clone()
-        .oneshot(general)
-        .await
-        .expect("router responds");
+    let refused = app.clone().oneshot(general).await.expect("router responds");
     assert_eq!(
         refused.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -830,10 +892,7 @@ async fn the_scan_route_carries_a_bigger_body_than_the_rest_of_the_gateway(pool:
         .header(header::CONTENT_LENGTH, too_big.to_string())
         .body(Body::empty())
         .expect("request builds");
-    let refused_scan = app
-        .oneshot(over_scan)
-        .await
-        .expect("router responds");
+    let refused_scan = app.oneshot(over_scan).await.expect("router responds");
     assert_eq!(
         refused_scan.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
