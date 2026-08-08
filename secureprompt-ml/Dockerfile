@@ -98,25 +98,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/.cache/torch /app/.cache/huggingface
+# The runtime user is created BEFORE the large COPYs so each one can set
+# ownership as it writes (`--chown=`). See the note on the removed
+# `chown -R` at the bottom of this stage for why that ordering matters.
+RUN useradd -m -u 1001 appuser
 
-COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
-COPY --from=deps /root/.cache/huggingface /app/.cache/huggingface
+RUN mkdir -p /app/.cache/torch /app/.cache/huggingface \
+ && chown -R appuser /app
+
+COPY --chown=appuser:appuser --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --chown=appuser:appuser --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+COPY --chown=appuser:appuser --from=deps /root/.cache/huggingface /app/.cache/huggingface
 
 # Compiled app: only __init__.py stubs + .so binaries + any data files.
 # NOTE: plaintext model.safetensors is intentionally NOT copied here.
 #       Only the AES-256-GCM encrypted variant is included (see below).
-COPY --from=compile /build/app ./app
+COPY --chown=appuser:appuser --from=compile /build/app ./app
 
 # Ship ONLY the encrypted weights — the plaintext file never touches this layer.
 # The .enc is produced on the host (see the header) and rides in via the build
 # context; .dockerignore excludes the plaintext model.safetensors next to it.
 # Active model dir: multilingual_ner_v8_xlmr (ACTIVE_NER_MODELS default). v7_xlmr's .enc is
 # also shipped so a rollback is an ACTIVE_NER_MODELS env change, not a rebuild.
-COPY secureprompt-ml/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc \
+COPY --chown=appuser:appuser secureprompt-ml/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc \
      /app/app/resources/multilingual_ner_v8_xlmr/model/model.safetensors.enc
-COPY secureprompt-ml/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc \
+COPY --chown=appuser:appuser secureprompt-ml/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc \
      /app/app/resources/multilingual_ner_v7_xlmr/model/model.safetensors.enc
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -139,7 +145,14 @@ ENV SECUREPROMPT_MODEL_KEY_REQUIRED=true
 
 EXPOSE 8080
 
-RUN useradd -m -u 1001 appuser && chown -R appuser /app
+# NO `chown -R /app` HERE, DELIBERATELY. It used to live on this line and
+# it cost 6.36 GB — measured, `docker history` named that single RUN as the
+# largest layer in a 16.6 GB image. chown rewrites the metadata of every
+# file it touches, and an overlay layer stores a changed file in full, so
+# recursively chowning /app AFTER the copies duplicated both 1.11 GB model
+# blobs, the 4.27 GB compiled app and the 2.09 GB HuggingFace cache into a
+# second copy that shipped in the image forever. Ownership is now set as
+# each COPY writes, which costs nothing.
 USER appuser
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
