@@ -23,10 +23,26 @@ CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://localhost:8123}"
 CLICKHOUSE_DB="${CLICKHOUSE_DB:-sp_analytics}"
 MIGRATIONS_DIR="${CLICKHOUSE_MIGRATIONS_DIR:-secureprompt-api/clickhouse/migrations}"
 
+# WS6-5 turned ClickHouse authentication ON and this script was not updated,
+# so every statement started coming back `403` — including the `CREATE DATABASE`
+# on line one, which made the failure look like a missing database rather than a
+# refused credential. The worker applies the same migrations through the Rust
+# client, which DOES authenticate, so the gap only showed up when running the
+# script directly (CI, or an operator following the release notes).
+#
+# Credentials travel in headers, not the URL: `?user=&password=` would land in
+# ClickHouse's own query_log and in any proxy access log in front of it.
+CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+CH_AUTH=(-H "X-ClickHouse-User: ${CLICKHOUSE_USER}")
+if [ -n "${CLICKHOUSE_PASSWORD}" ]; then
+  CH_AUTH+=(-H "X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}")
+fi
+
 ch() {
   # $1 = SQL. Fails the script on any non-2xx or ClickHouse-reported error.
   local body
-  body=$(curl -sS --fail-with-body \
+  body=$(curl -sS --fail-with-body "${CH_AUTH[@]}" \
     --data-binary "$1" \
     "${CLICKHOUSE_URL}/?database=${CLICKHOUSE_DB}") || {
       echo "ClickHouse statement failed:" >&2
@@ -38,7 +54,7 @@ ch() {
 }
 
 ch_nodb() {
-  curl -sS --fail-with-body --data-binary "$1" "${CLICKHOUSE_URL}/" >/dev/null
+  curl -sS --fail-with-body "${CH_AUTH[@]}" --data-binary "$1" "${CLICKHOUSE_URL}/" >/dev/null
 }
 
 echo "==> waiting for ClickHouse at ${CLICKHOUSE_URL}"
