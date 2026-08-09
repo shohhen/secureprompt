@@ -43,6 +43,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@formatjs/icu-messageformat-parser": "^3.5.16",
     "@playwright/test": "^1.48.2",
     "@tailwindcss/postcss": "^4.0.0-beta.5",
     "@testing-library/jest-dom": "^6.6.3",
