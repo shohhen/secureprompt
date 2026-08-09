@@ -63,11 +63,50 @@ echo "==> building mirror in $WORK"
 rm -rf "$WORK"
 git clone --no-local --quiet "$SRC" "$WORK"
 
+# ── Strings rewritten across every commit ─────────────────────────────────
+#
+# GitHub push protection matches the SHAPE of a Slack incoming-webhook URL and
+# does not judge the value, so the documentation placeholder
+# `T00000000/B00000000/XXXX…` in the commented-out alertmanager receiver blocks
+# the push. It is not a credential — the T and B segments are all zeros — but
+# leaving a string in a public repository that every scanner will flag forever
+# is its own cost, and clicking "allow this secret" to get past it is a habit
+# worth not forming.
+#
+# Rewritten to an obviously-inert form instead. filter-repo applies this to all
+# history, so old commits carrying the placeholder are rewritten too — which is
+# the point, since the block was triggered by a commit, not by the tip.
+REPLACEMENTS="$WORK/.mirror-replacements.txt"
+
 FILTER_ARGS=(--force --invert-paths)
 for p in "${STRIP[@]}"; do FILTER_ARGS+=(--path "$p"); done
 
 cd "$WORK"
-git filter-repo "${FILTER_ARGS[@]}" >/dev/null
+cat > "$REPLACEMENTS" <<'EOF'
+https://slack.example.invalid/replace-with-your-webhook-url==>https://slack.example.invalid/replace-with-your-webhook-url
+EOF
+# ── Commit-message trailers stripped from the public history ──────────────
+#
+# No commit is AUTHORED by an Anthropic address, so GitHub never listed an
+# assistant among the repository's contributors. What it does show is the
+# trailer on the message of 769 commits, on every commit page. Removing it is
+# an authorship-presentation choice for the published copy; GitLab keeps its
+# history untouched.
+#
+# Only the two exact trailers are removed. A `Co-Authored-By:` naming a HUMAN
+# is left alone — this repository has a second real contributor, and dropping
+# their credit would be a different and worse mistake than the one being fixed.
+git filter-repo "${FILTER_ARGS[@]}" --replace-text "$REPLACEMENTS" \
+  --message-callback '
+import re
+message = re.sub(rb"(?im)^Co-Authored-By:[ \t]*Claude[^\n]*\n?", b"", message)
+message = re.sub(rb"(?im)^Claude-Session:[^\n]*\n?", b"", message)
+# Collapse the blank run the removed trailers leave behind, and drop trailing
+# whitespace, so messages do not end in a gap where the trailer used to be.
+message = re.sub(rb"\n{3,}", b"\n\n", message)
+return message.rstrip() + b"\n"
+' >/dev/null
+rm -f "$REPLACEMENTS"
 echo "==> rewritten: $(git rev-list --count HEAD) commits (source has $(git -C "$SRC" rev-list --count HEAD))"
 
 # ── Verify, do not assume ─────────────────────────────────────────────────
@@ -86,6 +125,20 @@ for p in "${STRIP[@]}"; do
     fi
 done
 [ "$fail" -eq 0 ] || { echo "refusing to push" >&2; exit 1; }
+
+# The replaced string must be gone from every commit, or the push is blocked
+# again and we learn about it from GitHub rather than from here.
+if git log --all -p 2>/dev/null | grep -qE "hooks\.slack\.com/services/T0"; then
+    echo "   LEFT BEHIND: the slack placeholder survived the rewrite" >&2
+    exit 1
+fi
+echo "   clean: slack webhook placeholder (rewritten across history)"
+
+if git log --all --format=%B | grep -qiE "^(Co-Authored-By:[ \t]*Claude|Claude-Session:)"; then
+    echo "   LEFT BEHIND: Claude trailers survived the rewrite" >&2
+    exit 1
+fi
+echo "   clean: assistant trailers removed from commit messages"
 
 # Positive control: the rewrite must not have emptied the repository.
 tracked="$(git ls-files | wc -l | tr -d ' ')"
