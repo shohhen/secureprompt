@@ -162,6 +162,23 @@ impl ProviderCatalog {
             "google".to_owned(),
             Arc::new(openai_compat::OpenAiCompatAdapter::google()),
         );
+        // Amazon Bedrock's OpenAI-compatible surface. Same protocol, same
+        // bearer-token auth (Bedrock API keys), so it reuses the compat
+        // adapter rather than needing a SigV4 implementation. Its base URL
+        // embeds a region and therefore has NO compiled-in default — it comes
+        // from the provider row's `config.base_url`. See
+        // `OpenAiCompatAdapter::resolve_base_url`.
+        //
+        // That URL is operator-supplied and only STRUCTURALLY screened on the
+        // request path (scheme / embedded-credentials / host). The full
+        // `validate_outbound_url` egress check resolves DNS and pins the
+        // resulting addresses, which is right for a one-shot credential test
+        // but would put a resolution on every chat completion; the durable fix
+        // is to validate when the provider is saved, not when it is used.
+        adapters.insert(
+            "bedrock".to_owned(),
+            Arc::new(openai_compat::OpenAiCompatAdapter::bedrock()),
+        );
         adapters.insert(
             "vertex".to_owned(),
             Arc::new(vertex::VertexAdapter::new()),

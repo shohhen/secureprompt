@@ -6,4 +6,4 @@
 
 pub mod url_guard;
 
-pub use url_guard::{build_pinned_client, validate_outbound_url, EgressPolicy, SsrfError, ValidatedUrl};
+pub use url_guard::{build_pinned_client, parse_and_check_url, validate_outbound_url, EgressPolicy, SsrfError, ValidatedUrl};

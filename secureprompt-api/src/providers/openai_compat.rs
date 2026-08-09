@@ -61,14 +61,23 @@ fn shared_http_client() -> &'static reqwest::Client {
     &shared_upstream().0
 }
 
-/// Generic OpenAI-compatible adapter. The `base_url` is fixed at
-/// construction time so we can register one instance per provider_type
-/// without doing a runtime lookup on every request.
+/// Generic OpenAI-compatible adapter. One instance is registered per
+/// `provider_type`; the base URL is resolved PER REQUEST from the provider
+/// row, falling back to a compiled-in default.
+///
+/// It used to be a `&'static str` fixed at construction. That works while
+/// every endpoint has one global address (api.openai.com), and breaks the
+/// moment one does not: Bedrock's host embeds the region
+/// (`bedrock-runtime.eu-north-1.amazonaws.com`), and two workspaces on the
+/// same gateway can legitimately sit in different regions, so no constant can
+/// be right for both. The same limitation is what a self-hosted vLLM
+/// deployment runs into — its address is site-specific by definition.
 pub struct OpenAiCompatAdapter {
     /// Static identifier returned to the registry (e.g. "openai", "google").
     provider_type: &'static str,
-    /// Base URL for the upstream provider — `/chat/completions` is appended.
-    base_url: &'static str,
+    /// Fallback when the provider row carries no `base_url`. Empty means the
+    /// provider CANNOT be defaulted and must be configured.
+    default_base_url: &'static str,
 }
 
 impl OpenAiCompatAdapter {
@@ -76,7 +85,7 @@ impl OpenAiCompatAdapter {
     pub const fn openai() -> Self {
         Self {
             provider_type: "openai",
-            base_url: "https://api.openai.com/v1",
+            default_base_url: "https://api.openai.com/v1",
         }
     }
 
@@ -84,8 +93,72 @@ impl OpenAiCompatAdapter {
     pub const fn google() -> Self {
         Self {
             provider_type: "google",
-            base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+            default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         }
+    }
+
+    /// Amazon Bedrock's OpenAI-compatible surface.
+    ///
+    /// `POST {base}/chat/completions` with `Authorization: Bearer <Bedrock
+    /// API key>` — the same shape this adapter already speaks, so Bedrock
+    /// needs no bespoke adapter and no SigV4 signing.
+    ///
+    /// NO DEFAULT, deliberately. The host is
+    /// `https://bedrock-runtime.{region}.amazonaws.com/openai/v1`, and
+    /// guessing a region would silently send a workspace's prompts to the
+    /// wrong continent — a data-residency problem, not just a wrong answer.
+    /// An unconfigured Bedrock provider fails fast instead.
+    #[must_use]
+    pub const fn bedrock() -> Self {
+        Self {
+            provider_type: "bedrock",
+            default_base_url: "",
+        }
+    }
+
+    /// Resolve the upstream base URL for THIS request.
+    ///
+    /// `target.config.base_url` wins over the compiled-in default, so an
+    /// operator can point a provider at a region, a self-hosted endpoint or a
+    /// compatible proxy without a rebuild.
+    ///
+    /// The value is operator-supplied, which makes it an SSRF vector — the
+    /// gateway would otherwise dial whatever a workspace admin typed. It goes
+    /// through the same structural checks `security::url_guard` applies to
+    /// credential testing: scheme must be http(s), no credentials embedded in
+    /// the URL, host must be present. See the note in `mod.rs` on why the full
+    /// DNS-pinning validation is not on this path.
+    fn resolve_base_url(&self, target: &ModelTarget) -> Result<String, ProviderFailure> {
+        let configured = target
+            .config
+            .get("base_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let raw = match configured {
+            Some(url) => url,
+            None if !self.default_base_url.is_empty() => self.default_base_url,
+            None => {
+                return Err(ProviderFailure {
+                    message: format!(
+                        "{}: no base_url configured — set `base_url` in the provider's config \
+                         (e.g. https://bedrock-runtime.<region>.amazonaws.com/openai/v1)",
+                        self.provider_type
+                    ),
+                    retryable: false,
+                })
+            }
+        };
+
+        crate::security::parse_and_check_url(raw).map_err(|e| ProviderFailure {
+            message: format!("{}: refusing base_url — {e}", self.provider_type),
+            retryable: false,
+        })?;
+
+        // Trailing slash would make `{base}/chat/completions` a double slash.
+        // Some gateways 404 on it; none require it.
+        Ok(raw.trim_end_matches('/').to_owned())
     }
 
     /// Resolve the bearer token from the invocation's decrypted credential,
@@ -110,17 +183,17 @@ impl ProviderAdapter for OpenAiCompatAdapter {
 
     async fn complete(
         &self,
-        _target: &ModelTarget,
+        target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure> {
         let bearer = self.bearer(invocation)?;
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.resolve_base_url(target)?);
         invoke(self.provider_type, &url, &bearer, &invocation.model, invocation, false).await
     }
 
     async fn stream(
         &self,
-        _target: &ModelTarget,
+        target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderOutput, ProviderFailure> {
         // Buffered fallback: fetch the full response in one shot. Retained for
@@ -128,17 +201,17 @@ impl ProviderAdapter for OpenAiCompatAdapter {
         // default `stream_events` adapter's source). True incremental
         // streaming lives in `stream_events` below.
         let bearer = self.bearer(invocation)?;
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.resolve_base_url(target)?);
         invoke(self.provider_type, &url, &bearer, &invocation.model, invocation, true).await
     }
 
     async fn stream_events(
         &self,
-        _target: &ModelTarget,
+        target: &ModelTarget,
         invocation: &ProviderInvocation,
     ) -> Result<ProviderEventStream, ProviderFailure> {
         let bearer = self.bearer(invocation)?;
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.resolve_base_url(target)?);
         invoke_stream(self.provider_type, &url, &bearer, &invocation.model, invocation).await
     }
 }
@@ -484,4 +557,154 @@ pub(crate) async fn invoke(
         finish_reason,
         ttft_ms: Some(ttft_ms),
     })
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::*;
+    use crate::http::model_router::ModelTarget;
+    use secureprompt_common::types::{ProviderId, WorkspaceId};
+    use uuid::Uuid;
+
+    fn target(provider_type: &str, config: serde_json::Value) -> ModelTarget {
+        ModelTarget {
+            model_id: Uuid::new_v4(),
+            workspace_id: WorkspaceId(Uuid::new_v4()),
+            provider_id: ProviderId(Uuid::new_v4()),
+            provider_name: format!("{provider_type}-primary"),
+            provider_type: provider_type.to_owned(),
+            model_name: "some-model".to_owned(),
+            encrypted_credential: None,
+            config,
+        }
+    }
+
+    // Bedrock's endpoint embeds the REGION
+    // (https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1), so a
+    // compiled-in constant cannot express it: two workspaces on one gateway
+    // can legitimately sit in different regions. The base URL therefore has to
+    // come from the provider row at request time.
+    #[test]
+    fn bedrock_takes_its_region_from_provider_config_not_from_the_binary() {
+        let adapter = OpenAiCompatAdapter::bedrock();
+        let eu = target(
+            "bedrock",
+            serde_json::json!({"base_url": "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"}),
+        );
+        let us = target(
+            "bedrock",
+            serde_json::json!({"base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"}),
+        );
+
+        assert_eq!(
+            adapter.resolve_base_url(&eu).unwrap(),
+            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+        );
+        // MUST DIFFER: the same adapter instance serves a second region.
+        assert_eq!(
+            adapter.resolve_base_url(&us).unwrap(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+        );
+        assert_ne!(
+            adapter.resolve_base_url(&eu).unwrap(),
+            adapter.resolve_base_url(&us).unwrap()
+        );
+    }
+
+    #[test]
+    fn bedrock_without_a_configured_base_url_fails_fast_and_says_what_is_missing() {
+        let adapter = OpenAiCompatAdapter::bedrock();
+        let err = adapter
+            .resolve_base_url(&target("bedrock", serde_json::json!({})))
+            .expect_err("bedrock has no sane default — there is no region to guess");
+        assert!(!err.retryable, "a missing config is not a transient fault");
+        assert!(
+            err.message.contains("base_url"),
+            "the error must name the field an operator has to set; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn openai_and_google_keep_their_defaults_when_config_is_silent() {
+        // Regression guard: making the URL configurable must not require
+        // every existing provider row to grow a config key.
+        assert_eq!(
+            OpenAiCompatAdapter::openai()
+                .resolve_base_url(&target("openai", serde_json::json!({})))
+                .unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            OpenAiCompatAdapter::google()
+                .resolve_base_url(&target("google", serde_json::json!({})))
+                .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+    }
+
+    #[test]
+    fn a_configured_base_url_overrides_the_compiled_in_default() {
+        // This is what unblocks self-hosted vLLM as well as Bedrock.
+        let adapter = OpenAiCompatAdapter::openai();
+        let t = target("openai", serde_json::json!({"base_url": "https://gateway.internal.example/v1"}));
+        assert_eq!(
+            adapter.resolve_base_url(&t).unwrap(),
+            "https://gateway.internal.example/v1"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_produce_a_double_slash_path() {
+        let adapter = OpenAiCompatAdapter::bedrock();
+        let t = target(
+            "bedrock",
+            serde_json::json!({"base_url": "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1/"}),
+        );
+        assert_eq!(
+            adapter.resolve_base_url(&t).unwrap(),
+            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+        );
+    }
+
+    // The base URL is operator-supplied, which makes it an SSRF vector: the
+    // gateway would otherwise issue a request to whatever a workspace admin
+    // typed. These are the structural checks `security::url_guard` already
+    // enforces for credential testing; the same input deserves the same
+    // treatment on the request path.
+    #[test]
+    fn a_non_http_scheme_is_refused() {
+        let adapter = OpenAiCompatAdapter::bedrock();
+        let err = adapter
+            .resolve_base_url(&target("bedrock", serde_json::json!({"base_url": "file:///etc/passwd"})))
+            .expect_err("file:// must never be dialled");
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn credentials_embedded_in_the_url_are_refused() {
+        // `http://trusted.com@evil.com/` — classic parser confusion, and a
+        // credential-leak channel.
+        let adapter = OpenAiCompatAdapter::bedrock();
+        let err = adapter
+            .resolve_base_url(&target(
+                "bedrock",
+                serde_json::json!({"base_url": "https://user:pass@bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"}),
+            ))
+            .expect_err("credentials in the URL must be refused");
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn a_garbage_base_url_is_refused_rather_than_concatenated() {
+        let adapter = OpenAiCompatAdapter::bedrock();
+        assert!(adapter
+            .resolve_base_url(&target("bedrock", serde_json::json!({"base_url": "not a url"})))
+            .is_err());
+        // An empty string must fall through to "not configured", not produce
+        // a request to `/chat/completions` with no host.
+        assert!(adapter
+            .resolve_base_url(&target("bedrock", serde_json::json!({"base_url": "   "})))
+            .is_err());
+    }
 }
