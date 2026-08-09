@@ -539,7 +539,11 @@
     "cancel": "TODO(uz-Cyrl): Cancel",
     "save": "TODO(uz-Cyrl): Save",
     "saving": "TODO(uz-Cyrl): Saving…",
-    "add": "TODO(uz-Cyrl): Add"
+    "add": "TODO(uz-Cyrl): Add",
+    "fieldBedrockRegion": "AWS минтақаси",
+    "fieldBedrockRegionHint": "Bedrock эндпойнти минтақага боғлиқ. Моделларга рухсат ҳам минтақа бўйича ёқилади — фақат калитнинг ўзи етарли эмас.",
+    "fieldBaseUrl": "Асосий URL",
+    "fieldBaseUrlHint": "Чақириладиган OpenAI-мос эндпойнт. Бу провайдер тури учун мажбурий — стандарт қиймат йўқ."
   },
   "providerModels": {
     "title": "TODO(uz-Cyrl): Models",

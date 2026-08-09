@@ -27,6 +27,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+
+// Provider types whose endpoint has no single global address, so the gateway
+// cannot carry a default for them. `bedrock`'s host embeds an AWS region;
+// `azure` and `custom` are site-specific by definition. Choosing one of these
+// in the dialog without supplying an address is what produced
+// "no default base_url for provider_type=bedrock; supply one explicitly".
+const TYPES_NEEDING_BASE_URL = ["azure", "custom"];
+
+// Bedrock is asked for a REGION rather than a URL: it is the only part that
+// varies, an operator knows it, and deriving the URL here means the console
+// never sends an arbitrary address for the gateway to dial.
+function bedrockBaseUrl(region: string): string {
+  return `https://bedrock-runtime.${region.trim()}.amazonaws.com/openai/v1`;
+}
+
 const PROVIDER_TYPES = ["openai", "anthropic", "google", "vertex", "azure", "bedrock", "custom"];
 
 const schema = z.object({
@@ -35,6 +50,7 @@ const schema = z.object({
   credential: z.string().optional(),
   region: z.string().optional(),
   project: z.string().optional(),
+  base_url: z.string().optional(),
 });
 type FormData = z.infer<typeof schema>;
 
@@ -64,11 +80,15 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
         "us-central1",
       project:
         (provider?.config as { region?: string; project?: string } | undefined)?.project ?? "",
+      base_url:
+        (provider?.config as { base_url?: string } | undefined)?.base_url ?? "",
     },
   });
 
   const providerType = form.watch("provider_type");
   const isVertex = providerType === "vertex";
+  const isBedrock = providerType === "bedrock";
+  const needsBaseUrl = TYPES_NEEDING_BASE_URL.includes(providerType);
 
   useEffect(() => {
     if (open) {
@@ -81,6 +101,8 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
           "us-central1",
         project:
           (provider?.config as { region?: string; project?: string } | undefined)?.project ?? "",
+        base_url:
+          (provider?.config as { base_url?: string } | undefined)?.base_url ?? "",
       });
       setTestResult(null);
     }
@@ -101,17 +123,20 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
       });
       return;
     }
-    const config =
-      provider_type === "vertex"
-        ? {
-            region: form.getValues("region") || "us-central1",
-            project: form.getValues("project") || undefined,
-          }
-        : undefined;
+    const config = buildConfig(provider_type, {
+      region: form.getValues("region"),
+      project: form.getValues("project"),
+      base_url: form.getValues("base_url"),
+    });
     try {
+      const baseUrl = resolveBaseUrl(provider_type, {
+        region: form.getValues("region"),
+        base_url: form.getValues("base_url"),
+      });
       const result = await testConn.mutateAsync({
         provider_type,
         credential: credential || "",
+        ...(baseUrl ? { base_url: baseUrl } : {}),
         ...(config ? { config } : {}),
       });
       setTestResult(result);
@@ -124,11 +149,42 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
     }
   }
 
+
+  /**
+   * Build the provider `config` for a type. Shared by "test connection" and
+   * submit deliberately: when these two disagree, a provider tests green and
+   * then fails in production, which is worse than failing here.
+   */
+  function resolveBaseUrl(
+    providerType: string,
+    values: { region?: string; base_url?: string },
+  ): string | undefined {
+    if (providerType === "bedrock") {
+      const region = (values.region || "").trim();
+      return region ? bedrockBaseUrl(region) : undefined;
+    }
+    if (TYPES_NEEDING_BASE_URL.includes(providerType)) {
+      return (values.base_url || "").trim() || undefined;
+    }
+    return undefined;
+  }
+
+  function buildConfig(
+    providerType: string,
+    values: { region?: string; project?: string; base_url?: string },
+  ): Record<string, string> | undefined {
+    if (providerType === "vertex") {
+      return {
+        region: values.region || "us-central1",
+        ...(values.project ? { project: values.project } : {}),
+      };
+    }
+    const base = resolveBaseUrl(providerType, values);
+    return base ? { base_url: base } : undefined;
+  }
+
   async function onSubmit(data: FormData) {
-    const config =
-      data.provider_type === "vertex"
-        ? { region: data.region || "us-central1", ...(data.project ? { project: data.project } : {}) }
-        : undefined;
+    const config = buildConfig(data.provider_type, data);
     try {
       if (isEdit && provider) {
         await update.mutateAsync({
@@ -209,6 +265,24 @@ export function ProviderForm({ provider, open, onOpenChange }: ProviderFormProps
                   />
                 </div>
               </>
+            )}
+
+            {isBedrock && (
+              <div className="space-y-1.5">
+                <Label htmlFor="prov-bedrock-region">{t("fieldBedrockRegion")}</Label>
+                {/* i18n-exempt: an AWS region identifier, identical in every locale */}
+                <Input id="prov-bedrock-region" placeholder="eu-north-1" {...form.register("region")} />
+                <p className="text-xs text-muted-foreground">{t("fieldBedrockRegionHint")}</p>
+              </div>
+            )}
+
+            {needsBaseUrl && (
+              <div className="space-y-1.5">
+                <Label htmlFor="prov-base-url">{t("fieldBaseUrl")}</Label>
+                {/* i18n-exempt: a URL example, identical in every locale */}
+                <Input id="prov-base-url" placeholder="https://example.internal/v1" {...form.register("base_url")} />
+                <p className="text-xs text-muted-foreground">{t("fieldBaseUrlHint")}</p>
+              </div>
             )}
 
             <div className="space-y-1.5">

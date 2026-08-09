@@ -539,7 +539,11 @@
     "cancel": "TODO(uz-Latn): Cancel",
     "save": "TODO(uz-Latn): Save",
     "saving": "TODO(uz-Latn): Saving…",
-    "add": "TODO(uz-Latn): Add"
+    "add": "TODO(uz-Latn): Add",
+    "fieldBedrockRegion": "AWS mintaqasi",
+    "fieldBedrockRegionHint": "Bedrock endpointi mintaqaga bogʻliq. Modellarga ruxsat ham mintaqa boʻyicha yoqiladi — faqat kalitning oʻzi yetarli emas.",
+    "fieldBaseUrl": "Asosiy URL",
+    "fieldBaseUrlHint": "Chaqiriladigan OpenAI-mos endpoint. Bu provayder turi uchun majburiy — standart qiymat yoʻq."
   },
   "providerModels": {
     "title": "TODO(uz-Latn): Models",

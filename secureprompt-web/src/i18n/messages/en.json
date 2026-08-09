@@ -539,7 +539,11 @@
     "cancel": "Cancel",
     "save": "Save",
     "saving": "Saving…",
-    "add": "Add"
+    "add": "Add",
+    "fieldBedrockRegion": "AWS region",
+    "fieldBedrockRegionHint": "Bedrock's endpoint is per-region. Model access is enabled per region too — a key alone is not enough.",
+    "fieldBaseUrl": "Base URL",
+    "fieldBaseUrlHint": "The OpenAI-compatible endpoint to call. Required for this provider type — there is no default."
   },
   "providerModels": {
     "title": "Models",
