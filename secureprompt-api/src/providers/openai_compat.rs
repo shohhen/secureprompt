@@ -68,7 +68,7 @@ fn shared_http_client() -> &'static reqwest::Client {
 /// It used to be a `&'static str` fixed at construction. That works while
 /// every endpoint has one global address (api.openai.com), and breaks the
 /// moment one does not: Bedrock's host embeds the region
-/// (`bedrock-runtime.eu-north-1.amazonaws.com`), and two workspaces on the
+/// (`bedrock-mantle.eu-north-1.api.aws`), and two workspaces on the
 /// same gateway can legitimately sit in different regions, so no constant can
 /// be right for both. The same limitation is what a self-hosted vLLM
 /// deployment runs into — its address is site-specific by definition.
@@ -104,7 +104,13 @@ impl OpenAiCompatAdapter {
     /// needs no bespoke adapter and no SigV4 signing.
     ///
     /// NO DEFAULT, deliberately. The host is
-    /// `https://bedrock-runtime.{region}.amazonaws.com/openai/v1`, and
+    /// `https://bedrock-mantle.{region}.api.aws/v1` — mantle, not
+    /// bedrock-runtime: runtime can complete a chat but answers 404
+    /// `<UnknownOperationException/>` on `/models`, because it lists via the
+    /// AWS-native ListFoundationModels instead. The credential probe and model
+    /// sync both call `GET {base}/models`, so runtime would leave those two
+    /// permanently broken while completions worked. The URL also embeds a
+    /// region, and
     /// guessing a region would silently send a workspace's prompts to the
     /// wrong continent — a data-residency problem, not just a wrong answer.
     /// An unconfigured Bedrock provider fails fast instead.
@@ -143,7 +149,7 @@ impl OpenAiCompatAdapter {
                 return Err(ProviderFailure {
                     message: format!(
                         "{}: no base_url configured — set `base_url` in the provider's config \
-                         (e.g. https://bedrock-runtime.<region>.amazonaws.com/openai/v1)",
+                         (e.g. https://bedrock-mantle.<region>.api.aws/v1)",
                         self.provider_type
                     ),
                     retryable: false,
@@ -580,7 +586,7 @@ mod base_url_tests {
     }
 
     // Bedrock's endpoint embeds the REGION
-    // (https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1), so a
+    // (https://bedrock-mantle.eu-north-1.api.aws/v1), so a
     // compiled-in constant cannot express it: two workspaces on one gateway
     // can legitimately sit in different regions. The base URL therefore has to
     // come from the provider row at request time.
@@ -589,21 +595,21 @@ mod base_url_tests {
         let adapter = OpenAiCompatAdapter::bedrock();
         let eu = target(
             "bedrock",
-            serde_json::json!({"base_url": "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"}),
+            serde_json::json!({"base_url": "https://bedrock-mantle.eu-north-1.api.aws/v1"}),
         );
         let us = target(
             "bedrock",
-            serde_json::json!({"base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"}),
+            serde_json::json!({"base_url": "https://bedrock-mantle.us-east-1.api.aws/v1"}),
         );
 
         assert_eq!(
             adapter.resolve_base_url(&eu).unwrap(),
-            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+            "https://bedrock-mantle.eu-north-1.api.aws/v1"
         );
         // MUST DIFFER: the same adapter instance serves a second region.
         assert_eq!(
             adapter.resolve_base_url(&us).unwrap(),
-            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+            "https://bedrock-mantle.us-east-1.api.aws/v1"
         );
         assert_ne!(
             adapter.resolve_base_url(&eu).unwrap(),
@@ -659,11 +665,11 @@ mod base_url_tests {
         let adapter = OpenAiCompatAdapter::bedrock();
         let t = target(
             "bedrock",
-            serde_json::json!({"base_url": "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1/"}),
+            serde_json::json!({"base_url": "https://bedrock-mantle.eu-north-1.api.aws/v1/"}),
         );
         assert_eq!(
             adapter.resolve_base_url(&t).unwrap(),
-            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+            "https://bedrock-mantle.eu-north-1.api.aws/v1"
         );
     }
 
@@ -689,7 +695,7 @@ mod base_url_tests {
         let err = adapter
             .resolve_base_url(&target(
                 "bedrock",
-                serde_json::json!({"base_url": "https://user:pass@bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"}),
+                serde_json::json!({"base_url": "https://user:pass@bedrock-mantle.eu-north-1.api.aws/v1"}),
             ))
             .expect_err("credentials in the URL must be refused");
         assert!(!err.retryable);

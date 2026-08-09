@@ -38,8 +38,25 @@ const TYPES_NEEDING_BASE_URL = ["azure", "custom"];
 // Bedrock is asked for a REGION rather than a URL: it is the only part that
 // varies, an operator knows it, and deriving the URL here means the console
 // never sends an arbitrary address for the gateway to dial.
+//
+// `bedrock-mantle`, NOT `bedrock-runtime`. Bedrock exposes two surfaces and
+// only one of them is fully OpenAI-shaped. Measured against eu-north-1 with a
+// dummy bearer token, where 401 proves the route exists and 404 proves it does
+// not:
+//
+//   bedrock-runtime/openai/v1/models            404 <UnknownOperationException/>
+//   bedrock-runtime/v1/models                   404 <UnknownOperationException/>
+//   bedrock-runtime/openai/v1/chat/completions  400 (route exists)
+//   bedrock-mantle/v1/models                    401 invalid_api_key
+//   bedrock-mantle/v1/chat/completions          401 invalid_api_key
+//
+// bedrock-runtime can complete a chat but cannot list models the OpenAI way —
+// it uses the AWS-native ListFoundationModels instead. Both the credential
+// probe and model sync call `GET {base}/chat../models`, so runtime would have
+// left "Test connection" and "Sync" permanently broken while completions
+// worked. mantle serves both from one base.
 function bedrockBaseUrl(region: string): string {
-  return `https://bedrock-runtime.${region.trim()}.amazonaws.com/openai/v1`;
+  return `https://bedrock-mantle.${region.trim()}.api.aws/v1`;
 }
 
 const PROVIDER_TYPES = ["openai", "anthropic", "google", "vertex", "azure", "bedrock", "custom"];

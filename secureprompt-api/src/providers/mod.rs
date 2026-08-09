@@ -164,9 +164,11 @@ impl ProviderCatalog {
         );
         // Amazon Bedrock's OpenAI-compatible surface. Same protocol, same
         // bearer-token auth (Bedrock API keys), so it reuses the compat
-        // adapter rather than needing a SigV4 implementation. Its base URL
-        // embeds a region and therefore has NO compiled-in default — it comes
-        // from the provider row's `config.base_url`. See
+        // adapter rather than needing a SigV4 implementation. Its base URL is
+        // the `bedrock-mantle` surface (the one that also implements /models —
+        // bedrock-runtime 404s there) and embeds a region, so it has NO
+        // compiled-in default; it comes from the provider row's
+        // `config.base_url`. See
         // `OpenAiCompatAdapter::resolve_base_url`.
         //
         // That URL is operator-supplied and only STRUCTURALLY screened on the
