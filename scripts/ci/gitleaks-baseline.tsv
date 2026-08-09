@@ -115,3 +115,5 @@ secureprompt-docs/docs/getting-started/quickstart.md	curl-auth-header	8da6239fc5
 secureprompt-ml/scripts/probe_gliner2_zeroshot.py	generic-api-key	fbf52105b9039f7c	detector probe corpus: SECRET_SENTENCES fed to GLiNER to measure whether it finds api keys
 secureprompt-ml/tests/test_sidecar_route_auth.py	generic-api-key	a6d75dfe9b1ab8d9	test fixture; asserts config.INTERNAL_TOKEN equals a monkeypatched env value
 secureprompt-web/src/app/(dashboard)/cost/cost-chart.tsx	generic-api-key	74908b3feaeb6fd1	FALSE POSITIVE: "rolling_7d_cost_usd" is a chart series key, not a credential
+scripts/ci/check-compose-appliance.sh	generic-api-key	dc8ef1b1e223d028	render-only KMS_FILE_KEY for `docker compose config`; base64-decodes to "render-only-not-a-secret-32bytes!" and sits beside SECUREPROMPT_JWT_SECRET="render-only-not-a-secret". The render never runs, so nothing is encrypted with it.
+.superpowers/sdd/2026-07-27-prd-workstreams/artifacts/task27-auth-anchor-devtext.json	jwt	906828afa7fac586	synthetic HS256 token from a detection fixture; its only claim is {"sub":"synthetic"}. Not stripped from GitLab, but excluded from the public mirror by scripts/mirror-to-github.sh.
