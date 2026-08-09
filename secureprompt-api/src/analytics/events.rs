@@ -100,6 +100,11 @@ pub struct RequestEvent {
     ///
     /// See [`RedactedPrompt`] for what each path may record and why.
     redacted_prompt: Option<String>,
+    /// Migration 010 — the placeholder-safe ANSWER, on the same terms as the
+    /// question above. Private for the same reason `redacted_prompt` is: the
+    /// only way to set it is [`RequestEvent::record_response`], so a new call
+    /// site cannot assign restored (PII-bearing) text here by mistake.
+    redacted_response: Option<String>,
     /// WS3-1 / WS3-2 — the raw user message, the raw upstream response and
     /// the PII-restored response, encrypted, IF AND ONLY IF the workspace
     /// opted in.
@@ -205,6 +210,7 @@ impl RequestEvent {
             ip_address: None,
             user_agent: None,
             redacted_prompt: None,
+            redacted_response: None,
             captured: None,
             floor_only: false,
             engines: crate::analytics::engines::DetectionEngines::FloorOnly,
@@ -287,6 +293,29 @@ impl RequestEvent {
     pub fn redacted_prompt(&self) -> Option<&str> {
         self.redacted_prompt.as_deref()
     }
+
+    /// Record the upstream answer BEFORE placeholder restoration.
+    ///
+    /// Takes the same `RedactedPrompt` discriminator as [`Self::record_prompt`]
+    /// deliberately: the question of whether text is safe to store is the same
+    /// question for both halves of a conversation — did NER cover it — and one
+    /// type means the two answers cannot drift apart.
+    ///
+    /// The caller MUST pass the pre-restoration text. Post-restoration output
+    /// carries the real values back and belongs in `restored_response`, which
+    /// is gated behind the capture opt-in.
+    pub fn record_response(&mut self, response: RedactedPrompt) {
+        self.redacted_response = match response {
+            RedactedPrompt::Redacted(text) if !text.is_empty() => Some(text),
+            RedactedPrompt::Redacted(_) | RedactedPrompt::CoverageLost => None,
+        };
+    }
+
+    /// Read-only view, for the same reason as [`Self::captured`].
+    #[must_use]
+    pub fn redacted_response(&self) -> Option<&str> {
+        self.redacted_response.as_deref()
+    }
 }
 
 use clickhouse::Row;
@@ -347,6 +376,10 @@ pub struct RequestEventRow {
     // a closed enum whose only constructor is an exhaustive match over
     // `SidecarCoverage`.
     pub engines: Vec<String>,
+    // ── Migration 010: the placeholder-safe answer ─────────────────────────
+    // Column order MUST match the ALTER TABLE order; this one is newest so it
+    // goes last.
+    pub redacted_response: Option<String>,
 }
 
 impl RequestEventRow {
@@ -371,6 +404,7 @@ impl RequestEventRow {
             ip_address: e.ip_address.clone(),
             user_agent: e.user_agent.clone(),
             redacted_prompt: e.redacted_prompt.clone(),
+            redacted_response: e.redacted_response.clone(),
             // WS3-1 — UNCONDITIONALLY NULL. `request_events` is the table the
             // cost, latency and audit-list dashboards read; nothing raw goes
             // into it again, whether or not the workspace opted in. The

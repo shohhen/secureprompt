@@ -130,6 +130,9 @@ struct RequestDetailRow {
     // as "no engine ran". The floor is unconditional, so an empty array is
     // never a true statement about a served request.
     pub engines: Vec<String>,
+    // ── Migration 010: the placeholder-safe answer ─────────────────────────
+    // Selected LAST, matching the ALTER TABLE order.
+    pub redacted_response: Option<String>,
 }
 
 /// WS3-1 / WS3-2 — one row from `request_content_captures`, the opt-in
@@ -212,7 +215,15 @@ pub struct RequestDetail {
     pub redacted_prompt: Option<String>,
     /// AI-side checked content — what we returned to the client after
     /// placeholder restoration. `None` for embeddings or denied requests.
+    ///
+    /// Behind the workspace's content-capture opt-in, so `None` on a default
+    /// install even for a request that plainly had an answer. Use
+    /// `redacted_response` to show the reply without requiring that opt-in.
     pub restored_response: Option<String>,
+    /// The upstream answer BEFORE placeholder restoration (migration 010) —
+    /// the counterpart of `redacted_prompt`, recorded on the same terms and
+    /// with no opt-in, because it says `{{Person_1}}` wherever the prompt did.
+    pub redacted_response: Option<String>,
     /// Raw user input pre-redaction. Paired with `redacted_prompt` on the
     /// detail page so reviewers can see what the user actually typed.
     pub raw_prompt: Option<String>,
@@ -442,7 +453,7 @@ async fn get_request_detail(
             toUnixTimestamp(created_at) AS created_at_unix, \
             user_id, api_key_id, api_key_name, \
             ip_address, user_agent, redacted_prompt, restored_response, \
-            raw_prompt, raw_response, engines \
+            raw_prompt, raw_response, engines, redacted_response \
         FROM request_events \
         WHERE workspace_id = toUUID('{ws}') \
           AND request_id = toUUID('{rid}') \
@@ -595,6 +606,7 @@ async fn get_request_detail(
         ip_address: req_row.ip_address,
         user_agent: req_row.user_agent,
         redacted_prompt: req_row.redacted_prompt,
+        redacted_response: req_row.redacted_response,
         restored_response,
         raw_prompt,
         raw_response,

@@ -1103,6 +1103,22 @@ impl PipelineService {
                 restored_content.clone(),
             )
             .await;
+        // Migration 010 — the ANSWER, on the same terms as the question.
+        //
+        // `provider_output.content` is the upstream reply BEFORE placeholder
+        // restoration, so it says `{{Person_1}}` wherever the prompt did: the
+        // model was never shown the real value. `restored_content` above is the
+        // post-restoration text and stays behind the capture gate.
+        //
+        // Gated on the SAME discriminator as `record_prompt` — NER coverage,
+        // not success. On a degraded request the prompt went upstream with
+        // floor-only redaction, so the reply can echo whatever the floor missed
+        // and is no safer than the prompt `audit_prompt` refuses to record.
+        event.record_response(if degraded_reason.is_some() {
+            RedactedPrompt::CoverageLost
+        } else {
+            RedactedPrompt::Redacted(provider_output.content.clone())
+        });
         // WS2-3 — the audit/analytics row records that this answer was
         // produced with the deterministic floor alone.
         event.floor_only = degraded_reason.is_some();
@@ -1414,6 +1430,16 @@ impl PipelineService {
                     },
                 )
                 .await;
+            // Migration 010 — the ANSWER, same terms as the question. See the
+            // buffered path for why `raw_full` (pre-restoration) is the safe
+            // half and `restored_full` is not. Kept beside `capture_content`
+            // so the streaming and buffered paths cannot drift on what an
+            // audit row records.
+            event.record_response(if stream_degraded.is_some() {
+                RedactedPrompt::CoverageLost
+            } else {
+                RedactedPrompt::Redacted(raw_full.clone())
+            });
             // WS2-3 — floor-only for the whole stream: set at prepare time,
             // or upgraded by a mid-stream response-side coverage loss.
             event.floor_only = stream_degraded.is_some();

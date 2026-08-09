@@ -1344,7 +1344,9 @@ export interface components {
             user_agent: string | null;
             /** @description The latest user message post-redaction, placeholders substituted in. */
             redacted_prompt: string | null;
-            /** @description What was returned to the client after placeholder restoration. */
+            /** @description The upstream answer BEFORE placeholder restoration (ClickHouse migration 010) — the counterpart of `redacted_prompt`. Recorded on every served request with no opt-in, because the model only ever saw placeholders and so its reply carries them too. `null` when the request was blocked, was an embedding, lost NER coverage, or predates the migration. */
+            redacted_response: string | null;
+            /** @description What was returned to the client after placeholder restoration — real values, so it is behind the `capture_raw_content` opt-in and is `null` on a default install even when an answer existed. Use `redacted_response` to show the reply without that opt-in. */
             restored_response: string | null;
             /** @description Raw user input pre-redaction. Present only for workspaces that opted into `capture_raw_content`. */
             raw_prompt: string | null;

@@ -1,0 +1,48 @@
+-- 010: the placeholder-safe ANSWER, stored on the same terms as the question.
+--
+-- THE ASYMMETRY THIS CLOSES
+--
+-- `redacted_prompt` (migration 002) is written on every served request, with no
+-- opt-in, because what it holds is placeholder-safe: `{{Person_1}}`, not a name.
+-- The answer had no equivalent. Every response column on this table
+-- (`restored_response`, `raw_prompt`, `raw_response`) is written NULL always —
+-- since 007 the writer sends nothing to them and captured content goes to
+-- `request_content_captures` as ciphertext, behind the workspace's capture
+-- opt-in, which is off by default.
+--
+-- So a default install records what a user ASKED and nothing about what the
+-- model ANSWERED. The audit log shows half a conversation, and the only way to
+-- see the other half is to turn on raw capture — which stores UNREDACTED
+-- prompts and answers for 90 days. "I want to see the reply" should not cost a
+-- workspace its redaction guarantee.
+--
+-- WHAT THIS COLUMN HOLDS, AND WHY IT IS SAFE TO STORE UNCONDITIONALLY
+--
+-- The upstream answer BEFORE placeholder restoration. The gateway sends a
+-- redacted prompt, so the model only ever saw `{{Person_1}}`; anything it says
+-- back about that entity says `{{Person_1}}` too. Restoration to the real value
+-- happens afterwards, on the way to the user, and that restored text is what
+-- `restored_response` means and why it stays gated.
+--
+-- The risk class is therefore IDENTICAL to `redacted_prompt`, and worth stating
+-- rather than implying: both hold post-detection text, so both carry whatever
+-- the detector missed, and neither carries what it caught. A model can also
+-- emit PII it invented or inferred — but so can a prompt the detector under-
+-- covered, and that is the risk `redacted_prompt` has always carried.
+--
+-- WHEN IT IS NULL
+--
+-- The same discriminator `redacted_prompt` uses: NER COVERAGE. On a
+-- coverage-lost request (`final_action = block_sidecar_unavailable`) nothing
+-- was forwarded and nothing came back, so there is no answer to record. A
+-- blocked or errored request has no answer either. NULL means "no
+-- placeholder-safe answer exists", never "an answer existed and we dropped it".
+--
+-- RETENTION
+--
+-- Inherits `request_events`' 90-day TTL — the same window as the prompt it
+-- belongs to, so the two halves of a conversation expire together rather than
+-- leaving orphaned questions.
+
+ALTER TABLE request_events
+    ADD COLUMN IF NOT EXISTS redacted_response Nullable(String);

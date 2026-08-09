@@ -244,11 +244,18 @@ export function AuditDetail({ requestId, workspaceId }: Props) {
           <CardDescription>{t("aiResponseDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-2">
+          {/* `raw_response` is the opt-in capture (ciphertext, decrypted
+              server-side). `redacted_response` is migration 010: the same
+              pre-restoration text, recorded with no opt-in because it is
+              placeholder-safe. Prefer the captured one when a workspace has
+              opted in — it is the same content — and fall back to the
+              always-recorded one so a default install shows the reply instead
+              of an empty panel. */}
           <MessagePanel
             label={t("panelRaw")}
             badgeVariant="outline"
             description={t("panelRawResponseDescription")}
-            content={data.raw_response}
+            content={data.raw_response ?? data.redacted_response}
             emptyMessage={t("panelRawResponseEmpty")}
           />
           <MessagePanel

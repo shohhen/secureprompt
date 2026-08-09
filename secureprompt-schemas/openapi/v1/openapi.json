@@ -3705,6 +3705,7 @@
           "ip_address",
           "user_agent",
           "redacted_prompt",
+          "redacted_response",
           "restored_response",
           "raw_prompt",
           "raw_response",
@@ -3799,10 +3800,15 @@
             "nullable": true,
             "description": "The latest user message post-redaction, placeholders substituted in."
           },
+          "redacted_response": {
+            "type": "string",
+            "nullable": true,
+            "description": "The upstream answer BEFORE placeholder restoration (ClickHouse migration 010) — the counterpart of `redacted_prompt`. Recorded on every served request with no opt-in, because the model only ever saw placeholders and so its reply carries them too. `null` when the request was blocked, was an embedding, lost NER coverage, or predates the migration."
+          },
           "restored_response": {
             "type": "string",
             "nullable": true,
-            "description": "What was returned to the client after placeholder restoration."
+            "description": "What was returned to the client after placeholder restoration — real values, so it is behind the `capture_raw_content` opt-in and is `null` on a default install even when an answer existed. Use `redacted_response` to show the reply without that opt-in."
           },
           "raw_prompt": {
             "type": "string",
