@@ -239,6 +239,7 @@ async fn create_provider(
             record.id,
             &record.provider_type,
             plaintext,
+            config_base_url(&record.config),
         )
         .await;
     }
@@ -321,6 +322,7 @@ async fn update_provider(
             record.id,
             &record.provider_type,
             plaintext,
+            config_base_url(&record.config),
         )
         .await;
     }
@@ -592,7 +594,7 @@ async fn sync_provider_models(
     let upstream_ids = crate::providers::credential_test::list_upstream_models(
         &target.provider_type,
         &plaintext,
-        None,
+        config_base_url(&target.config),
     )
     .await
     .map_err(|e| {
@@ -661,6 +663,28 @@ async fn persist_synced_models(
 /// rotation. Failures are logged at warn level — the caller should still
 /// succeed the user-facing operation. The dashboard's "Sync from upstream"
 /// button is the explicit retry path.
+
+/// The upstream base URL a provider row carries, if any.
+///
+/// Model sync and the credential probe both need it, and neither could see it
+/// before: they were handed `None` and fell back to `default_base_url`, which
+/// is empty for provider types whose endpoint has no single global address.
+/// For `bedrock` that produced, on every create and every "Sync from upstream":
+///
+///   auto model sync skipped: upstream fetch failed
+///   error: no default base_url for provider_type=bedrock; supply one explicitly
+///
+/// A provider whose credential tests green but whose models never load is a
+/// worse failure than one that refuses outright, because nothing in the UI
+/// says why the list is empty.
+fn config_base_url(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 async fn auto_sync_models(
     _state: &AppState,
     repo: &ProviderRepository,
@@ -668,11 +692,12 @@ async fn auto_sync_models(
     provider_id: Uuid,
     provider_type: &str,
     credential: &str,
+    base_url: Option<&str>,
 ) {
     let upstream_ids = match crate::providers::credential_test::list_upstream_models(
         provider_type,
         credential,
-        None,
+        base_url,
     )
     .await
     {
