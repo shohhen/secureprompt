@@ -224,6 +224,10 @@ static-checks:
     - bash scripts/ci/check-no-dangerous-html.sh
     # AUTH-07: .env.example carries CHANGEME sentinels, never a real secret.
     - bash scripts/ci/check-env-hygiene.sh
+    # check-env-hygiene guards the TEMPLATE (it must still say CHANGEME);
+    # this guards the SCRIPT that replaces those placeholders. Five were
+    # being left behind, MONGO_PASSWORD among them.
+    - bash scripts/ci/check-init-env-leaves-no-placeholder.sh
     # MR1 I1. check-env-hygiene.sh guards .env.example; this guards the compose
     # files, where the actual defect was — a `${VAR:-...}` fallback meant the
     # boot gate never saw a placeholder because the var was never unset.

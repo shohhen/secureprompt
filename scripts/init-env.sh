@@ -98,6 +98,23 @@ KMS_FILE_KEY="$(openssl rand 32 | base64)"
 # rejects rather than a working one.
 REDIS_PASSWORD="$(gen)"
 CLICKHOUSE_PASSWORD="$(gen)"
+# The LibreChat stack. These were left as CHANGEME for as long as chat was
+# optional, and the script printed them under "only needed for the LibreChat
+# stack". librechat and librechat-mongo are in docker-compose.yml now, so that
+# heading stopped being true and MONGO_PASSWORD=CHANGEME became a database
+# reachable from every container on the compose network under a credential
+# published in this repository.
+MONGO_PASSWORD="$(gen)"
+LIBRECHAT_JWT="$(gen)"
+LIBRECHAT_JWT_REFRESH="$(gen)"
+# WIDTHS ARE LOAD-BEARING. LibreChat reads CREDS_KEY as 32 bytes of hex and
+# CREDS_IV as 16; the wrong width boots fine and then fails to encrypt, which
+# is a worse failure than not booting.
+LIBRECHAT_KEY="$(openssl rand -hex 32)"
+LIBRECHAT_IV="$(openssl rand -hex 16)"
+# Not a secret, so it is not generated — but it must EXIST, or an upgraded
+# deployment keeps the compiled-in default that covers only localhost:3000.
+CORS_ORIGINS="http://localhost:3003,http://localhost:3000"
 
 # --fill-missing: append the keys this .env does not have, and stop. Every
 # existing assignment is left byte-for-byte alone — that is the entire point,
@@ -109,8 +126,20 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fi
 
     added=()
+    repaired=()
     fill() {
         local key="$1" value="$2"
+        # A key that is PRESENT but still holds the placeholder is the upgrade
+        # case: an operator ran an older version of this script, which left
+        # CHANGEME behind, and --fill-missing then skipped it forever because
+        # the key existed. Repairing it is not "clobbering an existing value" —
+        # CHANGEME is the absence of one, and the boot gate rejects it.
+        if grep -qE "^${key}=CHANGEME$" "$TARGET"; then
+            sed -i.bak -E "s|^${key}=CHANGEME$|${key}=${value}|" "$TARGET"
+            rm -f "${TARGET}.bak"
+            repaired+=("$key")
+            return
+        fi
         if grep -qE "^${key}=" "$TARGET"; then
             return
         fi
@@ -129,11 +158,20 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fill KMS_FILE_KEY                 "$KMS_FILE_KEY"
     fill REDIS_PASSWORD               "$REDIS_PASSWORD"
     fill CLICKHOUSE_PASSWORD          "$CLICKHOUSE_PASSWORD"
+    fill MONGO_PASSWORD               "$MONGO_PASSWORD"
+    fill LIBRECHAT_JWT_SECRET         "$LIBRECHAT_JWT"
+    fill LIBRECHAT_JWT_REFRESH_SECRET "$LIBRECHAT_JWT_REFRESH"
+    fill LIBRECHAT_CREDS_KEY          "$LIBRECHAT_KEY"
+    fill LIBRECHAT_CREDS_IV           "$LIBRECHAT_IV"
+    fill SECUREPROMPT_CORS_ORIGINS    "$CORS_ORIGINS"
 
-    if [[ "${#added[@]}" -eq 0 ]]; then
+    if [[ "${#added[@]}" -eq 0 && "${#repaired[@]}" -eq 0 ]]; then
         echo "$TARGET already has every key this script manages. Nothing changed."
     else
-        echo "Added to $TARGET (existing values untouched): ${added[*]}"
+        [[ "${#added[@]}" -gt 0 ]] && echo "Added to $TARGET (existing values untouched): ${added[*]}"
+        # Named separately from "added" so an operator can see that something
+        # already on disk was rewritten, and which.
+        [[ "${#repaired[@]}" -gt 0 ]] && echo "Replaced leftover CHANGEME placeholders: ${repaired[*]}"
     fi
     exit 0
 fi
@@ -161,10 +199,42 @@ replace SECUREPROMPT_APP_DB_PASSWORD "$APP_DB_PASSWORD"
 replace KMS_FILE_KEY                 "$KMS_FILE_KEY"
 replace REDIS_PASSWORD               "$REDIS_PASSWORD"
 replace CLICKHOUSE_PASSWORD          "$CLICKHOUSE_PASSWORD"
+replace MONGO_PASSWORD               "$MONGO_PASSWORD"
+replace LIBRECHAT_JWT_SECRET         "$LIBRECHAT_JWT"
+replace LIBRECHAT_JWT_REFRESH_SECRET "$LIBRECHAT_JWT_REFRESH"
+replace LIBRECHAT_CREDS_KEY          "$LIBRECHAT_KEY"
+replace LIBRECHAT_CREDS_IV           "$LIBRECHAT_IV"
 
 echo "Wrote $TARGET with freshly generated secrets."
+
+# This used to read "Still CHANGEME and only needed for the LibreChat stack"
+# and list five keys. They are generated now, so anything printed here is a
+# placeholder nobody owns — a bug in this script, not a note for the operator.
+leftover="$(grep -nE "^[A-Z_]+=CHANGEME" "$TARGET" || true)"
+if [ -n "$leftover" ]; then
+    echo
+    echo "BUG: these keys were left as placeholders and nothing will replace them:" >&2
+    echo "$leftover" >&2
+    echo "scripts/ci/check-init-env-leaves-no-placeholder.sh covers this." >&2
+    exit 1
+fi
+
 echo
-echo "Still CHANGEME and only needed for the LibreChat stack:"
-grep -nE "^[A-Z_]+=CHANGEME" "$TARGET" || echo "  (none)"
+echo "Two settings are NOT secrets and this script cannot guess them. A"
+echo "deployment reachable at anything other than localhost must set both:"
+echo
+echo "  SECUREPROMPT_CORS_ORIGINS=https://<your console host>"
+echo "      Currently: $(grep -E '^SECUREPROMPT_CORS_ORIGINS=' "$TARGET" | cut -d= -f2-)"
+echo "      The browser sends credentials, so the API must echo the exact"
+echo "      origin. Miss it and the console reports \"Invalid credentials\"."
+echo
+echo "  NEXT_PUBLIC_API_URL=https://<your api host>"
+echo "      A BUILD ARGUMENT, not a runtime variable. Next.js inlines it into"
+echo "      the browser bundle, so setting it in $TARGET does nothing to an"
+echo "      already-built image — the bundle keeps whatever it was compiled"
+echo "      with: http://localhost:8080 — the browser's own machine, not yours."
+echo "      Rebuild the web image to change it:"
+echo "        docker build --build-arg NEXT_PUBLIC_API_URL=https://<api host> \\"
+echo "          -f secureprompt-web/Dockerfile -t secureprompt/web:0.1.0 ."
 echo
 echo "Next: docker compose up"
