@@ -115,6 +115,9 @@ LIBRECHAT_IV="$(openssl rand -hex 16)"
 # Not a secret, so it is not generated — but it must EXIST, or an upgraded
 # deployment keeps the compiled-in default that covers only localhost:3000.
 CORS_ORIGINS="http://localhost:3003,http://localhost:3000"
+# Also not a secret: the vendor PUBLIC key that licence tokens verify against.
+# Absent, licence activation 500s before it reads the token.
+LICENSE_PUBKEY="6/lucPVN8u5Wa7U2kt2/GuyRojFxXdNYiz9DI1dJ3AY="
 
 # --fill-missing: append the keys this .env does not have, and stop. Every
 # existing assignment is left byte-for-byte alone — that is the entire point,
@@ -164,6 +167,7 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fill LIBRECHAT_CREDS_KEY          "$LIBRECHAT_KEY"
     fill LIBRECHAT_CREDS_IV           "$LIBRECHAT_IV"
     fill SECUREPROMPT_CORS_ORIGINS    "$CORS_ORIGINS"
+    fill SECUREPROMPT_LICENSE_PUBKEY  "$LICENSE_PUBKEY"
 
     if [[ "${#added[@]}" -eq 0 && "${#repaired[@]}" -eq 0 ]]; then
         echo "$TARGET already has every key this script manages. Nothing changed."
