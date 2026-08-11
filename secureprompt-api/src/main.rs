@@ -412,13 +412,62 @@ async fn main() -> anyhow::Result<()> {
             let url = format!("{}/v1/attestations", server_url.trim_end_matches('/'));
             let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
             tracing::info!(url, interval_secs = secs, "attestation heartbeat enabled");
+            // Why a skipped beat is logged, and only on change.
+            //
+            // This loop used to `continue` in silence. A deployment missing
+            // SECUREPROMPT_ATTEST_KEK therefore uploaded nothing, forever,
+            // while emitting "attestation heartbeat enabled" at boot and not
+            // one line afterwards. From sp-admin the symptom is a customer
+            // with no attestations; from the gateway log it is indistinguishable
+            // from a healthy deployment. That is what actually happened in
+            // production, and the diagnosis cost far more than this branch.
+            //
+            // The reason is logged when it CHANGES rather than every beat: at
+            // the default hourly interval an unlicensed gateway would otherwise
+            // emit the same warning 24 times a day, which is how a real signal
+            // gets filtered out. Recovery is logged for the same reason — the
+            // operator who fixed it wants confirmation, not silence.
+            let mut last_skip: Option<&'static str> = None;
             loop {
                 t.tick().await;
-                let Some(signed) =
-                    secureprompt_api::http::routes::internal::build_signed_attestation(&att_state)
-                        .await
-                else {
-                    continue; // no valid license/key right now — skip this beat
+                let signed = match secureprompt_api::http::routes::internal::build_signed_attestation(
+                    &att_state,
+                )
+                .await
+                {
+                    Some(s) => {
+                        if last_skip.take().is_some() {
+                            tracing::info!("attestation heartbeat recovered — resuming uploads");
+                        }
+                        s
+                    }
+                    None => {
+                        // Re-derive the reason rather than plumbing it out of
+                        // build_signed_attestation: that function is shared with
+                        // GET /internal/attestation, which answers 503 and wants
+                        // no opinion about logging.
+                        let kek_ok = secureprompt_api::license::parse_kek(
+                            &secureprompt_api::license::effective_attest_kek(
+                                &att_state.config.license.attest_kek_b64,
+                            ),
+                        )
+                        .is_some();
+                        let reason = if !kek_ok {
+                            "SECUREPROMPT_ATTEST_KEK is unset or not 32 base64 bytes — \
+                             the attestation signing key cannot be unwrapped"
+                        } else {
+                            "no valid licence (unlicensed, expired or revoked) — \
+                             the licence carries the attestation key"
+                        };
+                        if last_skip != Some(reason) {
+                            tracing::warn!(
+                                reason,
+                                "attestation heartbeat skipped — sp-admin will show no attestations"
+                            );
+                            last_skip = Some(reason);
+                        }
+                        continue;
+                    }
                 };
                 match client
                     .post(&url)

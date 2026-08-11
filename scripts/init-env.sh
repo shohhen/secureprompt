@@ -168,6 +168,11 @@ if [[ "$MODE" == "--fill-missing" ]]; then
     fill LIBRECHAT_CREDS_IV           "$LIBRECHAT_IV"
     fill SECUREPROMPT_CORS_ORIGINS    "$CORS_ORIGINS"
     fill SECUREPROMPT_LICENSE_PUBKEY  "$LICENSE_PUBKEY"
+    # Deliberately filled EMPTY. See the note by the fresh-install path below:
+    # this key comes from the vendor and generating one would be actively
+    # harmful. Adding the empty line still helps — it puts the setting in the
+    # file where an operator can find it instead of nowhere.
+    fill SECUREPROMPT_ATTEST_KEK      ""
 
     if [[ "${#added[@]}" -eq 0 && "${#repaired[@]}" -eq 0 ]]; then
         echo "$TARGET already has every key this script manages. Nothing changed."
@@ -224,8 +229,8 @@ if [ -n "$leftover" ]; then
 fi
 
 echo
-echo "Two settings are NOT secrets and this script cannot guess them. A"
-echo "deployment reachable at anything other than localhost must set both:"
+echo "Three settings are NOT secrets and this script cannot guess them. A"
+echo "deployment reachable at anything other than localhost must set all three:"
 echo
 echo "  SECUREPROMPT_CORS_ORIGINS=https://<your console host>"
 echo "      Currently: $(grep -E '^SECUREPROMPT_CORS_ORIGINS=' "$TARGET" | cut -d= -f2-)"
@@ -240,5 +245,14 @@ echo "      with: http://localhost:8080 — the browser's own machine, not yours
 echo "      Rebuild the web image to change it:"
 echo "        docker build --build-arg NEXT_PUBLIC_API_URL=https://<api host> \\"
 echo "          -f secureprompt-web/Dockerfile -t secureprompt/web:0.1.0 ."
+echo
+echo "  SECUREPROMPT_ATTEST_KEK=<from the vendor's keys.json>"
+echo "      NOT generated here on purpose. It is one half of a SYMMETRIC pair:"
+echo "      the issuer seals this deployment's attestation signing key under"
+echo "      its SP_ADMIN_ATTEST_KEK, and only the identical value unwraps it."
+echo "      A random key would parse, look configured, and unwrap nothing."
+echo "      Left empty, the gateway runs normally but signs no usage"
+echo "      attestations, so the licence server shows the deployment as silent."
+echo "      Get it from GET /v1/provisioning on the licence server."
 echo
 echo "Next: docker compose up"
